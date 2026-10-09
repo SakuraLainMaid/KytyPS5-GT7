@@ -26,6 +26,45 @@ namespace {
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t MaxIndirectDescriptorProbes = 65536u;
 
+// EQAA FMASK formats (kFmask<bits>_S<samples>_F<fragments> with fewer fragments than samples):
+// the number of color fragments stored per pixel. 0 for formats with one fragment per sample,
+// whose native mapping is the identity.
+uint8_t FmaskEqaaFragmentCount(Prospero::BufferFormat format) {
+	using F = Prospero::BufferFormat;
+	switch (format) {
+		case F::kFmask8_S2_F1:
+		case F::kFmask8_S4_F1:
+		case F::kFmask8_S8_F1:
+		case F::kFmask16_S16_F1: return 1;
+		case F::kFmask8_S4_F2:
+		case F::kFmask16_S8_F2:
+		case F::kFmask32_S16_F2: return 2;
+		case F::kFmask32_S8_F4:
+		case F::kFmask64_S16_F4: return 4;
+		case F::kFmask64_S16_F8: return 8;
+		default: return 0;
+	}
+}
+
+// One 32-bit word of an expanded FMASK value (four bits per sample) covering samples
+// first_sample..first_sample+7. Without EQAA (fragments == 0) sample i maps to host sample i;
+// with EQAA it maps to fragment (i mod fragments), so every index names a host sample that exists.
+constexpr uint32_t FmaskSampleMapWord(uint32_t fragments, uint32_t first_sample) {
+	if (fragments == 0) {
+		return first_sample == 0 ? 0x76543210u : 0xfedcba98u;
+	}
+	uint32_t word = 0;
+	for (uint32_t i = 0; i < 8; i++) {
+		word |= ((first_sample + i) % fragments) << (i * 4u);
+	}
+	return word;
+}
+static_assert(FmaskSampleMapWord(0, 0) == 0x76543210u && FmaskSampleMapWord(0, 8) == 0xfedcba98u);
+static_assert(FmaskSampleMapWord(8, 8) == 0x76543210u);
+static_assert(FmaskSampleMapWord(4, 0) == 0x32103210u);
+static_assert(FmaskSampleMapWord(2, 8) == 0x10101010u);
+static_assert(FmaskSampleMapWord(1, 0) == 0u);
+
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
 	             static_cast<int>(message.size()), message.data());
@@ -590,6 +629,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		}
 		const bool storage      = base.resource_class == ImageResourceClass::Storage;
 		image.fmask             = Prospero::IsFmaskTextureFormat(format);
+		image.fmask_fragments   = image.fmask ? FmaskEqaaFragmentCount(format) : 0;
 		if (image.fmask) {
 			if (storage || base.depth_compare ||
 			    image.indirect_root != ImageResource::NoIndirectImage ||
@@ -2018,9 +2058,12 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			const auto& image = images[memory.resource];
 			if (specialization.images[memory.resource].fmask) {
 				EXIT_IF(inst.GetOpcode() != ValueOpcode::ImageRead || memory.data_bits != 32u);
-				// Vulkan MSAA stores each sample directly; FMASK's four-bit fragment indices
-				// therefore map each coverage sample to the same host sample.
-				constexpr uint32_t indices[] = {0x76543210u, 0xfedcba98u};
+				// The host image holds one sample per guest fragment. FMASK's four-bit fragment
+				// indices map coverage sample i to host sample i, or with EQAA (fewer fragments
+				// than samples) to i mod fragments, so every index names a sample that exists.
+				const uint32_t fragments_per_pixel = specialization.images[memory.resource].fmask_fragments;
+				const uint32_t indices[] = {FmaskSampleMapWord(fragments_per_pixel, 0),
+				                            FmaskSampleMapWord(fragments_per_pixel, 8)};
 				std::array<Value, 2> fragments;
 				for (uint32_t component = 0; component < fragments.size(); component++) {
 					const auto selected = block->PrependNewInst(

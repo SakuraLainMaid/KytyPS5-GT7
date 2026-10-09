@@ -828,6 +828,8 @@ std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPip
 	}
 	PipelineKeyHash::Mix(hash, static_cast<uint32_t>(key.rendering.depth_format));
 	PipelineKeyHash::Mix(hash, static_cast<uint32_t>(key.rendering.stencil_format));
+	PipelineKeyHash::Mix(hash, key.rendering.color_samples);
+	PipelineKeyHash::Mix(hash, key.rendering.depth_samples);
 	for (const auto id: key.vertex_shader_ids) {
 		PipelineKeyHash::Mix(hash, id);
 	}
@@ -2549,11 +2551,31 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		rendering.stencil_format = aspects & vk::ImageAspectFlagBits::eStencil
 		                               ? depth.desc.view_info.format
 		                               : vk::Format::eUndefined;
+		const uint32_t depth_samples = depth.desc.info.samples;
 		if (attachment_samples == 0) {
-			attachment_samples = depth.desc.info.samples;
-		} else if (attachment_samples != depth.desc.info.samples) {
-			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
-			     depth.desc.info.samples);
+			attachment_samples = depth_samples;
+		} else if (attachment_samples != depth_samples) {
+			// PS5 EQAA: color holds the fragment count, depth the coverage count.
+			using MixedSamples       = GraphicContext::MixedAttachmentSamples;
+			const auto     mixed     = m_graphics.mixed_attachment_samples;
+			const uint32_t color_samples = attachment_samples;
+			const bool     allowed   = mixed == MixedSamples::Amd ||
+			                     (mixed == MixedSamples::Nv && color_samples < depth_samples);
+			if (!allowed) {
+				EXIT("mixed color/depth sample counts are unsupported on this GPU: color %u, "
+				     "depth %u (needs VK_AMD_mixed_attachment_samples, or "
+				     "VK_NV_framebuffer_mixed_samples with color <= depth)\n",
+				     color_samples, depth_samples);
+			}
+			rendering.color_samples = color_samples;
+			rendering.depth_samples = depth_samples;
+			attachment_samples      = std::max(color_samples, depth_samples);
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				LOGF("Pipeline: mixed attachment samples (%s): color %u, depth %u, raster %u\n",
+				     mixed == MixedSamples::Amd ? "AMD" : "NV", color_samples, depth_samples,
+				     attachment_samples);
+			}
 		}
 	}
 	if (color_count == 0 && !with_depth) {
@@ -2580,6 +2602,16 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	static_params.samples                  = attachment_samples;
 	static_params.sample_shading_enable =
 	    ps_active && attachment_samples > 1 && ps_input_info->ps_sample_shading;
+	if (static_params.sample_shading_enable && rendering.color_samples != 0 &&
+	    m_graphics.mixed_attachment_samples == GraphicContext::MixedAttachmentSamples::Nv) {
+		// NV mixed samples shades per pixel with coverage modulation; per-sample shading
+		// against fewer color samples than raster samples is not something it defines.
+		static_params.sample_shading_enable = false;
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("Pipeline: temporary: per-sample shading disabled for NV mixed-sample draw\n");
+		}
+	}
 	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
 		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
 	}

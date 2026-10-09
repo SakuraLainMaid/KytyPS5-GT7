@@ -618,6 +618,20 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	build.rendering_info.pColorAttachmentFormats = build.rendering.color_formats.data();
 	build.rendering_info.depthAttachmentFormat   = build.rendering.depth_format;
 	build.rendering_info.stencilAttachmentFormat = build.rendering.stencil_format;
+	if (build.rendering.color_samples != 0) {
+		// Mixed attachment samples (EQAA): rasterization runs at the larger count, each
+		// attachment keeps its own (VK_AMD_mixed_attachment_samples / NV_framebuffer_mixed_samples).
+		EXIT_IF(graphics.mixed_attachment_samples == GraphicContext::MixedAttachmentSamples::None);
+		for (uint32_t i = 0; i < build.rendering.color_count; i++) {
+			build.color_attachment_samples[i] = vulkan_sample_count(build.rendering.color_samples);
+		}
+		auto& counts                         = build.attachment_sample_count;
+		counts.colorAttachmentCount          = build.rendering.color_count;
+		counts.pColorAttachmentSamples       = build.color_attachment_samples.data();
+		counts.depthStencilAttachmentSamples = vulkan_sample_count(build.rendering.depth_samples);
+		counts.pNext                         = build.rendering_info.pNext;
+		build.rendering_info.pNext           = &counts;
+	}
 	pipeline_info.pNext                          = &build.rendering_info;
 	pipeline_info.stageCount                     = shader_stage_count;
 	pipeline_info.pStages                        = build.stages.data();

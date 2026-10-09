@@ -71,10 +71,24 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 		return;
 	}
+	// NUM_SAMPLES (coverage) and NUM_FRAGMENTS (stored colors) are both log2. EQAA stores fewer
+	// fragments than it has coverage samples (e.g. 4s/2f) and keeps the sample->fragment map in
+	// FMASK. The guest surface layout follows the fragment count, so the host image does too;
+	// the extra coverage samples only reach the depth attachment (see the pipeline's mixed-sample
+	// path) and the FMASK emulation maps each sample onto an existing fragment.
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
-	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {
+	if (samples == 0 || render_sample_count(rt.attrib.num_samples) == 0 ||
+	    rt.attrib.num_samples < rt.attrib.num_fragments) {
 		EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
 		     rt.attrib.num_samples, rt.attrib.num_fragments);
+	}
+	if (rt.attrib.num_samples != rt.attrib.num_fragments) {
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("RenderColorTarget: EQAA target %ux coverage / %ux fragments, host image uses %u "
+			     "samples\n",
+			     render_sample_count(rt.attrib.num_samples), samples, samples);
+		}
 	}
 	const uint32_t levels = rt.attrib2.num_mip_levels + 1u;
 	if (levels == 0 || levels > 16 || rt.view.current_mip_level >= levels) {

@@ -62,6 +62,11 @@ struct GraphicContext {
 	// subgroupSizeControl is enabled: the device has more than one subgroup size.
 	bool                               subgroup_size_control_enabled         = false;
 	bool                               sample_rate_shading_enabled           = false;
+	// Attachments with different sample counts in one draw (PS5 EQAA: depth at the coverage
+	// count, color at the fragment count). AMD allows either side to be larger; NV only allows
+	// color <= depth, with rasterization at the depth count.
+	enum class MixedAttachmentSamples : uint8_t { None, Amd, Nv };
+	MixedAttachmentSamples             mixed_attachment_samples              = MixedAttachmentSamples::None;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;

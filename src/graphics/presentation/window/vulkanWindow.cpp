@@ -1256,6 +1256,20 @@ void WindowContext::CreateVulkan() {
 				device_extensions.push_back(extension);
 			}
 		}
+		// PS5 EQAA renders color at its fragment count and depth at its coverage count.
+		using MixedSamples = GraphicContext::MixedAttachmentSamples;
+		if (HasExtension(available_extensions, VK_AMD_MIXED_ATTACHMENT_SAMPLES_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_AMD_MIXED_ATTACHMENT_SAMPLES_EXTENSION_NAME);
+			graphic_ctx.mixed_attachment_samples = MixedSamples::Amd;
+		} else if (HasExtension(available_extensions,
+		                        VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME);
+			graphic_ctx.mixed_attachment_samples = MixedSamples::Nv;
+		}
+		LOGF("Vulkan mixed attachment samples: %s\n",
+		     graphic_ctx.mixed_attachment_samples == MixedSamples::Amd  ? "AMD"
+		     : graphic_ctx.mixed_attachment_samples == MixedSamples::Nv ? "NV"
+		                                                                : "unsupported");
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);

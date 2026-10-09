@@ -78,6 +78,10 @@ struct PipelineRenderingState {
 	vk::Format                                           depth_format   = vk::Format::eUndefined;
 	vk::Format                                           stencil_format = vk::Format::eUndefined;
 	uint32_t                                             color_count    = 0;
+	// Sample count of the color attachments when it differs from the rasterization count
+	// (PipelineStaticParameters::samples); 0 when every attachment matches rasterization.
+	uint32_t                                             color_samples  = 0;
+	uint32_t                                             depth_samples  = 0;
 
 	bool operator==(const PipelineRenderingState&) const = default;
 };
@@ -144,6 +148,8 @@ struct GraphicsPipelineBuild {
 	vk::PipelineTessellationStateCreateInfo                               tessellation {};
 	PipelineRenderingState                                                rendering;
 	vk::PipelineRenderingCreateInfo                                       rendering_info {};
+	std::array<vk::SampleCountFlagBits, RENDER_COLOR_ATTACHMENTS_MAX>     color_attachment_samples {};
+	vk::AttachmentSampleCountInfoAMD                                      attachment_sample_count {};
 	vk::GraphicsPipelineCreateInfo                                        pipeline_info {};
 	uint64_t                                                              vs_hash = 0;
 	uint64_t                                                              ps_hash = 0;

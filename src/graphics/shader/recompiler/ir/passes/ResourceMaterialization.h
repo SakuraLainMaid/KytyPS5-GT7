@@ -34,6 +34,9 @@ struct ResourceSpecialization {
 		uint32_t                      indirect_search_iterations = 0;
 		bool                          cube                       = false;
 		bool                          fmask                      = false;
+		// EQAA FMASK only: color fragments stored per pixel (1, 2, 4 or 8) when the format has
+		// fewer fragments than coverage samples, so samples share fragments; 0 otherwise.
+		uint8_t                       fmask_fragments            = 0;
 		bool                          bindless                   = false;
 		bool                          operator==(const Image&) const = default;
 	};

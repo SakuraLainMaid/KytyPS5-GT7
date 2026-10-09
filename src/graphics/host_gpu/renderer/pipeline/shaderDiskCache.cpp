@@ -24,7 +24,7 @@ namespace {
 
 // Bump when the encoding below changes in a way the source version cannot see (it hashes this
 // file too, so this is belt and braces).
-constexpr uint32_t FormatVersion = 2;
+constexpr uint32_t FormatVersion = 3;
 constexpr uint32_t FileMagic     = 0x4344534bu; // "KSDC"
 constexpr uint64_t MaxFileSize   = uint64_t {256} << 20u;
 
@@ -321,6 +321,7 @@ void Visit(Io& io, T& v) {
 	io(v.indirect_search_iterations);
 	io(v.cube);
 	io(v.fmask);
+	io(v.fmask_fragments);
 	io(v.bindless);
 }
 
