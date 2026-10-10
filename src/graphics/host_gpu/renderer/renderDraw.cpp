@@ -1331,7 +1331,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    vertex_stages.front().stage.program->shader_hash,
 	    state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0,
 	    state.color_count != 0 ? state.color_info[0].desc.info.samples : 0,
-	    state.depth_info.image_id ? state.depth_info.desc.info.samples : 0);
+	    state.depth_info.image_id ? state.depth_info.desc.info.samples : 0,
+	    (state.ps_active && writes_memory(state.ps_input_info.stage) ? 1u : 0u) |
+	        (std::ranges::any_of(vertex_stages,
+	                             [&](const auto& stage) { return writes_memory(stage.stage); })
+	             ? 2u
+	             : 0u));
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}

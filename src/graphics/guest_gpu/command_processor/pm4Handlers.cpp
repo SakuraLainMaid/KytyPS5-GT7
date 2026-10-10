@@ -2015,7 +2015,16 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 				}
 				continue;
 			}
-			EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			// GT7's indirect lists are sometimes not register pairs at all (floats in the offset
+			// slots: the list is read before it is written, or after reuse). Skip, as the other
+			// unknown indirect entries are, rather than abort.
+			static std::atomic<uint32_t> unknown_reports {0};
+			if (unknown_reports.fetch_add(1) < 16) {
+				LOGF("\t temporary: skipping unknown indirect CX register 0x%" PRIx32
+				     " (raw 0x%08" PRIx32 "), value = 0x%08" PRIx32 "\n",
+				     cmd_offset, raw_cmd_offset, value);
+			}
+			continue;
 		}
 
 		pfunc(cp, cmd_offset, value);
@@ -2147,12 +2156,19 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		auto pfunc = g_hw_uc_indirect_func[cmd_offset & (Pm4::UC_NUM - 1)];
 
 		if (pfunc == nullptr) {
-			auto* dump_regs = indirect_buffer - i * 2;
-			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
-				LOGF("\t uc_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
-				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
+			static std::atomic<uint32_t> unknown_reports {0};
+			if (unknown_reports.fetch_add(1) < 16) {
+				auto* dump_regs = indirect_buffer - i * 2;
+				for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
+					LOGF("\t uc_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32
+					     "\n",
+					     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
+				}
+				LOGF("\t temporary: skipping unknown indirect UC register 0x%" PRIx32
+				     " (raw 0x%08" PRIx32 "), value = 0x%08" PRIx32 "\n",
+				     cmd_offset, raw_cmd_offset, value);
 			}
-			EXIT("unknown uc reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			continue;
 		}
 		pfunc(cp, cmd_offset, value);
 	}

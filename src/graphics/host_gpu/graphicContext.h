@@ -34,6 +34,8 @@ struct DiagnosticCheckpoint {
 	uint64_t ps_hash       = 0;
 	uint32_t color_samples = 0;
 	uint32_t depth_samples = 0;
+	// Bit 0: the pixel stage writes buffers or storage images; bit 1: a vertex stage does.
+	uint32_t write_flags = 0;
 };
 
 struct GraphicContext;

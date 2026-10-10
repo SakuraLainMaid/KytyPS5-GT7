@@ -56,6 +56,28 @@ void DumpGaveUpCode(const CompileOptions& options, std::span<const uint32_t> cod
 		std::fwrite(code.data(), sizeof(uint32_t), code.size(), file);
 		std::fclose(file);
 	}
+	// What else the translation depended on, to reproduce it offline.
+	const auto info_path = fmt::format("{}/{}_{:016x}.txt", folder, StageName(options.stage),
+	                                   options.shader_hash);
+	if (FILE* file = std::fopen(info_path.c_str(), "w"); file != nullptr) {
+		std::fprintf(file, "wave_size=%u bindless_images=%d user_data_base=%u user_data_count=%zu\n",
+		             options.wave_size, options.bindless_images ? 1 : 0, options.user_data_base,
+		             options.user_data.size());
+		std::fprintf(file, "user_data=");
+		for (const auto value: options.user_data) std::fprintf(file, "%08x ", value);
+		std::fprintf(file, "\n");
+		if (options.stage == ShaderType::Compute && options.input_info.compute != nullptr) {
+			const auto& cs = *options.input_info.compute;
+			std::fprintf(file,
+			             "threads=%u,%u,%u thread_ids_num=%d workgroup_register=%d group_id=%d,%d,%d "
+			             "tg_size_en=%d wave_size=%u lds_size_dwords=%u\n",
+			             cs.threads_num[0], cs.threads_num[1], cs.threads_num[2], cs.thread_ids_num,
+			             cs.workgroup_register, cs.group_id[0] ? 1 : 0, cs.group_id[1] ? 1 : 0,
+			             cs.group_id[2] ? 1 : 0, cs.tg_size_en ? 1 : 0, cs.wave_size,
+			             cs.lds_size_dwords);
+		}
+		std::fclose(file);
+	}
 }
 
 // A shader that gives up: the current compile phase turns red, and the timeline gets the reason.

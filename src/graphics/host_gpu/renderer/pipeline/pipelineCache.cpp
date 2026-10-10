@@ -363,7 +363,8 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 		const char* value = std::getenv("KYTY_DUMP_SPIRV_HASHES");
 		return value != nullptr ? std::string(value) : std::string();
 	}();
-	if (!Config::GraphicsDebugDumpEnabled() &&
+	// "all" dumps every shader as it compiles.
+	if (!Config::GraphicsDebugDumpEnabled() && requested != "all" &&
 	    (requested.empty() ||
 	     requested.find(fmt::format("{:016x}", shader_hash)) == std::string::npos)) {
 		return;
@@ -1581,16 +1582,21 @@ struct PipelineCache::ProgramCache {
             expanded, reason, wave_size, params.hash, &summary);
 		if (!summary.empty()) {
 			// A table call left targets out: they take the miss trap, and the GPU reports the
-			// ones that run (ReportShaderCallMiss) for the next expansion.
-			static std::atomic<uint32_t> partial_reports {0};
-			if (partial_reports.fetch_add(1) < 256) {
+			// ones that run (ReportShaderCallMiss) for the next expansion. Logged once per
+			// distinct summary of a shader (the table sizes are left out of the comparison).
+			const auto inlined = summary.find("inlined=");
+			const auto key     = fmt::format("{:016x} {}", params.hash,
+			                                 inlined != std::string::npos ? summary.substr(inlined)
+			                                                              : summary);
+			if (partial_logged.size() < 4096 && partial_logged.insert(key).second) {
 				LOGF("Shader function expansion hash=%016" PRIx64 ": partial: %s\n", params.hash,
 				     summary.c_str());
 			}
 		}
 		if (!ok) {
-			static std::atomic<uint32_t> reports {0};
-			if (reports.fetch_add(1) < 16) {
+			// Once per shader and reason: a failing shader is expanded again every dispatch.
+			if (failure_logged.size() < 4096 &&
+			    failure_logged.insert(fmt::format("{:016x} {}", params.hash, reason)).second) {
 				::printf("Shader function expansion hash=%016" PRIx64 ": %s\n", params.hash,
 				         reason.c_str());
 				LOGF("Shader function expansion hash=%016" PRIx64 ": %s\n", params.hash,
@@ -1605,6 +1611,8 @@ struct PipelineCache::ProgramCache {
 	std::shared_mutex                                              programs_mutex;
 	std::unordered_set<ProgramKey, ProgramKeyHash>                 unsupported;
 	ShaderRecompiler::Decoder::ShaderFunctionExpander             function_expander;
+	std::unordered_set<std::string>                               partial_logged;
+	std::unordered_set<std::string>                               failure_logged;
 	ProgramKey                                                     lookup_key;
 	vk::Device                                                  device;
 	bool                                                        shader_clock = false;

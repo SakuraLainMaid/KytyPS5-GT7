@@ -89,10 +89,12 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 
 void CommandBuffer::AnnotateDiagnosticCheckpoint(uint64_t vs_hash, uint64_t ps_hash,
                                                  uint32_t color_samples,
-                                                 uint32_t depth_samples) const noexcept {
+                                                 uint32_t depth_samples,
+                                                 uint32_t write_flags) const noexcept {
 	if (m_debug_marker == nullptr) {
 		return;
 	}
+	m_debug_marker->write_flags   = write_flags;
 	m_debug_marker->vs_hash       = vs_hash;
 	m_debug_marker->ps_hash       = ps_hash;
 	m_debug_marker->color_samples = color_samples;

@@ -126,7 +126,8 @@ public:
 	// Adds the running draw's shaders and sample counts to the checkpoint SetDebugInfo recorded
 	// last (no-op without NV diagnostic checkpoints).
 	void AnnotateDiagnosticCheckpoint(uint64_t vs_hash, uint64_t ps_hash, uint32_t color_samples,
-	                                  uint32_t depth_samples) const noexcept;
+	                                  uint32_t depth_samples,
+	                                  uint32_t write_flags = 0) const noexcept;
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 

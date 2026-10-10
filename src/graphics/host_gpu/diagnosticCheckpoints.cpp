@@ -30,6 +30,7 @@ const char* OpName(uint32_t op) {
 		case 6: return "EopFlip";
 		case 7: return "EopWriteBackFlip";
 		case 8: return "EopOnlyFlip";
+		case 9: return "DispatchIndirect";
 		default: return "Unknown";
 	}
 }
@@ -43,13 +44,18 @@ void Print(const char* stage, const DiagnosticCheckpoint& checkpoint) {
 	LOGF("  [%s] seq=%" PRIu64 " op=%s submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
 	     stage, checkpoint.sequence, OpName(checkpoint.op), checkpoint.submit_id, checkpoint.arg0,
 	     checkpoint.arg1, checkpoint.arg2, checkpoint.arg3, checkpoint.arg4);
-	if (checkpoint.vs_hash != 0 || checkpoint.ps_hash != 0) {
-		std::printf("      VS=0x%016" PRIx64 " PS=0x%016" PRIx64 " color_samples=%u depth_samples=%u\n",
+	if ((checkpoint.op == 0 || checkpoint.op == 9) && checkpoint.vs_hash != 0) {
+		std::printf("      CS=0x%016" PRIx64 "\n", checkpoint.vs_hash);
+		LOGF("      CS=0x%016" PRIx64 "\n", checkpoint.vs_hash);
+	} else if (checkpoint.vs_hash != 0 || checkpoint.ps_hash != 0) {
+		std::printf("      VS=0x%016" PRIx64 " PS=0x%016" PRIx64
+		            " color_samples=%u depth_samples=%u writes=%u\n",
 		            checkpoint.vs_hash, checkpoint.ps_hash, checkpoint.color_samples,
-		            checkpoint.depth_samples);
-		LOGF("      VS=0x%016" PRIx64 " PS=0x%016" PRIx64 " color_samples=%u depth_samples=%u\n",
+		            checkpoint.depth_samples, checkpoint.write_flags);
+		LOGF("      VS=0x%016" PRIx64 " PS=0x%016" PRIx64
+		     " color_samples=%u depth_samples=%u writes=%u\n",
 		     checkpoint.vs_hash, checkpoint.ps_hash, checkpoint.color_samples,
-		     checkpoint.depth_samples);
+		     checkpoint.depth_samples, checkpoint.write_flags);
 	}
 }
 

@@ -375,9 +375,17 @@ struct CallSite {
 	bool                 specialized = false;
 	std::vector<Variant> variants;  // ascending, the candidates
 	std::vector<Variant> preferred; // the reported variants among them (ascending), first
-	size_t               table_targets = 0; // the variants the table holds
+	size_t               table_targets = 0; // the variants the table holds (for the log only)
 
-	bool operator==(const CallSite&) const = default;
+	// The table size (and a table call's distinct targets, which only the log uses) are left
+	// out: a table that grows (GT7 streams materials in) while offering the same variants keeps
+	// its expansion.
+	bool operator==(const CallSite& other) const {
+		return pc == other.pc && source_reg == other.source_reg && return_reg == other.return_reg &&
+		       dynamic == other.dynamic && (dynamic || addresses == other.addresses) &&
+		       pinned == other.pinned && specialized == other.specialized &&
+		       variants == other.variants && preferred == other.preferred;
+	}
 };
 
 // Resolves each call's targets from the user data and the memory holding call tables. Which
