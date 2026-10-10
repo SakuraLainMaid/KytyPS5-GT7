@@ -3644,6 +3644,19 @@ void GraphicsInitJmpTablesShIndirect() {
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
+	// PS block offsets 0x000/0x001, written together by GT7 mid-race. 0x001 matches
+	// SPI_SHADER_PGM_RSRC4_PS (the PS form of the RSRC4_GS/RSRC4_HS hints ignored above); 0x000
+	// is unconfirmed. Neither affects translation, so both are accepted and their first values
+	// logged.
+	for (uint32_t offset = 0; offset <= 1; offset++) {
+		g_hw_sh_indirect_func[offset] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+				LOGF("\t temporary: ignoring PS SH register 0x%03" PRIx32 " = 0x%08" PRIx32 "\n",
+				     cmd_offset, value);
+			}
+		};
+	}
 	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
