@@ -652,6 +652,39 @@ static bool ConsumeMetadataColorOperation(const CommandBuffer& buffer) {
 	       mode == static_cast<uint8_t>(CbColorMode::DccDecompress);
 }
 
+// DB_RENDER_CONTROL.COPY_DEPTH_TO_COLOR / COPY_STENCIL_TO_COLOR: instead of a normal draw, the DB
+// copies the bound depth (or stencil) samples into the bound color target; COPY_SAMPLE or
+// COPY_CENTROID picks the sample. Drivers use it to resolve MSAA depth into a color surface.
+// Not emulated yet: the draw is skipped, so the color target keeps its previous contents. The
+// first draws are logged so the copy can be built from the states games actually use.
+static bool ConsumeDepthColorCopy(const CommandBuffer& buffer) {
+	const auto& hw = buffer.GetRegisters();
+	const auto& rc = hw.GetRenderControl();
+	if (!rc.copy_depth_to_color && !rc.copy_stencil_to_color) {
+		return false;
+	}
+	static std::atomic_uint log_count {0};
+	if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+		const auto& z    = hw.GetDepthRenderTarget();
+		const auto  slot = render_target_first_bound_slot(buffer);
+		const auto& rt   = hw.GetRenderTarget(slot);
+		LOGF("DepthColorCopy: temporary: skipped (%s%s) sample=%u centroid=%u | depth "
+		     "fmt=%u stencil_fmt=%u samples_log2=%u %ux%u read=0x%010" PRIx64 " | color slot=%u "
+		     "base=0x%010" PRIx64 " fmt=%u type=%u samples_log2=%u fragments_log2=%u %ux%u "
+		     "mask=0x%08" PRIx32 " cb_mode=%u\n",
+		     rc.copy_depth_to_color ? "depth" : "", rc.copy_stencil_to_color ? "+stencil" : "",
+		     static_cast<uint32_t>(rc.copy_sample), rc.copy_centroid ? 1u : 0u,
+		     static_cast<uint32_t>(z.z_info.format), static_cast<uint32_t>(z.stencil_info.format),
+		     static_cast<uint32_t>(z.z_info.num_samples), static_cast<uint32_t>(z.size.x_max) + 1u,
+		     static_cast<uint32_t>(z.size.y_max) + 1u, z.z_read_base_addr, slot, rt.base.addr,
+		     static_cast<uint32_t>(rt.info.format), static_cast<uint32_t>(rt.info.channel_type),
+		     rt.attrib.num_samples, rt.attrib.num_fragments, rt.attrib2.width + 1u,
+		     rt.attrib2.height + 1u, hw.GetRenderTargetMask(),
+		     static_cast<uint32_t>(hw.GetColorControl().mode));
+	}
+	return true;
+}
+
 struct DrawEmitInfo {
 	int32_t  vertex_offset = 0;
 	uint32_t first_vertex  = 0;
@@ -1523,7 +1556,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
+	if (ConsumeMetadataColorOperation(buffer) || ConsumeDepthColorCopy(buffer) ||
+	    DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
 		return;
@@ -1640,7 +1674,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
+	if (ConsumeMetadataColorOperation(buffer) || ConsumeDepthColorCopy(buffer) ||
+	    DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
 		return;
