@@ -776,6 +776,19 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 		reason = "expanded shader exceeds the bounded code size";
 		return false;
 	}
+	// A table target left out takes the miss path, which returns as if the callee did nothing.
+	// The material waterfalls do not depend on what their callee does, but a ray traversal loop
+	// does (its hit functions end the traversal): a partial expansion of one hung the GPU. Such
+	// a shader needs every target, or it gives up as before.
+	const auto has_bvh = [](const std::vector<Instruction>& instructions) {
+		return std::any_of(instructions.begin(), instructions.end(), [](const auto& inst) {
+			return inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY;
+		});
+	};
+	if (st.Partial() && has_bvh(program.instructions)) {
+		reason = "ray tracing shader with table call targets left out";
+		return false;
+	}
 	const bool has_backedge =
 	    std::any_of(program.instructions.begin(), program.instructions.end(), [](const auto& inst) {
 		    return IsDirectBranch(inst.opcode) && inst.branch_target <= inst.pc;
