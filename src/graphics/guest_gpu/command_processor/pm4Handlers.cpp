@@ -2062,9 +2062,17 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		}
 
 		if (cmd_offset >= Pm4::SH_NUM) {
-			EXIT("unsupported indirect SH register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
-			     "), value = 0x%08" PRIx32 "\n",
-			     cmd_offset, raw_cmd_offset, value);
+			// As for indirect CX registers: an offset outside the SH range is skipped. These turn
+			// up intermittently (one run in several at boot), alongside the CX tables' unknown
+			// offsets, so they are likely stale or partly written table entries.
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("\t temporary: skipping unknown indirect SH register offset 0x%08" PRIx32
+				     " (raw 0x%08" PRIx32 "), value = 0x%08" PRIx32 ", index=%" PRIu32 "/%" PRIu32
+				     ", regs=0x%016" PRIx64 "\n",
+				     cmd_offset, raw_cmd_offset, value, i, indirect_num_dw, indirect_address);
+			}
+			continue;
 		}
 
 		auto pfunc = g_hw_sh_indirect_func[cmd_offset];

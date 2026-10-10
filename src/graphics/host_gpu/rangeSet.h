@@ -2,8 +2,11 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RANGESET_H_
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cinttypes>
 #include <cstdint>
 #include <map>
 
@@ -12,6 +15,9 @@ namespace Libs::Graphics {
 class RangeSet final {
 public:
 	void Add(uint64_t address, uint64_t size) {
+		if (Empty(address, size)) {
+			return;
+		}
 		const auto end = End(address, size);
 		auto       it  = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second >= address) {
@@ -28,6 +34,9 @@ public:
 	}
 
 	void Subtract(uint64_t address, uint64_t size) {
+		if (Empty(address, size)) {
+			return;
+		}
 		const auto end = End(address, size);
 		auto       it  = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second > address) {
@@ -57,6 +66,9 @@ public:
 	}
 
 	[[nodiscard]] bool Intersects(uint64_t address, uint64_t size) const {
+		if (Empty(address, size)) {
+			return false;
+		}
 		const auto end = End(address, size);
 		auto       it  = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second > address) {
@@ -66,6 +78,9 @@ public:
 	}
 
 	[[nodiscard]] bool Contains(uint64_t address, uint64_t size) const {
+		if (Empty(address, size)) {
+			return true;
+		}
 		const auto end = End(address, size);
 		auto       it  = m_ranges.upper_bound(address);
 		if (it == m_ranges.begin()) {
@@ -77,6 +92,9 @@ public:
 
 	template <typename Func>
 	void ForEachInRange(uint64_t address, uint64_t size, Func&& func) const {
+		if (Empty(address, size)) {
+			return;
+		}
 		const auto end = End(address, size);
 		auto       it  = m_ranges.upper_bound(address);
 		if (it != m_ranges.begin()) {
@@ -94,6 +112,9 @@ public:
 	// Like ForEachInRange, but passes each overlapping range whole instead of clipped.
 	template <typename Func>
 	void ForEachOverlapping(uint64_t address, uint64_t size, Func&& func) const {
+		if (Empty(address, size)) {
+			return;
+		}
 		const auto end = End(address, size);
 		auto       it  = m_ranges.upper_bound(address);
 		if (it != m_ranges.begin()) {
@@ -109,6 +130,20 @@ public:
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
 
 private:
+	// An empty range touches nothing, so every operation on it is a no-op. The first few are
+	// logged with a host stack: they usually mean a caller computed a size it did not expect.
+	static bool Empty(uint64_t address, uint64_t size) {
+		if (size != 0) {
+			return false;
+		}
+		static std::atomic_uint log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+			LOGF("RangeSet: temporary: ignoring empty range at 0x%016" PRIx64 "\n%s", address,
+			     Common::HostBacktrace().c_str());
+		}
+		return true;
+	}
+
 	static uint64_t End(uint64_t address, uint64_t size) {
 		if (size == 0 || size > UINT64_MAX - address) {
 			EXIT("invalid range-set address or size\n");
