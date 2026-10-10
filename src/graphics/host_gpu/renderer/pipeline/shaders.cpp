@@ -323,10 +323,17 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	                     (build.tess_control == nullptr || build.tess_eval == nullptr));
 
 	uint32_t shader_stage_count = 0;
+	build.layer_limit_value = build.rendering.layer_limit;
+	build.layer_limit_entry = {ShaderRecompiler::IR::LayerLimitSpecId, 0, sizeof(uint32_t)};
+	build.layer_limit_spec  = {1, &build.layer_limit_entry, sizeof(uint32_t),
+	                           &build.layer_limit_value};
 	for (uint32_t i = 0; i < vertex_info.size(); i++) {
 		build.stages[shader_stage_count++] = {.stage  = NativeShaderStage(vertex_info[i].logical_stage),
 		                                      .module = programs.vertex[i].module,
 		                                      .pName  = "main"};
+		if (build.layer_limit_value != 0) {
+			build.stages[shader_stage_count - 1].pSpecializationInfo = &build.layer_limit_spec;
+		}
 	}
 	if (rect_list) {
 		build.stages[shader_stage_count++] = {.stage  = vk::ShaderStageFlagBits::eTessellationControl,

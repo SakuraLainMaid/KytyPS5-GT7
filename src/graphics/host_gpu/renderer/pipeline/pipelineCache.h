@@ -82,6 +82,9 @@ struct PipelineRenderingState {
 	// (PipelineStaticParameters::samples); 0 when every attachment matches rasterization.
 	uint32_t                                             color_samples  = 0;
 	uint32_t                                             depth_samples  = 0;
+	// The bound layer count when a vertex-side stage exports the render target array index
+	// (ShaderRecompiler::IR::LayerLimitSpecId), else 0.
+	uint32_t                                             layer_limit    = 0;
 
 	bool operator==(const PipelineRenderingState&) const = default;
 };
@@ -151,6 +154,9 @@ struct GraphicsPipelineBuild {
 	std::array<vk::SampleCountFlagBits, RENDER_COLOR_ATTACHMENTS_MAX>     color_attachment_samples {};
 	vk::AttachmentSampleCountInfoAMD                                      attachment_sample_count {};
 	vk::GraphicsPipelineCreateInfo                                        pipeline_info {};
+	vk::SpecializationMapEntry                                            layer_limit_entry {};
+	uint32_t                                                              layer_limit_value = 0;
+	vk::SpecializationInfo                                                layer_limit_spec {};
 	uint64_t                                                              vs_hash = 0;
 	uint64_t                                                              ps_hash = 0;
 };

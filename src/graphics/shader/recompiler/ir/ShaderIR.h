@@ -243,6 +243,10 @@ enum class StageOutputKind {
 	ViewportIndex
 };
 
+// The specialization constant a pre-rasterization stage clamps its exported render target
+// array index with: the bound layer count (0: no clamp).
+inline constexpr uint32_t LayerLimitSpecId = 0x4c00u;
+
 struct PositionExportComponent {
 	uint32_t clip_distance = UINT32_MAX;
 	uint32_t cull_distance = UINT32_MAX;

@@ -832,6 +832,7 @@ std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPip
 	PipelineKeyHash::Mix(hash, static_cast<uint32_t>(key.rendering.stencil_format));
 	PipelineKeyHash::Mix(hash, key.rendering.color_samples);
 	PipelineKeyHash::Mix(hash, key.rendering.depth_samples);
+	PipelineKeyHash::Mix(hash, key.rendering.layer_limit);
 	for (const auto id: key.vertex_shader_ids) {
 		PipelineKeyHash::Mix(hash, id);
 	}
@@ -2627,6 +2628,18 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 				     attachment_samples);
 			}
 		}
+	}
+	{
+		const bool exports_layer = std::ranges::any_of(vertex_info, [](const auto& info) {
+			return info.stage && std::ranges::any_of(info.stage.program->info.outputs, [](const auto& o) {
+				       return o.kind == ShaderRecompiler::IR::StageOutputKind::Layer;
+			       });
+		});
+		uint32_t layers = UINT32_MAX;
+		for (uint32_t i = 0; i < color_count; i++)
+			layers = std::min(layers, colors[i].desc.view_info.layer_count);
+		if (with_depth) layers = std::min(layers, depth.desc.view_info.layer_count);
+		rendering.layer_limit = exports_layer && layers != UINT32_MAX ? std::max(layers, 1u) : 0u;
 	}
 	if (color_count == 0 && !with_depth) {
 		attachment_samples = render_sample_count(ctx.GetAaConfig().msaa_num_samples);

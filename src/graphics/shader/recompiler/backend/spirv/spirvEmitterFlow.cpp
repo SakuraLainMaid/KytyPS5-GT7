@@ -364,9 +364,26 @@ void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::Expor
 		if (output.layer || output.viewport) {
 			const auto raw = ExportRawComponent(ctx, data, component);
 			if (output.layer) {
-				const auto layer = state.builder.AllocateId();
-				state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), layer, raw,
+				const auto masked = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), masked, raw,
 				                          ConstantU32(state, 0x7ffu));
+				// A render target array index past the bound layers is undefined in Vulkan (an
+				// NVIDIA device fault: GT7 race draws wrote to address 0); the hardware treats it
+				// as layer 0, as D3D does. The pipeline specializes the bound layer count
+				// (LayerLimitSpecId; 0 keeps the index as is).
+				const auto limit =
+				    state.builder.Constant(spv::OpSpecConstant, TypeU32(state), 0u);
+				if (!state.layer_limit_decorated) {
+					state.builder.AddAnnotation(spv::OpDecorate, limit, spv::DecorationSpecId,
+					                            IR::LayerLimitSpecId);
+					state.layer_limit_decorated = true;
+				}
+				const auto in_range = Binary(
+				    state, spv::OpLogicalOr, TypeBool(state),
+				    Binary(state, spv::OpIEqual, TypeBool(state), limit, ConstantU32(state, 0)),
+				    Binary(state, spv::OpULessThan, TypeBool(state), masked, limit));
+				const auto layer =
+				    Select(state, TypeU32(state), in_range, masked, ConstantU32(state, 0));
 				const auto pointer = state.program.stage == ShaderType::Mesh
 				                         ? MeshOutputPointer(state, IR::StageOutputKind::Layer)
 				                         : state.layer_variable;
