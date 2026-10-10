@@ -773,6 +773,26 @@ bool TextureDescCacheEnabled() {
 
 } // namespace
 
+// Set while a bindless heap entry is resolved (ResolveBindlessKey). The guest rewrites heap
+// entries as it streams textures, and one read mid-rewrite, or a freed one, decodes to a texture
+// no draw binds: unaligned for its tiling (GT7, re-entering the garage). For such an entry the
+// layout checks below leave the key on its placeholder instead of ending the emulator.
+thread_local bool t_resolving_bindless = false;
+
+static bool RejectBindlessTexture(const char* what, uint64_t address) {
+	if (!t_resolving_bindless) {
+		return false;
+	}
+	static std::atomic<uint32_t> reports {0};
+	const auto                   report = reports.fetch_add(1, std::memory_order_relaxed);
+	if (report < 16u || (report & (report + 1u)) == 0u) {
+		LOGF("Bindless: heap entry for 0x%016" PRIx64 " left on its placeholder: %s (%" PRIu32
+		     " so far)\n",
+		     address, what, report + 1u);
+	}
+	return true;
+}
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
@@ -867,6 +887,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		    width, height, volume ? depth : 1u, physical_levels, image_layers};
 		if (!ResolveTextureMipView(physical, !resource.r128 && descriptor.MetaCompress(),
 		                           view_levels, levels, view_base)) {
+			if (RejectBindlessTexture("mip view changes the physical layout", address)) {
+				return {};
+			}
 			EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
 			     "extent=%ux%ux%u tile=%u\n",
 			     base_level, last_level, max_mip, width, height, depth,
@@ -881,6 +904,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		                              : TileGetRenderTargetPitch(width, bytes, last_level);
 		if (pitch == 0 || !TileGetRenderTargetSize(width, height, pitch, bytes, size, last_level) ||
 		    size.size > UINT32_MAX / image_layers) {
+			if (RejectBindlessTexture("multisample layout", address)) {
+				return {};
+			}
 			EXIT("unsupported multisample texture layout\n");
 		}
 		size.size *= image_layers;
@@ -888,6 +914,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		pitch = TileGetTexturePitch(format, width, tile);
 		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers,
 		                        physical_levels, tile, volume, size);
+	}
+	if ((size.size == 0 || size.align == 0 ||
+	     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0) &&
+	    RejectBindlessTexture("address not aligned for its tiling", address)) {
+		return {};
 	}
 	EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
 	                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);
@@ -1205,7 +1236,9 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
-	auto binding = ResolveTexture(heap.resource, value);
+	t_resolving_bindless = true;
+	auto binding         = ResolveTexture(heap.resource, value);
+	t_resolving_bindless = false;
 	auto& texture_cache = m_context.GetTextureCache();
 	auto* image = texture_cache.m_slot_images.try_get(binding.image_id);
 	if (image == nullptr || image->info.data.Empty()) {
