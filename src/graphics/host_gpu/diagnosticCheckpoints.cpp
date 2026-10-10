@@ -43,11 +43,19 @@ void Print(const char* stage, const DiagnosticCheckpoint& checkpoint) {
 	LOGF("  [%s] seq=%" PRIu64 " op=%s submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
 	     stage, checkpoint.sequence, OpName(checkpoint.op), checkpoint.submit_id, checkpoint.arg0,
 	     checkpoint.arg1, checkpoint.arg2, checkpoint.arg3, checkpoint.arg4);
+	if (checkpoint.vs_hash != 0 || checkpoint.ps_hash != 0) {
+		std::printf("      VS=0x%016" PRIx64 " PS=0x%016" PRIx64 " color_samples=%u depth_samples=%u\n",
+		            checkpoint.vs_hash, checkpoint.ps_hash, checkpoint.color_samples,
+		            checkpoint.depth_samples);
+		LOGF("      VS=0x%016" PRIx64 " PS=0x%016" PRIx64 " color_samples=%u depth_samples=%u\n",
+		     checkpoint.vs_hash, checkpoint.ps_hash, checkpoint.color_samples,
+		     checkpoint.depth_samples);
+	}
 }
 
 } // namespace
 
-const DiagnosticCheckpoint* RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint) {
+DiagnosticCheckpoint* RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint) {
 	const auto sequence = g_checkpoint_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
 	auto&      slot     = g_checkpoints[sequence % CHECKPOINT_RING_SIZE];
 	slot                = checkpoint;

@@ -28,12 +28,18 @@ struct DiagnosticCheckpoint {
 	uint32_t arg3      = 0;
 	uint64_t arg4      = 0;
 	uint64_t sequence  = 0;
+	// Filled in once a draw has chosen its pipeline (CommandBuffer::AnnotateDiagnosticCheckpoint),
+	// so a device-loss report names the shaders that were running.
+	uint64_t vs_hash       = 0;
+	uint64_t ps_hash       = 0;
+	uint32_t color_samples = 0;
+	uint32_t depth_samples = 0;
 };
 
 struct GraphicContext;
 
 // Returns a stable marker for vkCmdSetCheckpointNV.
-[[nodiscard]] const DiagnosticCheckpoint*
+[[nodiscard]] DiagnosticCheckpoint*
 RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint);
 // After a device loss: VK_EXT_device_fault info, the NVIDIA crash dump written to
 // _device_fault.nv-gpudmp, and the queue's last diagnostic checkpoints.

@@ -73,17 +73,30 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg3      = arg3;
 	m_debug_arg4      = arg4;
 	if (m_graphics.diagnostic_checkpoints_enabled && !IsInvalid()) {
-		const auto* marker = RecordDiagnosticCheckpoint({.op        = op,
+		auto* marker = RecordDiagnosticCheckpoint({.op        = op,
 		                                                 .submit_id = submit_id,
 		                                                 .arg0      = arg0,
 		                                                 .arg1      = arg1,
 		                                                 .arg2      = arg2,
 		                                                 .arg3      = arg3,
 		                                                 .arg4      = arg4});
+		m_debug_marker = marker;
 		if (marker != nullptr) {
 			Recorder().setCheckpointNV(marker);
 		}
 	}
+}
+
+void CommandBuffer::AnnotateDiagnosticCheckpoint(uint64_t vs_hash, uint64_t ps_hash,
+                                                 uint32_t color_samples,
+                                                 uint32_t depth_samples) const noexcept {
+	if (m_debug_marker == nullptr) {
+		return;
+	}
+	m_debug_marker->vs_hash       = vs_hash;
+	m_debug_marker->ps_hash       = ps_hash;
+	m_debug_marker->color_samples = color_samples;
+	m_debug_marker->depth_samples = depth_samples;
 }
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {

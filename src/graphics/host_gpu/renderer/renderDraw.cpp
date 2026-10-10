@@ -1327,6 +1327,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// memory. Recorded through the recording thread when it runs.
 	const auto vk_buffer = buffer.Recorder();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
+	buffer.AnnotateDiagnosticCheckpoint(
+	    vertex_stages.front().stage.program->shader_hash,
+	    state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0,
+	    state.color_count != 0 ? state.color_info[0].desc.info.samples : 0,
+	    state.depth_info.image_id ? state.depth_info.desc.info.samples : 0);
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}

@@ -32,6 +32,7 @@ struct ShaderComputeInputInfo;
 struct RenderDepthInfo;
 struct RenderColorInfo;
 struct DrawCallInfo;
+struct DiagnosticCheckpoint;
 struct DrawEmitInfo;
 struct DrawIndexBufferSource;
 struct DrawRenderState;
@@ -122,6 +123,10 @@ public:
 
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
+	// Adds the running draw's shaders and sample counts to the checkpoint SetDebugInfo recorded
+	// last (no-op without NV diagnostic checkpoints).
+	void AnnotateDiagnosticCheckpoint(uint64_t vs_hash, uint64_t ps_hash, uint32_t color_samples,
+	                                  uint32_t depth_samples) const noexcept;
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
@@ -160,6 +165,7 @@ private:
 	uint32_t            m_debug_arg2      = 0;
 	uint32_t            m_debug_arg3      = 0;
 	uint64_t            m_debug_arg4      = 0;
+	DiagnosticCheckpoint* m_debug_marker  = nullptr;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
 	HW::Context*        m_registers   = nullptr;

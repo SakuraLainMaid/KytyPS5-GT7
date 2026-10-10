@@ -15,7 +15,7 @@ namespace Libs::Graphics {
 class RangeSet final {
 public:
 	void Add(uint64_t address, uint64_t size) {
-		if (Empty(address, size)) {
+		if (Ignored(address, size)) {
 			return;
 		}
 		const auto end = End(address, size);
@@ -34,7 +34,7 @@ public:
 	}
 
 	void Subtract(uint64_t address, uint64_t size) {
-		if (Empty(address, size)) {
+		if (Ignored(address, size)) {
 			return;
 		}
 		const auto end = End(address, size);
@@ -66,7 +66,7 @@ public:
 	}
 
 	[[nodiscard]] bool Intersects(uint64_t address, uint64_t size) const {
-		if (Empty(address, size)) {
+		if (Ignored(address, size)) {
 			return false;
 		}
 		const auto end = End(address, size);
@@ -78,7 +78,7 @@ public:
 	}
 
 	[[nodiscard]] bool Contains(uint64_t address, uint64_t size) const {
-		if (Empty(address, size)) {
+		if (Ignored(address, size)) {
 			return true;
 		}
 		const auto end = End(address, size);
@@ -92,7 +92,7 @@ public:
 
 	template <typename Func>
 	void ForEachInRange(uint64_t address, uint64_t size, Func&& func) const {
-		if (Empty(address, size)) {
+		if (Ignored(address, size)) {
 			return;
 		}
 		const auto end = End(address, size);
@@ -112,7 +112,7 @@ public:
 	// Like ForEachInRange, but passes each overlapping range whole instead of clipped.
 	template <typename Func>
 	void ForEachOverlapping(uint64_t address, uint64_t size, Func&& func) const {
-		if (Empty(address, size)) {
+		if (Ignored(address, size)) {
 			return;
 		}
 		const auto end = End(address, size);
@@ -130,16 +130,23 @@ public:
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
 
 private:
-	// An empty range touches nothing, so every operation on it is a no-op. The first few are
-	// logged with a host stack: they usually mean a caller computed a size it did not expect.
-	static bool Empty(uint64_t address, uint64_t size) {
-		if (size != 0) {
+	// An empty range touches nothing, so every operation on it is a no-op. A range whose end
+	// passes the top of the address space is a corrupt request (a garbage size); it is ignored
+	// rather than aborting. The first few of each are logged with a host stack, to find the
+	// caller that computed them.
+	static bool Ignored(uint64_t address, uint64_t size) {
+		const bool empty    = size == 0;
+		const bool overflow = !empty && size > UINT64_MAX - address;
+		if (!empty && !overflow) {
 			return false;
 		}
-		static std::atomic_uint log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
-			LOGF("RangeSet: temporary: ignoring empty range at 0x%016" PRIx64 "\n%s", address,
-			     Common::HostBacktrace().c_str());
+		static std::atomic_uint empty_count {0};
+		static std::atomic_uint overflow_count {0};
+		auto& count = empty ? empty_count : overflow_count;
+		if (count.fetch_add(1, std::memory_order_relaxed) < 4) {
+			LOGF("RangeSet: temporary: ignoring %s range at 0x%016" PRIx64 " size 0x%016" PRIx64
+			     "\n%s",
+			     empty ? "empty" : "overflowing", address, size, Common::HostBacktrace().c_str());
 		}
 		return true;
 	}
