@@ -36,6 +36,9 @@ struct BindlessHeapUse {
 	uint64_t base           = 0;
 	uint64_t size           = 0;
 	uint32_t table_offset   = 0;
+	// Bytes from one key's T# to the next: 32 for a plain T# array, more when each T# sits in a
+	// larger per-key record (GT7's 188-byte materials).
+	uint32_t table_stride   = 32;
 	uint32_t image          = 0;
 	uint32_t mapping_offset = 0;
 

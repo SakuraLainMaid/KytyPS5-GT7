@@ -1076,27 +1076,56 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
+// The T#s of keys [first, first + count) of a bindless heap whose keys' T#s are `stride` bytes
+// apart from `table` on: one read when they are contiguous, one read of the covering span
+// otherwise (a T# inside a larger per-key record).
+static bool ReadHeapDescriptors(uint64_t table, uint32_t stride, uint64_t first, uint64_t count,
+                                std::array<uint32_t, 8>* out) {
+	if (count == 0) {
+		return true;
+	}
+	if (stride == 32u) {
+		return Libs::LibKernel::Memory::TryReadBacking(table + first * 32u, out, count * 32u);
+	}
+	thread_local std::vector<uint8_t> span;
+	const uint64_t bytes = (count - 1u) * stride + 32u;
+	span.resize(bytes);
+	if (!Libs::LibKernel::Memory::TryReadBacking(table + first * stride, span.data(), bytes)) {
+		return false;
+	}
+	for (uint64_t i = 0; i < count; i++) {
+		std::memcpy(out[i].data(), span.data() + i * stride, 32u);
+	}
+	return true;
+}
+
+// Keys whose T# lies within `span` bytes of the table start.
+static uint64_t HeapEntriesInSpan(uint64_t span, uint32_t stride) {
+	return span < 32u ? 0 : (span - 32u) / stride + 1u;
+}
+
 // Diagnostics: the first time a draw uses a bindless heap,
 // read its texture descriptors and log how many are valid, of which types, and roughly how
 // much memory they would take as host textures. Nothing is created.
 static void SurveyBindlessHeap(const ShaderRecompiler::IR::BindlessHeapUse& use) {
 	constexpr uint64_t MaxEntries = 1u << 20u;
 	const uint64_t     span       = use.size > use.table_offset ? use.size - use.table_offset : 0;
-	const uint64_t     entries    = std::min<uint64_t>(span / 32u, MaxEntries);
+	const uint64_t     entries =
+	    std::min<uint64_t>(HeapEntriesInSpan(span, use.table_stride), MaxEntries);
 	uint64_t valid = 0, bytes = 0, unreadable = 0;
 	std::array<uint64_t, 16> types {};
-	std::vector<uint32_t> chunk(8u * 1024u);
-	for (uint64_t first = 0; first < entries; first += chunk.size() / 8u) {
-		const auto count   = std::min<uint64_t>(chunk.size() / 8u, entries - first);
-		const auto address = use.base + use.table_offset + first * 32u;
-		if (!Libs::LibKernel::Memory::TryReadBacking(address, chunk.data(), count * 32u)) {
+	std::vector<std::array<uint32_t, 8>> chunk(1024u);
+	for (uint64_t first = 0; first < entries; first += chunk.size()) {
+		const auto count = std::min<uint64_t>(chunk.size(), entries - first);
+		if (!ReadHeapDescriptors(use.base + use.table_offset, use.table_stride, first, count,
+		                         chunk.data())) {
 			unreadable += count;
 			continue;
 		}
 		for (uint64_t i = 0; i < count; i++) {
 			ShaderRecompiler::IR::DescriptorValue value {};
 			value.dword_count = 8u;
-			std::copy_n(chunk.begin() + static_cast<ptrdiff_t>(i * 8u), 8, value.dwords.begin());
+			std::copy_n(chunk[i].begin(), 8, value.dwords.begin());
 			const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 			if (descriptor.IsNull()) {
 				continue;
@@ -1162,7 +1191,7 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 	auto&                                 table = m_context.GetBindlessTable();
 	ShaderRecompiler::IR::DescriptorValue value {};
 	value.dword_count  = 8u;
-	const auto address = heap.base + heap.table_offset + static_cast<uint64_t>(key) * 32u;
+	const auto address = heap.base + heap.table_offset + static_cast<uint64_t>(key) * heap.table_stride;
 	heap.settled[key]  = 1;
 	heap.stale[key]    = 0;
 	heap.descriptors[key] = {};
@@ -1376,8 +1405,8 @@ void RenderExecutor::SettleBindlessHeaps() {
 			const auto count = std::min(Window, keys - key);
 			m_bindless_window.resize(count);
 			uint32_t   looked   = count;
-			const bool readable = Libs::LibKernel::Memory::TryReadBacking(
-			    base + uint64_t {key} * 32u, m_bindless_window.data(), uint64_t {count} * 32u);
+			const bool readable =
+			    ReadHeapDescriptors(base, heap.table_stride, key, count, m_bindless_window.data());
 			for (uint32_t i = 0; readable && i < count; i++) {
 				if (budget == 0) {
 					looked = i;
@@ -1444,7 +1473,7 @@ void RenderExecutor::SyncWrittenBindlessEntries() {
 	for (auto& heap: table.Heaps()) {
 		const auto heap_begin = heap.base + heap.table_offset;
 		const auto keys       = std::min(heap.guest_entries, static_cast<uint32_t>(heap.settled.size()));
-		const auto heap_end   = heap_begin + uint64_t {keys} * 32u;
+		const auto heap_end   = heap_begin + BindlessTable::HeapSpan(heap, keys);
 		for (const auto& [begin, end]: m_bindless_written) {
 			const auto from = std::max(begin, heap_begin);
 			const auto to   = std::min(end, heap_end);
@@ -1452,12 +1481,15 @@ void RenderExecutor::SyncWrittenBindlessEntries() {
 				continue;
 			}
 			heap.eager_complete = false; // entries may have become valid
-			const auto first = static_cast<uint32_t>((from - heap_begin) / 32u);
-			const auto last  = static_cast<uint32_t>((to - heap_begin + 31u) / 32u);
+			const auto stride = heap.table_stride;
+			const auto first  = static_cast<uint32_t>((from - heap_begin) / stride);
+			const auto last   = std::min(keys, static_cast<uint32_t>((to - heap_begin + stride - 1u) / stride));
+			if (last <= first) {
+				continue;
+			}
 			m_bindless_window.resize(last - first);
-			if (!Libs::LibKernel::Memory::TryReadBacking(heap_begin + uint64_t {first} * 32u,
-			                                              m_bindless_window.data(),
-			                                              uint64_t {last - first} * 32u)) {
+			if (!ReadHeapDescriptors(heap_begin, stride, first, last - first,
+			                         m_bindless_window.data())) {
 				continue;
 			}
 			for (uint32_t key = first; key < last; key++) {
@@ -1529,9 +1561,8 @@ uint32_t RenderExecutor::RevalidateBindlessKeys(uint32_t budget) {
 		const uint32_t begin = heap.revalidate_cursor < keys ? heap.revalidate_cursor : 0u;
 		const uint32_t count = std::min(Window, keys - begin);
 		m_bindless_window.resize(count);
-		const auto address = heap.base + heap.table_offset + static_cast<uint64_t>(begin) * 32u;
-		const bool readable = Libs::LibKernel::Memory::TryReadBacking(
-		    address, m_bindless_window.data(), static_cast<uint64_t>(count) * 32u);
+		const bool readable = ReadHeapDescriptors(heap.base + heap.table_offset, heap.table_stride,
+		                                          begin, count, m_bindless_window.data());
 		uint32_t next = begin + count;
 		for (uint32_t i = 0; readable && i < count; i++) {
 			const auto key = begin + i;
@@ -1609,8 +1640,8 @@ static void LogBindlessHeapStats(BindlessTable& table, uint64_t frame) {
 			continue;
 		}
 		words.resize(entries);
-		if (!Libs::LibKernel::Memory::TryReadBacking(heap.base + heap.table_offset, words.data(),
-		                                              static_cast<uint64_t>(entries) * 32u)) {
+		if (!ReadHeapDescriptors(heap.base + heap.table_offset, heap.table_stride, 0, entries,
+		                         words.data())) {
 			continue;
 		}
 		uint32_t valid = 0, mip_stats = 0, settled = 0, view_changes = 0, resource_changes = 0;
@@ -1868,9 +1899,10 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 		}
 		const auto& resource = program.info.images[use.image];
 		const uint64_t span  = use.size > use.table_offset ? use.size - use.table_offset : 0;
-		const auto entries   = static_cast<uint32_t>(std::min<uint64_t>(span / 32u, 1u << 18u));
-		auto* heap = table.FindOrCreateHeap(use.base, use.table_offset, BindlessBindingFor(resource),
-		                                    entries, resource);
+		const auto entries   = static_cast<uint32_t>(
+		    std::min<uint64_t>(HeapEntriesInSpan(span, use.table_stride), 1u << 18u));
+		auto* heap = table.FindOrCreateHeap(use.base, use.table_offset, use.table_stride,
+		                                    BindlessBindingFor(resource), entries, resource);
 		if (heap == nullptr) {
 			continue; // region 0, count 0: every key samples the placeholder
 		}

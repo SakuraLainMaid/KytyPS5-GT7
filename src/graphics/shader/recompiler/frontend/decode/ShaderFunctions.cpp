@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <map>
 #include <memory>
@@ -235,6 +236,10 @@ struct ShaderAnalysis {
 	std::set<uint32_t>    labels;
 	bool                  has_calls = false;
 	bool                  has_setpc = false;
+	// ResolveCalls' reaching-definition queries depend on the code alone, so their graph and
+	// answers are kept with it (one expander per pipeline cache, used from one thread).
+	mutable std::vector<std::vector<size_t>>                               successors;
+	mutable std::map<std::pair<uint32_t, size_t>, std::optional<size_t>> reaching;
 };
 
 void AnalyzeShader(std::span<const uint32_t> code, ShaderAnalysis& analysis) {
@@ -255,6 +260,9 @@ struct CallSite {
 	uint32_t              return_reg = 0;
 	bool                  dynamic    = false;
 	std::vector<uint64_t> addresses; // ascending
+	// Registers the targets were resolved through across control flow (a descriptor loaded
+	// before the call's loop): a callee that wrote one would change them, so none may.
+	std::vector<uint32_t> pinned; // ascending
 
 	bool operator==(const CallSite&) const = default;
 };
@@ -268,6 +276,74 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
                   std::set<uint32_t>& dependencies, std::string& reason) {
 	const auto& program = analysis.program;
 	const auto& labels  = analysis.labels;
+	// Instruction-level control flow, built on first use: fallthrough and direct branch edges.
+	if (analysis.successors.empty() && !program.instructions.empty()) {
+		std::unordered_map<uint32_t, size_t> index_of_pc;
+		for (size_t i = 0; i < program.instructions.size(); i++)
+			index_of_pc.emplace(program.instructions[i].pc, i);
+		analysis.successors.resize(program.instructions.size());
+		for (size_t i = 0; i < program.instructions.size(); i++) {
+			const auto& inst = program.instructions[i];
+			auto&       next = analysis.successors[i];
+			if (inst.opcode == Opcode::S_ENDPGM) continue;
+			if (IsDirectBranch(inst.opcode)) {
+				if (const auto target = index_of_pc.find(inst.branch_target);
+				    target != index_of_pc.end())
+					next.push_back(target->second);
+				if (inst.opcode == Opcode::S_BRANCH) continue;
+			}
+			if (i + 1 < program.instructions.size()) next.push_back(i + 1);
+		}
+	}
+	// Whether `to` is reachable: from the successors of `from`, or from the entry while never
+	// passing `avoid` (from == SIZE_MAX).
+	const auto reaches = [&](size_t from, size_t to, size_t avoid) {
+		std::vector<bool>   seen(program.instructions.size());
+		std::vector<size_t> work;
+		if (from == SIZE_MAX) {
+			if (avoid == 0) return false;
+			work.push_back(0);
+		} else {
+			work = analysis.successors[from];
+		}
+		while (!work.empty()) {
+			const auto at = work.back();
+			work.pop_back();
+			if (at == avoid || seen[at]) continue;
+			if (at == to) return true;
+			seen[at] = true;
+			work.insert(work.end(), analysis.successors[at].begin(), analysis.successors[at].end());
+		}
+		return false;
+	};
+	// The one write of reg whose value reaches the block starting at `first` on every path: the
+	// only writer that can reach it, and one every path from the entry passes. A call inside a
+	// loop reads a table descriptor loaded before the loop this way. Indirect branches (S_SETPC)
+	// make reachability unknown, so they disable this.
+	const auto reaching_definition = [&](uint32_t reg, size_t first) -> std::optional<size_t> {
+		if (analysis.has_setpc) return {};
+		const auto key = std::pair {reg, first};
+		if (const auto known = analysis.reaching.find(key); known != analysis.reaching.end())
+			return known->second;
+		std::optional<size_t> definition;
+		bool                  ambiguous = false;
+		for (size_t i = 0; i < program.instructions.size() && !ambiguous; i++) {
+			if (!Writes(program.instructions[i], reg, wave_size) || !reaches(i, first, SIZE_MAX))
+				continue;
+			ambiguous  = definition.has_value();
+			definition = i;
+		}
+		if (ambiguous || (definition && reaches(SIZE_MAX, first, *definition))) definition.reset();
+		analysis.reaching.emplace(key, definition);
+		return definition;
+	};
+	const auto block_start = [&](size_t at) {
+		while (at > 0 && !labels.contains(program.instructions[at].pc) &&
+		       !IsDirectBranch(program.instructions[at - 1].opcode))
+			--at;
+		return at;
+	};
+	std::set<uint32_t> pinned; // the call site's, collected while resolving it
 	const auto resolve = [&](auto&& self, uint32_t reg, size_t before, size_t first, uint32_t depth,
 	                         bool load_memory = false) -> std::optional<uint32_t> {
 		if (reg >= 128 || depth > 32) return {};
@@ -315,7 +391,14 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 					return inst.src0.value;
 				return {};
 			}
-			if (labels.contains(inst.pc)) return {};
+			if (labels.contains(inst.pc) && i != first) return {};
+		}
+		if (first != 0) {
+			if (const auto definition = reaching_definition(reg, first)) {
+				pinned.insert(reg);
+				return self(self, reg, *definition + 1u, block_start(*definition), depth + 1,
+				            load_memory);
+			}
 		}
 		return {};
 	};
@@ -347,6 +430,7 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 		while (first > 0 && !labels.contains(program.instructions[first].pc) &&
 		       !IsDirectBranch(program.instructions[first - 1].opcode))
 			--first;
+		pinned.clear();
 		const auto low  = resolve(resolve, src, i, first, 0);
 		const auto high = resolve(resolve, src + 1u, i, first, 0);
 		if (src >= 105u || dst >= 105u) {
@@ -425,7 +509,8 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 				}
 			}
 		}
-		sites.push_back({inst.pc, src, dst, dynamic, {addresses.begin(), addresses.end()}});
+		sites.push_back({inst.pc, src, dst, dynamic, {addresses.begin(), addresses.end()},
+		                 {pinned.begin(), pinned.end()}});
 	}
 	return true;
 }
@@ -446,6 +531,14 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 			    !ReadFunction(address, site.return_reg, read, target.function, reason, wave_size)) {
 				if (reason.empty()) reason = "shader call target is not DWORD aligned";
 				return false;
+			}
+			for (const auto& inst: target.function.instructions) {
+				for (const auto reg: site.pinned) {
+					if (Writes(inst, reg, wave_size)) {
+						reason = "shader function modifies its call table descriptor";
+						return false;
+					}
+				}
 			}
 			call.targets.push_back(std::move(target));
 		}

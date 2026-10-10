@@ -74,6 +74,8 @@ public:
 	struct Heap {
 		uint64_t                            base         = 0;
 		uint32_t                            table_offset = 0;
+		// Bytes between consecutive keys' T#s (32 for a plain T# array).
+		uint32_t                            table_stride = 32;
 		uint32_t                            binding      = 0;
 		uint32_t                            region       = 0;
 		// Keys the region holds. The guest appends textures to a heap as it streams them in and
@@ -120,9 +122,13 @@ public:
 	// The heap for (base, table offset, view binding), created with every entry pending and
 	// room to grow, or moved to a larger region when a descriptor covers more keys; null when
 	// the translation buffer is full.
-	[[nodiscard]] Heap* FindOrCreateHeap(uint64_t base, uint32_t table_offset, uint32_t binding,
-	                                     uint32_t entries,
+	[[nodiscard]] Heap* FindOrCreateHeap(uint64_t base, uint32_t table_offset,
+	                                     uint32_t table_stride, uint32_t binding, uint32_t entries,
 	                                     const ShaderRecompiler::IR::ImageResource& resource);
+	// Bytes the T#s of keys [0, entries) span in guest memory.
+	[[nodiscard]] static uint64_t HeapSpan(const Heap& heap, uint32_t entries) noexcept {
+		return entries == 0 ? 0 : uint64_t {entries - 1u} * heap.table_stride + 32u;
+	}
 	[[nodiscard]] std::deque<Heap>& Heaps() noexcept { return m_heaps; }
 	// 0 when the array is full. A released slot is reused once the GPU has finished the work
 	// recorded before its release.

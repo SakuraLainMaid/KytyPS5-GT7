@@ -2303,7 +2303,10 @@ private:
 			return true;
 		};
 		if (!enumerable()) {
-			if (!bindless || table_stride != 32u) {
+			// The bindless lookup indexes keys; the host reads key k's T# at
+			// table_offset + k * table_stride, so any 4-byte-aligned stride that holds a T# works
+			// (a T# inside a larger per-material record, not only a plain T# array).
+			if (!bindless || table_stride < 32u || (table_stride & 3u) != 0u) {
 				return false;
 			}
 			indirect              = {};

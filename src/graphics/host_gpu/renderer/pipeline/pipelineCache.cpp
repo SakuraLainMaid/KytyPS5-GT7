@@ -1553,6 +1553,8 @@ struct PipelineCache::ProgramCache {
 			if (reports.fetch_add(1) < 16) {
 				::printf("Shader function expansion hash=%016" PRIx64 ": %s\n", params.hash,
 				         reason.c_str());
+				LOGF("Shader function expansion hash=%016" PRIx64 ": %s\n", params.hash,
+				     reason.c_str());
 			}
 		}
 	}

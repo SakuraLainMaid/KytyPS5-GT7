@@ -293,6 +293,9 @@ bool MaterializeBindlessImage(const DescriptorSource::IndirectDescriptor& indire
 	snapshot.bindless_heaps.push_back({.base           = heap.Base48(),
 	                                   .size           = heap.GetSize(),
 	                                   .table_offset   = indirect.table_offset,
+	                                   .table_stride   = indirect.table_stride != 0u
+	                                                         ? indirect.table_stride
+	                                                         : 32u,
 	                                   .image          = image_index,
 	                                   .mapping_offset = mapping_offset});
 	auto& root                      = specialization.images[image_index];

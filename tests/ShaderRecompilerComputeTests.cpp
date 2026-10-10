@@ -68,6 +68,7 @@
 
 #include <algorithm>
 #include <array>
+#include <map>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -1332,6 +1333,100 @@ void CheckShaderFunctionExpansionCache() {
   Require(name, "patched callee", patched != first,
           "changed callee code reused the old expansion");
   check("target again", {u32(callee_b), 0, 7}, true);
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// A call through a scalar-buffer table inside a loop, with the table descriptor loaded once in
+// the prologue (GT7's material shaders): the descriptor's only reaching definition is in the
+// entry block, so the call's targets resolve. Rewriting the descriptor inside the loop must
+// still be rejected, since that write reaches the call through the back edge.
+void CheckShaderFunctionTableCallInLoop() {
+  constexpr const char *name = "ShaderFunctionTableCallInLoop";
+  constexpr uint64_t callee_a = 0x10000000ull;
+  constexpr uint64_t callee_b = 0x10000100ull;
+  constexpr uint64_t srt = 0x20000000ull;
+  constexpr uint64_t table = 0x20000100ull;
+  std::map<uint64_t, u32> memory;
+  const auto store = [&](uint64_t address, std::initializer_list<u32> words) {
+    for (const auto word : words) {
+      memory[address] = word;
+      address += 4;
+    }
+  };
+  // v_mov_b32 v0, 1; s_setpc_b64 s[14:15]
+  store(callee_a, {EncodeVop1(0x01u, 0, InlineU32(1)), EncodeSop1(0x20u, 0, 14)});
+  // v_mov_b32 v0, 2; v_mov_b32 v1, 3; s_setpc_b64 s[14:15]
+  store(callee_b, {EncodeVop1(0x01u, 0, InlineU32(2)), EncodeVop1(0x01u, 1, InlineU32(3)),
+                   EncodeSop1(0x20u, 0, 14)});
+  // SRT + 0x40: a raw buffer V# over two 16-byte table entries {target lo, target hi, 0, 0}.
+  store(srt + 0x40, {u32(table), u32(table >> 32u), 32u, 0u});
+  store(table, {u32(callee_a), u32(callee_a >> 32u), 0u, 0u,
+                u32(callee_b), u32(callee_b >> 32u), 0u, 0u});
+  const ShaderRecompiler::Decoder::ShaderCodeReader read = [&](uint64_t address,
+                                                               std::span<uint32_t> words) {
+    for (size_t i = 0; i < words.size(); i++) {
+      const auto it = memory.find(address + i * 4u);
+      words[i] = it != memory.end() ? it->second : 0xbf810000u;
+    }
+    return true;
+  };
+  const auto build = [](bool rewrite_descriptor) {
+    std::vector<u32> code{
+        EncodeSmem0(0x02u, 8, 0), EncodeSmem1(0x40u, 125), // s_load_dwordx4 s[8:11], s[0:1], 0x40
+        EncodeSMovB32(12, InlineU32(0)),                   // s_mov_b32 s12, 0
+        EncodeSopp(0x0cu, 0),                              // s_waitcnt
+        // loop:
+        EncodeSop2(0x1eu, 13, 12, InlineU32(4)),           // s_lshl_b32 s13, s12, 4
+        EncodeSmem0(0x0au, 16, 4), EncodeSmem1(0, 13),     // s_buffer_load_dwordx4 s[16:19], s[8:11], s13
+        EncodeSopp(0x0cu, 0),                              // s_waitcnt
+        EncodeSMovB32(14, 16),                             // s_mov_b32 s14, s16
+        EncodeSMovB32(15, 17),                             // s_mov_b32 s15, s17
+        EncodeSop1(0x21u, 14, 14),                         // s_swappc_b64 s[14:15], s[14:15]
+    };
+    if (rewrite_descriptor) {
+      code.push_back(EncodeSMovB32(8, InlineU32(0)));      // s_mov_b32 s8, 0
+    }
+    code.push_back(EncodeSop2(0x00u, 12, 12, InlineU32(1))); // s_add_u32 s12, s12, 1
+    code.push_back(EncodeSopc(0x0au, 12, InlineU32(2)));     // s_cmp_lt_u32 s12, 2
+    const auto branch_word = static_cast<int32_t>(code.size());
+    code.push_back(EncodeSopp(0x05u, static_cast<u32>(4 - (branch_word + 1)) & 0xffffu)); // s_cbranch_scc1 loop
+    AppendEnd(&code);
+    return code;
+  };
+  const std::array<u32, 2> user_data{u32(srt), u32(srt >> 32u)};
+  const auto contains = [](const std::vector<u32> &code, u32 word) {
+    return std::find(code.begin(), code.end(), word) != code.end();
+  };
+
+  const auto code = build(false);
+  std::vector<u32> expanded;
+  std::string reason;
+  const bool ok = ShaderRecompiler::Decoder::InlineShaderFunctions(
+      code, reinterpret_cast<uint64_t>(code.data()), user_data, read, expanded, reason, 64);
+  Require(name, "prologue descriptor",
+          ok && !expanded.empty() && contains(expanded, EncodeVop1(0x01u, 0, InlineU32(1))) &&
+              contains(expanded, EncodeVop1(0x01u, 1, InlineU32(3))),
+          "a table call in a loop did not resolve its prologue-loaded descriptor");
+
+  const auto rewritten = build(true);
+  expanded.clear();
+  reason.clear();
+  const bool rewritten_ok = ShaderRecompiler::Decoder::InlineShaderFunctions(
+      rewritten, reinterpret_cast<uint64_t>(rewritten.data()), user_data, read, expanded, reason,
+      64);
+  Require(name, "descriptor rewritten in the loop",
+          !rewritten_ok && reason.find("not statically readable") != std::string::npos,
+          "a descriptor rewritten inside the loop was taken from the prologue");
+
+  // s_mov_b32 s8, 0; s_setpc_b64 s[14:15]: a callee that overwrites the table descriptor.
+  store(callee_b, {EncodeSMovB32(8, InlineU32(0)), EncodeSop1(0x20u, 0, 14)});
+  expanded.clear();
+  reason.clear();
+  const bool clobbered_ok = ShaderRecompiler::Decoder::InlineShaderFunctions(
+      code, reinterpret_cast<uint64_t>(code.data()), user_data, read, expanded, reason, 64);
+  Require(name, "callee overwrites the descriptor",
+          !clobbered_ok && reason.find("modifies its call table descriptor") != std::string::npos,
+          "a callee that rewrites the table descriptor was expanded");
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -40228,6 +40323,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   CheckShaderFunctionExpansionCache();
+  CheckShaderFunctionTableCallInLoop();
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());

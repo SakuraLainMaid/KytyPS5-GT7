@@ -35,7 +35,7 @@ void BindlessTable::WatchHeap(Heap& heap) {
 	heap.watch_generation = m_watch_generation.load(std::memory_order_acquire);
 	const auto table = heap.base + heap.table_offset;
 	const auto begin = Common::AlignDown(table, TRACKER_PAGE_SIZE);
-	const auto end   = Common::AlignUp(table + uint64_t {heap.guest_entries} * 32u, TRACKER_PAGE_SIZE);
+	const auto end   = Common::AlignUp(table + HeapSpan(heap, heap.guest_entries), TRACKER_PAGE_SIZE);
 	if (end <= begin) {
 		return;
 	}
@@ -541,13 +541,14 @@ bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
 }
 
 BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
-    uint64_t base, uint32_t table_offset, uint32_t binding, uint32_t entries,
-    const ShaderRecompiler::IR::ImageResource& resource) {
+    uint64_t base, uint32_t table_offset, uint32_t table_stride, uint32_t binding,
+    uint32_t entries, const ShaderRecompiler::IR::ImageResource& resource) {
 	if (entries == 0) {
 		return nullptr;
 	}
 	for (auto& heap: m_heaps) {
-		if (heap.base == base && heap.table_offset == table_offset && heap.binding == binding) {
+		if (heap.base == base && heap.table_offset == table_offset &&
+		    heap.table_stride == table_stride && heap.binding == binding) {
 			if (entries > heap.entries && !AllocateRegion(heap, entries)) {
 				return nullptr;
 			}
@@ -558,6 +559,7 @@ BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
 	auto& heap         = m_heaps.emplace_back();
 	heap.base          = base;
 	heap.table_offset  = table_offset;
+	heap.table_stride  = table_stride;
 	heap.binding       = binding;
 	heap.resource      = resource;
 	heap.guest_entries = entries;
