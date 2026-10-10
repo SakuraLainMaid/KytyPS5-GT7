@@ -1523,10 +1523,11 @@ void CheckShaderFunctionTableVariants() {
   std::this_thread::sleep_for(std::chrono::milliseconds(400));
   ok = expander.Expand(code, reinterpret_cast<uint64_t>(code.data()), user_data, read, expanded,
                        reason, 64, hash, &summary);
-  Require(name, "reported variants",
-          ok && count(expanded, body) == 2 && count(expanded, 0x7700u) >= 2 &&
-              count(expanded, 0x7900u) >= 2,
-          "reported variants were not inlined into the next expansion");
+  // Specialized variants of an over-bound table are learned only with KYTY_CALL_LEARN=1: by
+  // default the reports leave the expansion as it was.
+  Require(name, "reported variants left out",
+          ok && count(expanded, body) == 0 && count(expanded, trap) > 0,
+          "reported variants of an over-bound specialized table were inlined by default");
 
   // A target whose data changes every frame (GT7's race materials): past the churn bound its
   // variants leave the expansion and its misses are no longer reported.

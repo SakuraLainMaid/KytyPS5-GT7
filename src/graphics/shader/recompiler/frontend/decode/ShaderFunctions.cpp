@@ -1029,14 +1029,29 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 	return true;
 }
 
-// Bounds the table calls: a table over MaxCallTargets offers only its reported variants.
-// An unspecialized site matches reports by target alone.
+// KYTY_CALL_LEARN=1: a specialized table over the bound inlines the variants the GPU reported.
+// Off by default: every such table seen so far (GT7's race and license materials) takes new
+// records every frame, so a learned variant only matches when a later frame reuses the record's
+// address for another material, and those runs hung the GPU or faulted (round 13 logs: each
+// device loss followed a fresh learned target; a run without any lasted four races).
+bool LearnSpecializedVariants() {
+	static const bool value = [] {
+		const char* text = std::getenv("KYTY_CALL_LEARN");
+		return text != nullptr && text[0] == '1';
+	}();
+	return value;
+}
+
+// Bounds the table calls: a table over MaxCallTargets offers only its reported variants (none,
+// for a specialized one, unless LearnSpecializedVariants). An unspecialized site matches reports
+// by target alone.
 void SelectTableTargets(std::vector<CallSite>& sites,
                         const std::vector<ShaderCallVariant>* reported) {
 	for (auto& site: sites) {
 		if (!site.dynamic) continue;
 		site.preferred.clear();
-		if (reported != nullptr) {
+		const bool over_bound = site.variants.size() > MaxCallTargets;
+		if (reported != nullptr && (!over_bound || !site.specialized || LearnSpecializedVariants())) {
 			if (site.specialized) {
 				std::set_intersection(site.variants.begin(), site.variants.end(),
 				                      reported->begin(), reported->end(),
@@ -1051,7 +1066,7 @@ void SelectTableTargets(std::vector<CallSite>& sites,
 				}
 			}
 		}
-		if (site.variants.size() > MaxCallTargets) {
+		if (over_bound) {
 			site.variants = site.preferred;
 		}
 	}

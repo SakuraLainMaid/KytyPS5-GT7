@@ -1003,4 +1003,8 @@ if(KYTY_BUILD_LAUNCHER)
 endif()
 if(KYTY_CLANG_CL)
 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)
+	# Next to the exe, the PDB symbolises the host stacks fatal errors print; the map lets them
+	# be symbolised afterwards (the image base is fixed: /DYNAMICBASE:NO).
+	install(FILES "${KYTY_EMULATOR_PDB_LINK_PATH}" "${KYTY_EMULATOR_MAP_LINK_PATH}" DESTINATION .
+	        OPTIONAL)
 endif()

@@ -1954,6 +1954,45 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	return 3;
 }
 
+// GT7's indirect register lists are sometimes not register pairs at all, intermittently around
+// boot and scene changes: floats sit in the offset slots, as if the list were read before it was
+// written or after its memory was reused. Applying the pairs that happen to decode as registers
+// put random values into real ones, and an in-range offset without a handler ended the emulator
+// ("unknown sh reg"). A list with an offset outside its register file is dropped whole.
+static bool IndirectRegisterListIsStale(const uint32_t* list, uint32_t count, uint32_t num_regs,
+                                        uint32_t nop, const char* kind) {
+	uint32_t bad = count;
+	for (uint32_t i = 0; i < count; i++) {
+		const auto raw    = list[i * 2u];
+		const auto offset = NormalizeRegisterOffset(raw);
+		if (raw == 0xffffffffu || offset == nop || (raw == 0u && list[i * 2u + 1u] == 0u)) {
+			continue;
+		}
+		if (offset >= num_regs) {
+			bad = i;
+			break;
+		}
+	}
+	if (bad == count) {
+		return false;
+	}
+	static std::atomic<uint32_t> reports {0};
+	const auto                   report = reports.fetch_add(1, std::memory_order_relaxed);
+	if (report < 16u || (report & (report + 1u)) == 0u) {
+		LOGF("\t temporary: dropping stale indirect %s register list at %p: entry %" PRIu32
+		     " of %" PRIu32 " has offset 0x%08" PRIx32 " (%" PRIu32 " dropped so far)\n",
+		     kind, static_cast<const void*>(list), bad, count, list[bad * 2u], report + 1u);
+		if (report < 4u) {
+			for (uint32_t j = 0; j < count && j < 16u; j++) {
+				LOGF("\t   %s_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32
+				     "\n",
+				     kind, j, list[j * 2u], list[j * 2u + 1u]);
+			}
+		}
+	}
+	return true;
+}
+
 KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1970,6 +2009,10 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	}
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
+	}
+	if (IndirectRegisterListIsStale(indirect_buffer, indirect_num_dw, Pm4::CX_NUM, Pm4::CX_NOP,
+	                                "CX")) {
+		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
@@ -2050,6 +2093,10 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	if (IndirectRegisterListIsStale(indirect_buffer, indirect_num_dw, Pm4::SH_NUM, Pm4::SH_NOP,
+	                                "SH")) {
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
@@ -2087,15 +2134,21 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		auto pfunc = g_hw_sh_indirect_func[cmd_offset];
 
 		if (pfunc == nullptr) {
-			LOGF("unknown indirect SH register: index=%" PRIu32 "/%" PRIu32 ", regs=0x%016" PRIx64
-			     ", offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
-			     i, indirect_num_dw, indirect_address, cmd_offset, value);
-			auto* dump_regs = indirect_buffer - i * 2;
-			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
-				LOGF("\t sh_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
-				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
+			// As for CX and UC: an SH register without a handler is skipped, not fatal.
+			static std::atomic<uint32_t> unknown_reports {0};
+			if (unknown_reports.fetch_add(1, std::memory_order_relaxed) < 4u) {
+				LOGF("\t temporary: skipping unknown indirect SH register: index=%" PRIu32
+				     "/%" PRIu32 ", regs=0x%016" PRIx64 ", offset=0x%08" PRIx32
+				     ", value=0x%08" PRIx32 "\n",
+				     i, indirect_num_dw, indirect_address, cmd_offset, value);
+				auto* dump_regs = indirect_buffer - i * 2;
+				for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
+					LOGF("\t sh_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32
+					     "\n",
+					     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
+				}
 			}
-			EXIT("unknown sh reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			continue;
 		}
 
 		pfunc(cp, cmd_offset, value);
@@ -2120,6 +2173,10 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	}
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
+	}
+	if (IndirectRegisterListIsStale(indirect_buffer, indirect_num_dw, Pm4::UC_NUM, Pm4::UC_NOP,
+	                                "UC")) {
+		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
