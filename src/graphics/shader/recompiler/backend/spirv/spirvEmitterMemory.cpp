@@ -1193,6 +1193,17 @@ void EmitShaderTrap(EmitterState& state, uint32_t pc, uint32_t code, uint32_t ta
 			EmitIfCondition(state, taken, [&]() { self(self, attempt + 1u); });
 		}
 	};
+	if (state.program.stage == ShaderType::Compute) {
+		// The trap's operands are scalars, the same in every lane: one lane of the subgroup reports
+		// (every lane of a material pass contending for one slot cost a device-wide atomic each).
+		// Not in pixel shaders, where the elected lane may be a helper, whose stores are dropped.
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+		const auto elected = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformElect, TypeBool(state), elected,
+		                          ConstantU32(state, spv::ScopeSubgroup));
+		EmitIfCondition(state, elected, [&]() { probe(probe, 0); });
+		return;
+	}
 	probe(probe, 0);
 }
 

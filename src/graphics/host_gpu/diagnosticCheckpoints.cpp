@@ -59,6 +59,22 @@ void Print(const char* stage, const DiagnosticCheckpoint& checkpoint) {
 		     checkpoint.vs_hash, checkpoint.ps_hash, checkpoint.color_samples,
 		     checkpoint.depth_samples, flags & 0xffu, (flags >> 8u) & 0xffu, (flags >> 16u) & 0xffu,
 		     (flags >> 24u) & 1u);
+		const auto& t = checkpoint.targets;
+		if (t.area != 0) {
+			char line[320];
+			std::snprintf(line, sizeof(line),
+			              "      targets: color=0x%016" PRIx64 " %ux%u fmt=%u depth=0x%016" PRIx64
+			              " %ux%u fmt=%u area=%ux%u attachments=%u clears=%s%s%s%s\n",
+			              t.color_address, t.color_extent & 0xffffu, t.color_extent >> 16u,
+			              t.color_format, t.depth_address, t.depth_extent & 0xffffu,
+			              t.depth_extent >> 16u, t.depth_format, t.area & 0xffffu, t.area >> 16u,
+			              t.flags & 0xffu, (t.flags & (1u << 8u)) != 0 ? "color " : "",
+			              (t.flags & (1u << 9u)) != 0 ? "depth " : "",
+			              (t.flags & (1u << 10u)) != 0 ? "stencil " : "",
+			              (t.flags & (1u << 11u)) != 0 ? "(has stencil)" : "");
+			std::printf("%s", line);
+			LOGF("%s", line);
+		}
 	}
 }
 

@@ -21,18 +21,23 @@ layout(push_constant) uniform Push {
     uint  local_size_y;
     uint  local_size_z;
     uint  output_dword;
+    uint  max_groups_x;
+    uint  max_groups_y;
+    uint  max_groups_z;
 } pc;
 
-uint GroupCount(uint threads, uint local_size) {
-    return threads == 0u ? 0u : (threads - 1u) / max(local_size, 1u) + 1u;
+// Bounded by the device's maxComputeWorkGroupCount: a dispatch beyond it is undefined (the
+// shader still bounds its threads by the copied counts below).
+uint GroupCount(uint threads, uint local_size, uint max_groups) {
+    return threads == 0u ? 0u : min((threads - 1u) / max(local_size, 1u) + 1u, max_groups);
 }
 
 void main() {
     ThreadCounts counts = ThreadCounts(pc.threads_address);
     const uvec3 threads = uvec3(counts.threads[0], counts.threads[1], counts.threads[2]);
-    groups[pc.output_dword + 0u] = GroupCount(threads.x, pc.local_size_x);
-    groups[pc.output_dword + 1u] = GroupCount(threads.y, pc.local_size_y);
-    groups[pc.output_dword + 2u] = GroupCount(threads.z, pc.local_size_z);
+    groups[pc.output_dword + 0u] = GroupCount(threads.x, pc.local_size_x, pc.max_groups_x);
+    groups[pc.output_dword + 1u] = GroupCount(threads.y, pc.local_size_y, pc.max_groups_y);
+    groups[pc.output_dword + 2u] = GroupCount(threads.z, pc.local_size_z, pc.max_groups_z);
     // The dispatch bounds its threads by this copy (see IndirectDispatchGroups::Result).
     groups[pc.output_dword + 4u] = threads.x;
     groups[pc.output_dword + 5u] = threads.y;

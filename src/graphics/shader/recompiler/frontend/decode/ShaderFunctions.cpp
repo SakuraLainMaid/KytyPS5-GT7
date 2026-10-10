@@ -32,10 +32,10 @@ constexpr size_t   MaxCallTargets    = 256;
 constexpr size_t   DefaultMaxSpecializedVariants = 32;
 size_t MaxSpecializedVariants() {
 	static const size_t value = [] {
+		// KYTY_CALL_VARIANTS=0: no specialized variants at all (every one takes the miss path).
 		const char* text = std::getenv("KYTY_CALL_VARIANTS");
-		const auto  parsed = text != nullptr ? std::strtoul(text, nullptr, 10) : 0ul;
-		return parsed != 0ul ? std::min<size_t>(parsed, MaxCallTargets)
-		                     : DefaultMaxSpecializedVariants;
+		if (text == nullptr || text[0] == '\0') return DefaultMaxSpecializedVariants;
+		return std::min<size_t>(std::strtoul(text, nullptr, 10), MaxCallTargets);
 	}();
 	return value;
 }
@@ -1068,11 +1068,34 @@ std::string DescribeStats(const ExpansionStats& st, size_t words) {
 	return line;
 }
 
+// A specialized target counts as churning once this many distinct data values were reported for
+// it, over at least ChurnBatches batches (a scene that shows many materials at once reports
+// them in one or two). KYTY_CALL_CHURN=<values> changes the bound; 0 never drops a target.
+constexpr uint32_t DefaultChurnValues = 12;
+constexpr uint32_t ChurnBatches       = 6;
+uint32_t ChurnValues() {
+	static const uint32_t value = [] {
+		const char* text = std::getenv("KYTY_CALL_CHURN");
+		if (text == nullptr || text[0] == '\0') return DefaultChurnValues;
+		return static_cast<uint32_t>(std::strtoul(text, nullptr, 10));
+	}();
+	return value;
+}
+
 struct CallMissRegistry {
+	struct Target {
+		uint32_t values     = 0; // distinct data values reported
+		uint32_t batches    = 0; // batches they arrived in
+		uint64_t last_batch = std::numeric_limits<uint64_t>::max();
+		bool     churning   = false;
+	};
 	struct Shader {
 		std::set<ShaderCallVariant>                           pending;
 		std::shared_ptr<const std::vector<ShaderCallVariant>> absorbed;
 		std::chrono::steady_clock::time_point        first_pending {};
+		std::map<uint64_t, Target>                   targets;
+		uint64_t                                     batch = 0; // absorptions so far
+		bool                                         dirty = false; // a target started churning
 	};
 	static constexpr size_t                    MaxTargetsPerShader = 8192;
 	static constexpr std::chrono::milliseconds BatchWindow {300};
@@ -1192,10 +1215,14 @@ struct ShaderFunctionExpander::Impl {
 ShaderFunctionExpander::ShaderFunctionExpander(): m_impl(std::make_unique<Impl>()) {}
 ShaderFunctionExpander::~ShaderFunctionExpander() = default;
 
-bool ReportShaderCallMiss(uint64_t shader_hash, const ShaderCallVariant& target) {
+bool ReportShaderCallMiss(uint64_t shader_hash, const ShaderCallVariant& target, bool* churned) {
+	if (churned != nullptr) *churned = false;
 	auto&           registry = CallMissRegistry::Get();
 	std::lock_guard lock(registry.mutex);
 	auto&           shader = registry.shaders[shader_hash];
+	const bool      specialized = target.data0 != 0u || target.data1 != 0u;
+	auto*           stats = specialized ? &shader.targets[target.target] : nullptr;
+	if (stats != nullptr && stats->churning) return false;
 	if (shader.absorbed != nullptr &&
 	    std::binary_search(shader.absorbed->begin(), shader.absorbed->end(), target)) {
 		return false;
@@ -1203,6 +1230,23 @@ bool ReportShaderCallMiss(uint64_t shader_hash, const ShaderCallVariant& target)
 	const size_t known = shader.pending.size() + (shader.absorbed ? shader.absorbed->size() : 0u);
 	if (known >= CallMissRegistry::MaxTargetsPerShader || shader.pending.contains(target)) {
 		return false;
+	}
+	if (stats != nullptr) {
+		stats->values++;
+		if (stats->last_batch != shader.batch) {
+			stats->last_batch = shader.batch;
+			stats->batches++;
+		}
+		const auto bound = ChurnValues();
+		if (bound != 0u && stats->values > bound && stats->batches >= ChurnBatches) {
+			// Its learned variants are dropped at the next expansion (ShaderCallMissTargets).
+			stats->churning = true;
+			shader.dirty    = true;
+			std::erase_if(shader.pending,
+			              [&](const auto& variant) { return variant.target == target.target; });
+			if (churned != nullptr) *churned = true;
+			return true;
+		}
 	}
 	if (shader.pending.empty()) shader.first_pending = std::chrono::steady_clock::now();
 	shader.pending.insert(target);
@@ -1215,14 +1259,23 @@ std::shared_ptr<const std::vector<ShaderCallVariant>> ShaderCallMissTargets(uint
 	const auto      found = registry.shaders.find(shader_hash);
 	if (found == registry.shaders.end()) return nullptr;
 	auto& shader = found->second;
-	if (!shader.pending.empty() && std::chrono::steady_clock::now() - shader.first_pending >=
-	                                   CallMissRegistry::BatchWindow) {
+	if (shader.dirty ||
+	    (!shader.pending.empty() &&
+	     std::chrono::steady_clock::now() - shader.first_pending >= CallMissRegistry::BatchWindow)) {
+		const auto churning = [&](const ShaderCallVariant& variant) {
+			if (variant.data0 == 0u && variant.data1 == 0u) return false;
+			const auto stats = shader.targets.find(variant.target);
+			return stats != shader.targets.end() && stats->second.churning;
+		};
 		std::vector<ShaderCallVariant> merged;
 		if (shader.absorbed != nullptr) merged = *shader.absorbed;
 		merged.insert(merged.end(), shader.pending.begin(), shader.pending.end());
+		std::erase_if(merged, churning);
 		std::sort(merged.begin(), merged.end());
 		shader.absorbed = std::make_shared<const std::vector<ShaderCallVariant>>(std::move(merged));
 		shader.pending.clear();
+		shader.dirty = false;
+		shader.batch++;
 	}
 	return shader.absorbed;
 }

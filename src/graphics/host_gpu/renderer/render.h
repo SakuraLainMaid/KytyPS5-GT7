@@ -131,6 +131,9 @@ public:
 	void AnnotateDiagnosticCheckpoint(uint64_t vs_hash, uint64_t ps_hash, uint32_t color_samples,
 	                                  uint32_t depth_samples,
 	                                  uint32_t write_flags = 0) const noexcept;
+	// Adds the draw's render targets to the checkpoint SetDebugInfo recorded last (carried to
+	// later phases with the rest of the annotation).
+	void AnnotateDiagnosticTargets(const DiagnosticTargets& targets) const noexcept;
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
@@ -176,6 +179,7 @@ private:
 	mutable uint32_t      m_annotation_color   = 0;
 	mutable uint32_t      m_annotation_depth   = 0;
 	mutable uint32_t      m_annotation_writes  = 0;
+	mutable DiagnosticTargets m_annotation_targets {};
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
 	HW::Context*        m_registers   = nullptr;

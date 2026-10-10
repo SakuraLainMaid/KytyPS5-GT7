@@ -1527,6 +1527,35 @@ void CheckShaderFunctionTableVariants() {
           ok && count(expanded, body) == 2 && count(expanded, 0x7700u) >= 2 &&
               count(expanded, 0x7900u) >= 2,
           "reported variants were not inlined into the next expansion");
+
+  // A target whose data changes every frame (GT7's race materials): past the churn bound its
+  // variants leave the expansion and its misses are no longer reported.
+  const uint64_t churn_hash = 0x7ab1e6ull;
+  const auto churn_variant = [&](u32 i) {
+    return ShaderRecompiler::Decoder::ShaderCallVariant{callee_a, 0x7000u + i * 0x100u, 0x7u};
+  };
+  bool churned = false;
+  u32 next = 0;
+  for (u32 batch = 0; batch < 5; ++batch) {
+    ShaderRecompiler::Decoder::ReportShaderCallMiss(churn_hash, churn_variant(next++), &churned);
+    std::this_thread::sleep_for(std::chrono::milliseconds(310));
+    (void)ShaderRecompiler::Decoder::ShaderCallMissTargets(churn_hash);
+  }
+  Require(name, "no churn while learning", !churned,
+          "a target was dropped before its data proved to churn");
+  while (next < 13u && !churned) {
+    ShaderRecompiler::Decoder::ReportShaderCallMiss(churn_hash, churn_variant(next++), &churned);
+  }
+  const auto left = ShaderRecompiler::Decoder::ShaderCallMissTargets(churn_hash);
+  Require(name, "churning target dropped",
+          churned && next == 13u && left != nullptr && left->empty() &&
+              !ShaderRecompiler::Decoder::ReportShaderCallMiss(churn_hash, churn_variant(40)),
+          "a target with new data every batch kept its variants or its reports");
+  ok = expander.Expand(code, reinterpret_cast<uint64_t>(code.data()), user_data, read, expanded,
+                       reason, 64, churn_hash, &summary);
+  Require(name, "churning target takes the miss path",
+          ok && count(expanded, body) == 0 && count(expanded, trap) > 0,
+          "a dropped target was still inlined");
   std::printf("[host]    %-32s ok\n", name);
 }
 

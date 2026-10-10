@@ -90,6 +90,14 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 void CommandBuffer::CarryDiagnosticAnnotation() const noexcept {
 	AnnotateDiagnosticCheckpoint(m_annotation_vs, m_annotation_ps, m_annotation_color,
 	                             m_annotation_depth, m_annotation_writes);
+	AnnotateDiagnosticTargets(m_annotation_targets);
+}
+
+void CommandBuffer::AnnotateDiagnosticTargets(const DiagnosticTargets& targets) const noexcept {
+	m_annotation_targets = targets;
+	if (m_debug_marker != nullptr) {
+		m_debug_marker->targets = targets;
+	}
 }
 
 void CommandBuffer::AnnotateDiagnosticCheckpoint(uint64_t vs_hash, uint64_t ps_hash,

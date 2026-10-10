@@ -39,7 +39,16 @@ void ReportCallMisses(const uint8_t* slots) {
 		const auto hash   = (uint64_t {slot.shader_hash_high} << 32u) | slot.shader_hash_low;
 		const auto target = (uint64_t {slot.target_high} << 32u) | slot.target_low;
 		if (target == 0) continue;
-		if (ShaderRecompiler::Decoder::ReportShaderCallMiss(hash, {target, slot.data0, slot.data1})) {
+		bool churned = false;
+		if (ShaderRecompiler::Decoder::ReportShaderCallMiss(hash, {target, slot.data0, slot.data1},
+		                                                    &churned)) {
+			if (churned) {
+				LOGF("Shader call target: hash=%016" PRIx64 " target=0x%016" PRIx64
+				     " takes new data every frame: its variants are dropped, the miss path "
+				     "handles it from now on\n",
+				     hash, target);
+				continue;
+			}
 			const auto count = total.fetch_add(1) + 1;
 			if (logged.fetch_add(1) < 64 || (count & (count - 1)) == 0) {
 				LOGF("Shader call miss: hash=%016" PRIx64 " target=0x%016" PRIx64

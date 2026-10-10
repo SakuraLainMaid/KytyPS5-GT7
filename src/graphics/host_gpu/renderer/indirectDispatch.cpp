@@ -16,6 +16,7 @@ struct PushConstants {
 	uint32_t threads_high;
 	uint32_t local_size[3];
 	uint32_t output_dword;
+	uint32_t max_groups[3];
 };
 
 } // namespace
@@ -92,9 +93,12 @@ IndirectDispatchGroups::Result IndirectDispatchGroups::Convert(
 	write.descriptorCount = 1;
 	write.descriptorType  = vk::DescriptorType::eStorageBuffer;
 	write.pBufferInfo     = &info;
+	const auto&         limits = m_graphics.physical_device_properties.limits;
 	const PushConstants push {
 	    static_cast<uint32_t>(threads), static_cast<uint32_t>(threads >> 32u),
-	    {local_size[0], local_size[1], local_size[2]}, entry * EntryDwords};
+	    {local_size[0], local_size[1], local_size[2]}, entry * EntryDwords,
+	    {limits.maxComputeWorkGroupCount[0], limits.maxComputeWorkGroupCount[1],
+	     limits.maxComputeWorkGroupCount[2]}};
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0, 1, &write);
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),

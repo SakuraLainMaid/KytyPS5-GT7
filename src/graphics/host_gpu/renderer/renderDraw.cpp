@@ -1342,6 +1342,35 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	        (std::min(rendering.num_layers, 255u) << 8u) |
 	        (std::min(rendering.num_color_attachments, 255u) << 16u) |
 	        (rendering.depth_stencil_attachment.image_view ? 1u << 24u : 0u));
+	if (buffer.GetGraphics().diagnostic_checkpoints_enabled) {
+		DiagnosticTargets targets;
+		const auto        pack = [](uint32_t width, uint32_t height) {
+			return std::min(width, 0xffffu) | (std::min(height, 0xffffu) << 16u);
+		};
+		if (state.color_count != 0) {
+			const auto& color     = state.color_info[0];
+			const auto  extent    = color.Extent();
+			targets.color_address = color.desc.info.data.address;
+			targets.color_extent  = pack(extent.width, extent.height);
+			targets.color_format  = static_cast<uint32_t>(color.desc.info.pixel_format);
+		}
+		if (state.depth_info.image_id) {
+			const auto& depth     = state.depth_info.desc.info;
+			targets.depth_address = depth.data.address;
+			targets.depth_extent  = pack(depth.extent.width, depth.extent.height);
+			targets.depth_format  = static_cast<uint32_t>(depth.pixel_format);
+		}
+		const auto& ds = rendering.depth_stencil_attachment;
+		targets.area   = pack(rendering.width, rendering.height);
+		targets.flags  = std::min(rendering.num_color_attachments, 255u) |
+		                (rendering.num_color_attachments != 0 &&
+		                         rendering.color_attachments[0].is_clear
+		                     ? 1u << 8u
+		                     : 0u) |
+		                (ds.depth_clear ? 1u << 9u : 0u) | (ds.stencil_clear ? 1u << 10u : 0u) |
+		                (ds.has_stencil ? 1u << 11u : 0u);
+		buffer.AnnotateDiagnosticTargets(targets);
+	}
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}

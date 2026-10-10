@@ -19,6 +19,21 @@ struct VulkanImage;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
+// The render targets of a draw, for device-loss reports: guest addresses, extents (width |
+// height << 16), host formats (vk::Format values) and the render area.
+struct DiagnosticTargets {
+	uint64_t color_address = 0;
+	uint64_t depth_address = 0;
+	uint32_t color_extent  = 0;
+	uint32_t depth_extent  = 0;
+	uint32_t color_format  = 0;
+	uint32_t depth_format  = 0;
+	uint32_t area          = 0;
+	// Bits 0-7: color attachments; bit 8: color 0 clears; bits 9, 10: depth, stencil clear;
+	// bit 11: has stencil.
+	uint32_t flags         = 0;
+};
+
 struct DiagnosticCheckpoint {
 	uint32_t op        = 0;
 	uint64_t submit_id = 0;
@@ -36,6 +51,7 @@ struct DiagnosticCheckpoint {
 	uint32_t depth_samples = 0;
 	// Bit 0: the pixel stage writes buffers or storage images; bit 1: a vertex stage does.
 	uint32_t write_flags = 0;
+	DiagnosticTargets targets;
 };
 
 struct GraphicContext;

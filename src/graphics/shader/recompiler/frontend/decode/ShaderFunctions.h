@@ -38,7 +38,12 @@ struct ShaderCallVariant {
 	uint32_t data1  = 0;
 	auto     operator<=>(const ShaderCallVariant&) const = default;
 };
-bool ReportShaderCallMiss(uint64_t shader_hash, const ShaderCallVariant& variant);
+// A specialized target whose data keeps changing (GT7 allocates its race material records anew
+// each frame) never matches a learned variant again: past a bound it is dropped from the
+// expansion, left to the miss path, and no longer reported. churned is set when this report
+// dropped it.
+bool ReportShaderCallMiss(uint64_t shader_hash, const ShaderCallVariant& variant,
+                          bool* churned = nullptr);
 // The variants reported for the shader so far (ascending), or null.
 std::shared_ptr<const std::vector<ShaderCallVariant>> ShaderCallMissTargets(uint64_t shader_hash);
 
