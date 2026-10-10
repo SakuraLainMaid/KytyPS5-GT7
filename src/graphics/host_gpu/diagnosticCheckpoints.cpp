@@ -48,14 +48,17 @@ void Print(const char* stage, const DiagnosticCheckpoint& checkpoint) {
 		std::printf("      CS=0x%016" PRIx64 "\n", checkpoint.vs_hash);
 		LOGF("      CS=0x%016" PRIx64 "\n", checkpoint.vs_hash);
 	} else if (checkpoint.vs_hash != 0 || checkpoint.ps_hash != 0) {
+		const auto flags = checkpoint.write_flags;
 		std::printf("      VS=0x%016" PRIx64 " PS=0x%016" PRIx64
-		            " color_samples=%u depth_samples=%u writes=%u\n",
+		            " color_samples=%u depth_samples=%u writes=%u layers=%u colors=%u depth=%u\n",
 		            checkpoint.vs_hash, checkpoint.ps_hash, checkpoint.color_samples,
-		            checkpoint.depth_samples, checkpoint.write_flags);
+		            checkpoint.depth_samples, flags & 0xffu, (flags >> 8u) & 0xffu,
+		            (flags >> 16u) & 0xffu, (flags >> 24u) & 1u);
 		LOGF("      VS=0x%016" PRIx64 " PS=0x%016" PRIx64
-		     " color_samples=%u depth_samples=%u writes=%u\n",
+		     " color_samples=%u depth_samples=%u writes=%u layers=%u colors=%u depth=%u\n",
 		     checkpoint.vs_hash, checkpoint.ps_hash, checkpoint.color_samples,
-		     checkpoint.depth_samples, checkpoint.write_flags);
+		     checkpoint.depth_samples, flags & 0xffu, (flags >> 8u) & 0xffu, (flags >> 16u) & 0xffu,
+		     (flags >> 24u) & 1u);
 	}
 }
 

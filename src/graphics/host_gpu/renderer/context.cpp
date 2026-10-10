@@ -87,10 +87,20 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	}
 }
 
+void CommandBuffer::CarryDiagnosticAnnotation() const noexcept {
+	AnnotateDiagnosticCheckpoint(m_annotation_vs, m_annotation_ps, m_annotation_color,
+	                             m_annotation_depth, m_annotation_writes);
+}
+
 void CommandBuffer::AnnotateDiagnosticCheckpoint(uint64_t vs_hash, uint64_t ps_hash,
                                                  uint32_t color_samples,
                                                  uint32_t depth_samples,
                                                  uint32_t write_flags) const noexcept {
+	m_annotation_vs     = vs_hash;
+	m_annotation_ps     = ps_hash;
+	m_annotation_color  = color_samples;
+	m_annotation_depth  = depth_samples;
+	m_annotation_writes = write_flags;
 	if (m_debug_marker == nullptr) {
 		return;
 	}

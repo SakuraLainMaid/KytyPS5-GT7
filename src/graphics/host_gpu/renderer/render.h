@@ -125,6 +125,9 @@ public:
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	// Adds the running draw's shaders and sample counts to the checkpoint SetDebugInfo recorded
 	// last (no-op without NV diagnostic checkpoints).
+	// Puts the last annotation on the checkpoint SetDebugInfo recorded last (a later phase of
+	// the same draw).
+	void CarryDiagnosticAnnotation() const noexcept;
 	void AnnotateDiagnosticCheckpoint(uint64_t vs_hash, uint64_t ps_hash, uint32_t color_samples,
 	                                  uint32_t depth_samples,
 	                                  uint32_t write_flags = 0) const noexcept;
@@ -167,6 +170,12 @@ private:
 	uint32_t            m_debug_arg3      = 0;
 	uint64_t            m_debug_arg4      = 0;
 	DiagnosticCheckpoint* m_debug_marker  = nullptr;
+	// The last AnnotateDiagnosticCheckpoint values, for CarryDiagnosticAnnotation.
+	mutable uint64_t      m_annotation_vs      = 0;
+	mutable uint64_t      m_annotation_ps      = 0;
+	mutable uint32_t      m_annotation_color   = 0;
+	mutable uint32_t      m_annotation_depth   = 0;
+	mutable uint32_t      m_annotation_writes  = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
 	HW::Context*        m_registers   = nullptr;

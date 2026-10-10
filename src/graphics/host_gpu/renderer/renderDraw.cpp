@@ -847,6 +847,8 @@ static void SetDrawDebugPhase(CommandBuffer& buffer, uint64_t submit_id, const D
                               uint32_t phase) {
 	buffer.SetDebugInfo(static_cast<uint32_t>(draw.debug_op), submit_id, phase, draw.index_count, 0,
 	                    draw.instance_count, draw.first_instance);
+	// Later phases name the draw's shaders too (the first is annotated once they are chosen).
+	buffer.CarryDiagnosticAnnotation();
 }
 
 static bool GetDrawTopology(const HW::UserConfig& ucfg, vk::PrimitiveTopology& topology) {
@@ -1336,11 +1338,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	        (std::ranges::any_of(vertex_stages,
 	                             [&](const auto& stage) { return writes_memory(stage.stage); })
 	             ? 2u
-	             : 0u));
+	             : 0u) |
+	        (std::min(rendering.num_layers, 255u) << 8u) |
+	        (std::min(rendering.num_color_attachments, 255u) << 16u) |
+	        (rendering.depth_stencil_attachment.image_view ? 1u << 24u : 0u));
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
-	if (state.ps_active && !draw.IsIndexed()) {
+	// Every phase marker, for indexed draws too: a device loss then names the step it was in.
+	if (state.ps_active) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
@@ -1463,14 +1469,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 
 	LogDrawPhase(draw.Name(), "BeginRendering");
-	if (!draw.IsIndexed()) {
-		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
-	}
+	SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	m_context.GetCommandScheduler().BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
-	if (!draw.IsIndexed()) {
-		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
-	}
+	SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	GpuTiming::Before(m_context, buffer);
 	int64_t gpu_zone = -1;
 	if (Profiler::g_counters) {
@@ -1523,9 +1525,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                                 : vertex_stages.back().stage.program->shader_hash,
 	                 GpuTiming::Draw);
 
-	if (!draw.IsIndexed()) {
-		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
-	}
+	SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
 	vk::PipelineStageFlags shader_write_stages = {};
 	for (const auto& stage: vertex_stages) {
 		if (HasShaderBufferWrites(stage.stage)) {
@@ -1540,9 +1540,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}
 	LogDrawPhase(draw.Name(), "DrawComplete");
-	if (!draw.IsIndexed()) {
-		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
-	}
+	SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
 }
 
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
