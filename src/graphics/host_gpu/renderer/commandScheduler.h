@@ -188,10 +188,19 @@ private:
 	};
 	struct Chunk {
 		static constexpr size_t Size = 256 * 1024;
+		// Allocations above this get a heap block of their own, owned by the chunk and freed when
+		// the recording thread recycles it, so one command's stashed arrays (a texture upload's
+		// copy regions, a large barrier batch) are not limited by Size.
+		static constexpr size_t LargeThreshold = Size / 4;
 		alignas(64) std::byte storage[Size];
 		size_t           used  = 0;
 		RecordedCommand* first = nullptr;
 		RecordedCommand* last  = nullptr;
+		std::vector<std::unique_ptr<std::byte[]>> large;
+
+		[[nodiscard]] bool Empty() const noexcept {
+			return first == nullptr && used == 0 && large.empty();
+		}
 	};
 	void* Allocate(size_t size, size_t alignment);
 	void  DispatchChunk();

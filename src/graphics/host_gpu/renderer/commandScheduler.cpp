@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
@@ -613,7 +614,7 @@ void CommandScheduler::EnableRecordingThread() {
 }
 
 void* CommandScheduler::Allocate(size_t size, size_t alignment) {
-	EXIT_IF(!m_threaded || size > Chunk::Size);
+	EXIT_IF(!m_threaded || alignment == 0 || (alignment & (alignment - 1)) != 0);
 	const auto take = [this] {
 		std::lock_guard lock(m_record_mutex);
 		if (m_free_chunks.empty()) {
@@ -626,6 +627,15 @@ void* CommandScheduler::Allocate(size_t size, size_t alignment) {
 	if (m_chunk == nullptr) {
 		m_chunk = take();
 	}
+	if (size > Chunk::LargeThreshold) {
+		// Lives as long as the chunk's own storage: the recording thread retains executed chunks
+		// for two more, then frees these blocks when it recycles the chunk.
+		auto block   = std::unique_ptr<std::byte[]>(new std::byte[size + alignment]);
+		auto address = reinterpret_cast<uintptr_t>(block.get());
+		address      = (address + alignment - 1) & ~(static_cast<uintptr_t>(alignment) - 1);
+		m_chunk->large.push_back(std::move(block));
+		return reinterpret_cast<void*>(address);
+	}
 	auto offset = (m_chunk->used + alignment - 1) & ~(alignment - 1);
 	if (offset + size > Chunk::Size) {
 		DispatchChunk();
@@ -637,7 +647,9 @@ void* CommandScheduler::Allocate(size_t size, size_t alignment) {
 }
 
 void CommandScheduler::DispatchChunk() {
-	if (m_chunk == nullptr || m_chunk->first == nullptr) {
+	// A chunk holding only stashed data (its command went to the next chunk) is dispatched too:
+	// dropping it would free arrays that command still points to.
+	if (m_chunk == nullptr || m_chunk->Empty()) {
 		return;
 	}
 	{
@@ -699,6 +711,7 @@ void CommandScheduler::RecordingThread(std::stop_token stop) {
 		if (retained.size() > 2) {
 			recycled = std::move(retained.front());
 			retained.pop_front();
+			recycled->large.clear();
 		}
 		{
 			std::lock_guard lock(m_record_mutex);
