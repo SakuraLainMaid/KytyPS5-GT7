@@ -162,11 +162,27 @@ public:
 		cache.ProcessFaultBuffer();
 		scheduler.Finish();
 		RangeSet ranges;
-		for (size_t i = 0; i < program.info.buffers.size(); ++i) {
-			const auto& source = bindings.buffer_sources[i];
-			if (!program.info.buffers[i].written || source.size == 0) continue;
+		// buffer_sources is indexed by memory slot (FindBuffers), not by program.info.buffers:
+		// map each slot to its resource. Indexing it by resource read past the slots and
+		// handed FindBuffer garbage ranges (the GT7 Cafe "invalid buffer discovery request").
+		for (size_t i = 0; i < bindings.buffer_sources.size(); ++i) {
+			const auto  resource = program.bindings.descriptors.front().resources[i];
+			const auto& source   = bindings.buffer_sources[i];
+			if (resource >= program.info.buffers.size() || !program.info.buffers[resource].written ||
+			    source.size == 0) {
+				continue;
+			}
 			const auto start = source.address & ~uint64_t {3};
 			const auto end   = (source.address + source.size + 3) & ~uint64_t {3};
+			if (!GuestRange {start, end - start}.Valid()) {
+				static std::atomic<uint32_t> reported = 0;
+				if (reported.fetch_add(1) < 8) {
+					LOGF("DispatchBufferRecovery: temporary: skipping invalid written range "
+					     "0x%016" PRIx64 " size 0x%016" PRIx64 " (slot %zu)\n",
+					     source.address, source.size, i);
+				}
+				continue;
+			}
 			ranges.Add(start, end - start);
 		}
 		ranges.ForEach([&](uint64_t start, uint64_t end) {

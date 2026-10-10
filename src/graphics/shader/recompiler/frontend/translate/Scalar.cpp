@@ -229,7 +229,17 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 			// Retail GPUs run with traps disabled, so a guest assert falls through. Only a
 			// shader-call target outside the expanded set reports a trap.
 			if (inst.src0.value == Decoder::ShaderCallMissTrapCode) {
-				ir.Emit(IR::ValueOpcode::ShaderTrap, {IR::Value(inst.pc), IR::Value(inst.src0.value)});
+				// The expansion names the scalar pair holding the missed target in the upper
+				// byte (ShaderCallMissTrapImmediate); the trap reports the target.
+				const uint32_t named = (inst.raw[0] >> 8u) & 0xffu;
+				std::array<IR::Value, 4> words {IR::Value(0u), IR::Value(0u), IR::Value(0u),
+				                                IR::Value(0u)};
+				for (uint32_t word = 0; word < 4u; ++word) {
+					const uint32_t reg = named - 1u + word;
+					if (named != 0u && reg < 106u) words[word] = ReadScalarCode(reg);
+				}
+				ir.Emit(IR::ValueOpcode::ShaderTrap, {IR::Value(inst.pc), IR::Value(inst.src0.value),
+				                                      words[0], words[1], words[2], words[3]});
 			} else {
 				EmitControlNop();
 			}

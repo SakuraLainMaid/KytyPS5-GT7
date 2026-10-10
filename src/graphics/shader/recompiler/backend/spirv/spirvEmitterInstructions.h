@@ -200,7 +200,9 @@ inline constexpr auto EmitInstPrefetch = EmitVoid;
 void                  EmitBarrier(EmitterState& state);
 void                  EmitWaveLdsBarrier(EmitterState& state);
 void                  EmitStoreCompletion(EmitterState& state);
-void                  EmitShaderTrap(EmitterState& state, uint32_t pc, uint32_t code);
+void                  EmitShaderTrap(EmitterState& state, uint32_t pc, uint32_t code,
+                                     uint32_t target_low, uint32_t target_high, uint32_t data0,
+                                     uint32_t data1);
 void                  EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);

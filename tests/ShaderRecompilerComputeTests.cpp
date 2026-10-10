@@ -72,6 +72,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <thread>
 #include <cinttypes>
 #include <cmath>
 #include <cstdint>
@@ -1418,15 +1419,114 @@ void CheckShaderFunctionTableCallInLoop() {
           !rewritten_ok && reason.find("not statically readable") != std::string::npos,
           "a descriptor rewritten inside the loop was taken from the prologue");
 
-  // s_mov_b32 s8, 0; s_setpc_b64 s[14:15]: a callee that overwrites the table descriptor.
+  // s_mov_b32 s8, 0; s_setpc_b64 s[14:15]: a callee that writes a register of the table
+  // descriptor. The call ABI makes the descriptor callee-saved (GT7 reuses it after the call
+  // without reloading), so the expansion keeps it like any other callee.
   store(callee_b, {EncodeSMovB32(8, InlineU32(0)), EncodeSop1(0x20u, 0, 14)});
   expanded.clear();
   reason.clear();
   const bool clobbered_ok = ShaderRecompiler::Decoder::InlineShaderFunctions(
       code, reinterpret_cast<uint64_t>(code.data()), user_data, read, expanded, reason, 64);
-  Require(name, "callee overwrites the descriptor",
-          !clobbered_ok && reason.find("modifies its call table descriptor") != std::string::npos,
-          "a callee that rewrites the table descriptor was expanded");
+  Require(name, "callee writes the descriptor",
+          clobbered_ok && contains(expanded, EncodeSMovB32(8, InlineU32(0))),
+          "a callee that writes a descriptor register was not expanded");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// GT7's material tables: entries {target, record pointer}, the call passing the pointer in the
+// pair after the target's. Each entry inlines as a variant specialized on its pointer, with its
+// body emitted once; a table over the bound inlines only the variants the GPU reported missing
+// (ReportShaderCallMiss), and its miss trap names the target pair.
+void CheckShaderFunctionTableVariants() {
+  constexpr const char *name = "ShaderFunctionTableVariants";
+  constexpr uint64_t callee_a = 0x10000000ull;
+  constexpr uint64_t srt = 0x20000000ull;
+  constexpr uint64_t table = 0x20000100ull;
+  std::map<uint64_t, u32> memory;
+  const auto store = [&](uint64_t address, std::initializer_list<u32> words) {
+    for (const auto word : words) {
+      memory[address] = word;
+      address += 4;
+    }
+  };
+  // v_mov_b32 v0, 1; s_setpc_b64 s[14:15]
+  store(callee_a, {EncodeVop1(0x01u, 0, InlineU32(1)), EncodeSop1(0x20u, 0, 14)});
+  const auto fill_table = [&](u32 entries) {
+    store(srt + 0x40, {u32(table), u32(table >> 32u), entries * 16u, 0u});
+    for (u32 e = 0; e < entries; ++e) {
+      store(table + e * 16u, {u32(callee_a), u32(callee_a >> 32u), 0x7000u + e * 0x100u, 0x7u});
+    }
+  };
+  const ShaderRecompiler::Decoder::ShaderCodeReader read = [&](uint64_t address,
+                                                               std::span<uint32_t> words) {
+    for (size_t i = 0; i < words.size(); i++) {
+      const auto it = memory.find(address + i * 4u);
+      words[i] = it != memory.end() ? it->second : 0xbf810000u;
+    }
+    return true;
+  };
+  std::vector<u32> code{
+      EncodeSmem0(0x02u, 8, 0), EncodeSmem1(0x40u, 125), // s_load_dwordx4 s[8:11], s[0:1], 0x40
+      EncodeSMovB32(12, InlineU32(0)),                   // s_mov_b32 s12, 0
+      EncodeSopp(0x0cu, 0),                              // s_waitcnt
+      // loop:
+      EncodeSop2(0x1eu, 13, 12, InlineU32(4)),           // s_lshl_b32 s13, s12, 4
+      EncodeSmem0(0x0au, 16, 4), EncodeSmem1(0, 13),     // s_buffer_load_dwordx4 s[16:19], s[8:11], s13
+      EncodeSopp(0x0cu, 0),                              // s_waitcnt
+      EncodeSMovB32(14, 16),                             // s_mov_b32 s14, s16
+      EncodeSMovB32(15, 17),                             // s_mov_b32 s15, s17
+      EncodeSMovB32(16, 18),                             // s_mov_b32 s16, s18
+      EncodeSMovB32(17, 19),                             // s_mov_b32 s17, s19
+      EncodeSop1(0x21u, 14, 14),                         // s_swappc_b64 s[14:15], s[14:15]
+      EncodeSop2(0x00u, 12, 12, InlineU32(1)),           // s_add_u32 s12, s12, 1
+      EncodeSopc(0x0au, 12, InlineU32(2)),               // s_cmp_lt_u32 s12, 2
+  };
+  const auto branch_word = static_cast<int32_t>(code.size());
+  code.push_back(EncodeSopp(0x05u, static_cast<u32>(4 - (branch_word + 1)) & 0xffffu));
+  AppendEnd(&code);
+  const std::array<u32, 2> user_data{u32(srt), u32(srt >> 32u)};
+  const auto count = [](const std::vector<u32> &words, u32 word) {
+    return std::count(words.begin(), words.end(), word);
+  };
+  const u32 body = EncodeVop1(0x01u, 0, InlineU32(1));
+  const u32 trap = 0xbf920000u | ShaderRecompiler::Decoder::ShaderCallMissTrapImmediate(14);
+
+  fill_table(2);
+  std::vector<u32> expanded;
+  std::string reason;
+  bool ok = ShaderRecompiler::Decoder::InlineShaderFunctions(
+      code, reinterpret_cast<uint64_t>(code.data()), user_data, read, expanded, reason, 64);
+  // s_mov_b32 s16, literal (each variant's record pointer, as a constant).
+  const u32 move_s16 = 0xbe8003ffu | (16u << 16u);
+  Require(name, "two variants of one function",
+          ok && count(expanded, body) == 2 && count(expanded, move_s16) == 2 &&
+              count(expanded, 0x7000u) >= 2 && count(expanded, 0x7100u) >= 2 &&
+              count(expanded, trap) > 0,
+          "table entries were not inlined as specialized variants with a named miss trap");
+  // The callee leaves SCC alone and the continuation overwrites it first: one selection tree,
+  // so each variant body appears once (two trees would need SCC stubs).
+  Require(name, "one selection tree", count(expanded, 0xbf068080u) == 0,
+          "a dead incoming SCC still produced a second selection tree");
+
+  fill_table(300);
+  const uint64_t hash = 0x7ab1e5ull;
+  ShaderRecompiler::Decoder::ShaderFunctionExpander expander;
+  std::string summary;
+  ok = expander.Expand(code, reinterpret_cast<uint64_t>(code.data()), user_data, read, expanded,
+                       reason, 64, hash, &summary);
+  Require(name, "over-bound table",
+          ok && count(expanded, body) == 0 && count(expanded, trap) > 0 &&
+              summary.find("table targets=300") != std::string::npos,
+          "a table over the bound did not expand to its miss trap");
+  ShaderRecompiler::Decoder::ReportShaderCallMiss(hash, {callee_a, 0x7000u + 7u * 0x100u, 0x7u});
+  ShaderRecompiler::Decoder::ReportShaderCallMiss(hash, {callee_a, 0x7000u + 9u * 0x100u, 0x7u});
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  ok = expander.Expand(code, reinterpret_cast<uint64_t>(code.data()), user_data, read, expanded,
+                       reason, 64, hash, &summary);
+  Require(name, "reported variants",
+          ok && count(expanded, body) == 2 && count(expanded, 0x7700u) >= 2 &&
+              count(expanded, 0x7900u) >= 2,
+          "reported variants were not inlined into the next expansion");
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -33341,7 +33441,10 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   candidate.indirect_search_iterations = 0;
   candidate.indirect_resources.clear();
   program.descriptor_sources.resize(1);
-  program.descriptor_sources[0].indirect_descriptor.emplace().table_stride = 16;
+  // Assigned rather than emplace()d: libstdc++ rejects emplace() of the nested aggregate.
+  ShaderRecompiler::IR::DescriptorSource::IndirectDescriptor indirect_descriptor;
+  indirect_descriptor.table_stride = 16;
+  program.descriptor_sources[0].indirect_descriptor = indirect_descriptor;
   ShaderComputeInputInfo compute;
   compute.wave_size = 32;
   compute.host_subgroup_size = vulkan.SubgroupSize();
@@ -40324,6 +40427,7 @@ int main(int argc, char **argv) {
   }
   CheckShaderFunctionExpansionCache();
   CheckShaderFunctionTableCallInLoop();
+  CheckShaderFunctionTableVariants();
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());

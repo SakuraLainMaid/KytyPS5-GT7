@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstddef>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
@@ -849,7 +850,9 @@ struct IndirectBufferAccess {
 	uint32_t raw_index_in_bounds;
 };
 
-IndirectBufferAccess PrepareIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
+// component: the result component whose destination selector (DST_SEL_X..W) .selector holds.
+IndirectBufferAccess PrepareIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst,
+                                           uint32_t component = 0) {
 	auto&       state  = ctx.state;
 	const auto& handle = *inst.Arg(0).ResolveInstruction();
 	const auto word1   = ctx.Arg(handle, 1);
@@ -880,7 +883,7 @@ IndirectBufferAccess PrepareIndirectBuffer(ValueEmitContext& ctx, const IR::Inst
 	    .stride = stride,
 	    .swizzle = swizzle,
 	    .format = field(word3, 12, 7),
-	    .selector = ctx.Memory(inst).formatted ? field(word3, 0, 3) : 0u,
+	    .selector = ctx.Memory(inst).formatted ? field(word3, component * 3u, 3) : 0u,
 	    .mode = field(word3, 28, 2),
 	    .records = records,
 	    .index_in_bounds = Binary(state, spv::OpULessThan, TypeBool(state), index, records),
@@ -946,10 +949,13 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 	return components == 1u ? values[0] : ConstructU32Composite(state, components, values);
 }
 
-uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
+// One result component of a formatted load through a GPU-selected V#: the element's format
+// and the component's destination selector come from the descriptor at run time.
+uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst,
+                                uint32_t result_component = 0) {
 	auto& state = ctx.state;
 	return EmitValueOrZeroIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto buffer = PrepareIndirectBuffer(ctx, inst);
+		const auto buffer = PrepareIndirectBuffer(ctx, inst, result_component);
 		return EmitIndexSwitch(
 		    state, buffer.format, static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u,
 		    TypeU32(state), [&](uint32_t format) {
@@ -998,6 +1004,15 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 	    ConstantU32CompositeZero(state, components), [&]() {
 		    const auto mem = ctx.Memory(inst);
 		    if (mem.kind == IR::ResourceKind::IndirectBuffer) {
+			    if (mem.formatted) {
+				    // BUFFER_LOAD_FORMAT_XY/XYZ/XYZW (GT7's material vertex fetches).
+				    std::array<uint32_t, 4> values {};
+				    for (uint32_t component = 0; component < components; ++component) {
+					    values[component] = LoadIndirectFormattedX(ctx, inst, component);
+				    }
+				    return components == 1u ? values[0]
+				                            : ConstructU32Composite(state, components, values);
+			    }
 			    return LoadIndirectBuffer(ctx, inst, components);
 		    }
 		    const auto resource = PrepareMemoryResourceAccess(state, mem);
@@ -1112,31 +1127,73 @@ uint32_t GetBdaPointer(EmitterState& state, uint32_t address) {
 	return result;
 }
 
-void EmitShaderTrap(EmitterState& state, uint32_t pc, uint32_t code) {
+// A shader-call variant outside the expansion (ShaderCallMissTrapCode): the target and the
+// two data words join the fault buffer's miss set (ShaderCallMissSlot), from which the host
+// feeds the next expansion. The trapping wave then ends, as before. pc and code stay in the IR
+// for diagnostics.
+void EmitShaderTrap(EmitterState& state, uint32_t pc, uint32_t code, uint32_t target_low,
+                    uint32_t target_high, uint32_t data0, uint32_t data1) {
+	(void)pc;
+	(void)code;
 	constexpr auto record_word = BufferCachePages::kNumPages / 8 / sizeof(uint32_t);
-	const auto     pointer     = FaultElementPointer(state, ConstantU32(state, record_word));
-	const auto     old         = state.builder.AllocateId();
-	// Only the winning invocation writes the payload. Queue completion, rather
-	// than another shader invocation, publishes those writes to the host.
-	state.builder.AddFunction(spv::OpAtomicCompareExchange, TypeU32(state), old, pointer,
-	                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0),
-	                          ConstantU32(state, 0), ConstantU32(state, 1), ConstantU32(state, 0));
-	const auto won = Binary(state, spv::OpIEqual, TypeBool(state), old, ConstantU32(state, 0));
-	EmitIfCondition(state, won, [&]() {
-		const auto store = [&](size_t offset, uint32_t value) {
-			state.builder.AddFunction(
-			    spv::OpStore,
-			    FaultElementPointer(state,
-			                        ConstantU32(state, record_word + offset / sizeof(uint32_t))),
-			    value);
+	constexpr auto slots_word  = record_word + offsetof(ShaderTrapArea, misses) / sizeof(uint32_t);
+	constexpr auto slot_words  = sizeof(ShaderCallMissSlot) / sizeof(uint32_t);
+	static_assert((kShaderCallMissSlots & (kShaderCallMissSlots - 1u)) == 0);
+	const auto u32 = TypeU32(state);
+	const auto mix = [&](uint32_t value, uint32_t multiplier) {
+		return Binary(state, spv::OpIMul, u32, value, ConstantU32(state, multiplier));
+	};
+	const auto xor_ = [&](uint32_t a, uint32_t b) {
+		return Binary(state, spv::OpBitwiseXor, u32, a, b);
+	};
+	const auto hashed = mix(xor_(xor_(xor_(target_low, mix(target_high, 0x85ebca77u)),
+	                                  mix(data0, 0xc2b2ae3du)),
+	                             mix(data1, 0x27d4eb2fu)),
+	                        0x9e3779b1u);
+	const auto key = Binary(state, spv::OpBitwiseOr, u32, hashed, ConstantU32(state, 1));
+	const auto first = Binary(
+	    state, spv::OpShiftRightLogical, u32, hashed,
+	    ConstantU32(state, 32u - static_cast<uint32_t>(std::countr_zero(kShaderCallMissSlots))));
+	const auto probe = [&](auto& self, uint32_t attempt) -> void {
+		const auto slot = Binary(state, spv::OpBitwiseAnd, u32,
+		                         Binary(state, spv::OpIAdd, u32, first, ConstantU32(state, attempt)),
+		                         ConstantU32(state, kShaderCallMissSlots - 1u));
+		const auto base = Binary(state, spv::OpIAdd, u32, ConstantU32(state, slots_word),
+		                         Binary(state, spv::OpIMul, u32, slot, ConstantU32(state, slot_words)));
+		const auto word = [&](size_t offset) {
+			return FaultElementPointer(
+			    state, Binary(state, spv::OpIAdd, u32, base,
+			                  ConstantU32(state, static_cast<uint32_t>(offset / sizeof(uint32_t)))));
 		};
-		store(offsetof(ShaderTrapRecord, shader_hash_low),
-		      ConstantU32(state, static_cast<uint32_t>(state.program.shader_hash)));
-		store(offsetof(ShaderTrapRecord, shader_hash_high),
-		      ConstantU32(state, static_cast<uint32_t>(state.program.shader_hash >> 32)));
-		store(offsetof(ShaderTrapRecord, pc), pc);
-		store(offsetof(ShaderTrapRecord, code), code);
-	});
+		const auto old = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicCompareExchange, u32, old,
+		                          word(offsetof(ShaderCallMissSlot, key)),
+		                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0),
+		                          ConstantU32(state, 0), key, ConstantU32(state, 0));
+		const auto won = Binary(state, spv::OpIEqual, TypeBool(state), old, ConstantU32(state, 0));
+		EmitIfCondition(state, won, [&]() {
+			const auto store = [&](size_t offset, uint32_t value) {
+				state.builder.AddFunction(spv::OpStore, word(offset), value);
+			};
+			store(offsetof(ShaderCallMissSlot, target_low), target_low);
+			store(offsetof(ShaderCallMissSlot, target_high), target_high);
+			store(offsetof(ShaderCallMissSlot, data0), data0);
+			store(offsetof(ShaderCallMissSlot, data1), data1);
+			store(offsetof(ShaderCallMissSlot, shader_hash_low),
+			      ConstantU32(state, static_cast<uint32_t>(state.program.shader_hash)));
+			store(offsetof(ShaderCallMissSlot, shader_hash_high),
+			      ConstantU32(state, static_cast<uint32_t>(state.program.shader_hash >> 32)));
+		});
+		if (attempt + 1u < kShaderCallMissProbes) {
+			// Taken by another variant: try the next slot. (Equal: already reported.)
+			const auto taken = Binary(state, spv::OpLogicalAnd, TypeBool(state),
+			                          Binary(state, spv::OpINotEqual, TypeBool(state), old,
+			                                 ConstantU32(state, 0)),
+			                          Binary(state, spv::OpINotEqual, TypeBool(state), old, key));
+			EmitIfCondition(state, taken, [&]() { self(self, attempt + 1u); });
+		}
+	};
+	probe(probe, 0);
 }
 
 void DefineGetBdaPointer(EmitterState& state) {

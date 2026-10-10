@@ -81,7 +81,10 @@ struct MemoryInfo {
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		return !typed && data_bits == 32u &&
-		       (formatted ? opcode == ValueOpcode::LoadBufferU32
+		       (formatted ? opcode == ValueOpcode::LoadBufferU32 ||
+		                        opcode == ValueOpcode::LoadBufferU32x2 ||
+		                        opcode == ValueOpcode::LoadBufferU32x3 ||
+		                        opcode == ValueOpcode::LoadBufferU32x4
 		                  : opcode == ValueOpcode::ReadConstBuffer ||
 		                        opcode == ValueOpcode::LoadBufferU32 ||
 		                        opcode == ValueOpcode::LoadBufferU32x2 ||
@@ -490,10 +493,12 @@ struct BindingLayout {
 
 // Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct ShaderInfo {
-	static constexpr uint32_t MaxBuffers      = 64;
-	static constexpr uint32_t MaxImages       = 64;
-	static constexpr uint32_t MaxSamplers     = 32;
-	static constexpr uint32_t MaxSampledPairs = 64;
+	// Raised for expanded table calls: each inlined GT7 material variant brings its own
+	// statically resolved descriptors.
+	static constexpr uint32_t MaxBuffers      = 256;
+	static constexpr uint32_t MaxImages       = 512;
+	static constexpr uint32_t MaxSamplers     = 128;
+	static constexpr uint32_t MaxSampledPairs = 512;
 
 	std::vector<BufferResource>      buffers;
 	std::vector<ImageResource>       images;

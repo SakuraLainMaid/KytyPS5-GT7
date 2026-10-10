@@ -9,9 +9,12 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <cstddef>
 #include <cinttypes>
 #include <cstring>
 #include <limits>
@@ -24,11 +27,34 @@ constexpr size_t MaxPageFaults       = 1024;
 constexpr size_t PageFaultAreaSize   = MaxPageFaults * sizeof(uint64_t);
 constexpr size_t PageFaultBitsetSize = BufferCache::CACHING_NUMPAGES / 8;
 
+// The table-call targets the shaders' expansions trapped on: each joins its shader's next
+// expansion (ShaderFunctionExpander).
+void ReportCallMisses(const uint8_t* slots) {
+	static std::atomic<uint32_t> logged {0};
+	static std::atomic<uint64_t> total {0};
+	for (uint32_t index = 0; index < kShaderCallMissSlots; ++index) {
+		ShaderCallMissSlot slot;
+		std::memcpy(&slot, slots + index * sizeof(slot), sizeof(slot));
+		if (slot.key == 0) continue;
+		const auto hash   = (uint64_t {slot.shader_hash_high} << 32u) | slot.shader_hash_low;
+		const auto target = (uint64_t {slot.target_high} << 32u) | slot.target_low;
+		if (target == 0) continue;
+		if (ShaderRecompiler::Decoder::ReportShaderCallMiss(hash, {target, slot.data0, slot.data1})) {
+			const auto count = total.fetch_add(1) + 1;
+			if (logged.fetch_add(1) < 64 || (count & (count - 1)) == 0) {
+				LOGF("Shader call miss: hash=%016" PRIx64 " target=0x%016" PRIx64
+				     " data=0x%08x%08x (%" PRIu64 " reported)\n",
+				     hash, target, slot.data1, slot.data0, count);
+			}
+		}
+	}
+}
+
 size_t DownloadAreaSize(const GraphicContext& graphics) {
 	const auto& limits = graphics.physical_device_properties.limits;
 	const auto  alignment =
 	    std::max(limits.nonCoherentAtomSize, limits.minStorageBufferOffsetAlignment);
-	return (PageFaultAreaSize + sizeof(ShaderTrapRecord) + alignment - 1) & ~(alignment - 1);
+	return (PageFaultAreaSize + sizeof(ShaderTrapArea) + alignment - 1) & ~(alignment - 1);
 }
 
 } // namespace
@@ -38,7 +64,7 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
     : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
       m_download_area_size(DownloadAreaSize(graphics)),
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                     PageFaultBitsetSize + sizeof(ShaderTrapRecord)),
+                     PageFaultBitsetSize + sizeof(ShaderTrapArea)),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
                         MaxPendingFaults * m_download_area_size) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
@@ -166,7 +192,7 @@ void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 	const auto num_workgroups = (num_threads + 63) / 64;
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	const vk::BufferCopy trap_copy {PageFaultBitsetSize, offset + PageFaultAreaSize,
-	                                sizeof(ShaderTrapRecord)};
+	                                sizeof(ShaderTrapArea)};
 	command.copyBuffer(m_fault_buffer.Handle(), m_download_buffer.Handle(), trap_copy);
 	dependency.pBufferMemoryBarriers = &post_barrier;
 	command.pipelineBarrier2(dependency);
@@ -185,12 +211,13 @@ void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 
 	// Preserve the record in readback, then release it for the next attempt. Fill
 	// supplies the transfer-read -> transfer-write -> shader-access dependencies.
-	m_fault_buffer.Fill(PageFaultBitsetSize, sizeof(ShaderTrapRecord), 0);
+	m_fault_buffer.Fill(PageFaultBitsetSize, sizeof(ShaderTrapArea), 0);
 	const auto area = m_current_area;
 	m_scheduler.DeferOperation([this, mapped, offset, area, report] {
 		m_download_buffer.Invalidate(offset, m_download_area_size);
 		ShaderTrapRecord trap;
 		std::memcpy(&trap, mapped + PageFaultAreaSize, sizeof(trap));
+		ReportCallMisses(mapped + PageFaultAreaSize + offsetof(ShaderTrapArea, misses));
 		if (trap.claimed != 0 && report == nullptr) {
 			const auto  hash    = (uint64_t {trap.shader_hash_high} << 32) | trap.shader_hash_low;
 			const auto* pending = std::bit_cast<const uint64_t*>(mapped);

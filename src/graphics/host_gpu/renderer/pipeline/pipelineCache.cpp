@@ -1543,12 +1543,23 @@ struct PipelineCache::ProgramCache {
 	void ExpandShaderFunctions(const ShaderParams& params, std::span<const uint32_t> user_data,
 	                           uint32_t wave_size, std::vector<uint32_t>& expanded) {
 		std::string reason;
-		if (!function_expander.Expand(
-		        params.code, params.Base(), user_data,
-		        [](uint64_t address, std::span<uint32_t> words) {
-			        return ReadShaderGuestMemoryRaw(nullptr, address, words);
-		        },
-		        expanded, reason, wave_size)) {
+		std::string summary;
+		const bool  ok = function_expander.Expand(
+            params.code, params.Base(), user_data,
+            [](uint64_t address, std::span<uint32_t> words) {
+                return ReadShaderGuestMemoryRaw(nullptr, address, words);
+            },
+            expanded, reason, wave_size, params.hash, &summary);
+		if (!summary.empty()) {
+			// A table call left targets out: they take the miss trap, and the GPU reports the
+			// ones that run (ReportShaderCallMiss) for the next expansion.
+			static std::atomic<uint32_t> partial_reports {0};
+			if (partial_reports.fetch_add(1) < 256) {
+				LOGF("Shader function expansion hash=%016" PRIx64 ": partial: %s\n", params.hash,
+				     summary.c_str());
+			}
+		}
+		if (!ok) {
 			static std::atomic<uint32_t> reports {0};
 			if (reports.fetch_add(1) < 16) {
 				::printf("Shader function expansion hash=%016" PRIx64 ": %s\n", params.hash,

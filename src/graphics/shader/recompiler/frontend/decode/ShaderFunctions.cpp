@@ -6,10 +6,16 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <iterator>
+#include <string_view>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <unordered_map>
@@ -21,6 +27,23 @@ constexpr uint32_t MaxFunctionWords  = 4096;
 constexpr uint32_t MaxExpandedWords  = 131072;
 constexpr uint64_t MaxCallTableBytes = 16u * 1024u * 1024u;
 constexpr size_t   MaxCallTargets    = 256;
+// Specialized variants carry their own descriptors, and the translation time grows faster than
+// linearly with them (GT7: 27 variants ~1.4 s, 54 ~8.6 s); KYTY_CALL_VARIANTS overrides.
+constexpr size_t   DefaultMaxSpecializedVariants = 32;
+size_t MaxSpecializedVariants() {
+	static const size_t value = [] {
+		const char* text = std::getenv("KYTY_CALL_VARIANTS");
+		const auto  parsed = text != nullptr ? std::strtoul(text, nullptr, 10) : 0ul;
+		return parsed != 0ul ? std::min<size_t>(parsed, MaxCallTargets)
+		                     : DefaultMaxSpecializedVariants;
+	}();
+	return value;
+}
+// A table may hold more targets than one expansion inlines: the expansion then takes the
+// reported ones (ReportShaderCallMiss) and traps on the rest.
+constexpr size_t   MaxTableTargets   = 16384;
+// Words kept free of callee code for the main program, the selection trees and branch islands.
+constexpr uint32_t ExpansionSlackWords = 8192;
 
 bool IsCall(uint32_t word) {
 	return (word & 0xff80ff00u) == 0xbe802100u && ((word >> 16u) & 127u) != 125u;
@@ -48,6 +71,79 @@ struct Function {
 	std::vector<uint32_t>    code;
 	std::vector<Instruction> instructions;
 };
+
+bool ReadsScc(const Instruction& inst) {
+	switch (inst.opcode) {
+		case Opcode::S_CBRANCH_SCC0:
+		case Opcode::S_CBRANCH_SCC1:
+		case Opcode::S_CSELECT_B32:
+		case Opcode::S_CSELECT_B64:
+		case Opcode::S_ADDC_U32:
+		case Opcode::S_SUBB_U32:
+		case Opcode::S_CMOV_B64: return true;
+		default: return false;
+	}
+}
+
+// Conservative: true only for scalar ALU operations that always set SCC.
+bool WritesScc(const Instruction& inst) {
+	const auto name = magic_enum::enum_name(inst.opcode);
+	if (name.starts_with("S_CMP") || name.starts_with("S_BITCMP")) return true;
+	static constexpr std::string_view prefixes[] = {
+	    "S_AND_B", "S_OR_B", "S_XOR_B", "S_NAND_B", "S_NOR_B", "S_XNOR_B", "S_ANDN2_B",
+	    "S_ORN2_B", "S_LSHL_B", "S_LSHR_B", "S_ASHR_I", "S_BFE_", "S_NOT_B", "S_BCNT",
+	    "S_MIN_", "S_MAX_", "S_ABS_I32", "S_ABSDIFF", "S_ADD_U32", "S_ADD_I32", "S_SUB_U32",
+	    "S_SUB_I32", "S_ADDK_I32", "S_LSHL1_ADD", "S_LSHL2_ADD", "S_LSHL3_ADD", "S_LSHL4_ADD"};
+	for (const auto prefix: prefixes)
+		if (name.starts_with(prefix)) return true;
+	return false;
+}
+
+enum class SccUse { Dead, Live, PassThrough };
+
+// How code from `start` uses the SCC it is entered with: read on some path (Live), overwritten
+// on every path first (Dead), or carried to a S_SETPC_B64 return (PassThrough). Bounded and
+// conservative: an unknown path counts as a read.
+SccUse ScanScc(const std::vector<Instruction>& insts, size_t start) {
+	const auto index_of = [&](uint32_t pc) -> std::optional<size_t> {
+		const auto found = std::lower_bound(insts.begin(), insts.end(), pc,
+		                                    [](const Instruction& inst, uint32_t value) {
+			                                    return inst.pc < value;
+		                                    });
+		if (found == insts.end() || found->pc != pc) return {};
+		return static_cast<size_t>(found - insts.begin());
+	};
+	std::vector<size_t> pending {start};
+	std::set<size_t>    seen;
+	bool                passes = false;
+	size_t              steps  = 0;
+	while (!pending.empty()) {
+		size_t at = pending.back();
+		pending.pop_back();
+		for (;;) {
+			if (at >= insts.size() || ++steps > 8192) return SccUse::Live;
+			if (!seen.insert(at).second) break;
+			const auto& inst = insts[at];
+			if (ReadsScc(inst) || IsCall(inst.raw[0])) return SccUse::Live;
+			if (WritesScc(inst) || inst.opcode == Opcode::S_ENDPGM) break;
+			if (inst.opcode == Opcode::S_SETPC_B64) {
+				passes = true;
+				break;
+			}
+			if (IsDirectBranch(inst.opcode)) {
+				const auto target = index_of(inst.branch_target);
+				if (!target) return SccUse::Live;
+				if (inst.opcode == Opcode::S_BRANCH) {
+					at = *target;
+					continue;
+				}
+				pending.push_back(*target);
+			}
+			++at;
+		}
+	}
+	return passes ? SccUse::PassThrough : SccUse::Dead;
+}
 
 bool ReadFunction(uint64_t address, uint32_t return_reg, const ShaderCodeReader& read,
                   Function& function, std::string& reason, uint32_t wave_size) {
@@ -116,6 +212,9 @@ struct Call {
 	uint32_t                return_reg;
 	bool                    dynamic;
 	std::vector<CallTarget> targets;
+	// Table calls: the inlined variants, each with the index of its function in `targets`.
+	bool                                                specialized = false;
+	std::vector<std::pair<ShaderCallVariant, size_t>> variants;
 };
 
 bool IsScalarLoad(Opcode opcode) {
@@ -255,6 +354,7 @@ void AnalyzeShader(std::span<const uint32_t> code, ShaderAnalysis& analysis) {
 
 // One call instruction and every address it can reach.
 struct CallSite {
+	using Variant = ShaderCallVariant;
 	uint32_t              pc         = 0;
 	uint32_t              source_reg = 0;
 	uint32_t              return_reg = 0;
@@ -263,6 +363,13 @@ struct CallSite {
 	// Registers the targets were resolved through across control flow (a descriptor loaded
 	// before the call's loop): a callee that wrote one would change them, so none may.
 	std::vector<uint32_t> pinned; // ascending
+	// A table call inlines variants: a target, and when `specialized`, the two table words the
+	// call passes in the pair after the target's (GT7's material record pointer), which the
+	// inlined body then sees as constants. Unspecialized variants have zero data.
+	bool                 specialized = false;
+	std::vector<Variant> variants;  // ascending, the candidates
+	std::vector<Variant> preferred; // the reported variants among them (ascending), first
+	size_t               table_targets = 0; // the variants the table holds
 
 	bool operator==(const CallSite&) const = default;
 };
@@ -437,8 +544,10 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 			reason = "shader call uses a special scalar register pair";
 			return false;
 		}
-		const bool         dynamic = !low || !high;
-		std::set<uint64_t> addresses;
+		const bool                      dynamic = !low || !high;
+		std::set<uint64_t>              addresses;
+		std::set<CallSite::Variant>     variants;
+		bool                            specialized = false;
 		if (!dynamic) {
 			addresses.insert((uint64_t {*high} << 32u) | *low);
 		} else {
@@ -498,51 +607,154 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 			}
 			const uint64_t step       = uint64_t {1} << shift;
 			const uint64_t first_slot = (load.offset % step) + lo->second * 4u;
-			for (uint64_t offset = first_slot; offset + 8u <= size; offset += step) {
+			// The pair after the target's, when it holds the next two words of the same table
+			// record at the call: the variants are specialized on them.
+			const auto d0 = src + 3u < 106u ? origin(origin, src + 2u, i, first, 0)
+			                                : std::optional<std::pair<size_t, uint32_t>> {};
+			const auto d1 = src + 3u < 106u ? origin(origin, src + 3u, i, first, 0)
+			                                : std::optional<std::pair<size_t, uint32_t>> {};
+			specialized = d0 && d1 && d0->first == lo->first && d1->first == lo->first &&
+			              d0->second == lo->second + 2u && d1->second == lo->second + 3u &&
+			              step >= 16u;
+			for (uint64_t offset = first_slot; offset + (specialized ? 16u : 8u) <= size;
+			     offset += step) {
 				const uint64_t address =
 				    table[offset / 4u] | (uint64_t {table[offset / 4u + 1u]} << 32u);
 				if (address == 0) continue; // A runtime null target takes the explicit trap path.
 				addresses.insert(address);
-				if (addresses.size() > MaxCallTargets) {
+				variants.insert({address,
+				                 specialized ? table[offset / 4u + 2u] : 0u,
+				                 specialized ? table[offset / 4u + 3u] : 0u});
+				if (variants.size() > MaxTableTargets) {
 					reason = "shader call table exceeds the bounded target count";
 					return false;
 				}
 			}
 		}
-		sites.push_back({inst.pc, src, dst, dynamic, {addresses.begin(), addresses.end()},
-		                 {pinned.begin(), pinned.end()}});
+		CallSite site {inst.pc, src, dst, dynamic, {addresses.begin(), addresses.end()},
+		               {pinned.begin(), pinned.end()}};
+		site.specialized   = specialized;
+		site.variants      = {variants.begin(), variants.end()};
+		site.table_targets = variants.size();
+		sites.push_back(std::move(site));
 	}
 	return true;
 }
 
+// What an expansion left out of its table calls (for the log).
+struct ExpansionStats {
+	size_t table_targets = 0; // targets the tables hold
+	size_t candidates    = 0; // targets offered to the expansion
+	size_t inlined       = 0;
+	size_t over_budget   = 0; // left out: the expanded code would exceed its bound
+	size_t unreadable    = 0; // left out: the callee is not expandable (reason below)
+	size_t dependency    = 0; // left out: the callee writes a call-target dependency
+	size_t callee_words  = 0;
+	std::string first_unreadable;
+
+	[[nodiscard]] bool Partial() const {
+		return inlined < table_targets || over_budget != 0 || unreadable != 0 || dependency != 0;
+	}
+};
+
 // Reads the callees and emits the expanded program: a function of the code, the resolved
 // targets, the consulted registers and the callee code.
+//
+// A table call (dynamic) inlines its preferred targets first, then the rest, while the expanded
+// code stays in bound; a target left out, or not expandable, takes the miss trap at run time
+// instead of failing the whole shader. Each inlined target's body is emitted once: the two SCC
+// selection trees enter it through a stub that restores SCC.
 bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
                     const std::vector<CallSite>& sites, const std::set<uint32_t>& dependencies,
                     const ShaderCodeReader& read, uint32_t wave_size,
-                    std::vector<uint32_t>& expanded, std::string& reason) {
+                    std::vector<uint32_t>& expanded, std::string& reason,
+                    ExpansionStats* stats = nullptr) {
 	const auto&              program = analysis.program;
+	ExpansionStats           local_stats;
+	auto&                    st = stats != nullptr ? *stats : local_stats;
 	std::map<uint32_t, Call> calls;
+	const uint32_t           budget =
+        MaxExpandedWords > analysis.code.size() + ExpansionSlackWords
+	                  ? MaxExpandedWords - static_cast<uint32_t>(analysis.code.size()) -
+	                        ExpansionSlackWords
+	                  : 0u;
+	uint64_t used = 0;
+	const auto writes_dependency = [&](const Function& function) {
+		for (const auto& inst: function.instructions)
+			for (const auto reg: dependencies)
+				if (Writes(inst, reg, wave_size)) return true;
+		return false;
+	};
 	for (const auto& site: sites) {
 		Call call {site.source_reg, site.return_reg, site.dynamic, {}};
-		for (const auto address: site.addresses) {
-			CallTarget target {address, {}};
-			if ((address & 3u) != 0 ||
-			    !ReadFunction(address, site.return_reg, read, target.function, reason, wave_size)) {
-				if (reason.empty()) reason = "shader call target is not DWORD aligned";
-				return false;
-			}
-			for (const auto& inst: target.function.instructions) {
-				for (const auto reg: site.pinned) {
-					if (Writes(inst, reg, wave_size)) {
-						reason = "shader function modifies its call table descriptor";
-						return false;
-					}
+		if (!site.dynamic) {
+			for (const auto address: site.addresses) {
+				CallTarget target {address, {}};
+				if ((address & 3u) != 0 || !ReadFunction(address, site.return_reg, read,
+				                                         target.function, reason, wave_size)) {
+					if (reason.empty()) reason = "shader call target is not DWORD aligned";
+					return false;
 				}
+				used += target.function.code.size() + 4u;
+				call.targets.push_back(std::move(target));
 			}
-			call.targets.push_back(std::move(target));
+			calls.emplace(site.pc, std::move(call));
+			continue;
 		}
+		st.table_targets += site.table_targets;
+		st.candidates += site.variants.size();
+		call.specialized = site.specialized;
+		std::vector<CallSite::Variant> order = site.preferred;
+		for (const auto& variant: site.variants)
+			if (!std::binary_search(site.preferred.begin(), site.preferred.end(), variant))
+				order.push_back(variant);
+		std::map<uint64_t, std::optional<size_t>> functions; // target -> index in call.targets
+		const size_t limit = site.specialized ? MaxSpecializedVariants() : MaxCallTargets;
+		for (const auto& variant: order) {
+			if (call.variants.size() >= limit) {
+				st.over_budget++;
+				continue;
+			}
+			auto found = functions.find(variant.target);
+			if (found == functions.end()) {
+				CallTarget  target {variant.target, {}};
+				std::string why;
+				if ((variant.target & 3u) != 0) {
+					why = "shader call target is not DWORD aligned";
+				} else if (!ReadFunction(variant.target, site.return_reg, read, target.function,
+				                         why, wave_size)) {
+					if (why.empty()) why = "shader function is not expandable";
+				} else if (writes_dependency(target.function)) {
+					why = "shader function modifies a call-target dependency";
+				}
+				std::optional<size_t> index;
+				if (why.empty()) {
+					index = call.targets.size();
+					call.targets.push_back(std::move(target));
+				} else if (st.unreadable++ == 0) {
+					st.first_unreadable = why;
+				}
+				found = functions.emplace(variant.target, index).first;
+			}
+			if (!found->second) continue;
+			const auto& function = call.targets[*found->second].function;
+			// The body, the return-address and data moves, two SCC stubs, and the compares
+			// in each selection tree.
+			const uint64_t cost = function.code.size() + 8u + 3u + 2u * 9u;
+			if (used + cost > budget) {
+				st.over_budget++;
+				continue;
+			}
+			used += cost;
+			st.callee_words += function.code.size();
+			call.variants.emplace_back(variant, *found->second);
+		}
+		st.inlined += call.variants.size();
 		calls.emplace(site.pc, std::move(call));
+	}
+	if (used > budget) {
+		reason = "expanded shader exceeds the bounded code size";
+		return false;
 	}
 	const bool has_backedge =
 	    std::any_of(program.instructions.begin(), program.instructions.end(), [](const auto& inst) {
@@ -558,15 +770,12 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 		}
 	}
 	// A callee must not invalidate the user-data assumptions used to resolve later calls.
+	// (Table targets that would were left out above.)
 	for (const auto& [pc, call]: calls) {
 		for (const auto& target: call.targets) {
-			for (const auto& inst: target.function.instructions) {
-				for (const auto reg: dependencies) {
-					if (Writes(inst, reg, wave_size)) {
-						reason = "shader function modifies a call-target dependency";
-						return false;
-					}
-				}
+			if (writes_dependency(target.function)) {
+				reason = "shader function modifies a call-target dependency";
+				return false;
 			}
 		}
 	}
@@ -616,38 +825,117 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 				return true;
 			};
 			if (call.dynamic) {
-				// SWAPPC preserves SCC. Keep separate decision trees and callee
-				// bodies for its two incoming values, without borrowing a guest SGPR.
-				// Group by the high address word so each low-word comparison has
-				// one failure edge, rather than two branches sharing a later arm.
+				// SWAPPC preserves SCC, and the selection compares overwrite it: one selection
+				// tree per incoming SCC value, without borrowing a guest SGPR. Each tree's hit
+				// branches to a stub that restores its SCC value and enters the variant's body,
+				// emitted once. The miss trap names the target pair, so the GPU can report the
+				// variant (the target and the pair after it).
+				const uint32_t miss_trap =
+				    0xbf920000u | ShaderCallMissTrapImmediate(call.source_reg);
+				std::map<uint32_t, std::vector<size_t>> groups;
+				for (size_t k = 0; k < call.variants.size(); ++k)
+					groups[static_cast<uint32_t>(call.variants[k].first.target >> 32u)].push_back(k);
+				std::array<std::vector<std::pair<uint32_t, size_t>>, 2> hits; // (branch, variant)
+				// One tree suffices when no inlined body reads the SCC the call passed in, and
+				// none carries it back to a continuation that reads it.
+				bool dual = false, passes = false;
+				for (const auto& entry: call.variants) {
+					const auto use = ScanScc(call.targets[entry.second].function.instructions, 0);
+					dual |= use == SccUse::Live;
+					passes |= use == SccUse::PassThrough;
+				}
+				if (!dual && passes) {
+					const auto at = static_cast<size_t>(&inst - program.instructions.data());
+					dual = ScanScc(program.instructions, at + 1u) == SccUse::Live;
+				}
+				const uint32_t trees = dual ? 2u : 1u;
+				const auto compare = [&](uint32_t reg, uint32_t value) {
+					result.push_back(0xbf06ff00u | reg); // S_CMP_EQ_U32 s[reg], literal
+					result.push_back(value);
+				};
 				const auto select_scc = static_cast<uint32_t>(result.size());
-				result.push_back(0xbf850000u);
-				for (uint32_t scc = 0; scc < 2; ++scc) {
+				if (dual) result.push_back(0xbf850000u); // S_CBRANCH_SCC1 to the SCC=1 tree.
+				for (uint32_t scc = 0; scc < trees; ++scc) {
 					if (scc != 0) relocations.emplace_back(select_scc, result.size());
-					std::map<uint32_t, std::vector<const CallTarget*>> groups;
-					for (const auto& target: call.targets)
-						groups[static_cast<uint32_t>(target.address >> 32u)].push_back(&target);
-					for (const auto& [high, targets]: groups) {
-						result.push_back(0xbf06ff00u | (call.source_reg + 1u));
-						result.push_back(high);
+					for (const auto& [high, members]: groups) {
+						compare(call.source_reg + 1u, high);
 						const auto high_miss = static_cast<uint32_t>(result.size());
-						result.push_back(0xbf840000u);
-						for (const auto* target: targets) {
-							result.push_back(0xbf06ff00u | call.source_reg);
-							result.push_back(static_cast<uint32_t>(target->address));
-							const auto low_miss = static_cast<uint32_t>(result.size());
-							result.push_back(0xbf840000u);
-							result.push_back(scc != 0 ? 0xbf068080u : 0xbf068180u);
-							if (!emit_target(*target)) return false;
-							relocations.emplace_back(low_miss, result.size());
+						result.push_back(0xbf840000u); // S_CBRANCH_SCC0 to the next group.
+						for (const auto k: members) {
+							const auto& variant = call.variants[k].first;
+							compare(call.source_reg, static_cast<uint32_t>(variant.target));
+							if (!dual) {
+								// An if/else chain with each body in place: the structurizer
+								// keeps it linear (bodies placed after the chain made it
+								// quadratic in the variants).
+								std::vector<uint32_t> misses;
+								misses.push_back(static_cast<uint32_t>(result.size()));
+								result.push_back(0xbf840000u); // S_CBRANCH_SCC0 to the next.
+								if (call.specialized) {
+									compare(call.source_reg + 2u, variant.data0);
+									misses.push_back(static_cast<uint32_t>(result.size()));
+									result.push_back(0xbf840000u);
+									compare(call.source_reg + 3u, variant.data1);
+									misses.push_back(static_cast<uint32_t>(result.size()));
+									result.push_back(0xbf840000u);
+									// The values the compares proved, as constants the resource
+									// tracking can follow (S_MOV leaves SCC alone).
+									EmitMove(result, call.source_reg + 2u, variant.data0);
+									EmitMove(result, call.source_reg + 3u, variant.data1);
+								}
+								if (!emit_target(call.targets[call.variants[k].second]))
+									return false;
+								for (const auto at: misses)
+									relocations.emplace_back(at, result.size());
+							} else if (call.specialized) {
+								std::array<uint32_t, 2> misses {};
+								misses[0] = static_cast<uint32_t>(result.size());
+								result.push_back(0xbf840000u); // S_CBRANCH_SCC0 to the next.
+								compare(call.source_reg + 2u, variant.data0);
+								misses[1] = static_cast<uint32_t>(result.size());
+								result.push_back(0xbf840000u);
+								compare(call.source_reg + 3u, variant.data1);
+								hits[scc].emplace_back(static_cast<uint32_t>(result.size()), k);
+								result.push_back(0xbf850000u); // S_CBRANCH_SCC1 to the stub.
+								for (const auto at: misses)
+									relocations.emplace_back(at, result.size());
+							} else {
+								hits[scc].emplace_back(static_cast<uint32_t>(result.size()), k);
+								result.push_back(0xbf850000u); // S_CBRANCH_SCC1 to the stub.
+							}
 						}
-						result.push_back(0xbf920000u | ShaderCallMissTrapCode);
+						result.push_back(miss_trap);
 						result.push_back(0xbf810000u);
 						relocations.emplace_back(high_miss, result.size());
 					}
-					result.push_back(0xbf920000u | ShaderCallMissTrapCode);
+					result.push_back(miss_trap);
 					result.push_back(0xbf810000u);
 				}
+				std::vector<std::array<uint32_t, 2>> stubs(call.variants.size());
+				for (size_t k = 0; dual && k < call.variants.size(); ++k) {
+					const auto& [variant, function] = call.variants[k];
+					if (dual) {
+						stubs[k][0] = static_cast<uint32_t>(result.size());
+						result.push_back(0xbf068180u); // S_CMP_EQ_U32 0, 1: SCC = 0.
+						const auto enter = static_cast<uint32_t>(result.size());
+						result.push_back(0xbf820000u); // S_BRANCH to the body.
+						stubs[k][1] = static_cast<uint32_t>(result.size());
+						result.push_back(0xbf068080u); // S_CMP_EQ_U32 0, 0: SCC = 1.
+						relocations.emplace_back(enter, result.size());
+					} else {
+						stubs[k][0] = static_cast<uint32_t>(result.size());
+					}
+					if (call.specialized) {
+						// The values the compares proved, as constants the resource tracking
+						// can follow (S_MOV leaves SCC alone).
+						EmitMove(result, call.source_reg + 2u, variant.data0);
+						EmitMove(result, call.source_reg + 3u, variant.data1);
+					}
+					if (!emit_target(call.targets[function])) return false;
+				}
+				for (uint32_t scc = 0; scc < trees; ++scc)
+					for (const auto& [at, k]: hits[scc])
+						relocations.emplace_back(at, stubs[k][scc]);
 			} else {
 				for (const auto& target: call.targets)
 					if (!emit_target(target)) return false;
@@ -672,6 +960,62 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 	expanded = std::move(result);
 	return true;
 }
+
+// Bounds the table calls: a table over MaxCallTargets offers only its reported variants.
+// An unspecialized site matches reports by target alone.
+void SelectTableTargets(std::vector<CallSite>& sites,
+                        const std::vector<ShaderCallVariant>* reported) {
+	for (auto& site: sites) {
+		if (!site.dynamic) continue;
+		site.preferred.clear();
+		if (reported != nullptr) {
+			if (site.specialized) {
+				std::set_intersection(site.variants.begin(), site.variants.end(),
+				                      reported->begin(), reported->end(),
+				                      std::back_inserter(site.preferred));
+			} else {
+				for (const auto& variant: *reported) {
+					const ShaderCallVariant plain {variant.target, 0u, 0u};
+					if (std::binary_search(site.variants.begin(), site.variants.end(), plain) &&
+					    (site.preferred.empty() || site.preferred.back() != plain)) {
+						site.preferred.push_back(plain);
+					}
+				}
+			}
+		}
+		if (site.variants.size() > MaxCallTargets) {
+			site.variants = site.preferred;
+		}
+	}
+}
+
+std::string DescribeStats(const ExpansionStats& st, size_t words) {
+	char line[512];
+	std::snprintf(line, sizeof(line),
+	              "table targets=%zu offered=%zu inlined=%zu (callee words %zu, expanded words "
+	              "%zu) over budget=%zu not expandable=%zu%s%s writes dependency=%zu",
+	              st.table_targets, st.candidates, st.inlined, st.callee_words, words,
+	              st.over_budget, st.unreadable, st.first_unreadable.empty() ? "" : " first: ",
+	              st.first_unreadable.c_str(), st.dependency);
+	return line;
+}
+
+struct CallMissRegistry {
+	struct Shader {
+		std::set<ShaderCallVariant>                           pending;
+		std::shared_ptr<const std::vector<ShaderCallVariant>> absorbed;
+		std::chrono::steady_clock::time_point        first_pending {};
+	};
+	static constexpr size_t                    MaxTargetsPerShader = 8192;
+	static constexpr std::chrono::milliseconds BatchWindow {300};
+	std::mutex                                 mutex;
+	std::unordered_map<uint64_t, Shader>       shaders;
+
+	static CallMissRegistry& Get() {
+		static CallMissRegistry registry;
+		return registry;
+	}
+};
 
 using Reads = std::vector<std::pair<uint64_t, std::vector<uint32_t>>>;
 
@@ -724,9 +1068,11 @@ bool InlineShaderFunctions(std::span<const uint32_t> code, uint64_t base,
 	}
 	std::vector<CallSite> sites;
 	std::set<uint32_t>    dependencies;
-	const bool            ok =
-	    ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason) &&
-	    BuildExpansion(analysis, base, sites, dependencies, read, wave_size, expanded, reason);
+	bool ok = ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason);
+	if (ok) {
+		SelectTableTargets(sites, nullptr);
+		ok = BuildExpansion(analysis, base, sites, dependencies, read, wave_size, expanded, reason);
+	}
 	if (consulted_user_data != nullptr) {
 		consulted_user_data->assign(dependencies.begin(), dependencies.end());
 	}
@@ -748,8 +1094,10 @@ struct ShaderFunctionExpander::Impl {
 	struct Shader {
 		ShaderAnalysis         analysis;
 		std::vector<Expansion> expansions; // most recent last
+		uint64_t               builds = 0;
 	};
-	static constexpr size_t MaxExpansions = 8;
+	// GT7 dispatches one material shader over several tables a frame.
+	static constexpr size_t MaxExpansions = 32;
 
 	std::unordered_map<uint64_t, Shader> shaders; // by code address
 	std::vector<uint32_t>                scratch;
@@ -770,12 +1118,56 @@ struct ShaderFunctionExpander::Impl {
 ShaderFunctionExpander::ShaderFunctionExpander(): m_impl(std::make_unique<Impl>()) {}
 ShaderFunctionExpander::~ShaderFunctionExpander() = default;
 
+bool ReportShaderCallMiss(uint64_t shader_hash, const ShaderCallVariant& target) {
+	auto&           registry = CallMissRegistry::Get();
+	std::lock_guard lock(registry.mutex);
+	auto&           shader = registry.shaders[shader_hash];
+	if (shader.absorbed != nullptr &&
+	    std::binary_search(shader.absorbed->begin(), shader.absorbed->end(), target)) {
+		return false;
+	}
+	const size_t known = shader.pending.size() + (shader.absorbed ? shader.absorbed->size() : 0u);
+	if (known >= CallMissRegistry::MaxTargetsPerShader || shader.pending.contains(target)) {
+		return false;
+	}
+	if (shader.pending.empty()) shader.first_pending = std::chrono::steady_clock::now();
+	shader.pending.insert(target);
+	return true;
+}
+
+std::shared_ptr<const std::vector<ShaderCallVariant>> ShaderCallMissTargets(uint64_t shader_hash) {
+	auto&           registry = CallMissRegistry::Get();
+	std::lock_guard lock(registry.mutex);
+	const auto      found = registry.shaders.find(shader_hash);
+	if (found == registry.shaders.end()) return nullptr;
+	auto& shader = found->second;
+	if (!shader.pending.empty() && std::chrono::steady_clock::now() - shader.first_pending >=
+	                                   CallMissRegistry::BatchWindow) {
+		std::vector<ShaderCallVariant> merged;
+		if (shader.absorbed != nullptr) merged = *shader.absorbed;
+		merged.insert(merged.end(), shader.pending.begin(), shader.pending.end());
+		std::sort(merged.begin(), merged.end());
+		shader.absorbed = std::make_shared<const std::vector<ShaderCallVariant>>(std::move(merged));
+		shader.pending.clear();
+	}
+	return shader.absorbed;
+}
+
 bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t base,
                                     std::span<const uint32_t> user_data,
                                     const ShaderCodeReader& read, std::vector<uint32_t>& expanded,
                                     std::string& reason, uint32_t wave_size) {
+	return Expand(code, base, user_data, read, expanded, reason, wave_size, 0, nullptr);
+}
+
+bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t base,
+                                    std::span<const uint32_t> user_data,
+                                    const ShaderCodeReader& read, std::vector<uint32_t>& expanded,
+                                    std::string& reason, uint32_t wave_size, uint64_t shader_hash,
+                                    std::string* summary) {
 	expanded.clear();
 	reason.clear();
+	if (summary != nullptr) summary->clear();
 	if (wave_size != 32u && wave_size != 64u) {
 		reason = "shader calls require a known wave size";
 		return false;
@@ -797,6 +1189,10 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	if (!ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason)) {
 		return false;
 	}
+	{
+		const auto reported = shader_hash != 0 ? ShaderCallMissTargets(shader_hash) : nullptr;
+		SelectTableTargets(sites, reported.get());
+	}
 	for (const auto& expansion: shader.expansions) {
 		if (expansion.base == base && expansion.wave_size == wave_size &&
 		    expansion.user_data_count == user_data.size() && expansion.sites == sites &&
@@ -817,8 +1213,18 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 		    .emplace_back(address, std::vector<uint32_t>(words.begin(), words.end()));
 		return ok;
 	};
+	ExpansionStats stats;
 	expansion.ok = BuildExpansion(analysis, base, expansion.sites, dependencies, recording,
-	                              wave_size, expansion.code, expansion.reason);
+	                              wave_size, expansion.code, expansion.reason, &stats);
+	const auto builds = ++shader.builds;
+	if (summary != nullptr && expansion.ok && stats.Partial()) {
+		*summary = DescribeStats(stats, expansion.code.size());
+	}
+	if (summary != nullptr && builds >= 16 && (builds & (builds - 1)) == 0) {
+		// Each new expansion is a new program to translate and compile.
+		*summary += (summary->empty() ? "" : "; ") + std::to_string(builds) +
+		            " expansions built for this shader (call tables changing?)";
+	}
 	MergeReads(expansion.reads);
 	expanded = expansion.code;
 	reason   = expansion.reason;
