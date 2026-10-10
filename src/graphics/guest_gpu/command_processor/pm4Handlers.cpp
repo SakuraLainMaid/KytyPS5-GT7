@@ -2127,6 +2127,17 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		if (cmd_offset == Pm4::UC_NOP) {
 			continue;
 		}
+		if (raw_cmd_offset == 0 && value == 0) {
+			// An all-zero pair: the list is not filled in yet or was released (seen
+			// intermittently when leaving GT7's garage). Register 0 has no handler; skip it.
+			static std::atomic<uint32_t> zero_reports {0};
+			if (zero_reports.fetch_add(1) < 8) {
+				LOGF("\t temporary: skipping all-zero indirect UC register entry %" PRIu32
+				     " of %" PRIu32 " at %p\n",
+				     i, indirect_num_dw, static_cast<const void*>(indirect_buffer));
+			}
+			continue;
+		}
 		if (cmd_offset >= Pm4::UC_NUM) {
 			EXIT("unsupported indirect UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
 			     "), value = 0x%08" PRIx32 "\n",
