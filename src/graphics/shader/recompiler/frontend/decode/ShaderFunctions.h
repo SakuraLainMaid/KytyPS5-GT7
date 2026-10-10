@@ -73,6 +73,11 @@ public:
 	bool Expand(std::span<const uint32_t> code, uint64_t base, std::span<const uint32_t> user_data,
 	            const ShaderCodeReader& read, std::vector<uint32_t>& expanded, std::string& reason,
 	            uint32_t wave_size, uint64_t shader_hash, std::string* summary);
+	// The translation of an expansion this expander produced failed at `pc` (bytes into the
+	// expanded code): the table target whose inlined body holds pc is left out of later
+	// expansions, of every shader, and takes the miss path instead. Returns that target, or 0
+	// when pc is in no inlined table body.
+	uint64_t ExcludeFailedCallTarget(std::span<const uint32_t> expanded, uint32_t pc);
 
 private:
 	struct Impl;

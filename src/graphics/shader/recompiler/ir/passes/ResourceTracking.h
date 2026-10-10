@@ -9,6 +9,10 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 // False when a non-fatal compile could not track the resources: the shader gives up.
 bool TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg);
 
+// The shader pc of the last TrackResources failure on this thread, or UINT32_MAX (reset by each
+// TrackResources call).
+uint32_t LastResourceTrackingFailurePc();
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_RESOURCETRACKING_H_ */

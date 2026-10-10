@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/SrtNative.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
@@ -1417,9 +1418,27 @@ struct PipelineCache::ProgramCache {
 			translated = ShaderRecompiler::TranslateProgram(compile_code, options);
 		}
 		if (translated.unsupported) {
+			if (!lookup_key.function_code.empty()) {
+				// A table target's inlined body the resource tracking could not follow: leave
+				// it out of the next expansion (it takes the miss path) instead of giving up
+				// the whole shader for every material.
+				const auto pc = ShaderRecompiler::IR::LastResourceTrackingFailurePc();
+				const auto target =
+				    pc != UINT32_MAX
+				        ? function_expander.ExcludeFailedCallTarget(lookup_key.function_code, pc)
+				        : 0;
+				static std::atomic<uint32_t> exclusion_reports {0};
+				if (target != 0 && exclusion_reports.fetch_add(1) < 64) {
+					LOGF("Shader function expansion hash=%016" PRIx64
+					     ": excluding table target 0x%016" PRIx64
+					     " (its body failed resource tracking at pc 0x%08x)\n",
+					     params.hash, target, pc);
+				}
+			}
 			// Remember the refusal: a skipped shader is dispatched again every frame, and
-			// re-deriving the same answer costs as much as a compile each time.
-			if (disk != nullptr && entry == programs.end()) {
+			// re-deriving the same answer costs as much as a compile each time. (Not for an
+			// expansion: a later session learns its exclusions again.)
+			if (disk != nullptr && entry == programs.end() && lookup_key.function_code.empty()) {
 				std::vector<uint8_t> payload;
 				if (ShaderDiskCache::EncodeSourceRecord(true, false, nullptr, payload)) {
 					StoreEntry(true, params.hash, source_key, cached_source, payload);
@@ -1542,6 +1561,16 @@ struct PipelineCache::ProgramCache {
 	// calls can be dispatched hundreds of times a frame; the expander keeps what it can reuse.
 	void ExpandShaderFunctions(const ShaderParams& params, std::span<const uint32_t> user_data,
 	                           uint32_t wave_size, std::vector<uint32_t>& expanded) {
+		// KYTY_CALL_EXPANSION=0: no shader function expansion (shaders with calls give up, as
+		// before it existed) — an escape hatch while table-call expansion is new.
+		static const bool expansion_enabled = [] {
+			const char* value = std::getenv("KYTY_CALL_EXPANSION");
+			return value == nullptr || value[0] != '0';
+		}();
+		if (!expansion_enabled) {
+			expanded.clear();
+			return;
+		}
 		std::string reason;
 		std::string summary;
 		const bool  ok = function_expander.Expand(

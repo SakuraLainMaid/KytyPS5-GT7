@@ -36,9 +36,13 @@ bool SrtRawReadsOnGpu() {
 	return on_gpu;
 }
 
+// LastResourceTrackingFailurePc.
+thread_local uint32_t t_last_failure_pc = UINT32_MAX;
+
 // KYTY_GPU_RESOURCES=<hash>[,<hash>...] (hex) or "all": the listed shaders read their buffers
 // through the descriptor words in the shader (BDA), as GPU-selected buffers do, instead of a
 // binding the host refreshes for every draw.
+
 bool GpuResources(uint64_t shader_hash) {
 	static const auto list = [] {
 		std::pair<bool, std::unordered_set<uint64_t>> result {false, {}};
@@ -515,6 +519,7 @@ private:
 	// A non-fatal compile gives the shader up instead: the failure unwinds to TrackResources,
 	// which returns false.
 	[[noreturn]] void Fail(uint32_t pc, const std::string& reason) const {
+		t_last_failure_pc = pc;
 		const auto message =
 		    fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
@@ -3317,7 +3322,12 @@ private:
 
 } // namespace
 
+uint32_t LastResourceTrackingFailurePc() {
+	return t_last_failure_pc;
+}
+
 bool TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg) {
+	t_last_failure_pc = UINT32_MAX;
 	try {
 		Tracker(program, decoded, native_cfg).Run();
 	} catch (const TrackingFailure&) {

@@ -277,7 +277,9 @@ bool EmitOriginalPc(std::vector<uint32_t>& code, const Instruction& inst, uint64
 
 using Branches = std::vector<std::pair<uint32_t, uint32_t>>;
 
-bool RelocateBranches(std::vector<uint32_t>& code, Branches& branches, std::string& reason) {
+// marks: further word positions to keep pointing at the same instructions.
+bool RelocateBranches(std::vector<uint32_t>& code, Branches& branches, std::string& reason,
+                      std::vector<uint32_t>* marks = nullptr) {
 	// Keep relocation symbolic until every function has been inserted. A long
 	// edge uses guarded S_BRANCH islands; ordinary fallthrough skips the island.
 	// Unlike GETPC/ADD/SETPC stubs, these do not clobber guest SGPRs or SCC.
@@ -313,6 +315,10 @@ bool RelocateBranches(std::vector<uint32_t>& code, Branches& branches, std::stri
 		for (auto& [source, destination]: branches) {
 			if (source >= insertion) source += 2;
 			if (destination >= insertion) destination += 2;
+		}
+		if (marks != nullptr) {
+			for (auto& mark: *marks)
+				if (mark >= insertion) mark += 2;
 		}
 		const auto onward      = branches[index].second;
 		branches[index].second = insertion + 1u;
@@ -641,6 +647,13 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 	return true;
 }
 
+// Where an inlined table target's body sits in the expanded code (words).
+struct BodyRange {
+	uint32_t begin  = 0;
+	uint32_t end    = 0;
+	uint64_t target = 0;
+};
+
 // What an expansion left out of its table calls (for the log).
 struct ExpansionStats {
 	size_t table_targets = 0; // targets the tables hold
@@ -649,11 +662,13 @@ struct ExpansionStats {
 	size_t over_budget   = 0; // left out: the expanded code would exceed its bound
 	size_t unreadable    = 0; // left out: the callee is not expandable (reason below)
 	size_t dependency    = 0; // left out: the callee writes a call-target dependency
+	size_t excluded      = 0; // left out: its body failed to translate before
 	size_t callee_words  = 0;
 	std::string first_unreadable;
 
 	[[nodiscard]] bool Partial() const {
-		return inlined < table_targets || over_budget != 0 || unreadable != 0 || dependency != 0;
+		return inlined < table_targets || over_budget != 0 || unreadable != 0 || dependency != 0 ||
+		       excluded != 0;
 	}
 };
 
@@ -668,7 +683,8 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
                     const std::vector<CallSite>& sites, const std::set<uint32_t>& dependencies,
                     const ShaderCodeReader& read, uint32_t wave_size,
                     std::vector<uint32_t>& expanded, std::string& reason,
-                    ExpansionStats* stats = nullptr) {
+                    ExpansionStats* stats = nullptr, std::vector<BodyRange>* bodies = nullptr,
+                    const std::set<uint64_t>* excluded = nullptr) {
 	const auto&              program = analysis.program;
 	ExpansionStats           local_stats;
 	auto&                    st = stats != nullptr ? *stats : local_stats;
@@ -713,6 +729,10 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 		for (const auto& variant: order) {
 			if (call.variants.size() >= limit) {
 				st.over_budget++;
+				continue;
+			}
+			if (excluded != nullptr && excluded->contains(variant.target)) {
+				st.excluded++;
 				continue;
 			}
 			auto found = functions.find(variant.target);
@@ -832,6 +852,14 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 				// variant (the target and the pair after it).
 				const uint32_t miss_trap =
 				    0xbf920000u | ShaderCallMissTrapImmediate(call.source_reg);
+				// A miss reports the variant and returns as if the callee did nothing. It must not
+				// end the wave: inside the caller's waterfall loop that hung the GPU (the loop
+				// never retired the missing lanes), and the call's other lanes still need it.
+				const auto miss = [&]() {
+					result.push_back(miss_trap);
+					returns.push_back(static_cast<uint32_t>(result.size()));
+					result.push_back(0xbf820000u); // S_BRANCH to the caller's continuation.
+				};
 				std::map<uint32_t, std::vector<size_t>> groups;
 				for (size_t k = 0; k < call.variants.size(); ++k)
 					groups[static_cast<uint32_t>(call.variants[k].first.target >> 32u)].push_back(k);
@@ -883,8 +911,12 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 									EmitMove(result, call.source_reg + 2u, variant.data0);
 									EmitMove(result, call.source_reg + 3u, variant.data1);
 								}
+								const auto begin = static_cast<uint32_t>(result.size());
 								if (!emit_target(call.targets[call.variants[k].second]))
 									return false;
+								if (bodies != nullptr)
+									bodies->push_back({begin, static_cast<uint32_t>(result.size()),
+									                   variant.target});
 								for (const auto at: misses)
 									relocations.emplace_back(at, result.size());
 							} else if (call.specialized) {
@@ -904,12 +936,10 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 								result.push_back(0xbf850000u); // S_CBRANCH_SCC1 to the stub.
 							}
 						}
-						result.push_back(miss_trap);
-						result.push_back(0xbf810000u);
+						miss();
 						relocations.emplace_back(high_miss, result.size());
 					}
-					result.push_back(miss_trap);
-					result.push_back(0xbf810000u);
+					miss();
 				}
 				std::vector<std::array<uint32_t, 2>> stubs(call.variants.size());
 				for (size_t k = 0; dual && k < call.variants.size(); ++k) {
@@ -931,7 +961,11 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 						EmitMove(result, call.source_reg + 2u, variant.data0);
 						EmitMove(result, call.source_reg + 3u, variant.data1);
 					}
+					const auto begin = static_cast<uint32_t>(result.size());
 					if (!emit_target(call.targets[function])) return false;
+					if (bodies != nullptr)
+						bodies->push_back(
+						    {begin, static_cast<uint32_t>(result.size()), variant.target});
 				}
 				for (uint32_t scc = 0; scc < trees; ++scc)
 					for (const auto& [at, k]: hits[scc])
@@ -956,7 +990,20 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 		}
 		relocations.emplace_back(at, found->second);
 	}
-	if (!RelocateBranches(result, relocations, reason)) return false;
+	std::vector<uint32_t> marks;
+	if (bodies != nullptr) {
+		for (const auto& body: *bodies) {
+			marks.push_back(body.begin);
+			marks.push_back(body.end);
+		}
+	}
+	if (!RelocateBranches(result, relocations, reason, &marks)) return false;
+	if (bodies != nullptr) {
+		for (size_t i = 0; i < bodies->size(); ++i) {
+			(*bodies)[i].begin = marks[i * 2u];
+			(*bodies)[i].end   = marks[i * 2u + 1u];
+		}
+	}
 	expanded = std::move(result);
 	return true;
 }
@@ -993,10 +1040,10 @@ std::string DescribeStats(const ExpansionStats& st, size_t words) {
 	char line[512];
 	std::snprintf(line, sizeof(line),
 	              "table targets=%zu offered=%zu inlined=%zu (callee words %zu, expanded words "
-	              "%zu) over budget=%zu not expandable=%zu%s%s writes dependency=%zu",
+	              "%zu) over budget=%zu not expandable=%zu%s%s writes dependency=%zu excluded=%zu",
 	              st.table_targets, st.candidates, st.inlined, st.callee_words, words,
 	              st.over_budget, st.unreadable, st.first_unreadable.empty() ? "" : " first: ",
-	              st.first_unreadable.c_str(), st.dependency);
+	              st.first_unreadable.c_str(), st.dependency, st.excluded);
 	return line;
 }
 
@@ -1090,6 +1137,8 @@ struct ShaderFunctionExpander::Impl {
 		bool                  ok = false;
 		std::string           reason;
 		std::vector<uint32_t> code;
+		std::vector<BodyRange> bodies;
+		uint64_t               exclusion_generation = 0;
 	};
 	struct Shader {
 		ShaderAnalysis         analysis;
@@ -1101,6 +1150,10 @@ struct ShaderFunctionExpander::Impl {
 
 	std::unordered_map<uint64_t, Shader> shaders; // by code address
 	std::vector<uint32_t>                scratch;
+	// Table targets whose bodies failed to translate (ExcludeFailedCallTarget), for every shader:
+	// GT7's shaders share their material functions.
+	std::set<uint64_t> excluded;
+	uint64_t           exclusion_generation = 0;
 
 	bool StillReads(const Expansion& expansion, const ShaderCodeReader& read) {
 		for (const auto& [address, words]: expansion.reads) {
@@ -1153,6 +1206,27 @@ std::shared_ptr<const std::vector<ShaderCallVariant>> ShaderCallMissTargets(uint
 	return shader.absorbed;
 }
 
+uint64_t ShaderFunctionExpander::ExcludeFailedCallTarget(std::span<const uint32_t> expanded,
+                                                         uint32_t pc) {
+	const uint32_t word = pc / 4u;
+	for (const auto& [address, shader]: m_impl->shaders) {
+		(void)address;
+		for (const auto& expansion: shader.expansions) {
+			if (expansion.code.size() != expanded.size() ||
+			    !std::equal(expanded.begin(), expanded.end(), expansion.code.begin()))
+				continue;
+			for (const auto& body: expansion.bodies) {
+				if (word >= body.begin && word < body.end) {
+					if (m_impl->excluded.insert(body.target).second) m_impl->exclusion_generation++;
+					return body.target;
+				}
+			}
+			return 0;
+		}
+	}
+	return 0;
+}
+
 bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t base,
                                     std::span<const uint32_t> user_data,
                                     const ShaderCodeReader& read, std::vector<uint32_t>& expanded,
@@ -1196,6 +1270,7 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	for (const auto& expansion: shader.expansions) {
 		if (expansion.base == base && expansion.wave_size == wave_size &&
 		    expansion.user_data_count == user_data.size() && expansion.sites == sites &&
+		    expansion.exclusion_generation == m_impl->exclusion_generation &&
 		    m_impl->StillReads(expansion, read)) {
 			expanded = expansion.code;
 			reason   = expansion.reason;
@@ -1214,8 +1289,10 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 		return ok;
 	};
 	ExpansionStats stats;
+	expansion.exclusion_generation = m_impl->exclusion_generation;
 	expansion.ok = BuildExpansion(analysis, base, expansion.sites, dependencies, recording,
-	                              wave_size, expansion.code, expansion.reason, &stats);
+	                              wave_size, expansion.code, expansion.reason, &stats,
+	                              &expansion.bodies, &m_impl->excluded);
 	const auto builds = ++shader.builds;
 	if (summary != nullptr && expansion.ok && stats.Partial()) {
 		*summary = DescribeStats(stats, expansion.code.size());
