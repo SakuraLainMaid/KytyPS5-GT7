@@ -1508,6 +1508,19 @@ void CheckShaderFunctionTableVariants() {
   Require(name, "one selection tree", count(expanded, 0xbf068080u) == 0,
           "a dead incoming SCC still produced a second selection tree");
 
+  // A callee with a loop is left to the miss path (KYTY_CALL_LOOPS=1 inlines it).
+  constexpr uint64_t callee_loop = 0x10001000ull;
+  store(callee_loop, {EncodeVop1(0x01u, 0, InlineU32(1)), EncodeSopp(0x05u, 0xfffeu),
+                      EncodeSop1(0x20u, 0, 14)});
+  for (u32 e = 0; e < 2; ++e) {
+    store(table + e * 16u, {u32(callee_loop), u32(callee_loop >> 32u), 0x7000u + e * 0x100u, 0x7u});
+  }
+  ok = ShaderRecompiler::Decoder::InlineShaderFunctions(
+      code, reinterpret_cast<uint64_t>(code.data()), user_data, read, expanded, reason, 64);
+  Require(name, "looping callee left out",
+          ok && count(expanded, body) == 0 && count(expanded, trap) > 0,
+          "a specialized callee with a loop was inlined");
+
   fill_table(300);
   const uint64_t hash = 0x7ab1e5ull;
   ShaderRecompiler::Decoder::ShaderFunctionExpander expander;

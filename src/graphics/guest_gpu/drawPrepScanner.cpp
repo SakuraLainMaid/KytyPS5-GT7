@@ -11,9 +11,13 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
+#include "common/logging/log.h"
+#include "libs/agc.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cinttypes>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -23,6 +27,55 @@ namespace {
 bool IsGraphicsDraw(uint32_t opcode) {
 	return DrawPrep::CountsAsDrawOrDispatch(opcode) && opcode != Pm4::IT_DISPATCH_DIRECT &&
 	       opcode != Pm4::IT_DISPATCH_INDIRECT;
+}
+
+// The register file a SET_*_REG packet writes, and whether the command processor's handler would
+// take it: the handlers end the emulator on an offset they do not know, and the scanner reads each
+// submission as it is queued, when its command stream can still hold garbage (GT7, while a menu
+// waits: a SET_SH_REG with an offset past the SH file). Mirrors the handlers' checks.
+bool RegisterPacketIsSane(uint32_t opcode, uint32_t header, const uint32_t* body) {
+	constexpr uint32_t SelectorMask = 0x70000000u; // NormalizeRegisterOffset (pm4Handlers.cpp)
+	const uint32_t     num_values   = KYTY_PM4_LEN(header) - 2u;
+	const auto in_file = [&](uint32_t offset, uint32_t num, const auto& direct, const auto* indirect) {
+		if (offset >= num) return false;
+		if (direct[offset] != nullptr) return true;
+		if (num_values == 0) return false;
+		for (uint32_t i = 0; i < num_values; i++) {
+			if (offset + i >= num || indirect[offset + i] == nullptr) return false;
+		}
+		return true;
+	};
+	switch (opcode) {
+		case Pm4::IT_SET_CONTEXT_REG: {
+			const auto offset = body[0] & ~SelectorMask;
+			return offset == Pm4::CX_NOP ||
+			       in_file(offset, Pm4::CX_NUM, g_hw_ctx_func, g_hw_ctx_indirect_func);
+		}
+		case Pm4::IT_SET_SH_REG: {
+			const auto offset = body[0];
+			return offset == Pm4::SH_NOP ||
+			       in_file(offset, Pm4::SH_NUM, g_hw_sh_func, g_hw_sh_indirect_func);
+		}
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX: {
+			if (Gen5::AgcIsInternalDataPacket(header, body)) return true;
+			const auto offset = opcode == Pm4::IT_SET_UCONFIG_REG_INDEX ? body[0] & 0x0fffffffu
+			                                                             : body[0] & ~SelectorMask;
+			return offset == Pm4::UC_NOP ||
+			       in_file(offset, Pm4::UC_NUM, g_hw_uc_func, g_hw_uc_indirect_func);
+		}
+		default: return true;
+	}
+}
+
+void LogScanStopped(const char* what, uint32_t header, uint64_t value) {
+	static std::atomic<uint32_t> reports {0};
+	const auto                   report = reports.fetch_add(1, std::memory_order_relaxed);
+	if (report < 16u || (report & (report + 1u)) == 0u) {
+		LOGF("DrawPrepScanner: stopped at %s (header 0x%08" PRIx32 ", 0x%016" PRIx64
+		     "); the GPU thread prepares the rest itself (%" PRIu32 " so far)\n",
+		     what, header, value, report + 1u);
+	}
 }
 
 } // namespace
@@ -312,6 +365,13 @@ void DrawPrepScanner::Scan(const Item& item) {
 			case Pm4::IT_SET_SH_REG:
 			case Pm4::IT_SET_UCONFIG_REG:
 			case Pm4::IT_SET_UCONFIG_REG_INDEX: {
+				if (length < 2u || !RegisterPacketIsSane(opcode, command, packet + 1)) {
+					// Garbage in the stream: the registers after it are unknown.
+					m_state->tainted = true;
+					DrawPrep::Add(DrawPrep::Counter::TaintIndirect);
+					LogScanStopped("an unknown register", header, packet[1]);
+					return;
+				}
 				const auto consumed = g_cp_op_func[opcode](*m_state->cp, command, packet + 1, remaining, total) + 1u;
 				cursor.offset += consumed;
 				continue;
@@ -335,6 +395,16 @@ void DrawPrepScanner::Scan(const Item& item) {
 				const uint32_t control = packet[3];
 				const uint32_t count   = control & 0xfffffu;
 				cursor.offset += length;
+				if (count != 0 && sub != nullptr &&
+				    !LibKernel::Memory::IsCommittedRange(reinterpret_cast<uint64_t>(sub),
+				                                         uint64_t {count} * sizeof(uint32_t))) {
+					// Not guest memory (yet): following it read an unmapped address.
+					m_state->tainted = true;
+					DrawPrep::Add(DrawPrep::Counter::TaintIndirect);
+					LogScanStopped("an indirect buffer outside guest memory", header,
+					               reinterpret_cast<uint64_t>(sub));
+					return;
+				}
 				if (count != 0 && sub != nullptr) {
 					if ((control & (1u << 20u)) != 0) {
 						cursor = {std::span(sub, count)};

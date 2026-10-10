@@ -655,6 +655,25 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 	return true;
 }
 
+// KYTY_CALL_LOOPS=1: a specialized table target with a loop is inlined too. Off by default:
+// GT7's lit material functions walk a per-pixel light list whose length they read from an image,
+// and every garage visit with them inlined hung the GPU in the material pass (2026-10-10): a
+// wrong length, from data the emulator does not reproduce, runs the loop for up to 65,535 rounds
+// a pixel. Left out, the target takes the miss path, as one over the table bound does.
+bool InlineLoopingVariants() {
+	static const bool value = [] {
+		const char* text = std::getenv("KYTY_CALL_LOOPS");
+		return text != nullptr && text[0] == '1';
+	}();
+	return value;
+}
+
+bool HasBackEdge(const std::vector<Instruction>& instructions) {
+	return std::any_of(instructions.begin(), instructions.end(), [](const auto& inst) {
+		return IsDirectBranch(inst.opcode) && inst.branch_target <= inst.pc;
+	});
+}
+
 // Where an inlined table target's body sits in the expanded code (words).
 struct BodyRange {
 	uint32_t begin  = 0;
@@ -754,6 +773,9 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 					if (why.empty()) why = "shader function is not expandable";
 				} else if (writes_dependency(target.function)) {
 					why = "shader function modifies a call-target dependency";
+				} else if (site.specialized && !InlineLoopingVariants() &&
+				           HasBackEdge(target.function.instructions)) {
+					why = "specialized shader function has a loop";
 				}
 				std::optional<size_t> index;
 				if (why.empty()) {
