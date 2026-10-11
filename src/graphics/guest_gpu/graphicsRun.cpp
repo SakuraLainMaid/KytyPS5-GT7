@@ -131,6 +131,17 @@ static bool GpuIndirectDraws() {
 	return enabled;
 }
 
+// KYTY_GPU_INDEXED_INDIRECT=0 reads DRAW_INDEX_INDIRECT arguments on the CPU, as before. Read
+// there, arguments a dispatch had just written drained the GPU: in GT7's races, 78 % of the GPU
+// thread's waits (2026-10-10 profile).
+static bool GpuIndexedIndirectDraws() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GPU_INDEXED_INDIRECT");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled && GpuIndirectDraws();
+}
+
 static bool LogIndirectDraw() {
 	static const uint32_t budget = [] {
 		const char* value = std::getenv("KYTY_LOG_INDIRECT_DRAWS");
@@ -1194,6 +1205,19 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 		return;
 	}
 
+	if (GpuIndexedIndirectDraws() && m_index_buffer_size != 0 &&
+	    (m_index_type_and_size == 0 || m_index_type_and_size == 1)) {
+		// The GPU reads the arguments (RenderExecutor::DrawIndex, drawIndexedIndirect): the index
+		// buffer is bound up to INDEX_BUFFER_SIZE, the start index applied there. Draws the GPU
+		// cannot take that way read them on the CPU there.
+		m_num_instances_args = reinterpret_cast<uint64_t>(args_addr);
+		DrawIndex({.index_count      = m_index_buffer_size,
+		           .index_addr       = reinterpret_cast<const void*>(m_index_base_addr),
+		           .instance_count   = 1,
+		           .offset_source    = DrawOffsetSource::IndirectArgs,
+		           .gpu_args_address = reinterpret_cast<uint64_t>(args_addr)});
+		return;
+	}
 	DrawIndexedIndirectArgs args {};
 	std::memcpy(&args, args_addr, sizeof(args));
 	if (LogIndirectDraw()) {

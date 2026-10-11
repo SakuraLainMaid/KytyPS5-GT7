@@ -1279,11 +1279,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 
+	// DrawIndirectArgs, or DrawIndexedIndirectArgs (VkDrawIndexedIndirectCommand).
+	const uint32_t gpu_args_size = draw.IsIndexed() ? 20u : 16u;
 	if (emit.gpu_args_address != 0) {
 		// The mesh shader reads the start vertex there, and the counts are copied from there:
 		// synchronize and register the arguments like the guest indices below.
-		(void)m_context.GetBufferCache().ObtainBuffer(emit.gpu_args_address, 16u, false, false,
-		                                              {}, true);
+		(void)m_context.GetBufferCache().ObtainBuffer(emit.gpu_args_address, gpu_args_size, false,
+		                                              false, {}, true);
 	}
 	if (emit.gpu_instance_count_address != 0) {
 		(void)m_context.GetBufferCache().ObtainBuffer(emit.gpu_instance_count_address, 4u, false,
@@ -1511,7 +1513,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                          nullptr, 0, nullptr);
 	} else if (!mesh_active && emit.gpu_args_address != 0) {
 		auto& cache = m_context.GetBufferCache();
-		auto& args  = cache.GetBuffer(cache.FindBuffer(emit.gpu_args_address, 16u));
+		auto& args  = cache.GetBuffer(cache.FindBuffer(emit.gpu_args_address, gpu_args_size));
 		vertex_indirect_buffer = args.Handle();
 		vertex_indirect_offset = args.Offset(emit.gpu_args_address);
 		m_context.GetCommandScheduler().EndRendering();
@@ -1568,6 +1570,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				groups_done += groups;
 			} while (groups_done < mesh_groups);
 		}
+	} else if (vertex_indirect_buffer && draw.IsIndexed()) {
+		vk_buffer.drawIndexedIndirect(vertex_indirect_buffer, vertex_indirect_offset, 1, 20u);
 	} else if (vertex_indirect_buffer) {
 		vk_buffer.drawIndirect(vertex_indirect_buffer, vertex_indirect_offset, 1, 16u);
 	} else {
@@ -1598,9 +1602,49 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
 }
 
+// A DRAW_INDEX_INDIRECT whose arguments the GPU reads, drawn with the arguments read here instead
+// (waiting for the GPU when it wrote them): the index buffer's start and the counts.
+static DrawIndexArgs ReadIndexedIndirectArgs(const DrawIndexArgs& args) {
+	uint32_t words[5] {};
+	std::memcpy(words, reinterpret_cast<const void*>(args.gpu_args_address), sizeof(words));
+	const uint32_t element = args.index_type_and_size == 1 ? 4u : 2u;
+	DrawIndexArgs  drawn   = args;
+	drawn.index_count      = std::min(words[0], args.index_count);
+	drawn.index_addr       = static_cast<const uint8_t*>(args.index_addr) +
+	                   static_cast<uint64_t>(words[2]) * element;
+	drawn.instance_count   = words[1];
+	drawn.base_vertex      = static_cast<int32_t>(words[3]);
+	drawn.first_instance   = words[4];
+	drawn.gpu_args_address = 0;
+	return drawn;
+}
+
+// Whether the GPU can read a DRAW_INDEX_INDIRECT's arguments, known before the draw's state:
+// not a legacy quad list (drawn as a call per quad) nor a custom primitive-restart index (found by
+// scanning the indices).
+static bool GpuIndexedArgsSupported(const CommandBuffer& buffer, uint32_t index_type_and_size) {
+	const auto& ucfg = buffer.GetUserConfig();
+	if (ucfg.GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy) {
+		return false;
+	}
+	const auto control = ucfg.GetPrimitiveResetControl();
+	if ((control & 0x1u) == 0) {
+		return true;
+	}
+	// As ResolvePrimitiveRestart: only the native restart index needs no scan.
+	const uint32_t index_mask = index_type_and_size == 1 ? 0xffffffffu : 0xffffu;
+	const auto     reset      = buffer.GetRegisters().GetPrimitiveResetIndex();
+	return (reset & index_mask) == index_mask;
+}
+
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
-                               const DrawIndexArgs& args) {
+                               const DrawIndexArgs& guest_args) {
 	KYTY_PROFILER_FUNCTION();
+	DrawIndexArgs args = guest_args;
+	if (args.gpu_args_address != 0 &&
+	    !GpuIndexedArgsSupported(buffer, args.index_type_and_size)) {
+		args = ReadIndexedIndirectArgs(args);
+	}
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1687,12 +1731,26 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		index_source.size      = expanded_indices.size() * sizeof(uint16_t);
 	}
 
-	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
-	                        args.instance_count, args.first_instance};
+	DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count, args.instance_count,
+	                   args.first_instance};
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return;
+	}
+	if (args.gpu_args_address != 0 &&
+	    state.vertex_info[0].stage.program->stage == ShaderType::Mesh) {
+		// Mesh draws need the counts for their group count: read here.
+		args = ReadIndexedIndirectArgs(args);
+		if (args.index_count == 0 || args.instance_count == 0) {
+			ResetBindings();
+			return;
+		}
+		index_source.address = reinterpret_cast<uint64_t>(args.index_addr);
+		index_source.size =
+		    static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
+		draw = {CommandBufferDebugOp::DrawIndex, args.index_count, args.instance_count,
+		        args.first_instance};
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
@@ -1706,6 +1764,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	DrawEmitInfo emit {};
 	emit.vertex_offset  = vertex_offset + args.base_vertex;
 	emit.first_instance = instance_offset;
+	emit.gpu_args_address = args.gpu_args_address;
 	LogWatchedDraw(draw, state, ucfg.GetIndexOffset(), args.base_vertex, 0, emit.vertex_offset,
 	               emit.first_instance, indirect);
 

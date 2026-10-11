@@ -69,6 +69,11 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// DRAW_INDEX_INDIRECT read on the GPU: the guest address of its DrawIndexedIndirectArgs
+	// (index count, instance count, start index, base vertex, start instance; the layout of
+	// VkDrawIndexedIndirectCommand). index_addr is then the index buffer's base and index_count
+	// its INDEX_BUFFER_SIZE, the bound of what the GPU may read.
+	uint64_t         gpu_args_address           = 0;
 };
 
 struct DrawAutoArgs {
