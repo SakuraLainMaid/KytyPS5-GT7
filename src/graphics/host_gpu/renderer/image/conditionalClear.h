@@ -41,7 +41,7 @@ public:
 	// the candidates' codes throughout. Records into the scheduler's current command buffer.
 	void Record(CommandBuffer& command, vk::DeviceAddress metadata, uint32_t words,
 	            std::span<const Candidate> candidates, vk::ImageView view, vk::Format format,
-	            vk::Extent2D extent);
+	            uint32_t samples, vk::Extent2D extent);
 
 	[[nodiscard]] static Numeric NumericOf(vk::Format format);
 
@@ -59,10 +59,11 @@ private:
 	static constexpr uint32_t Entries     = 1024;
 
 	struct PipelineKey {
-		vk::Format format = vk::Format::eUndefined;
+		vk::Format format  = vk::Format::eUndefined;
+		uint32_t   samples = 1;
 		auto       operator<=>(const PipelineKey&) const = default;
 	};
-	[[nodiscard]] vk::Pipeline GetDrawPipeline(vk::Format format);
+	[[nodiscard]] vk::Pipeline GetDrawPipeline(PipelineKey key);
 
 	GraphicContext&                               m_graphics;
 	Buffer                                        m_entries;
@@ -72,7 +73,7 @@ private:
 	vk::PipelineLayout                            m_draw_layout    = nullptr;
 	vk::ShaderModule                              m_vertex_shader  = nullptr;
 	std::array<vk::ShaderModule, 3>               m_fragment_shaders {};
-	std::vector<std::pair<vk::Format, vk::Pipeline>> m_draw_pipelines;
+	std::vector<std::pair<PipelineKey, vk::Pipeline>> m_draw_pipelines;
 };
 
 // KYTY_GPU_COLOR_CLEAR=0: render-target fast clears are found by reading the metadata back, as

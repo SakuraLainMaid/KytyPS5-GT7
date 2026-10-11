@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderTarget.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -93,8 +94,8 @@ ConditionalColorClear::ConditionalColorClear(GraphicContext& graphics, CommandSc
 }
 
 ConditionalColorClear::~ConditionalColorClear() {
-	for (const auto& [format, pipeline]: m_draw_pipelines) {
-		(void)format;
+	for (const auto& [key, pipeline]: m_draw_pipelines) {
+		(void)key;
 		m_graphics.device.destroyPipeline(pipeline, nullptr);
 	}
 	for (const auto module: m_fragment_shaders) {
@@ -106,9 +107,12 @@ ConditionalColorClear::~ConditionalColorClear() {
 	m_graphics.device.destroyPipelineLayout(m_check_layout, nullptr);
 }
 
-vk::Pipeline ConditionalColorClear::GetDrawPipeline(vk::Format format) {
-	const auto cached = std::ranges::find(m_draw_pipelines, format,
-	                                      &std::pair<vk::Format, vk::Pipeline>::first);
+vk::Pipeline ConditionalColorClear::GetDrawPipeline(PipelineKey key) {
+	const auto cached = std::ranges::find(m_draw_pipelines, key,
+	                                      &std::pair<PipelineKey, vk::Pipeline>::first);
+	auto       format  = key.format;
+	const auto samples = vulkan_sample_count(key.samples);
+	EXIT_IF(samples == vk::SampleCountFlagBits {});
 	if (cached != m_draw_pipelines.end()) {
 		return cached->second;
 	}
@@ -128,7 +132,8 @@ vk::Pipeline ConditionalColorClear::GetDrawPipeline(vk::Format format) {
 	rasterization.lineWidth = 1.0f;
 	rasterization.cullMode  = vk::CullModeFlagBits::eNone;
 	vk::PipelineMultisampleStateCreateInfo multisample {};
-	multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
+	// Each pixel's shading writes all of its samples: the clear covers them all.
+	multisample.rasterizationSamples = samples;
 	vk::PipelineDepthStencilStateCreateInfo depth {};
 	vk::PipelineColorBlendAttachmentState blend {};
 	blend.colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
@@ -162,13 +167,14 @@ vk::Pipeline ConditionalColorClear::GetDrawPipeline(vk::Format format) {
 	RequireVulkanSuccess(
 	    m_graphics.device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &pipeline),
 	    "create conditional-clear pipeline");
-	m_draw_pipelines.emplace_back(format, pipeline);
+	m_draw_pipelines.emplace_back(key, pipeline);
 	return pipeline;
 }
 
 void ConditionalColorClear::Record(CommandBuffer& command, vk::DeviceAddress metadata,
                                    uint32_t words, std::span<const Candidate> candidates,
-                                   vk::ImageView view, vk::Format format, vk::Extent2D extent) {
+                                   vk::ImageView view, vk::Format format, uint32_t samples,
+                                   vk::Extent2D extent) {
 	EXIT_IF(command.IsInvalid() || metadata == 0 || words == 0 || view == nullptr ||
 	        candidates.empty() || candidates.size() > MaxCandidates);
 	command.EndRendering();
@@ -235,7 +241,7 @@ void ConditionalColorClear::Record(CommandBuffer& command, vk::DeviceAddress met
 	rendering.colorAttachmentCount = 1;
 	rendering.pColorAttachments    = &attachment;
 	recorder.beginRendering(rendering);
-	recorder.bindPipeline(vk::PipelineBindPoint::eGraphics, GetDrawPipeline(format));
+	recorder.bindPipeline(vk::PipelineBindPoint::eGraphics, GetDrawPipeline({format, samples}));
 	const vk::Viewport viewport {0.0f, 0.0f, static_cast<float>(extent.width),
 	                             static_cast<float>(extent.height), 0.0f, 1.0f};
 	const vk::Rect2D   scissor {{0, 0}, extent};

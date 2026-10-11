@@ -1260,11 +1260,29 @@ void TextureCache::InitializeImage(ImageId id) {
 bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc, uint32_t first,
                                               uint32_t image_first, uint32_t count,
                                               uint64_t slice_size) {
-	const auto& view = desc.view_info;
-	if (!GpuColorClearEnabled() || desc.type != BindingType::RenderTarget ||
-	    desc.info.samples != 1 || desc.info.IsVolume() || slice_size == 0 ||
-	    slice_size % sizeof(uint32_t) != 0 || slice_size / sizeof(uint32_t) > UINT32_MAX) {
+	const auto& view    = desc.view_info;
+	const auto  decline = [&](const char* why) {
+		// Once per reason: the metadata is then read back, draining the GPU.
+		static std::mutex                   logged_mutex;
+		static std::unordered_set<std::string> logged;
+		std::lock_guard                     lock(logged_mutex);
+		if (logged.insert(why).second) {
+			LOGF("TextureCache: render-target clear of 0x%016" PRIx64
+			     " checked by a read-back: %s (samples %u, format %u)\n",
+			     desc.info.data.address, why, desc.info.samples,
+			     static_cast<uint32_t>(view.format));
+		}
 		return false;
+	};
+	if (!GpuColorClearEnabled() || desc.type != BindingType::RenderTarget) {
+		return false;
+	}
+	if (desc.info.IsVolume()) {
+		return decline("volume target");
+	}
+	if (slice_size == 0 || slice_size % sizeof(uint32_t) != 0 ||
+	    slice_size / sizeof(uint32_t) > UINT32_MAX) {
+		return decline("metadata slice size");
 	}
 	// The values the metadata may hold a clear of (DecodeColorClear's codes).
 	std::vector<ConditionalColorClear::Candidate> candidates;
@@ -1280,13 +1298,17 @@ bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
 	if (candidates.empty()) {
 		return true; // no code this target could be cleared with: nothing to check
 	}
+	uint32_t samples = 1;
 	{
 		std::scoped_lock lock {m_lock};
 		const auto&      image = m_slot_images[id];
-		if (image.backing.image == nullptr || image.backing.samples != 1 ||
-		    !(image.backing.usage & vk::ImageUsageFlagBits::eColorAttachment)) {
-			return false;
+		if (image.backing.image == nullptr) {
+			return decline("no image yet");
 		}
+		if (!(image.backing.usage & vk::ImageUsageFlagBits::eColorAttachment)) {
+			return decline("image without color-attachment use");
+		}
+		samples = image.backing.samples;
 	}
 	if (m_conditional_clear == nullptr) {
 		m_conditional_clear = std::make_unique<ConditionalColorClear>(m_graphics, m_scheduler);
@@ -1324,7 +1346,8 @@ bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
 		                           std::max(image.info.extent.height >> view.base_level, 1u)};
 		m_conditional_clear->Record(command, buffer->BufferDeviceAddress() + offset,
 		                            static_cast<uint32_t>(slice_size / sizeof(uint32_t)),
-		                            candidates, image.FindView(target), view.format, extent);
+		                            candidates, image.FindView(target), view.format, samples,
+		                            extent);
 		CommitGpuWrite(image);
 	}
 	static std::atomic<uint64_t> checks {0};
