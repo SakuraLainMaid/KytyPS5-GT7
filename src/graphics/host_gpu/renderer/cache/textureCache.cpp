@@ -1313,14 +1313,36 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
-	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+	// A GPU fill of the metadata (DMA_DATA, GT7's fast clears) leaves a value known here: the
+	// download drained the GPU twice a frame in its races (47 % of the GPU thread).
+	uint32_t   filled      = 0;
+	const bool gpu_written = m_buffer_cache.IsRegionGpuModified(range.address, range.size);
+	const bool known_fill =
+	    gpu_written && m_buffer_cache.KnownFill(range.address, range.size, filled);
+	if (gpu_written) {
+		// Logged at powers of two: how often a known fill spared the download.
+		static std::atomic<uint64_t> spared {0}, downloaded {0};
+		const auto n = (known_fill ? spared : downloaded).fetch_add(1, std::memory_order_relaxed) + 1;
+		if ((n & (n - 1)) == 0) {
+			LOGF("TextureCache: color metadata of 0x%016" PRIx64 " GPU-written: %" PRIu64
+			     " read from a known fill, %" PRIu64 " downloaded\n",
+			     range.address, spared.load(std::memory_order_relaxed),
+			     downloaded.load(std::memory_order_relaxed));
+		}
+	}
+	if (gpu_written && !known_fill) {
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
 	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
-		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
+		if (known_fill) {
+			code = static_cast<uint8_t>(filled);
+			if (filled != code * 0x01010101u) {
+				continue; // not one code throughout
+			}
+		} else if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
 			EXIT("TextureCache: failed to read color metadata backing\n");
 		}
 		vk::ClearValue clear {};
@@ -1328,11 +1350,14 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			continue;
 		}
 		std::vector<uint8_t> bytes(slice_size);
-		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
-			EXIT("TextureCache: failed to read color metadata slice\n");
-		}
-		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
-			continue;
+		if (!known_fill) {
+			if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
+				EXIT("TextureCache: failed to read color metadata slice\n");
+			}
+			if (!std::all_of(bytes.begin(), bytes.end(),
+			                 [code](uint8_t byte) { return byte == code; })) {
+				continue;
+			}
 		}
 		{
 			std::scoped_lock lock {m_lock};
@@ -1344,8 +1369,12 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		// to overlapping image data. Invalidate the buffer before updating its backing.
 		if (desc.type != BindingType::VideoOut) {
 			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
-			m_buffer_cache.InvalidateMemory(address, slice_size);
-			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
+			// Still GPU-written (a known fill): both copies, without the download a CPU store
+			// to GPU-written bytes needs.
+			if (!known_fill || !m_buffer_cache.WriteClean(address, bytes.data(), bytes.size())) {
+				m_buffer_cache.InvalidateMemory(address, slice_size);
+				LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
+			}
 		}
 	}
 }

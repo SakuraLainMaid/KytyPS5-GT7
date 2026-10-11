@@ -334,9 +334,33 @@ BufferCache::~BufferCache() {
 	m_buffers.clear();
 }
 
+void BufferCache::ForgetFills(uint64_t vaddr, uint64_t size) {
+	if (m_known_fills.empty()) {
+		return;
+	}
+	std::erase_if(m_known_fills, [&](const KnownFillRecord& fill) {
+		return fill.address < vaddr + size && vaddr < fill.address + fill.size;
+	});
+}
+
+bool BufferCache::KnownFill(uint64_t vaddr, uint64_t size, uint32_t& value) const {
+	std::shared_lock lock(m_dirty_ranges_mutex);
+	for (const auto& fill: m_known_fills) {
+		if (fill.address <= vaddr && vaddr + size <= fill.address + fill.size) {
+			value = fill.value;
+			return true;
+		}
+	}
+	return false;
+}
+
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
+	}
+	{
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		ForgetFills(vaddr, size);
 	}
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
@@ -1144,6 +1168,7 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 			m_bitmap_tracked.Subtract(first, last - first);
 		}
 		m_gpu_modified_ranges.Add(vaddr, size);
+		ForgetFills(vaddr, size);
 	}
 	// Diagnostics: KYTY_WATCH_GPU_WRITE=<address>[+<size>][,<address>[+<size>]...] (hex) names
 	// the bindings that mark bytes of those ranges GPU-written: the first write of each
@@ -1239,6 +1264,13 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
+	// After ObtainBuffer marked the range GPU-written (which forgets older fills of it).
+	std::unique_lock lock(m_dirty_ranges_mutex);
+	constexpr size_t MaxKnownFills = 256;
+	if (m_known_fills.size() >= MaxKnownFills) {
+		m_known_fills.erase(m_known_fills.begin());
+	}
+	m_known_fills.push_back({vaddr, size, value});
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,

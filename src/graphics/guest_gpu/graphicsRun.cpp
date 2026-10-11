@@ -266,7 +266,9 @@ void GuestGpu::DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size) 
 	                                                         sequence] {
 		(void)TrySendCommand([this, address, value, size, sequence] {
 			Timeline::Mark("label", address, value);
-			std::memcpy(reinterpret_cast<void*>(address), &value, size);
+			if (!m_renderer.GetBufferCache().WriteClean(address, &value, size)) {
+				std::memcpy(reinterpret_cast<void*>(address), &value, size);
+			}
 			const auto pending = m_pending_labels.find(address);
 			if (pending != m_pending_labels.end() && pending->second.sequence == sequence) {
 				m_pending_labels.erase(pending);
@@ -1488,7 +1490,13 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			m_renderer.GetGpu().DeferLabelWrite(reinterpret_cast<uint64_t>(dst), data,
 			                                    sizeof(data));
 		} else {
-			std::memcpy(dst, &data, sizeof(data));
+			// As WRITE_DATA: a label sharing a page with GPU-written bytes faulted and drained
+			// the GPU (twice a frame in GT7's races, 20 % of the GPU thread); WriteClean writes
+			// both copies instead.
+			if (!m_renderer.GetBufferCache().WriteClean(reinterpret_cast<uint64_t>(dst), &data,
+			                                            sizeof(data))) {
+				std::memcpy(dst, &data, sizeof(data));
+			}
 		}
 
 		if (with_interrupt) {
@@ -1546,7 +1554,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					if (at_completion) {
 						m_renderer.GetGpu().DeferLabelWrite(reinterpret_cast<uint64_t>(dst),
 						                                    value, sizeof(value));
-					} else {
+					} else if (!m_renderer.GetBufferCache().WriteClean(
+					               reinterpret_cast<uint64_t>(dst), &value, sizeof(value))) {
 						std::memcpy(dst, &value, sizeof(value));
 					}
 

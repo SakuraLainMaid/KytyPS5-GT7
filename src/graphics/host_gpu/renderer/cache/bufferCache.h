@@ -119,6 +119,10 @@ public:
 	// protected as GPU-written) or it would be wrong (a download of these bytes is in flight, or
 	// no cached buffer covers them); the caller then writes normally.
 	[[nodiscard]] bool              WriteClean(uint64_t vaddr, const void* data, uint64_t size);
+	// The dword a GPU fill (FillBuffer) left in all of [vaddr, vaddr + size), when no other GPU
+	// write and no CPU store touched those bytes since: a reader that only needs that value can
+	// skip downloading the range, which drains the GPU.
+	[[nodiscard]] bool              KnownFill(uint64_t vaddr, uint64_t size, uint32_t& value) const;
 	[[nodiscard]] ShaderFaultReport CollectFaults() { return m_fault_manager.CollectFaults(); }
 	[[nodiscard]] uint64_t          UnattributedFaults() const noexcept {
 		return m_fault_manager.UnattributedFaults();
@@ -218,6 +222,14 @@ private:
 	// Guards changes to both range sets (GPU thread and download completions) against
 	// IsCleanForConcurrentRead; the GPU thread reads them without it.
 	mutable std::shared_mutex                          m_dirty_ranges_mutex;
+	// GPU fills whose bytes nothing has written since (KnownFill); under m_dirty_ranges_mutex.
+	struct KnownFillRecord {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint32_t value   = 0;
+	};
+	std::vector<KnownFillRecord>                       m_known_fills;
+	void ForgetFills(uint64_t vaddr, uint64_t size); // m_dirty_ranges_mutex held
 	MemoryTracker                                      m_memory_tracker;
 	StreamBuffer                                       m_staging_buffer;
 	// Guest reads UploadCopies leaves to the recording thread: staging destination, guest
