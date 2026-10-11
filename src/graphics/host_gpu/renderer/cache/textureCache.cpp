@@ -1330,9 +1330,32 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			     downloaded.load(std::memory_order_relaxed));
 		}
 	}
+	// KYTY_DCC_CLEAR_READBACK=0: GPU-written color metadata is taken as not cleared, without the
+	// download (an A/B switch: a clear missed this way leaves the target uncleared).
+	static const bool readback = [] {
+		const char* value = std::getenv("KYTY_DCC_CLEAR_READBACK");
+		return value == nullptr || value[0] != '0';
+	}();
 	if (gpu_written && !known_fill) {
+		if (!readback) {
+			return;
+		}
+		// Who keeps writing it (the first few ranges): the download drains the GPU each time.
+		m_buffer_cache.WatchGpuWrites(range.address, range.size, "color metadata");
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
+	static std::atomic<uint64_t> downloads {0}, cleared {0};
+	bool                         found_clear = false;
+	const auto                   report      = [&] {
+		if (!gpu_written || known_fill) return;
+		const auto n = downloads.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (found_clear) cleared.fetch_add(1, std::memory_order_relaxed);
+		if ((n & (n - 1)) == 0) {
+			LOGF("TextureCache: color metadata downloads: %" PRIu64 ", a clear found in %" PRIu64
+			     "\n",
+			     n, cleared.load(std::memory_order_relaxed));
+		}
+	};
 	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
@@ -1359,6 +1382,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 				continue;
 			}
 		}
+		found_clear = true;
 		{
 			std::scoped_lock lock {m_lock};
 			ClearImage(m_scheduler.Current(), id, view.format,
@@ -1377,6 +1401,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			}
 		}
 	}
+	report();
 }
 
 void TextureCache::RefreshImage(ImageId id) {

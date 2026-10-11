@@ -343,6 +343,30 @@ void BufferCache::ForgetFills(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+namespace {
+struct DynamicWatch {
+	uint64_t    address = 0;
+	uint64_t    size    = 0;
+	const char* label   = "";
+};
+std::mutex                                    g_dynamic_watch_mutex;
+std::vector<DynamicWatch>                     g_dynamic_watches;
+std::atomic<bool>                             g_dynamic_watching {false};
+std::set<std::pair<uint64_t, uint64_t>>       g_dynamic_watch_seen; // (range, shader)
+} // namespace
+
+void BufferCache::WatchGpuWrites(uint64_t vaddr, uint64_t size, const char* label) {
+	std::lock_guard lock(g_dynamic_watch_mutex);
+	constexpr size_t MaxWatches = 8;
+	for (const auto& watch: g_dynamic_watches) {
+		if (watch.address == vaddr) return;
+	}
+	if (g_dynamic_watches.size() >= MaxWatches) return;
+	g_dynamic_watches.push_back({vaddr, size, label});
+	g_dynamic_watching.store(true, std::memory_order_release);
+	LOGF("GPU write watch: %s 0x%016" PRIx64 "+0x%" PRIx64 "\n", label, vaddr, size);
+}
+
 bool BufferCache::KnownFill(uint64_t vaddr, uint64_t size, uint32_t& value) const {
 	std::shared_lock lock(m_dirty_ranges_mutex);
 	for (const auto& fill: m_known_fills) {
@@ -1189,6 +1213,20 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 		return result;
 	}();
 	static std::atomic<uint32_t> watched {0};
+	if (g_dynamic_watching.load(std::memory_order_acquire)) {
+		std::lock_guard lock(g_dynamic_watch_mutex);
+		for (const auto& watch: g_dynamic_watches) {
+			if (vaddr >= watch.address + watch.size || watch.address >= vaddr + size) continue;
+			if (!g_dynamic_watch_seen.emplace(watch.address, s_diag_shader_hash).second ||
+			    watched.fetch_add(1) >= 128) {
+				continue;
+			}
+			LOGF("GPU write covers %s 0x%016" PRIx64 "+0x%" PRIx64 ": range=0x%016" PRIx64
+			     " size=0x%" PRIx64 " shader=0x%016" PRIx64 "\n%s",
+			     watch.label, watch.address, watch.size, vaddr, size, s_diag_shader_hash,
+			     s_diag_shader_hash == 0 ? Common::HostBacktrace().c_str() : "");
+		}
+	}
 	for (size_t index = 0; index < watches.size(); index++) {
 		const auto& [watch_begin, watch_size] = watches[index];
 		if (watch_size == 0 || vaddr >= watch_begin + watch_size ||

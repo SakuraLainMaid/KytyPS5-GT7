@@ -123,6 +123,9 @@ public:
 	// write and no CPU store touched those bytes since: a reader that only needs that value can
 	// skip downloading the range, which drains the GPU.
 	[[nodiscard]] bool              KnownFill(uint64_t vaddr, uint64_t size, uint32_t& value) const;
+	// Diagnostics: names the GPU writes that mark bytes of [vaddr, vaddr + size) GPU-written from
+	// now on, as KYTY_WATCH_GPU_WRITE does (a few ranges, the first write per range and shader).
+	void                            WatchGpuWrites(uint64_t vaddr, uint64_t size, const char* label);
 	[[nodiscard]] ShaderFaultReport CollectFaults() { return m_fault_manager.CollectFaults(); }
 	[[nodiscard]] uint64_t          UnattributedFaults() const noexcept {
 		return m_fault_manager.UnattributedFaults();
