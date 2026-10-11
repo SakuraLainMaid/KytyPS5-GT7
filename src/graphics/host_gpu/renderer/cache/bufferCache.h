@@ -140,6 +140,9 @@ public:
 
 	// Diagnostics: the guest shader whose bindings are being prepared on this thread, if any.
 	inline static thread_local uint64_t s_diag_shader_hash = 0;
+	// Diagnostics: the last writer of a GPU-written range, and game-thread downloads by writer.
+	static void                     RecordGpuWriter(uint64_t vaddr, uint64_t size, uint64_t shader);
+	static void                     ReportGameThreadDownload(uint64_t vaddr, uint64_t bytes);
 
 private:
 	friend struct BufferCacheTestAccess;

@@ -28,6 +28,7 @@
 #include <mutex>
 #include <unordered_set>
 #include <span>
+#include <string_view>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
@@ -1371,6 +1372,59 @@ bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
 	return true;
 }
 
+// Diagnostics: GT7's lit pixel shaders loop over a light list whose length they read from a
+// two-channel uint 2D-array image (a light grid), and some of their draws take 20-200 ms on the
+// GPU, as if the counts were garbage. Which images those are, who binds them and how (a compute
+// pass writing one as storage, a pixel shader reading it), and whether the guest bytes behind
+// them are GPU- or CPU-written: once per address, for the first few.
+void TextureCache::DescribeUintArrayImage(ImageId id, const ImageDesc& desc) {
+	const auto& info = desc.info;
+	if (info.IsVolume() || info.resources.layers < 2 || desc.type == BindingType::VideoOut ||
+	    desc.type == BindingType::DepthTarget || vk::componentCount(info.pixel_format) != 2 ||
+	    std::string_view(vk::componentNumericFormat(info.pixel_format, 0)) != "UINT") {
+		return;
+	}
+	static std::mutex                                   logged_mutex;
+	static std::unordered_set<uint64_t>                 addresses;
+	static std::unordered_set<uint64_t>                 pairs;
+	const uint64_t                                      shader = BufferCache::s_diag_shader_hash;
+	{
+		// The first 8 addresses; then each new (shader, binding kind) of them, up to 64.
+		std::lock_guard lock(logged_mutex);
+		if (!addresses.contains(info.data.address)) {
+			if (addresses.size() >= 8) {
+				return;
+			}
+			addresses.insert(info.data.address);
+		}
+		const auto pair = info.data.address ^ (shader * 0x9e3779b97f4a7c15ull) ^
+		                  (static_cast<uint64_t>(desc.type) << 56);
+		if (pairs.size() >= 64 || !pairs.insert(pair).second) {
+			return;
+		}
+	}
+	bool gpu_image = false, cpu_dirty = false, buffer_modified = false;
+	{
+		std::scoped_lock lock {m_lock};
+		const auto&      image = m_slot_images[id];
+		gpu_image              = image.IsGpuModified();
+		cpu_dirty              = image.IsCpuDirty();
+		buffer_modified        = image.IsBufferModified();
+	}
+	const bool gpu_bytes = m_buffer_cache.IsRegionGpuModified(info.data.address, info.data.size);
+	const bool cpu_bytes = m_buffer_cache.IsRegionCpuModified(info.data.address, info.data.size);
+	LOGF("TextureCache: uint2 array image 0x%016" PRIx64 "+0x%" PRIx64
+	     " %ux%u layers %u format %u guest %u tile %u pitch %u: binding %u by shader 0x%016" PRIx64
+	     "; image GPU-written %d, CPU-dirty %d, buffer-modified %d; guest bytes GPU-written %d, "
+	     "CPU-written %d\n",
+	     info.data.address, info.data.size, info.extent.width, info.extent.height,
+	     info.resources.layers, static_cast<uint32_t>(info.pixel_format),
+	     static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode),
+	     info.pitch, static_cast<uint32_t>(desc.type), shader, gpu_image ? 1 : 0,
+	     cpu_dirty ? 1 : 0, buffer_modified ? 1 : 0, gpu_bytes ? 1 : 0, cpu_bytes ? 1 : 0);
+	m_buffer_cache.WatchGpuWrites(info.data.address, info.data.size, "uint2 array image");
+}
+
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
                                        uint32_t metadata_base_layer) {
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
@@ -1649,6 +1703,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
 	}
+	DescribeUintArrayImage(result, desc);
 	MaterializeColorClear(result, desc, metadata_base_layer);
 	if (desc.type == BindingType::VideoOut &&
 	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {

@@ -25,7 +25,10 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <map>
 #include <set>
+#include <string>
+#include <unordered_map>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -618,6 +621,9 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 		window_end   = std::min(std::max(window_begin + window, vaddr + size), buffer_end);
 	}
 
+	if (!from_gpu_thread) {
+		ReportGameThreadDownload(vaddr, window_end - window_begin);
+	}
 	Timeline::Mark("readmem", vaddr, from_gpu_thread ? 1u : 0u);
 	if (async) {
 		// The download publishes when its tick completes; the page stays protected until the
@@ -1154,6 +1160,74 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 	return false;
 }
 
+// Diagnostics: which guest shader last marked a range GPU-written (0: a copy, fill or label
+// write), so that the downloads game threads wait for can be put down to their writers.
+namespace {
+struct GpuWriter {
+	uint64_t end    = 0;
+	uint64_t shader = 0;
+};
+std::mutex                     g_writers_mutex;
+std::map<uint64_t, GpuWriter>  g_writers;
+
+struct WriterDownloads {
+	uint64_t count = 0;
+	uint64_t bytes = 0;
+	uint64_t first = 0;
+};
+std::unordered_map<uint64_t, WriterDownloads> g_writer_downloads;
+uint64_t                                      g_game_downloads = 0;
+} // namespace
+
+void BufferCache::RecordGpuWriter(uint64_t vaddr, uint64_t size, uint64_t shader) {
+	std::lock_guard lock(g_writers_mutex);
+	if (g_writers.size() >= 65536) {
+		g_writers.clear();
+	}
+	g_writers[vaddr] = {vaddr + size, shader};
+}
+
+void BufferCache::ReportGameThreadDownload(uint64_t vaddr, uint64_t bytes) {
+	std::lock_guard lock(g_writers_mutex);
+	uint64_t        shader = UINT64_MAX; // no record
+	if (auto it = g_writers.upper_bound(vaddr); it != g_writers.begin()) {
+		--it;
+		// Ranges overlap: the closest start at or below the address that still covers it.
+		for (int steps = 0; steps < 64; steps++) {
+			if (vaddr < it->second.end) {
+				shader = it->second.shader;
+				break;
+			}
+			if (it == g_writers.begin()) {
+				break;
+			}
+			--it;
+		}
+	}
+	auto& entry = g_writer_downloads[shader];
+	if (entry.count++ == 0) {
+		entry.first = vaddr;
+	}
+	entry.bytes += bytes;
+	if (++g_game_downloads % 1024 != 0) {
+		return;
+	}
+	std::vector<std::pair<uint64_t, WriterDownloads>> top(g_writer_downloads.begin(),
+	                                                      g_writer_downloads.end());
+	std::ranges::sort(top, [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+	std::string line;
+	for (size_t index = 0; index < std::min<size_t>(top.size(), 10); index++) {
+		const auto& [hash, writer] = top[index];
+		line += fmt::format(" {}={}/{}KB@{:x}",
+		                    hash == UINT64_MAX ? std::string("unknown")
+		                    : hash == 0        ? std::string("copy")
+		                                       : fmt::format("{:016x}", hash),
+		                    writer.count, writer.bytes >> 10, writer.first);
+	}
+	LOGF("ReadMemory: %" PRIu64 " game-thread downloads, by writer:%s\n", g_game_downloads,
+	     line.c_str());
+}
+
 void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 	KYTY_PROFILER_BLOCK("Obtain::MarkWritten");
 	{
@@ -1194,6 +1268,7 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetFills(vaddr, size);
 	}
+	RecordGpuWriter(vaddr, size, s_diag_shader_hash);
 	// Diagnostics: KYTY_WATCH_GPU_WRITE=<address>[+<size>][,<address>[+<size>]...] (hex) names
 	// the bindings that mark bytes of those ranges GPU-written: the first write of each
 	// (range, shader), with a host stack when no shader is being bound (copies, fills).

@@ -171,6 +171,7 @@ private:
 	void                        RefreshImage(ImageId id);
 	// The GPU-side MaterializeColorClear of GPU-written render-target metadata; false when it
 	// does not apply (the caller then reads the metadata back).
+	void                        DescribeUintArrayImage(ImageId id, const ImageDesc& desc);
 	bool                        MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
 	                                                       uint32_t first, uint32_t image_first,
 	                                                       uint32_t count, uint64_t slice_size);
