@@ -1267,18 +1267,26 @@ bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
 		static std::unordered_set<std::string> logged;
 		std::lock_guard                     lock(logged_mutex);
 		if (logged.insert(why).second) {
-			LOGF("TextureCache: render-target clear of 0x%016" PRIx64
-			     " checked by a read-back: %s (samples %u, format %u)\n",
-			     desc.info.data.address, why, desc.info.samples,
-			     static_cast<uint32_t>(view.format));
+			LOGF("TextureCache: color clear of 0x%016" PRIx64
+			     " checked by a read-back: %s (binding %u, samples %u, format %u)\n",
+			     desc.info.data.address, why, static_cast<uint32_t>(desc.type),
+			     desc.info.samples, static_cast<uint32_t>(view.format));
 		}
 		return false;
 	};
-	if (!GpuColorClearEnabled() || desc.type != BindingType::RenderTarget) {
+	// Any binding but a video-out read, which needs the guest bytes clean (the readback path). A
+	// texture or storage binding of a target is checked the same way: once the render target's
+	// check left its metadata GPU-written, the first sampling of it downloaded it instead.
+	if (!GpuColorClearEnabled() || desc.type == BindingType::VideoOut) {
 		return false;
 	}
 	if (desc.info.IsVolume()) {
 		return decline("volume target");
+	}
+	if (desc.type != BindingType::RenderTarget &&
+	    !(m_graphics.GetFormatProperties(view.format).optimalTilingFeatures &
+	      vk::FormatFeatureFlagBits::eColorAttachment)) {
+		return decline("texture view format is not renderable");
 	}
 	if (slice_size == 0 || slice_size % sizeof(uint32_t) != 0 ||
 	    slice_size / sizeof(uint32_t) > UINT32_MAX) {
@@ -1350,10 +1358,15 @@ bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
 		                            extent);
 		CommitGpuWrite(image);
 	}
-	static std::atomic<uint64_t> checks {0};
-	const auto                   n = checks.fetch_add(count, std::memory_order_relaxed) + count;
+	static std::atomic<uint64_t> checks {0}, texture_checks {0};
+	if (desc.type != BindingType::RenderTarget) {
+		texture_checks.fetch_add(count, std::memory_order_relaxed);
+	}
+	const auto n = checks.fetch_add(count, std::memory_order_relaxed) + count;
 	if ((n & (n - 1)) == 0) {
-		LOGF("TextureCache: %" PRIu64 " render-target clears checked on the GPU\n", n);
+		LOGF("TextureCache: %" PRIu64 " render-target clears checked on the GPU (%" PRIu64
+		     " of them for a texture binding)\n",
+		     n, texture_checks.load(std::memory_order_relaxed));
 	}
 	return true;
 }
