@@ -1377,8 +1377,8 @@ bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
 // GPU, as if the counts were garbage. Which images those are, who binds them and how (a compute
 // pass writing one as storage, a pixel shader reading it), and whether the guest bytes behind
 // them are GPU- or CPU-written: once per address, for the first few.
-// The lit pixel shaders whose draws took 20-200 ms (round 21 dumps): every image they bind is
-// described, whatever its format. KYTY_DESCRIBE_SHADER_IMAGES=<hash>,<hash>... names others.
+// The lit pixel shaders whose draws took 20-200 ms (round 21 dumps), and two of the material
+// compute shaders: every image they bind is described, whatever its format. KYTY_DESCRIBE_SHADER_IMAGES=<hash>,<hash>... names others.
 static bool DescribesShaderImages(uint64_t shader) {
 	static const std::unordered_set<uint64_t> shaders = [] {
 		std::unordered_set<uint64_t> result;
@@ -1389,7 +1389,7 @@ static bool DescribesShaderImages(uint64_t shader) {
 		                      "3463527e3cbe7f8c,8a854858e103858d,cb06478e40bc6e99,3ed0b1867a8cbe66,"
 		                      "5e4037455eb3c1d8,4c542a4b581e3f2a,542f32f29799fc9d,5a4f390cdcf74502,"
 		                      "09f9cc4bc1217575,05c8efa0ef5999ca,6b3182b1b2362382,3ba2ad4871adc373,"
-		                      "f0a911d4544b7547";
+		                      "f0a911d4544b7547,5d8fac8c06b94572,6878a7b8d93bd00e";
 		for (size_t at = 0; at < list.size();) {
 			const auto end = std::min(list.find(',', at), list.size());
 			if (end > at) result.insert(std::strtoull(list.substr(at, end - at).c_str(), nullptr, 16));
@@ -1400,6 +1400,55 @@ static bool DescribesShaderImages(uint64_t shader) {
 	return shader != 0 && shaders.contains(shader);
 }
 
+// Diagnostics: the light grid those shaders read (R32G32_UINT, CPU-written): per cell an offset
+// into the light-index list (R) and packed light counts (G: bits 0-15, 16-23, 24-31). The guest
+// bytes, as the game wrote them, every 64th binding (and the first 8), when a count is large:
+// does the game's own data ask for thousands of lights a pixel, or does the emulator?
+static void DescribeLightGrid(const ImageInfo& info, uint64_t shader) {
+	static std::atomic<uint64_t> bindings {0};
+	static std::atomic<uint32_t> lines {0};
+	const auto                   n = bindings.fetch_add(1, std::memory_order_relaxed);
+	if ((n >= 8 && n % 64 != 0) || lines.load(std::memory_order_relaxed) >= 48) {
+		return;
+	}
+	std::vector<uint32_t> words(static_cast<size_t>(info.data.size / sizeof(uint32_t)));
+	if (words.empty() ||
+	    !Libs::LibKernel::Memory::TryReadBacking(info.data.address, words.data(),
+	                                             words.size() * sizeof(uint32_t))) {
+		return;
+	}
+	const uint32_t row_texels = std::max(info.pitch, info.extent.width);
+	const uint64_t layer_size = static_cast<uint64_t>(row_texels) * info.extent.height * 2u;
+	uint32_t max_low = 0, max_mid = 0, max_high = 0, max_offset = 0, over = 0, cells = 0;
+	for (uint32_t layer = 0; layer < info.resources.layers; layer++) {
+		for (uint32_t y = 0; y < info.extent.height; y++) {
+			for (uint32_t x = 0; x < info.extent.width; x++) {
+				const uint64_t at = layer * layer_size + (static_cast<uint64_t>(y) * row_texels + x) * 2u;
+				if (at + 1 >= words.size()) {
+					continue;
+				}
+				const uint32_t offset = words[at];
+				const uint32_t packed = words[at + 1];
+				cells++;
+				max_offset = std::max(max_offset, offset);
+				max_low    = std::max(max_low, packed & 0xffffu);
+				max_mid    = std::max(max_mid, (packed >> 16u) & 0xffu);
+				max_high   = std::max(max_high, packed >> 24u);
+				over += (packed & 0xffffu) > 256u ? 1u : 0u;
+			}
+		}
+	}
+	if (n >= 8 && max_low <= 256u) {
+		return;
+	}
+	lines.fetch_add(1, std::memory_order_relaxed);
+	LOGF("TextureCache: light grid 0x%016" PRIx64 " (%ux%u, %u layers, pitch %u) for shader "
+	     "0x%016" PRIx64 ", binding %" PRIu64 ": %u cells, max counts %u / %u / %u, %u cells over "
+	     "256 lights, max offset %u\n",
+	     info.data.address, info.extent.width, info.extent.height, info.resources.layers,
+	     info.pitch, shader, n, cells, max_low, max_mid, max_high, over, max_offset);
+}
+
 void TextureCache::DescribeUintArrayImage(ImageId id, const ImageDesc& desc) {
 	const auto& info   = desc.info;
 	const uint64_t shader = BufferCache::s_diag_shader_hash;
@@ -1407,6 +1456,9 @@ void TextureCache::DescribeUintArrayImage(ImageId id, const ImageDesc& desc) {
 		return;
 	}
 	const bool lit_shader = DescribesShaderImages(shader);
+	if (lit_shader && info.pixel_format == vk::Format::eR32G32Uint && info.data.size <= 0x100000) {
+		DescribeLightGrid(info, shader);
+	}
 	if (!lit_shader &&
 	    (info.IsVolume() || info.resources.layers < 2 || vk::componentCount(info.pixel_format) != 2 ||
 	     std::string_view(vk::componentNumericFormat(info.pixel_format, 0)) != "UINT")) {
