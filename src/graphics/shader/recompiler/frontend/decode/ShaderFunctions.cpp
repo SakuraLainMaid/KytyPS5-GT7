@@ -1119,6 +1119,28 @@ uint32_t ChurnValues() {
 	return value;
 }
 
+// KYTY_CALL_SPECIALIZED_SETS=<n>: how many distinct sets of specialized table variants (target
+// and record data) a shader inlines before its specialized tables take the miss path for the
+// rest of the session. Each new set is a new program: GT7's 28 material compute shaders take
+// ~1.5 s each to build, and its garage reallocates their material records as it loads (seven
+// sets, 196 builds, over four minutes on entering it; another set on each car change). Default
+// 1: the first set is kept; 0 never inlines a specialized table; a large number restores the
+// old behaviour.
+uint32_t MaxSpecializedSets() {
+	static const uint32_t value = [] {
+		const char* text = std::getenv("KYTY_CALL_SPECIALIZED_SETS");
+		if (text == nullptr || text[0] == '\0') return 1u;
+		return static_cast<uint32_t>(std::strtoul(text, nullptr, 10));
+	}();
+	return value;
+}
+
+// The distinct specialized variant sets each shader was expanded with (by shader hash).
+struct SpecializedSets {
+	std::set<std::vector<ShaderCallVariant>> seen;
+	bool                                     dropped = false;
+};
+
 struct CallMissRegistry {
 	struct Target {
 		uint32_t values     = 0; // distinct data values reported
@@ -1235,6 +1257,7 @@ struct ShaderFunctionExpander::Impl {
 	// GT7's shaders share their material functions.
 	std::set<uint64_t> excluded;
 	uint64_t           exclusion_generation = 0;
+	std::unordered_map<uint64_t, SpecializedSets> specialized_sets; // by shader hash
 
 	bool StillReads(const Expansion& expansion, const ShaderCodeReader& read) {
 		for (const auto& [address, words]: expansion.reads) {
@@ -1378,6 +1401,38 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 		const auto reported = shader_hash != 0 ? ShaderCallMissTargets(shader_hash) : nullptr;
 		SelectTableTargets(sites, reported.get());
 	}
+	std::string drop_note;
+	if (shader_hash != 0) {
+		// The specialized variants this expansion would inline, over all its table calls.
+		std::vector<ShaderCallVariant> offered;
+		for (const auto& site: sites) {
+			if (site.dynamic && site.specialized) {
+				offered.insert(offered.end(), site.variants.begin(), site.variants.end());
+			}
+		}
+		auto& history = m_impl->specialized_sets[shader_hash];
+		if (!offered.empty() && !history.dropped && !history.seen.contains(offered)) {
+			if (history.seen.size() >= MaxSpecializedSets()) {
+				history.dropped = true;
+				drop_note = "specialized table data changed (" +
+				            std::to_string(history.seen.size() + 1) +
+				            " sets): its specialized table calls take the miss path from now on "
+				            "(KYTY_CALL_SPECIALIZED_SETS)";
+			} else {
+				history.seen.insert(offered);
+			}
+		}
+		if (history.dropped) {
+			// As a table over the bound without reports: no variants, the same code whatever
+			// the table holds, so one program serves every later table.
+			for (auto& site: sites) {
+				if (site.dynamic && site.specialized) {
+					site.variants.clear();
+					site.preferred.clear();
+				}
+			}
+		}
+	}
 	for (const auto& expansion: shader.expansions) {
 		if (expansion.base == base && expansion.wave_size == wave_size &&
 		    expansion.user_data_count == user_data.size() && expansion.sites == sites &&
@@ -1385,6 +1440,7 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 		    m_impl->StillReads(expansion, read)) {
 			expanded = expansion.code;
 			reason   = expansion.reason;
+			if (summary != nullptr && !drop_note.empty()) *summary = drop_note;
 			return expansion.ok;
 		}
 	}
@@ -1407,6 +1463,9 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	const auto builds = ++shader.builds;
 	if (summary != nullptr && expansion.ok && stats.Partial()) {
 		*summary = DescribeStats(stats, expansion.code.size());
+	}
+	if (summary != nullptr && !drop_note.empty()) {
+		*summary += (summary->empty() ? "" : "; ") + drop_note;
 	}
 	if (summary != nullptr && builds >= 16 && (builds & (builds - 1)) == 0) {
 		// Each new expansion is a new program to translate and compile.

@@ -1377,30 +1377,68 @@ bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
 // GPU, as if the counts were garbage. Which images those are, who binds them and how (a compute
 // pass writing one as storage, a pixel shader reading it), and whether the guest bytes behind
 // them are GPU- or CPU-written: once per address, for the first few.
+// The lit pixel shaders whose draws took 20-200 ms (round 21 dumps): every image they bind is
+// described, whatever its format. KYTY_DESCRIBE_SHADER_IMAGES=<hash>,<hash>... names others.
+static bool DescribesShaderImages(uint64_t shader) {
+	static const std::unordered_set<uint64_t> shaders = [] {
+		std::unordered_set<uint64_t> result;
+		const char* text = std::getenv("KYTY_DESCRIBE_SHADER_IMAGES");
+		const std::string list =
+		    text != nullptr ? text
+		                    : "07c3689281322aba,2a9c7e7ccd1484f9,112704223b775ce7,ed063ee275c1373c,"
+		                      "3463527e3cbe7f8c,8a854858e103858d,cb06478e40bc6e99,3ed0b1867a8cbe66,"
+		                      "5e4037455eb3c1d8,4c542a4b581e3f2a,542f32f29799fc9d,5a4f390cdcf74502,"
+		                      "09f9cc4bc1217575,05c8efa0ef5999ca,6b3182b1b2362382,3ba2ad4871adc373,"
+		                      "f0a911d4544b7547";
+		for (size_t at = 0; at < list.size();) {
+			const auto end = std::min(list.find(',', at), list.size());
+			if (end > at) result.insert(std::strtoull(list.substr(at, end - at).c_str(), nullptr, 16));
+			at = end + 1;
+		}
+		return result;
+	}();
+	return shader != 0 && shaders.contains(shader);
+}
+
 void TextureCache::DescribeUintArrayImage(ImageId id, const ImageDesc& desc) {
-	const auto& info = desc.info;
-	if (info.IsVolume() || info.resources.layers < 2 || desc.type == BindingType::VideoOut ||
-	    desc.type == BindingType::DepthTarget || vk::componentCount(info.pixel_format) != 2 ||
-	    std::string_view(vk::componentNumericFormat(info.pixel_format, 0)) != "UINT") {
+	const auto& info   = desc.info;
+	const uint64_t shader = BufferCache::s_diag_shader_hash;
+	if (desc.type == BindingType::VideoOut || desc.type == BindingType::DepthTarget) {
+		return;
+	}
+	const bool lit_shader = DescribesShaderImages(shader);
+	if (!lit_shader &&
+	    (info.IsVolume() || info.resources.layers < 2 || vk::componentCount(info.pixel_format) != 2 ||
+	     std::string_view(vk::componentNumericFormat(info.pixel_format, 0)) != "UINT")) {
 		return;
 	}
 	static std::mutex                                   logged_mutex;
 	static std::unordered_set<uint64_t>                 addresses;
 	static std::unordered_set<uint64_t>                 pairs;
-	const uint64_t                                      shader = BufferCache::s_diag_shader_hash;
+	static uint32_t                                     lit_lines = 0;
 	{
-		// The first 8 addresses; then each new (shader, binding kind) of them, up to 64.
+		// The first 8 addresses; then each new (shader, binding kind) of them, up to 64. The lit
+		// shaders' images: each (image, shader) once, up to 96.
 		std::lock_guard lock(logged_mutex);
-		if (!addresses.contains(info.data.address)) {
+		if (lit_shader) {
+			const auto pair = info.data.address ^ (shader * 0x9e3779b97f4a7c15ull) ^
+			                  (static_cast<uint64_t>(desc.type) << 56) ^ 1u;
+			if (lit_lines >= 96 || !pairs.insert(pair).second) {
+				return;
+			}
+			lit_lines++;
+		} else if (!addresses.contains(info.data.address)) {
 			if (addresses.size() >= 8) {
 				return;
 			}
 			addresses.insert(info.data.address);
 		}
-		const auto pair = info.data.address ^ (shader * 0x9e3779b97f4a7c15ull) ^
-		                  (static_cast<uint64_t>(desc.type) << 56);
-		if (pairs.size() >= 64 || !pairs.insert(pair).second) {
-			return;
+		if (!lit_shader) {
+			const auto pair = info.data.address ^ (shader * 0x9e3779b97f4a7c15ull) ^
+			                  (static_cast<uint64_t>(desc.type) << 56);
+			if (pairs.size() >= 160 || !pairs.insert(pair).second) {
+				return;
+			}
 		}
 	}
 	bool gpu_image = false, cpu_dirty = false, buffer_modified = false;
@@ -1413,16 +1451,23 @@ void TextureCache::DescribeUintArrayImage(ImageId id, const ImageDesc& desc) {
 	}
 	const bool gpu_bytes = m_buffer_cache.IsRegionGpuModified(info.data.address, info.data.size);
 	const bool cpu_bytes = m_buffer_cache.IsRegionCpuModified(info.data.address, info.data.size);
-	LOGF("TextureCache: uint2 array image 0x%016" PRIx64 "+0x%" PRIx64
-	     " %ux%u layers %u format %u guest %u tile %u pitch %u: binding %u by shader 0x%016" PRIx64
+	LOGF("TextureCache: %s image 0x%016" PRIx64 "+0x%" PRIx64
+	     " %ux%u layers %u format %u (%s x%u) guest %u tile %u pitch %u: binding %u by shader 0x%016" PRIx64
 	     "; image GPU-written %d, CPU-dirty %d, buffer-modified %d; guest bytes GPU-written %d, "
 	     "CPU-written %d\n",
-	     info.data.address, info.data.size, info.extent.width, info.extent.height,
+	     lit_shader ? "lit-shader" : "uint2 array", info.data.address, info.data.size,
+	     info.extent.width, info.extent.height,
 	     info.resources.layers, static_cast<uint32_t>(info.pixel_format),
-	     static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode),
+	     vk::componentCount(info.pixel_format) != 0 ? vk::componentNumericFormat(info.pixel_format, 0)
+	                                                : "?",
+	     vk::componentCount(info.pixel_format), static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode),
 	     info.pitch, static_cast<uint32_t>(desc.type), shader, gpu_image ? 1 : 0,
 	     cpu_dirty ? 1 : 0, buffer_modified ? 1 : 0, gpu_bytes ? 1 : 0, cpu_bytes ? 1 : 0);
-	m_buffer_cache.WatchGpuWrites(info.data.address, info.data.size, "uint2 array image");
+	if (vk::componentCount(info.pixel_format) != 0 &&
+	    std::string_view(vk::componentNumericFormat(info.pixel_format, 0)) == "UINT") {
+		m_buffer_cache.WatchGpuWrites(info.data.address, info.data.size,
+		                              lit_shader ? "lit-shader uint image" : "uint2 array image");
+	}
 }
 
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,

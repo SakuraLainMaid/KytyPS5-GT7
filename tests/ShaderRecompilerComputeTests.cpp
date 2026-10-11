@@ -1570,6 +1570,35 @@ void CheckShaderFunctionTableVariants() {
   Require(name, "churning target takes the miss path",
           ok && count(expanded, body) == 0 && count(expanded, trap) > 0,
           "a dropped target was still inlined");
+
+  // A small specialized table whose record data changes (GT7's garage): the first set is
+  // inlined, a second set drops the shader's specialized tables to the miss path, and every
+  // later set expands to that same code, so no further programs are built.
+  const uint64_t sets_hash = 0x7ab1e7ull;
+  const auto fill_records = [&](u32 entries, u32 data) {
+    store(srt + 0x40, {u32(table), u32(table >> 32u), entries * 16u, 0u});
+    for (u32 e = 0; e < entries; ++e) {
+      store(table + e * 16u, {u32(callee_a), u32(callee_a >> 32u), data + e * 0x100u, 0x7u});
+    }
+  };
+  fill_records(2, 0x7000u);
+  ok = expander.Expand(code, reinterpret_cast<uint64_t>(code.data()), user_data, read, expanded,
+                       reason, 64, sets_hash, &summary);
+  Require(name, "first specialized set inlined", ok && count(expanded, body) == 2,
+          "the first set of a small specialized table was not inlined");
+  fill_records(2, 0x9000u);
+  ok = expander.Expand(code, reinterpret_cast<uint64_t>(code.data()), user_data, read, expanded,
+                       reason, 64, sets_hash, &summary);
+  const auto dropped = expanded;
+  Require(name, "second specialized set dropped",
+          ok && count(expanded, body) == 0 && count(expanded, trap) > 0 &&
+              summary.find("specialized table data changed") != std::string::npos,
+          "a second set of specialized table data was inlined, or not reported");
+  fill_records(2, 0xb000u);
+  ok = expander.Expand(code, reinterpret_cast<uint64_t>(code.data()), user_data, read, expanded,
+                       reason, 64, sets_hash, &summary);
+  Require(name, "later sets share one program", ok && expanded == dropped,
+          "a later set of specialized table data expanded to new code");
   std::printf("[host]    %-32s ok\n", name);
 }
 
