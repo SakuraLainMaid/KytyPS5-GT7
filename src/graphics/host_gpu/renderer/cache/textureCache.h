@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
+#include "graphics/host_gpu/renderer/image/conditionalClear.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
@@ -168,6 +169,11 @@ private:
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
+	// The GPU-side MaterializeColorClear of GPU-written render-target metadata; false when it
+	// does not apply (the caller then reads the metadata back).
+	bool                        MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
+	                                                       uint32_t first, uint32_t image_first,
+	                                                       uint32_t count, uint64_t slice_size);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
@@ -203,6 +209,8 @@ private:
 	TrackingSpinLock                                  m_lock;
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
+	// Render-target fast clears decided on the GPU (MaterializeColorClear); made at first use.
+	std::unique_ptr<ConditionalColorClear>            m_conditional_clear;
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;

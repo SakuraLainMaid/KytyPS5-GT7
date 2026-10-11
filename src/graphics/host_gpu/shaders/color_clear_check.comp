@@ -1,0 +1,77 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+// A render target's fast clear without a download (TextureCache::MaterializeColorClear): the
+// color metadata of one slice, read where the GPU wrote it, holds one clear code throughout or
+// not. When it holds one of the candidates, the entry's draw clears the target with that
+// candidate's value, and the keys are rewritten as uncompressed (0xff), as the host does after a
+// CPU-side check. One workgroup per slice.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Metadata {
+    uint words[];
+};
+
+// ConditionalColorClear::Entry.
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer Entry {
+    uint  draw[4];          // VkDrawIndirectCommand: 3 or 0 vertices, 1 instance
+    uvec4 color;            // the selected candidate's clear value
+    uint  candidate_count;
+    uint  codes[7];
+    uvec4 colors[5];
+};
+
+layout(push_constant) uniform Push {
+    uvec2 metadata_address;
+    uvec2 entry_address;
+    uint  words;
+} pc;
+
+shared uint s_mismatch;
+
+void main() {
+    Metadata metadata = Metadata(pc.metadata_address);
+    Entry    entry    = Entry(pc.entry_address);
+    const uint index  = gl_LocalInvocationIndex;
+    if (index == 0u) {
+        s_mismatch = 0u;
+    }
+    barrier();
+
+    const uint first  = metadata.words[0];
+    const uint code   = first & 0xffu;
+    const uint expect = code * 0x01010101u;
+    bool mismatch = first != expect;
+    for (uint i = index; i < pc.words && !mismatch; i += 256u) {
+        mismatch = metadata.words[i] != expect;
+    }
+    if (mismatch) {
+        atomicOr(s_mismatch, 1u);
+    }
+    barrier();
+
+    int selected = -1;
+    if (s_mismatch == 0u) {
+        for (uint c = 0u; c < min(entry.candidate_count, 5u); c++) {
+            if (entry.codes[c] == code) {
+                selected = int(c);
+            }
+        }
+    }
+    if (selected >= 0) {
+        for (uint i = index; i < pc.words; i += 256u) {
+            metadata.words[i] = 0xffffffffu;
+        }
+    }
+    if (index == 0u) {
+        entry.draw[0] = selected >= 0 ? 3u : 0u;
+        entry.draw[1] = 1u;
+        entry.draw[2] = 0u;
+        entry.draw[3] = 0u;
+        if (selected >= 0) {
+            entry.color = entry.colors[selected];
+        }
+    }
+}

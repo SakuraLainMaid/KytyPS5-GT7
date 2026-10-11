@@ -1257,6 +1257,84 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 }
 
+bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc, uint32_t first,
+                                              uint32_t image_first, uint32_t count,
+                                              uint64_t slice_size) {
+	const auto& view = desc.view_info;
+	if (!GpuColorClearEnabled() || desc.type != BindingType::RenderTarget ||
+	    desc.info.samples != 1 || desc.info.IsVolume() || slice_size == 0 ||
+	    slice_size % sizeof(uint32_t) != 0 || slice_size / sizeof(uint32_t) > UINT32_MAX) {
+		return false;
+	}
+	// The values the metadata may hold a clear of (DecodeColorClear's codes).
+	std::vector<ConditionalColorClear::Candidate> candidates;
+	for (const uint8_t code: {uint8_t {0x00}, uint8_t {0x20}, uint8_t {0x40}, uint8_t {0x80},
+	                          uint8_t {0xc0}}) {
+		vk::ClearColorValue clear {};
+		if (DecodeColorClear(desc, code, clear)) {
+			ConditionalColorClear::Candidate candidate {.code = code};
+			std::memcpy(candidate.bits.data(), clear.uint32.data(), sizeof(candidate.bits));
+			candidates.push_back(candidate);
+		}
+	}
+	if (candidates.empty()) {
+		return true; // no code this target could be cleared with: nothing to check
+	}
+	{
+		std::scoped_lock lock {m_lock};
+		const auto&      image = m_slot_images[id];
+		if (image.backing.image == nullptr || image.backing.samples != 1 ||
+		    !(image.backing.usage & vk::ImageUsageFlagBits::eColorAttachment)) {
+			return false;
+		}
+	}
+	if (m_conditional_clear == nullptr) {
+		m_conditional_clear = std::make_unique<ConditionalColorClear>(m_graphics, m_scheduler);
+		LOGF("TextureCache: render-target fast clears are checked on the GPU "
+		     "(KYTY_GPU_COLOR_CLEAR=0 reads the metadata back)\n");
+	}
+	const auto& range = desc.info.metadata.range;
+	for (uint32_t slice = 0; slice < count; slice++) {
+		const auto address = range.address + slice_size * (first + slice);
+		// The GPU copy of the slice's keys (read and rewritten by the check), synchronized first.
+		const auto [buffer, offset] =
+		    m_buffer_cache.ObtainBuffer(address, slice_size, true, false, {}, true);
+		EXIT_IF(buffer == nullptr || !buffer->HasDeviceAddress());
+		std::scoped_lock lock {m_lock};
+		auto&            image = m_slot_images[id];
+		TrackImage(id);
+		if (image.IsBufferModified() || image.IsCpuDirty()) {
+			// Drawn over in part, if at all: the guest contents come first.
+			InitializeImage(id);
+		}
+		ImageViewInfo target {};
+		target.format      = view.format;
+		target.type        = vk::ImageViewType::e2D;
+		target.base_level  = view.base_level;
+		target.base_layer  = image_first + slice;
+		target.layer_count = 1;
+		target.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+		auto& command      = m_scheduler.Current();
+		command.EndRendering();
+		image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+		              vk::AccessFlagBits2::eColorAttachmentWrite |
+		                  vk::AccessFlagBits2::eColorAttachmentRead,
+		              {}, command.Recorder());
+		const vk::Extent2D extent {std::max(image.info.extent.width >> view.base_level, 1u),
+		                           std::max(image.info.extent.height >> view.base_level, 1u)};
+		m_conditional_clear->Record(command, buffer->BufferDeviceAddress() + offset,
+		                            static_cast<uint32_t>(slice_size / sizeof(uint32_t)),
+		                            candidates, image.FindView(target), view.format, extent);
+		CommitGpuWrite(image);
+	}
+	static std::atomic<uint64_t> checks {0};
+	const auto                   n = checks.fetch_add(count, std::memory_order_relaxed) + count;
+	if ((n & (n - 1)) == 0) {
+		LOGF("TextureCache: %" PRIu64 " render-target clears checked on the GPU\n", n);
+	}
+	return true;
+}
+
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
                                        uint32_t metadata_base_layer) {
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
@@ -1336,8 +1414,12 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		const char* value = std::getenv("KYTY_DCC_CLEAR_READBACK");
 		return value == nullptr || value[0] != '0';
 	}();
+	if (gpu_written && !known_fill &&
+	    MaterializeColorClearOnGpu(id, desc, first, image_first, count, range.size / layers)) {
+		return;
+	}
 	if (gpu_written && !known_fill) {
-		if (!readback) {
+		if (!readback && desc.type == BindingType::RenderTarget) {
 			return;
 		}
 		// Who keeps writing it (the first few ranges): the download drains the GPU each time.
