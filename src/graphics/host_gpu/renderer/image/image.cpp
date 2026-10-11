@@ -14,7 +14,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
+#include <list>
+#include <mutex>
+#include <unordered_map>
 #include <fmt/format.h>
 #include <xxhash.h>
 
@@ -729,6 +735,189 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 
 } // namespace ImageOps
 
+// Recycles the Vulkan images (and their views) of destroyed cache images for new ones of the same
+// shape. GT7 binds hundreds of short-lived images a frame (per-frame CPU-written tables at new
+// addresses, a light grid rebound with 8, 16, ... 48 layers), and the texture cache creates and
+// destroys each: vmaCreateImage and vmaDestroyImage took 7.7 of the GPU thread's 21 s at Tokyo
+// Expressway (70,000 of each, ~110 us a pair). A backing reaches the pool only once its image's
+// last tick is done (TextureCache::ReleaseImage), so the GPU no longer uses it; its contents are
+// undefined again, as a new image's are. Bounded by KYTY_IMAGE_POOL_MB (default 256, 0: off),
+// images of at most 16 MB, kept for at most 4 s.
+class ImageBackingPool {
+public:
+	struct Key {
+		vk::ImageCreateFlags flags;
+		vk::ImageType        type = vk::ImageType::e2D;
+		vk::Extent3D         extent;
+		uint32_t             levels  = 1;
+		uint32_t             layers  = 1;
+		vk::Format           format  = vk::Format::eUndefined;
+		vk::ImageUsageFlags  usage;
+		uint32_t             samples = 1;
+		bool operator==(const Key& other) const {
+			return flags == other.flags && type == other.type && extent == other.extent &&
+			       levels == other.levels && layers == other.layers && format == other.format &&
+			       usage == other.usage && samples == other.samples;
+		}
+	};
+	struct KeyHash {
+		size_t operator()(const Key& key) const {
+			uint64_t words[6] = {
+			    static_cast<uint64_t>(static_cast<VkImageCreateFlags>(key.flags)) |
+			        (static_cast<uint64_t>(key.type) << 32u),
+			    key.extent.width | (static_cast<uint64_t>(key.extent.height) << 32u),
+			    key.extent.depth | (static_cast<uint64_t>(key.levels) << 32u),
+			    key.layers | (static_cast<uint64_t>(key.format) << 32u),
+			    static_cast<uint64_t>(static_cast<VkImageUsageFlags>(key.usage)),
+			    key.samples};
+			return static_cast<size_t>(XXH3_64bits(words, sizeof(words)));
+		}
+	};
+
+	static ImageBackingPool& Get() {
+		// Never destroyed: images may still be released during static destruction.
+		static auto* pool = new ImageBackingPool;
+		return *pool;
+	}
+
+	static uint64_t Budget() {
+		static const uint64_t budget = [] {
+			const char* value = std::getenv("KYTY_IMAGE_POOL_MB");
+			return (value != nullptr ? std::strtoull(value, nullptr, 10) : 256ull) << 20u;
+		}();
+		return budget;
+	}
+
+	static Key KeyOf(const vk::ImageCreateInfo& create) {
+		return {create.flags,       create.imageType, create.extent,
+		        create.mipLevels,   create.arrayLayers, create.format,
+		        create.usage,       static_cast<uint32_t>(create.samples)};
+	}
+	static Key KeyOf(const VulkanImage& backing) {
+		return {backing.flags,      backing.image_type, backing.extent, backing.mip_levels,
+		        backing.layers,     backing.format,     backing.usage,  backing.samples};
+	}
+
+	// A pooled backing of this shape, with its views, or false.
+	bool Take(GraphicContext& graphics, const vk::ImageCreateInfo& create, VulkanImage& backing,
+	          std::vector<CachedImageView>& views) {
+		if (Budget() == 0) {
+			return false;
+		}
+		const auto      key = KeyOf(create);
+		std::lock_guard lock(m_mutex);
+		Trim(graphics, Now());
+		const auto found = m_index.find(key);
+		if (found == m_index.end() || found->second.empty()) {
+			m_misses++;
+			return false;
+		}
+		const auto entry = found->second.back();
+		found->second.pop_back();
+		backing.format     = create.format;
+		backing.image_type = create.imageType;
+		backing.extent     = create.extent;
+		backing.layers     = create.arrayLayers;
+		backing.mip_levels = create.mipLevels;
+		backing.samples    = static_cast<uint32_t>(create.samples);
+		backing.usage      = create.usage;
+		backing.flags      = create.flags;
+		backing.image      = entry->image;
+		backing.allocation = entry->allocation;
+		backing.state      = {};
+		backing.subresource_states.clear();
+		views = std::move(entry->views);
+		m_bytes -= entry->bytes;
+		m_entries.erase(entry);
+		Report();
+		return true;
+	}
+
+	// Takes the backing (and views) of a destroyed image, or leaves them to be destroyed.
+	bool Put(GraphicContext& graphics, VulkanImage& backing, std::vector<CachedImageView>& views) {
+		if (Budget() == 0 || backing.image == nullptr || backing.allocation == nullptr) {
+			return false;
+		}
+		VmaAllocationInfo allocation {};
+		vmaGetAllocationInfo(graphics.allocator, backing.allocation, &allocation);
+		VkMemoryPropertyFlags properties = 0;
+		vmaGetAllocationMemoryProperties(graphics.allocator, backing.allocation, &properties);
+		constexpr uint64_t MaxImageBytes = 16ull << 20u;
+		if (allocation.size == 0 || allocation.size > MaxImageBytes ||
+		    (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
+			return false; // a large or spilled image: freed, as before
+		}
+		std::lock_guard lock(m_mutex);
+		const auto      now = Now();
+		m_entries.push_back({KeyOf(backing), backing.image, backing.allocation, std::move(views),
+		                     allocation.size, now});
+		m_index[m_entries.back().key].push_back(std::prev(m_entries.end()));
+		m_bytes += allocation.size;
+		m_puts++;
+		backing.image      = nullptr;
+		backing.allocation = nullptr;
+		views.clear();
+		Trim(graphics, now);
+		return true;
+	}
+
+private:
+	struct Entry {
+		Key                          key;
+		vk::Image                    image      = nullptr;
+		VmaAllocation                allocation = nullptr;
+		std::vector<CachedImageView> views;
+		uint64_t                     bytes = 0;
+		std::chrono::steady_clock::time_point stamp;
+	};
+	using Entries = std::list<Entry>;
+
+	static std::chrono::steady_clock::time_point Now() { return std::chrono::steady_clock::now(); }
+
+	// Oldest first, while over budget or older than the keep time.
+	void Trim(GraphicContext& graphics, std::chrono::steady_clock::time_point now) {
+		constexpr auto Keep = std::chrono::seconds(4);
+		while (!m_entries.empty() &&
+		       (m_bytes > Budget() || now - m_entries.front().stamp > Keep)) {
+			auto  oldest = m_entries.begin();
+			auto& list   = m_index[oldest->key];
+			std::erase(list, oldest);
+			if (list.empty()) {
+				m_index.erase(oldest->key);
+			}
+			for (const auto& cached: oldest->views) {
+				if (cached.view != nullptr) {
+					graphics.device.destroyImageView(cached.view, nullptr);
+				}
+			}
+			VulkanImage doomed;
+			doomed.image      = oldest->image;
+			doomed.allocation = oldest->allocation;
+			graphics.DeleteImage(doomed);
+			m_bytes -= oldest->bytes;
+			m_entries.erase(oldest);
+			m_destroyed++;
+		}
+	}
+
+	void Report() {
+		if (++m_hits % 4096 == 1) {
+			LOGF("Image pool: %" PRIu64 " images reused, %" PRIu64 " created anew, %" PRIu64
+			     " destroyed; %zu kept (%" PRIu64 " MB)\n",
+			     m_hits, m_misses, m_destroyed, m_entries.size(), m_bytes >> 20u);
+		}
+	}
+
+	std::mutex                                                     m_mutex;
+	Entries                                                        m_entries; // oldest first
+	std::unordered_map<Key, std::vector<Entries::iterator>, KeyHash> m_index;
+	uint64_t                                                       m_bytes     = 0;
+	uint64_t                                                       m_hits      = 0;
+	uint64_t                                                       m_misses    = 0;
+	uint64_t                                                       m_puts      = 0;
+	uint64_t                                                       m_destroyed = 0;
+};
+
 Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info)
     : info(image_info),
       stencil_subresources {0, image_info.resources.levels, 0, image_info.resources.layers},
@@ -753,6 +942,9 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.usage         = ImageUsageFlags(graphics, info);
 	create.samples       = vulkan_sample_count(info.samples);
 
+	if (ImageBackingPool::Get().Take(graphics, create, backing, views)) {
+		return;
+	}
 	vk::ImageFormatProperties properties {};
 	if (graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
 	                                      create.usage, create.flags,
@@ -802,6 +994,9 @@ uint64_t Image::HashGuestEdges() const {
 
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
+	if (backing.image != nullptr && ImageBackingPool::Get().Put(m_graphics, backing, views)) {
+		return;
+	}
 	for (const auto& cached: views) {
 		if (cached.view != nullptr) {
 			m_graphics.device.destroyImageView(cached.view, nullptr);
