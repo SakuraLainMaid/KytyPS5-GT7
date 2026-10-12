@@ -170,6 +170,9 @@ struct ImageResource {
 	// material record, say). The shader looks the T# up in the runtime image table (set 1) and
 	// queries its size from the dwords themselves; one resource serves every such T#.
 	bool                          runtime = false;
+	// A storage image of a 16-bit float format: its stores clamp finite values beyond the format's
+	// range to the largest half (65504), as the guest GPU's conversion does (FloatStoreClamp).
+	bool                          clamp_half_float = false;
 	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;

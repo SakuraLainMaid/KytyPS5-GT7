@@ -1769,6 +1769,7 @@ struct GraphicsCase {
   bool pixel_depth_export = false;
   u32 pixel_perspective_centroid_vgpr = UINT32_MAX;
   u32 pixel_custom_interpolation_mask = 0;
+  u32 pixel_target_half_float_mask = 0;
 };
 
 struct CompiledShader {
@@ -2186,6 +2187,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   pixel_info.ps_system_input_base = 2;
   pixel_info.ps_perspective_centroid_vgpr = test.pixel_perspective_centroid_vgpr;
   pixel_info.custom_interpolation_mask = test.pixel_custom_interpolation_mask;
+  pixel_info.target_half_float_mask = test.pixel_target_half_float_mask;
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
     pixel_info.interpolator_settings[i] = i;
   }
@@ -38300,6 +38302,100 @@ void CheckResourcePlanHandoff() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// Half-float stores clamp beyond the half range to the largest half, as the guest GPU's
+// conversion does where the host's gives infinity (IR::FloatStoreClampEnabled): storage images of
+// a 16-bit float format, 32-bit exports to half-float targets and formatted buffer stores. Packed
+// unsigned float buffer stores encode the 11- and 10-bit floats.
+void CheckFloatStoreClamp() {
+  constexpr const char *name = "FloatStoreClamp";
+  using O = ShaderOpcode;
+  const std::string largest_half = "1199562752"; // 0x477fe000, 65504.0f
+  const auto disassemble = [&](const std::vector<u32> &spirv) {
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string text;
+    Require(name, "SPIR-V disassembly", tools.Disassemble(spirv, &text),
+            "failed to disassemble emitted SPIR-V");
+    return text;
+  };
+  const auto large_values = [](std::vector<u32> *code) {
+    for (u32 component = 0; component < 4; component++) {
+      AppendVMovLiteral(code, component, std::bit_cast<u32>(1.0e6f));
+    }
+  };
+  for (const bool half : {true, false}) {
+    TestCase test;
+    test.name = half ? "FloatStoreClampHalfImage" : "FloatStoreClampFloatImage";
+    AppendVMovU32(&test.code, 20, 0);
+    AppendVMovU32(&test.code, 21, 0);
+    large_values(&test.code);
+    test.code.push_back(EncodeMimg0(0x08, 0xf));
+    test.code.push_back(EncodeMimg1(0, 20));
+    AppendEnd(&test.code);
+    test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE, O::S_ENDPGM};
+    test.user_data = MakeStorageTextureData(half ? Prospero::BufferFormat::k16_16_16_16Float
+                                                 : Prospero::BufferFormat::k32_32_32_32Float);
+    test.has_user_data = true;
+    test.compile_only = true;
+    const auto compiled = CompileCase(test);
+    const auto *image = compiled.program.info.images.empty()
+                            ? nullptr
+                            : &compiled.program.info.images.front();
+    Require(name, half ? "half image" : "float image",
+            image != nullptr && image->clamp_half_float == half &&
+                (disassemble(compiled.spirv).find(largest_half) != std::string::npos) == half,
+            half ? "a store into a half-float storage image does not clamp to the half range"
+                 : "a store into a 32-bit float storage image clamps to the half range");
+  }
+  {
+    TestCase test;
+    test.name = "FloatStoreClampHalfBuffer";
+    large_values(&test.code);
+    AppendVMovU32(&test.code, 20, 0);
+    test.code.push_back(EncodeMubuf0(0x07u, 0, true, false));
+    test.code.push_back(EncodeMubuf1(0, 0, 20));
+    AppendEnd(&test.code);
+    test.initial = std::vector<u32>(2, 0u);
+    test.user_data = MakeStructuredStorageBufferData(
+        8, 1, false, BufferFormat(Prospero::BufferFormat::k16_16_16_16Float));
+    test.has_user_data = true;
+    test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
+    test.required_spirv = {"PackHalf2x16", largest_half};
+    (void)CompileCase(test);
+  }
+  {
+    TestCase test;
+    test.name = "FloatStoreClampPackedFloatBuffer";
+    large_values(&test.code);
+    AppendVMovU32(&test.code, 20, 0);
+    test.code.push_back(EncodeMubuf0(0x06u, 0, true, false));
+    test.code.push_back(EncodeMubuf1(0, 0, 20));
+    AppendEnd(&test.code);
+    test.initial = std::vector<u32>(1, 0u);
+    test.user_data = MakeStructuredStorageBufferData(
+        4, 1, false, BufferFormat(Prospero::BufferFormat::k11_11_10Float));
+    test.has_user_data = true;
+    test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZ, O::S_ENDPGM};
+    // The largest 11-bit (0x7bf) and 10-bit (0x3df) floats.
+    test.required_spirv = {" 1983", " 991"};
+    (void)CompileCase(test);
+  }
+  for (const bool half : {true, false}) {
+    GraphicsCase test;
+    test.name = half ? "FloatStoreClampHalfTarget" : "FloatStoreClampFloatTarget";
+    large_values(&test.fragment_code);
+    test.fragment_code.push_back(EncodeExp0(0x00, 0xf));
+    test.fragment_code.push_back(EncodeExp1(0, 1, 2, 3));
+    AppendEnd(&test.fragment_code);
+    test.pixel_target_half_float_mask = half ? 1u : 0u;
+    const auto compiled = CompileFragmentCase(test);
+    Require(name, half ? "half target" : "float target",
+            (disassemble(compiled.spirv).find(largest_half) != std::string::npos) == half,
+            half ? "a 32-bit export to a half-float target does not clamp to the half range"
+                 : "an export to a 32-bit float target clamps to the half range");
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckNativeImageDescriptorTypes() {
   using ShaderRecompiler::IR::DescriptorBindingKind;
   using ShaderRecompiler::IR::FirstImageBinding;
@@ -40589,6 +40685,7 @@ int main(int argc, char **argv) {
   CheckShaderFunctionTableCallInLoop();
   CheckShaderFunctionTableVariants();
   CheckShaderFunctionRuntimeRecords();
+  CheckFloatStoreClamp();
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());

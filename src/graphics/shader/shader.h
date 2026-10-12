@@ -194,6 +194,9 @@ struct ShaderPixelInputInfo {
 	uint8_t                                        target_output_mode[8]        = {};
 	uint32_t                                       target_uint_mask             = 0;
 	uint32_t                                       target_sint_mask             = 0;
+	// Targets of a 16-bit float format: their float outputs clamp to the half range first
+	// (IR::FloatStoreClampEnabled).
+	uint32_t                                       target_half_float_mask       = 0;
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint32_t                                       scratch_size_dwords          = 0;
 	bool                                           ps_pos_x                     = false;

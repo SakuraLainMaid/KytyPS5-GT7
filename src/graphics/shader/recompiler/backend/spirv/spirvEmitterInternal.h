@@ -538,6 +538,15 @@ uint32_t EmitSubConstantMinusU32(EmitterState& state, uint32_t constant, uint32_
 
 uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32);
 
+// A float bound for a 16-bit float format, the guest GPU's way: a finite value beyond the half
+// range becomes the largest half of its sign (D3D's conversion rounds toward zero), where the
+// host's conversion can give infinity. Infinity and NaN pass unchanged.
+uint32_t EmitClampToHalfRange(EmitterState& state, uint32_t f32);
+
+// A 32-bit float (its bits) as an unsigned 11-bit or 10-bit float (5-bit exponent), rounded
+// toward zero: beyond the range the largest value, negative values zero, infinity and NaN kept.
+uint32_t EmitF32ToUFloatBits(EmitterState& state, uint32_t f32_bits, uint32_t bits);
+
 uint32_t EmitMinMaxU32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
 
 uint32_t EmitMinMaxI32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);

@@ -84,6 +84,60 @@ uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
 	return EmitAndConstant(state, EmitSelectValueU32(state, exp_eq_255, special, finite2), 0xffffu);
 }
 
+uint32_t EmitClampToHalfRange(EmitterState& state, uint32_t f32) {
+	const auto bits      = EmitBitcastF32ToU32(state, f32);
+	const auto magnitude = EmitAndConstant(state, bits, 0x7fffffffu);
+	// 0x477fe000 is 65504, the largest half; 0x7f800000 and above are infinity and NaN.
+	const auto beyond = EmitLogicalAndBool(
+	    state, EmitCompareU32Constant(state, spv::OpUGreaterThan, magnitude, 0x477fe000u),
+	    EmitCompareU32Constant(state, spv::OpULessThan, magnitude, 0x7f800000u));
+	const auto largest = EmitOrU32(state, EmitAndConstant(state, bits, 0x80000000u),
+	                               ConstantU32(state, 0x477fe000u));
+	return EmitBitcastU32ToF32(state, EmitSelectValueU32(state, beyond, largest, bits));
+}
+
+uint32_t EmitF32ToUFloatBits(EmitterState& state, uint32_t f32_bits, uint32_t bits) {
+	const uint32_t mantissa_bits = bits == 11u ? 6u : 5u;
+	const uint32_t infinity      = 0x1fu << mantissa_bits;
+	const uint32_t largest       = infinity - 1u;
+	const auto     exponent =
+	    EmitAndConstant(state, EmitShiftRightConstant(state, f32_bits, 23), 0xffu);
+	const auto mantissa = EmitAndConstant(state, f32_bits, 0x007fffffu);
+	const auto negative =
+	    EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, f32_bits, 0x80000000u);
+	const auto special = EmitCompareU32Constant(state, spv::OpIEqual, exponent, 0xffu);
+	// NaN keeps a quiet NaN, +infinity stays infinity.
+	const auto nan = EmitCompareU32Constant(state, spv::OpINotEqual, mantissa, 0u);
+	const auto special_bits =
+	    EmitSelectValueU32(state, nan, ConstantU32(state, infinity | (1u << (mantissa_bits - 1u))),
+	                       ConstantU32(state, infinity));
+	// Normal: the exponent rebiased from 127 to 15, the mantissa truncated (toward zero).
+	const auto small_exponent =
+	    Binary(state, spv::OpISub, TypeU32(state), exponent, ConstantU32(state, 127u - 15u));
+	const auto normal = EmitOrU32(state,
+	                              Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+	                                     small_exponent, ConstantU32(state, mantissa_bits)),
+	                              EmitShiftRightConstant(state, mantissa, 23u - mantissa_bits));
+	// Denormal (small exponent 0 or below): the mantissa with its hidden bit, shifted down by
+	// 24 - mantissa_bits - small exponent, i.e. 136 - mantissa_bits - exponent (under 32).
+	const auto with_hidden = EmitOrU32(state, mantissa, ConstantU32(state, 0x00800000u));
+	const auto shift       = EmitSubConstantMinusU32(state, 136u - mantissa_bits, exponent);
+	const auto denormal    = EmitSelectValueU32(
+        state, EmitCompareU32Constant(state, spv::OpULessThan, exponent, 105u - mantissa_bits),
+        ConstantU32(state, 0u),
+        Binary(state, spv::OpShiftRightLogical, TypeU32(state), with_hidden, shift));
+	const auto finite = EmitSelectValueU32(
+	    state, EmitCompareU32Constant(state, spv::OpULessThanEqual, exponent, 127u - 15u), denormal,
+	    EmitSelectValueU32(
+	        state, EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, exponent, 127u + 16u),
+	        ConstantU32(state, largest), normal));
+	const auto magnitude = EmitSelectValueU32(state, special, special_bits, finite);
+	// Negative values, -infinity included, become zero; a negative NaN stays NaN.
+	const auto negative_number = EmitLogicalAndBool(
+	    state, negative, EmitLogicalNotBool(state, EmitLogicalAndBool(state, special, nan)));
+	return EmitSelectValueU32(state, negative_number, ConstantU32(state, 0u), magnitude);
+}
+
 uint32_t EmitMinMaxU32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
 	const auto cond = state.builder.AllocateId();
 	const auto ret  = state.builder.AllocateId();

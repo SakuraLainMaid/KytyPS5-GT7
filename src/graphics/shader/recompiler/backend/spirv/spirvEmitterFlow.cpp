@@ -553,6 +553,22 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                         : sint_output ? TypeI32Vector(state, 4)
 		                                       : TypeF32Vector(state, 4);
 		auto       value       = ExportVector(ctx, data, exp, uint_output || sint_output);
+		if (mrt && !uint_output && !sint_output && !exp.compr &&
+		    (state.input_info.pixel->target_half_float_mask & (1u << exp.index)) != 0) {
+			// A 32-bit export to a half-float target: beyond the half range, the largest half (as
+			// the guest GPU's conversion), not the infinity the host's can give. Packed half
+			// exports are in range already.
+			uint32_t components[4] {};
+			for (uint32_t component = 0; component < 4u; component++) {
+				const auto scalar = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), scalar, value,
+				                          component);
+				components[component] = EmitClampToHalfRange(state, scalar);
+			}
+			value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeConstruct, vector_type, value, components[0],
+			                          components[1], components[2], components[3]);
+		}
 		if (sint_output) {
 			const auto signed_value = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpBitcast, vector_type, signed_value, value);

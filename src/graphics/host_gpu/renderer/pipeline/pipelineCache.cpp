@@ -2279,6 +2279,15 @@ bool PipelineCache::DescribeGraphicsStages(
 		}
 	}
 	if (pixel_active) {
+		static std::once_flag float_store_logged;
+		std::call_once(float_store_logged, [] {
+			const char* mode = ShaderRecompiler::IR::FloatStoreClampEnabled()
+			                       ? "beyond the half range, the largest half, as the guest GPU "
+			                         "(KYTY_FLOAT_STORE_CLAMP=0 leaves the host's conversion)"
+			                       : "the host's conversion (KYTY_FLOAT_STORE_CLAMP=0)";
+			::printf("Half-float stores: %s\n", mode);
+			LOGF("Half-float stores: %s\n", mode);
+		});
 		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
 		// SPI_SHADER_COL_FORMAT describes export packing, not the attachment numeric type.
 		// In particular, 32-bit exports can carry raw integer material data.
@@ -2292,6 +2301,12 @@ bool PipelineCache::DescribeGraphicsStages(
 				pixel_info.target_uint_mask |= 1u << slot;
 			} else if (rt.info.channel_type == Prospero::ChannelType::kSInt) {
 				pixel_info.target_sint_mask |= 1u << slot;
+			} else if (rt.info.channel_type == Prospero::ChannelType::kFloat &&
+			           (rt.info.format == Prospero::ChannelLayout::k16 ||
+			            rt.info.format == Prospero::ChannelLayout::k16_16 ||
+			            rt.info.format == Prospero::ChannelLayout::k16_16_16_16) &&
+			           ShaderRecompiler::IR::FloatStoreClampEnabled()) {
+				pixel_info.target_half_float_mask |= 1u << slot;
 			}
 		}
 		const auto& blend = context.GetBlendControl(0);
@@ -2335,6 +2350,8 @@ bool PipelineCache::DescribeGraphicsStages(
 			    (pixel_info.target_uint_mask & ~2u) | ((pixel_info.target_uint_mask & 1u) << 1u);
 			pixel_info.target_sint_mask =
 			    (pixel_info.target_sint_mask & ~2u) | ((pixel_info.target_sint_mask & 1u) << 1u);
+			pixel_info.target_half_float_mask = (pixel_info.target_half_float_mask & ~2u) |
+			                                    ((pixel_info.target_half_float_mask & 1u) << 1u);
 		}
 	}
 	if (context.GetClipControl().clip_disable) {

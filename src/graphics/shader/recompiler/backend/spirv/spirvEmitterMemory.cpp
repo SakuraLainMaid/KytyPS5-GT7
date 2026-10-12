@@ -2,6 +2,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <algorithm>
 #include <bit>
@@ -747,9 +748,18 @@ uint32_t EncodeFormattedStoreComponent(ValueEmitContext& ctx,
 		return is_signed ? Unary(state, spv::OpBitcast, TypeU32(state), value) : value;
 	}
 	if (bits == 16u && info.type == Format::ComponentType::Float) {
-		const auto pair = EmitCompositeConstructF32x2(
-		    state, EmitBitCastF32U32(state, data), ConstantF32Value(state, 0.0f));
+		// Beyond the half range the guest GPU stores the largest half (D3D's conversion), where
+		// packHalf2x16 overflows to infinity.
+		auto value = EmitBitCastF32U32(state, data);
+		if (IR::FloatStoreClampEnabled()) {
+			value = EmitClampToHalfRange(state, value);
+		}
+		const auto pair = EmitCompositeConstructF32x2(state, value, ConstantF32Value(state, 0.0f));
 		return EmitPackHalf2x16(state, pair);
+	}
+	if ((bits == 11u || bits == 10u) && info.type == Format::ComponentType::Float) {
+		// Packed unsigned floats (11_11_10, 10_11_11): encoded, not the float's low bits.
+		return EmitF32ToUFloatBits(state, data, bits);
 	}
 	return data;
 }

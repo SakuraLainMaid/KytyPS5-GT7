@@ -662,6 +662,12 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			if (raw_sint_storage || base.atomic) {
 				image.numeric_class = Prospero::TextureNumericClass::Uint;
 			}
+			image.clamp_half_float =
+			    FloatStoreClampEnabled() && base.written && !base.atomic &&
+			    image.numeric_class == Prospero::TextureNumericClass::Float &&
+			    (format == Prospero::BufferFormat::k16Float ||
+			     format == Prospero::BufferFormat::k16_16Float ||
+			     format == Prospero::BufferFormat::k16_16_16_16Float);
 		} else if (image.numeric_class == Prospero::TextureNumericClass::Unsupported ||
 		           (base.depth_compare &&
 		            image.numeric_class != Prospero::TextureNumericClass::Float)) {
@@ -1732,6 +1738,7 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 		    .cube                       = image.cube,
 		    .bindless                   = image.bindless,
 		    .runtime                    = image.runtime,
+		    .clamp_half_float           = image.clamp_half_float,
 		};
 		const auto* source = Source(program, image.source);
 		if (source == nullptr) {
@@ -2000,6 +2007,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.bindless                   = source.bindless;
 		image.runtime                    = source.runtime;
+		image.clamp_half_float           = source.clamp_half_float;
 		image.cube                       = source.cube;
 		image.indirect_resources.clear();
 	}
@@ -2174,6 +2182,14 @@ bool WriteBitmapEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_WRITE_BITMAP");
 		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+bool FloatStoreClampEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FLOAT_STORE_CLAMP");
+		return value == nullptr || value[0] != '0';
 	}();
 	return enabled;
 }

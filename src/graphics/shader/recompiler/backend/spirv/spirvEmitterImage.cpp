@@ -815,6 +815,10 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 		                    : mem.data_bits == 16u
 		                        ? EmitF16BitsToF32(ctx.state, raw)
 		                        : Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), raw);
+		if (!integer && mem.data_bits != 16u &&
+		    ctx.state.program.info.images[mem.resource].clamp_half_float) {
+			values[component] = EmitClampToHalfRange(ctx.state, values[component]);
+		}
 	}
 	const auto texel = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(spv::OpCompositeConstruct,

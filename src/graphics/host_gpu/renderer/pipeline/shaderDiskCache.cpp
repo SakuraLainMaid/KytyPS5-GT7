@@ -123,6 +123,7 @@ void Visit(Io& io, T& v) {
 	io(v.indirect_search_iterations);
 	io(v.bindless);
 	io(v.runtime);
+	io(v.clamp_half_float);
 	io(v.indirect_resources);
 }
 
@@ -326,6 +327,7 @@ void Visit(Io& io, T& v) {
 	io(v.fmask_fragments);
 	io(v.bindless);
 	io(v.runtime);
+	io(v.clamp_half_float);
 }
 
 template <typename Io, typename T>
@@ -767,7 +769,8 @@ void AppendInputKey(ByteWriter& key, const ShaderPixelInputInfo& info) {
 	}
 	for (const auto value: {info.wave_size, info.ps_system_input_base, info.custom_interpolation_mask,
 	                        info.ps_perspective_center_vgpr, info.ps_perspective_centroid_vgpr,
-	                        info.target_uint_mask, info.target_sint_mask, info.scratch_size_dwords}) {
+	                        info.target_uint_mask, info.target_sint_mask,
+	                        info.target_half_float_mask, info.scratch_size_dwords}) {
 		key.Put(value);
 	}
 	for (const auto mode: info.target_output_mode) {

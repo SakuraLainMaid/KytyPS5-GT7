@@ -39,6 +39,7 @@ struct ResourceSpecialization {
 		uint8_t                       fmask_fragments            = 0;
 		bool                          bindless                   = false;
 		bool                          runtime                        = false;
+		bool                          clamp_half_float               = false;
 		bool                          operator==(const Image&) const = default;
 	};
 
@@ -57,6 +58,14 @@ struct ResourceSpecialization {
 
 // KYTY_WRITE_BITMAP=1 (ResourceSpecialization::Buffer::write_tracked).
 [[nodiscard]] bool WriteBitmapEnabled();
+
+// The guest GPU converts a float to a smaller float format the D3D way, rounding toward zero: a
+// finite value beyond the format's range becomes its largest value. Vulkan's conversion to a
+// 16-bit float (NVIDIA's) gives infinity instead, which one bright pixel spreads over a frame
+// through bloom and exposure. On by default, the shaders clamp such values first (half-float
+// render targets and storage images, formatted buffer stores); KYTY_FLOAT_STORE_CLAMP=0 turns it
+// off.
+[[nodiscard]] bool FloatStoreClampEnabled();
 
 // Extracts the descriptor/SRT value graph before resource specialization. The returned plan owns
 // its values and is independent of the translated shader CFG.
