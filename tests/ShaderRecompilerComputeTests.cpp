@@ -1439,6 +1439,10 @@ void CheckShaderFunctionTableCallInLoop() {
 // (ReportShaderCallMiss), and its miss trap names the target pair.
 void CheckShaderFunctionTableVariants() {
   constexpr const char *name = "ShaderFunctionTableVariants";
+  // The specialized expansion (KYTY_CALL_RUNTIME_RECORDS=0); CheckShaderFunctionRuntimeRecords
+  // covers the default.
+  const bool runtime_records = ShaderRecompiler::Decoder::ShaderCallRuntimeRecords();
+  ShaderRecompiler::Decoder::SetShaderCallRuntimeRecords(false);
   constexpr uint64_t callee_a = 0x10000000ull;
   constexpr uint64_t srt = 0x20000000ull;
   constexpr uint64_t table = 0x20000100ull;
@@ -1599,6 +1603,90 @@ void CheckShaderFunctionTableVariants() {
                        reason, 64, sets_hash, &summary);
   Require(name, "later sets share one program", ok && expanded == dropped,
           "a later set of specialized table data expanded to new code");
+  ShaderRecompiler::Decoder::SetShaderCallRuntimeRecords(runtime_records);
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// The default for GT7's material tables: each target function is inlined once and the record
+// pointer stays a register, so records that change (the garage reallocating them, race
+// materials every frame) keep one program, and a table of more records than the variant bound
+// still inlines every function.
+void CheckShaderFunctionRuntimeRecords() {
+  constexpr const char *name = "ShaderFunctionRuntimeRecords";
+  const bool runtime_records = ShaderRecompiler::Decoder::ShaderCallRuntimeRecords();
+  ShaderRecompiler::Decoder::SetShaderCallRuntimeRecords(true);
+  constexpr uint64_t callee_a = 0x10000000ull;
+  constexpr uint64_t callee_b = 0x10000100ull;
+  constexpr uint64_t srt = 0x20000000ull;
+  constexpr uint64_t table = 0x20000100ull;
+  std::map<uint64_t, u32> memory;
+  const auto store = [&](uint64_t address, std::initializer_list<u32> words) {
+    for (const auto word : words) {
+      memory[address] = word;
+      address += 4;
+    }
+  };
+  store(callee_a, {EncodeVop1(0x01u, 0, InlineU32(1)), EncodeSop1(0x20u, 0, 14)});
+  store(callee_b, {EncodeVop1(0x01u, 1, InlineU32(2)), EncodeSop1(0x20u, 0, 14)});
+  const auto fill_records = [&](u32 entries, u32 data) {
+    store(srt + 0x40, {u32(table), u32(table >> 32u), entries * 16u, 0u});
+    for (u32 e = 0; e < entries; ++e) {
+      const uint64_t target = (e % 2u) != 0u ? callee_b : callee_a;
+      store(table + e * 16u, {u32(target), u32(target >> 32u), data + e * 0x100u, 0x7u});
+    }
+  };
+  const ShaderRecompiler::Decoder::ShaderCodeReader read = [&](uint64_t address,
+                                                               std::span<uint32_t> words) {
+    for (size_t i = 0; i < words.size(); i++) {
+      const auto it = memory.find(address + i * 4u);
+      words[i] = it != memory.end() ? it->second : 0xbf810000u;
+    }
+    return true;
+  };
+  std::vector<u32> code{
+      EncodeSmem0(0x02u, 8, 0), EncodeSmem1(0x40u, 125), // s_load_dwordx4 s[8:11], s[0:1], 0x40
+      EncodeSMovB32(12, InlineU32(0)),                   // s_mov_b32 s12, 0
+      EncodeSopp(0x0cu, 0),                              // s_waitcnt
+      EncodeSop2(0x1eu, 13, 12, InlineU32(4)),           // s_lshl_b32 s13, s12, 4
+      EncodeSmem0(0x0au, 16, 4), EncodeSmem1(0, 13),     // s_buffer_load_dwordx4 s[16:19], s[8:11], s13
+      EncodeSopp(0x0cu, 0),                              // s_waitcnt
+      EncodeSMovB32(14, 16),                             // s_mov_b32 s14, s16
+      EncodeSMovB32(15, 17),                             // s_mov_b32 s15, s17
+      EncodeSMovB32(16, 18),                             // s_mov_b32 s16, s18
+      EncodeSMovB32(17, 19),                             // s_mov_b32 s17, s19
+      EncodeSop1(0x21u, 14, 14),                         // s_swappc_b64 s[14:15], s[14:15]
+      EncodeSop2(0x00u, 12, 12, InlineU32(1)),           // s_add_u32 s12, s12, 1
+      EncodeSopc(0x0au, 12, InlineU32(2)),               // s_cmp_lt_u32 s12, 2
+  };
+  const auto branch_word = static_cast<int32_t>(code.size());
+  code.push_back(EncodeSopp(0x05u, static_cast<u32>(4 - (branch_word + 1)) & 0xffffu));
+  AppendEnd(&code);
+  const std::array<u32, 2> user_data{u32(srt), u32(srt >> 32u)};
+  const auto count = [](const std::vector<u32> &words, u32 word) {
+    return std::count(words.begin(), words.end(), word);
+  };
+  const u32 body_a = EncodeVop1(0x01u, 0, InlineU32(1));
+  const u32 body_b = EncodeVop1(0x01u, 1, InlineU32(2));
+  const u32 move_s16 = 0xbe8003ffu | (16u << 16u);
+  ShaderRecompiler::Decoder::ShaderFunctionExpander expander;
+  std::string reason;
+  std::string summary;
+  std::vector<u32> expanded;
+  const uint64_t hash = 0x7ab1e8ull;
+  fill_records(300, 0x7000u);
+  bool ok = expander.Expand(code, reinterpret_cast<uint64_t>(code.data()), user_data, read,
+                            expanded, reason, 64, hash, &summary);
+  const auto first = expanded;
+  Require(name, "each function once",
+          ok && count(expanded, body_a) == 1 && count(expanded, body_b) == 1 &&
+              count(expanded, move_s16) == 0 && count(expanded, 0x7000u) == 0,
+          "a table of 300 records did not inline each of its two functions once, unspecialized");
+  fill_records(300, 0x9000u);
+  ok = expander.Expand(code, reinterpret_cast<uint64_t>(code.data()), user_data, read, expanded,
+                       reason, 64, hash, &summary);
+  Require(name, "new records, same program", ok && expanded == first,
+          "records with new data expanded to new code");
+  ShaderRecompiler::Decoder::SetShaderCallRuntimeRecords(runtime_records);
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -40500,6 +40588,7 @@ int main(int argc, char **argv) {
   CheckShaderFunctionExpansionCache();
   CheckShaderFunctionTableCallInLoop();
   CheckShaderFunctionTableVariants();
+  CheckShaderFunctionRuntimeRecords();
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());

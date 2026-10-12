@@ -160,22 +160,28 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 	// A device without update-after-bind samplers still gets a one-entry array, holding the
 	// default sampler, so every bindless pipeline sees the same layout.
 	m_samplers_per_array = std::min(MaxSamplers, graphics.bindless_max_samplers);
-	const std::array<vk::DescriptorSetLayoutBinding, 7> bindings {{
-	    {Images2D, vk::DescriptorType::eSampledImage, m_images_per_array, vk::ShaderStageFlagBits::eAll,
-	     nullptr},
+	const std::array<vk::DescriptorSetLayoutBinding, 9> bindings {{
+	    {Images2D, vk::DescriptorType::eSampledImage, m_images_per_array,
+	     vk::ShaderStageFlagBits::eAll, nullptr},
 	    {Images2DArray, vk::DescriptorType::eSampledImage, m_images_per_array,
 	     vk::ShaderStageFlagBits::eAll, nullptr},
 	    {ImagesCube, vk::DescriptorType::eSampledImage, m_images_per_array,
 	     vk::ShaderStageFlagBits::eAll, nullptr},
-	    {Images3D, vk::DescriptorType::eSampledImage, m_images_per_array, vk::ShaderStageFlagBits::eAll,
+	    {Images3D, vk::DescriptorType::eSampledImage, m_images_per_array,
+	     vk::ShaderStageFlagBits::eAll, nullptr},
+	    {Translation, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eAll,
 	     nullptr},
-	    {Translation, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eAll, nullptr},
 	    {Feedback, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eAll, nullptr},
 	    {Samplers, vk::DescriptorType::eSampler, std::max(m_samplers_per_array, 1u),
 	     vk::ShaderStageFlagBits::eAll, nullptr},
+	    {RuntimeTable, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eAll,
+	     nullptr},
+	    {RuntimeRequests, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eAll,
+	     nullptr},
 	}};
-	const std::array<vk::DescriptorBindingFlags, 7> binding_flags {
-	    image_flags, image_flags, image_flags, image_flags, buffer_flags, buffer_flags, image_flags};
+	const std::array<vk::DescriptorBindingFlags, 9>     binding_flags {
+        image_flags,  image_flags, image_flags,  image_flags, buffer_flags,
+        buffer_flags, image_flags, buffer_flags, buffer_flags};
 	vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_info {};
 	flags_info.bindingCount  = static_cast<uint32_t>(binding_flags.size());
 	flags_info.pBindingFlags = binding_flags.data();
@@ -189,7 +195,7 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 
 	const std::array<vk::DescriptorPoolSize, 3> sizes {{
 	    {vk::DescriptorType::eSampledImage, m_images_per_array * ImageArrays},
-	    {vk::DescriptorType::eStorageBuffer, 2},
+	    {vk::DescriptorType::eStorageBuffer, 4},
 	    {vk::DescriptorType::eSampler, std::max(m_samplers_per_array, 1u)},
 	}};
 	vk::DescriptorPoolCreateInfo pool_info {};
@@ -224,15 +230,42 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 	m_feedback_snapshot->Flush(0, m_feedback_snapshot->Size());
 	SetVulkanObjectNameF(graphics.device, m_translation->Handle(), "Bindless Translation");
 	SetVulkanObjectNameF(graphics.device, m_feedback->Handle(), "Bindless Feedback");
+	// Runtime images: the host writes the table; shaders write requests, which the host reads
+	// from a snapshot as it does the feedback flags.
+	using namespace ShaderRecompiler::IR;
+	constexpr vk::DeviceSize runtime_table_bytes =
+	    vk::DeviceSize {RuntimeImageEntries} * RuntimeImageEntryWords * sizeof(uint32_t);
+	constexpr vk::DeviceSize runtime_requests_bytes =
+	    vk::DeviceSize {RuntimeImageRequestBufferWords} * sizeof(uint32_t);
+	m_runtime_table    = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Stream, 0,
+	                                              AllFlags, runtime_table_bytes);
+	m_runtime_requests = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Stream, 0,
+	                                              AllFlags, runtime_requests_bytes);
+	m_runtime_requests_snapshot = std::make_unique<Buffer>(
+	    graphics, scheduler, MemoryUsage::Download, 0, AllFlags, runtime_requests_bytes);
+	EXIT_IF(m_runtime_table->Mapped().empty() || m_runtime_requests->Mapped().empty() ||
+	        m_runtime_requests_snapshot->Mapped().empty());
+	for (auto* buffer:
+	     {m_runtime_table.get(), m_runtime_requests.get(), m_runtime_requests_snapshot.get()}) {
+		std::fill(buffer->Mapped().begin(), buffer->Mapped().end(), uint8_t {0});
+		buffer->Flush(0, buffer->Size());
+	}
+	SetVulkanObjectNameF(graphics.device, m_runtime_table->Handle(), "Bindless Runtime Table");
+	SetVulkanObjectNameF(graphics.device, m_runtime_requests->Handle(),
+	                     "Bindless Runtime Requests");
 
-	const std::array<vk::DescriptorBufferInfo, 2> buffer_infos {{
+	const std::array<vk::DescriptorBufferInfo, 4> buffer_infos {{
 	    {m_translation->Handle(), 0, VK_WHOLE_SIZE},
 	    {m_feedback->Handle(), 0, VK_WHOLE_SIZE},
+	    {m_runtime_table->Handle(), 0, VK_WHOLE_SIZE},
+	    {m_runtime_requests->Handle(), 0, VK_WHOLE_SIZE},
 	}};
-	std::array<vk::WriteDescriptorSet, 2> writes {};
+	constexpr std::array<uint32_t, 4>     buffer_bindings {Translation, Feedback, RuntimeTable,
+                                                       RuntimeRequests};
+	std::array<vk::WriteDescriptorSet, 4> writes {};
 	for (uint32_t i = 0; i < writes.size(); i++) {
 		writes[i].dstSet          = m_set;
-		writes[i].dstBinding      = Translation + i;
+		writes[i].dstBinding      = buffer_bindings[i];
 		writes[i].descriptorCount = 1;
 		writes[i].descriptorType  = vk::DescriptorType::eStorageBuffer;
 		writes[i].pBufferInfo     = &buffer_infos[i];
@@ -240,6 +273,31 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 	graphics.device.updateDescriptorSets(static_cast<uint32_t>(writes.size()), writes.data(), 0,
 	                                     nullptr);
 	CreatePlaceholders(scheduler);
+	// Before guest heaps take the translation buffer (they grow by moving, never freeing).
+	for (uint32_t binding = 0; binding < ImageArrays; binding++) {
+		auto& heap                   = m_heaps.emplace_back();
+		heap.base                    = 0;
+		heap.table_offset            = 0xfffffff0u + binding; // no guest heap matches it
+		heap.table_stride            = 32;
+		heap.binding                 = binding;
+		heap.runtime                 = true;
+		heap.eager_complete          = true;
+		heap.resource.resource_class = ImageResourceClass::Sampled;
+		heap.resource.numeric_class  = Prospero::TextureNumericClass::Float;
+		using ShaderRecompiler::Decoder::ImageDimension;
+		heap.resource.dimension = binding == Images3D        ? ImageDimension::Dim3D
+		                          : binding == Images2DArray ? ImageDimension::Dim2DArray
+		                                                     : ImageDimension::Dim2D;
+		heap.resource.cube      = binding == ImagesCube;
+		heap.resource.read      = true;
+		heap.resource.bindless  = true;
+		heap.resource.runtime   = true;
+		if (AllocateRegion(heap, RuntimeKeys)) {
+			m_runtime_heaps[binding] = &heap;
+		} else {
+			m_heaps.pop_back();
+		}
+	}
 	graphics.bindless_layout = m_layout;
 	graphics.bindless_set    = m_set;
 	LOGF("Bindless table: %u images per array, %u translation entries, %u samplers\n",
@@ -496,6 +554,9 @@ BindlessTable::~BindlessTable() {
 	m_translation.reset();
 	m_feedback.reset();
 	m_feedback_snapshot.reset();
+	m_runtime_table.reset();
+	m_runtime_requests.reset();
+	m_runtime_requests_snapshot.reset();
 	if (m_pool != nullptr) {
 		m_graphics.device.destroyDescriptorPool(m_pool, nullptr);
 	}
@@ -521,6 +582,9 @@ bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
 	heap.stale.resize(capacity, 0u);
 	heap.descriptors.resize(capacity);
 	heap.images.resize(capacity);
+	if (heap.runtime) {
+		heap.runtime_dwords.resize(capacity);
+	}
 	auto* translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
 	auto* feedback    = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
 	for (uint32_t key = 0; key < capacity; key++) {
@@ -702,18 +766,30 @@ void BindlessTable::RecordFeedbackSnapshot(CommandScheduler& scheduler) {
 	flags_written.buffer              = m_feedback->Handle();
 	flags_written.offset              = 0;
 	flags_written.size                = size;
+	auto requests_written             = flags_written;
+	requests_written.buffer           = m_runtime_requests->Handle();
+	requests_written.size             = VK_WHOLE_SIZE;
+	const std::array<vk::BufferMemoryBarrier, 2> written {flags_written, requests_written};
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1,
-	                        &flags_written, 0, nullptr);
+	                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr,
+	                        static_cast<uint32_t>(written.size()), written.data(), 0, nullptr);
 	const vk::BufferCopy copy {0, 0, size};
 	command.copyBuffer(m_feedback->Handle(), m_feedback_snapshot->Handle(), 1, &copy);
+	const vk::BufferCopy requests_copy {0, 0, m_runtime_requests->Size()};
+	command.copyBuffer(m_runtime_requests->Handle(), m_runtime_requests_snapshot->Handle(), 1,
+	                   &requests_copy);
 	auto snapshot_written          = flags_written;
 	snapshot_written.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 	snapshot_written.dstAccessMask = vk::AccessFlagBits::eHostRead;
 	snapshot_written.buffer        = m_feedback_snapshot->Handle();
-	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
-	                        &snapshot_written, 0, nullptr);
+	auto requests_snapshot_written   = snapshot_written;
+	requests_snapshot_written.buffer = m_runtime_requests_snapshot->Handle();
+	requests_snapshot_written.size   = VK_WHOLE_SIZE;
+	const std::array<vk::BufferMemoryBarrier, 2> snapshots {snapshot_written,
+	                                                        requests_snapshot_written};
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+	                        {}, 0, nullptr, static_cast<uint32_t>(snapshots.size()),
+	                        snapshots.data(), 0, nullptr);
 	m_snapshot_tick = scheduler.CurrentTick();
 }
 
@@ -834,6 +910,97 @@ bool BindlessTable::ReleaseKey(Heap& heap, uint32_t key) {
 	heap.images[key]  = {};
 	SetTranslation(heap, key, ShaderRecompiler::IR::BindlessPending);
 	return no_refs;
+}
+
+void BindlessTable::TakeRuntimeRequests(
+    std::vector<std::pair<std::array<uint32_t, 8>, uint32_t>>& requests) {
+	using namespace ShaderRecompiler::IR;
+	const auto* snapshot =
+	    reinterpret_cast<const uint32_t*>(m_runtime_requests_snapshot->Mapped().data());
+	auto* live = reinterpret_cast<uint32_t*>(m_runtime_requests->Mapped().data());
+	m_runtime_requests_snapshot->Invalidate(0, m_runtime_requests_snapshot->Size());
+	const auto count = std::min(snapshot[0], RuntimeImageRequests);
+	if (snapshot[0] == 0u) {
+		return;
+	}
+	for (uint32_t index = 0; index < count; index++) {
+		const auto* record  = snapshot + RuntimeImageRingOffset + index * RuntimeImageRequestWords;
+		const auto  binding = record[8];
+		if (binding == 0u || binding > ImageArrays) {
+			continue; // not written yet when the snapshot was taken
+		}
+		std::array<uint32_t, 8> dwords {};
+		std::copy_n(record, 8, dwords.begin());
+		requests.emplace_back(dwords, binding - 1u);
+	}
+	// Cleared for the next frame's requests. A request the GPU makes meanwhile may be lost; the
+	// T# is still missing from the table, so the shader asks again.
+	live[0] = 0;
+	std::fill_n(live + RuntimeImageBitsOffset, RuntimeImageEntries / 32u, 0u);
+	for (uint32_t index = 0; index < count; index++) {
+		live[RuntimeImageRingOffset + index * RuntimeImageRequestWords + 8u] = 0;
+	}
+	m_runtime_requests->Flush(0, m_runtime_requests->Size());
+}
+
+void BindlessTable::PublishRuntimeEntry(const Heap& heap, uint32_t key,
+                                        const std::array<uint32_t, 8>& dwords) {
+	using namespace ShaderRecompiler::IR;
+	auto*          table  = reinterpret_cast<uint32_t*>(m_runtime_table->Mapped().data());
+	const uint32_t target = heap.region + key + 1u;
+	const auto     home   = RuntimeImageHash(dwords.data(), heap.binding);
+	uint32_t       chosen = UINT32_MAX;
+	for (uint32_t probe = 0; probe < RuntimeImageProbes; probe++) {
+		const auto  entry = (home + probe) & (RuntimeImageEntries - 1u);
+		const auto* words = table + entry * RuntimeImageEntryWords;
+		if (words[8] == target && words[9] == heap.binding &&
+		    std::equal(dwords.begin(), dwords.end(), words)) {
+			return;
+		}
+		if (words[8] == 0u && chosen == UINT32_MAX) {
+			chosen = entry;
+		}
+	}
+	if (chosen == UINT32_MAX) {
+		// Every probe holds another T#: it is evicted, and asks again when sampled.
+		chosen = (home + RuntimeImageProbes - 1u) & (RuntimeImageEntries - 1u);
+		static std::atomic<uint32_t> evicted = 0;
+		if (evicted.fetch_add(1) < 16) {
+			LOGF("Bindless runtime images: table entry %u evicted\n", chosen);
+		}
+	}
+	auto* words = table + chosen * RuntimeImageEntryWords;
+	words[8]    = 0; // a shader reading the entry meanwhile misses it
+	std::copy(dwords.begin(), dwords.end(), words);
+	words[9] = heap.binding;
+	words[8] = target;
+	if (!m_runtime_table->IsCoherent()) {
+		m_runtime_table->Flush(vk::DeviceSize {chosen} * RuntimeImageEntryWords * sizeof(uint32_t),
+		                       RuntimeImageEntryWords * sizeof(uint32_t));
+	}
+}
+
+uint32_t BindlessTable::RuntimeKey(Heap& heap, const std::array<uint32_t, 8>& dwords) {
+	const auto map_key = std::pair {heap.binding, dwords};
+	if (const auto found = m_runtime_keys.find(map_key); found != m_runtime_keys.end()) {
+		PublishRuntimeEntry(heap, found->second, dwords); // evicted from the table meanwhile
+		return found->second;
+	}
+	if (heap.runtime_next_key >= heap.entries) {
+		static std::atomic<uint32_t> reported = 0;
+		if (reported.fetch_add(1) < 4) {
+			LOGF("Bindless runtime images: binding %u holds %u T#s; further ones sample the "
+			     "placeholder\n",
+			     heap.binding, heap.entries);
+		}
+		return UINT32_MAX;
+	}
+	const auto key = heap.runtime_next_key++;
+	m_runtime_keys.emplace(map_key, key);
+	heap.runtime_dwords[key] = dwords;
+	SetTranslation(heap, key, ShaderRecompiler::IR::BindlessPending);
+	PublishRuntimeEntry(heap, key, dwords);
+	return key;
 }
 
 void BindlessTable::OnImageUnregistered(ImageId id) {

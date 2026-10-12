@@ -166,6 +166,10 @@ struct ImageResource {
 	// Sampled through the bindless image arrays (descriptor set 1) at the slot the translation
 	// table gives for the handle's key; the mapping offset locates the heap's region and size.
 	bool                          bindless          = false;
+	// With bindless: the handle holds the eight T# dwords the shader loaded at run time (from a
+	// material record, say). The shader looks the T# up in the runtime image table (set 1) and
+	// queries its size from the dwords themselves; one resource serves every such T#.
+	bool                          runtime = false;
 	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;
@@ -545,6 +549,8 @@ struct DescriptorSource {
 		uint32_t key_mask  = UINT32_MAX;
 		// No enumeration: the shader looks the key up in the bindless translation table.
 		bool     bindless  = false;
+		// No table either: the T# is a value the shader loads; ImageResource::runtime.
+		bool                  runtime = false;
 		Value    key_count;
 		Value                 selector_first;
 		Value    selector_mask;

@@ -1331,7 +1331,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.clean_flat_slots.resize(plan.srt_reads.size());
 	bool capture_indirect_reads = false;
 	for (const auto& source: plan.descriptor_sources) {
-		if (!source.indirect_descriptor.has_value()) continue;
+		// A runtime image's T# is the shader's own value: the host reads nothing for it.
+		if (!source.indirect_descriptor.has_value() || source.indirect_descriptor->runtime)
+			continue;
 		const auto& indirect                = *source.indirect_descriptor;
 		plan.requires_specialization_memory = true;
 		capture_indirect_reads |= indirect.material_source != UINT32_MAX || !indirect.sources.empty();
@@ -1719,16 +1721,17 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
 		const auto& image = program.info.images[i];
 		specialization.images[i] = {
-		    .numeric_class = image.numeric_class,
-		    .dimension = image.dimension,
-		    .mip_count = image.mip_count,
-		    .conversion_format = image.conversion_format,
-		    .shader_swizzle = image.shader_swizzle,
-		    .indirect_root = image.indirect_root,
-		    .indirect_mapping_offset = image.indirect_mapping_offset,
+		    .numeric_class              = image.numeric_class,
+		    .dimension                  = image.dimension,
+		    .mip_count                  = image.mip_count,
+		    .conversion_format          = image.conversion_format,
+		    .shader_swizzle             = image.shader_swizzle,
+		    .indirect_root              = image.indirect_root,
+		    .indirect_mapping_offset    = image.indirect_mapping_offset,
 		    .indirect_search_iterations = image.indirect_search_iterations,
-		    .cube = image.cube,
-		    .bindless = image.bindless,
+		    .cube                       = image.cube,
+		    .bindless                   = image.bindless,
+		    .runtime                    = image.runtime,
 		};
 		const auto* source = Source(program, image.source);
 		if (source == nullptr) {
@@ -1740,6 +1743,13 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 				continue;
 			}
 			const auto& indirect = *source->indirect_descriptor;
+			if (indirect.runtime) {
+				// Bound to set 1 like a bindless image; set 0 sees a null descriptor.
+				specialization.images[i].bindless      = true;
+				specialization.images[i].runtime       = true;
+				specialization.images[i].indirect_root = ImageResource::NoIndirectImage;
+				continue;
+			}
 			if (indirect.bindless) {
 				DescriptorValue table_value;
 				if (!clean.EvaluateDescriptor(indirect.table_source, table_value) ||
@@ -1989,6 +1999,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.bindless                   = source.bindless;
+		image.runtime                    = source.runtime;
 		image.cube                       = source.cube;
 		image.indirect_resources.clear();
 	}

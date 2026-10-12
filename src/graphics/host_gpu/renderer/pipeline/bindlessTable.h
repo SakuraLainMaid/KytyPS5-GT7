@@ -11,11 +11,12 @@
 #include <array>
 #include <atomic>
 #include <deque>
-#include <mutex>
-#include <utility>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <vulkan/vulkan.hpp>
 
@@ -38,13 +39,15 @@ class SamplerCache;
 class BindlessTable {
 public:
 	enum Binding : uint32_t {
-		Images2D      = 0,
-		Images2DArray = 1,
-		ImagesCube    = 2,
-		Images3D      = 3,
-		Translation   = 4,
-		Feedback      = 5,
-		Samplers      = 6,
+		Images2D        = 0,
+		Images2DArray   = 1,
+		ImagesCube      = 2,
+		Images3D        = 3,
+		Translation     = 4,
+		Feedback        = 5,
+		Samplers        = 6,
+		RuntimeTable    = 7,
+		RuntimeRequests = 8,
 	};
 	static_assert(Images2D == ShaderRecompiler::IR::BindlessImages2D &&
 	              Images2DArray == ShaderRecompiler::IR::BindlessImages2DArray &&
@@ -52,13 +55,17 @@ public:
 	              Images3D == ShaderRecompiler::IR::BindlessImages3D &&
 	              Translation == ShaderRecompiler::IR::BindlessTranslation &&
 	              Feedback == ShaderRecompiler::IR::BindlessFeedback &&
-	              Samplers == ShaderRecompiler::IR::BindlessSamplers);
+	              Samplers == ShaderRecompiler::IR::BindlessSamplers &&
+	              RuntimeTable == ShaderRecompiler::IR::BindlessRuntimeTable &&
+	              RuntimeRequests == ShaderRecompiler::IR::BindlessRuntimeRequests);
 	static constexpr uint32_t ImageArrays        = 4;
 	static constexpr uint32_t PlaceholderColors  = 3;
 	static constexpr uint32_t Placeholders       = ImageArrays * PlaceholderColors;
 	static constexpr uint32_t MaxImagesPerArray  = 65536; // E3 settles every entry of a heap
 	static constexpr uint32_t TranslationEntries = 1u << 20u;
 	static constexpr uint32_t MaxSamplers        = 4096;
+	// Keys of each binding's runtime heap (the T#s runtime images requested).
+	static constexpr uint32_t RuntimeKeys = 8192;
 
 	BindlessTable(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager);
 	~BindlessTable();
@@ -117,6 +124,11 @@ public:
 		// how many resolved images. Unchanged since, only the images resolved after need a look.
 		uint64_t checked_generation = 0;
 		size_t   checked_count      = 0;
+		// A runtime heap (RuntimeHeap): its keys are T#s shaders loaded at run time and asked
+		// for, kept here, not entries of a guest table; nothing of it is read from guest memory.
+		bool                                 runtime          = false;
+		uint32_t                             runtime_next_key = 0;
+		std::vector<std::array<uint32_t, 8>> runtime_dwords;
 	};
 
 	// The heap for (base, table offset, view binding), created with every entry pending and
@@ -196,6 +208,19 @@ public:
 	                       SamplerCache& cache);
 	// Slot 0 of the sampler array, used for keys outside their heap; written once.
 	void WriteDefaultSampler(vk::Sampler sampler);
+
+	// Runtime images (ImageResource::runtime). Each set-1 image binding has a heap whose keys
+	// are the T#s shaders requested; the runtime image table on the GPU maps a T# to its key's
+	// translation entry (BindlessBindings.h).
+	[[nodiscard]] Heap* RuntimeHeap(uint32_t binding) noexcept {
+		return binding < ImageArrays ? m_runtime_heaps[binding] : nullptr;
+	}
+	// The T#s (and bindings) shaders requested before the last snapshot; the request buffer is
+	// cleared for new requests.
+	void TakeRuntimeRequests(std::vector<std::pair<std::array<uint32_t, 8>, uint32_t>>& requests);
+	// The key of a T# in its binding's runtime heap, added (pending) when new, and published in
+	// the runtime image table; UINT32_MAX when the heap is full.
+	[[nodiscard]] uint32_t RuntimeKey(Heap& heap, const std::array<uint32_t, 8>& dwords);
 	[[nodiscard]] bool SamplersEnabled() const noexcept { return m_samplers_per_array != 0; }
 	// Engine method, E1. The guest pages holding a heap's entries are write-watched; a CPU write
 	// to one (a page fault on a game thread, or an explicit invalidation such as a file read into
@@ -279,6 +304,12 @@ private:
 	std::unique_ptr<Buffer> m_translation;
 	std::unique_ptr<Buffer> m_feedback;
 	std::unique_ptr<Buffer> m_feedback_snapshot;
+	std::unique_ptr<Buffer>                 m_runtime_table;
+	std::unique_ptr<Buffer>                 m_runtime_requests;
+	std::unique_ptr<Buffer>                 m_runtime_requests_snapshot;
+	std::array<Heap*, ImageArrays>          m_runtime_heaps {};
+	std::map<std::pair<uint32_t, std::array<uint32_t, 8>>, uint32_t> m_runtime_keys;
+	void PublishRuntimeEntry(const Heap& heap, uint32_t key, const std::array<uint32_t, 8>& dwords);
 	uint64_t                m_snapshot_tick = 0; // 0 = none recorded
 	// The view each image slot holds, and the slots each view is in (placeholders excluded).
 	std::array<std::vector<vk::ImageView>, ImageArrays>                        m_slot_views;

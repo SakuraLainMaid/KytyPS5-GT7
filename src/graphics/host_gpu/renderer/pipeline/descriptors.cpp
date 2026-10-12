@@ -1199,10 +1199,21 @@ static uint32_t BindlessBindingFor(const ShaderRecompiler::IR::ImageResource& re
 // A heap entry the bindless array of this binding can hold: a float-sampled, single-sample
 // texture of a matching shape. Anything else stays the placeholder rather than reaching
 // ResolveTexture, which exits on descriptors a draw would never bind that way.
-static bool BindlessCompatible(const ShaderTextureResource& descriptor, uint32_t binding) {
-	if (descriptor.IsNull() ||
-	    Prospero::SampledTextureNumericClass(descriptor.Format()) !=
-	        Prospero::TextureNumericClass::Float) {
+static bool BindlessCompatible(const ShaderTextureResource& descriptor, uint32_t binding,
+                               bool runtime = false) {
+	if (descriptor.IsNull()) {
+		return false;
+	}
+	const auto numeric_class = Prospero::SampledTextureNumericClass(descriptor.Format());
+	if (runtime) {
+		// A runtime image's loads read integer textures through their own aliases; nothing
+		// converts a format in the shader for it.
+		if (numeric_class == Prospero::TextureNumericClass::Unsupported ||
+		    TextureGetSurfaceFormatInfo(descriptor.Format()).conversion_format !=
+		        Prospero::BufferFormat::kInvalid) {
+			return false;
+		}
+	} else if (numeric_class != Prospero::TextureNumericClass::Float) {
 		return false;
 	}
 	switch (descriptor.Type()) {
@@ -1226,18 +1237,25 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 	heap.settled[key]  = 1;
 	heap.stale[key]    = 0;
 	heap.descriptors[key] = {};
-	if (!Libs::LibKernel::Memory::TryReadBacking(address, value.dwords.data(), 32u)) {
+	if (heap.runtime) {
+		// The T# a shader requested (BindlessTable::RuntimeKey), not a guest heap entry.
+		std::copy_n(heap.runtime_dwords[key].begin(), 8, value.dwords.begin());
+	} else if (!Libs::LibKernel::Memory::TryReadBacking(address, value.dwords.data(), 32u)) {
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
 	std::copy_n(value.dwords.data(), 8, heap.descriptors[key].begin());
 	const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
-	if (!BindlessCompatible(descriptor, heap.binding)) {
+	if (!BindlessCompatible(descriptor, heap.binding, heap.runtime)) {
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
+	auto resource = heap.resource;
+	if (heap.runtime) {
+		resource.numeric_class = Prospero::SampledTextureNumericClass(descriptor.Format());
+	}
 	t_resolving_bindless = true;
-	auto binding         = ResolveTexture(heap.resource, value);
+	auto binding         = ResolveTexture(resource, value);
 	t_resolving_bindless = false;
 	auto& texture_cache = m_context.GetTextureCache();
 	auto* image = texture_cache.m_slot_images.try_get(binding.image_id);
@@ -1390,6 +1408,9 @@ void RenderExecutor::SettleBindlessHeaps() {
 		// Once a frame: stale keys a draw has sampled since are settled again (finer mips).
 		uint32_t stale_settled = 0;
 		for (auto& heap: table.Heaps()) {
+			if (heap.runtime) {
+				continue;
+			}
 			std::erase_if(heap.stale_keys, [&](uint32_t key) {
 				if (heap.stale[key] == 0) {
 					return true; // settled again meanwhile
@@ -1504,6 +1525,9 @@ void RenderExecutor::SyncWrittenBindlessEntries() {
 	                                            0x1fff0000u, 0x027fff00u, 0x000003ffu, 0u};
 	uint32_t view_changes = 0, resource_changes = 0, resettled = 0, released = 0, kept = 0;
 	for (auto& heap: table.Heaps()) {
+		if (heap.runtime) {
+			continue;
+		}
 		const auto heap_begin = heap.base + heap.table_offset;
 		const auto keys       = std::min(heap.guest_entries, static_cast<uint32_t>(heap.settled.size()));
 		const auto heap_end   = heap_begin + BindlessTable::HeapSpan(heap, keys);
@@ -1588,7 +1612,7 @@ uint32_t RenderExecutor::RevalidateBindlessKeys(uint32_t budget) {
 	uint32_t           resolved      = 0;
 	for (auto& heap: table.Heaps()) {
 		const auto keys = static_cast<uint32_t>(heap.settled.size());
-		if (keys == 0) {
+		if (keys == 0 || heap.runtime) {
 			continue;
 		}
 		const uint32_t begin = heap.revalidate_cursor < keys ? heap.revalidate_cursor : 0u;
@@ -1777,6 +1801,46 @@ void RenderExecutor::ResolveBindlessRequests() {
 			     word0 & 0x7fffffffu, word0);
 		}
 	}
+	// T#s shaders loaded at run time and found missing from the runtime image table: each takes
+	// a key of its binding's runtime heap and is resolved like a heap key. A key not resolved now
+	// stays pending in the table, and the next draw that reads it flags it.
+	m_runtime_image_requests.clear();
+	table.TakeRuntimeRequests(m_runtime_image_requests);
+	uint32_t runtime_requested = 0, runtime_resolved = 0;
+	for (const auto& [dwords, binding]: m_runtime_image_requests) {
+		auto* heap = table.RuntimeHeap(binding);
+		if (heap == nullptr) {
+			continue;
+		}
+		const auto key = table.RuntimeKey(*heap, dwords);
+		if (key == UINT32_MAX || heap->settled[key] != 0) {
+			continue;
+		}
+		runtime_requested++;
+		if (resolved >= Budget) {
+			continue;
+		}
+		const bool ok = ResolveBindlessKey(*heap, key);
+		resolved += ok ? 1u : 0u;
+		runtime_resolved += ok ? 1u : 0u;
+	}
+	if (runtime_requested != 0) {
+		static std::atomic<uint32_t> runtime_logged = 0;
+		const auto                   logged_count   = runtime_logged.fetch_add(1);
+		if (logged_count < 32 || (logged_count & (logged_count + 1u)) == 0u) {
+			uint32_t keys = 0;
+			for (uint32_t b = 0; b < BindlessTable::ImageArrays; b++) {
+				if (const auto* heap = table.RuntimeHeap(b); heap != nullptr) {
+					keys += heap->runtime_next_key;
+				}
+			}
+			const auto line = fmt::format(
+			    "Bindless runtime images: frame={} requested={} resolved={} ({} T#s so far)\n",
+			    frame, runtime_requested, runtime_resolved, keys);
+			std::fputs(line.c_str(), stdout);
+			LOGF("%s", line.c_str());
+		}
+	}
 	for (auto& heap: m_context.GetBindlessTable().Heaps()) {
 		m_bindless_requests.clear();
 		m_context.GetBindlessTable().TakeRequests(heap, m_bindless_requests);
@@ -1917,15 +1981,31 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
 	auto&       table    = m_context.GetBindlessTable();
-	if ((snapshot.bindless_heaps.empty() && snapshot.bindless_sampler_heaps.empty()) ||
+	const bool  runtime_images =
+	    std::ranges::any_of(program.info.images, &ShaderRecompiler::IR::ImageResource::runtime);
+	if ((snapshot.bindless_heaps.empty() && snapshot.bindless_sampler_heaps.empty() &&
+	     !runtime_images) ||
 	    !table.Enabled()) {
 		return;
 	}
 	PrepareBindlessSamplers(runtime, prepared);
-	if (snapshot.bindless_heaps.empty()) {
+	if (snapshot.bindless_heaps.empty() && !runtime_images) {
 		return;
 	}
 	ResolveBindlessRequests();
+	if (runtime_images) {
+		// Every runtime heap of a binding the shader reads: its resolved images must be readable.
+		for (const auto& image: program.info.images) {
+			if (!image.runtime) {
+				continue;
+			}
+			auto* heap = table.RuntimeHeap(BindlessBindingFor(image));
+			if (heap != nullptr &&
+			    std::ranges::find(prepared.bindless_heaps, heap) == prepared.bindless_heaps.end()) {
+				prepared.bindless_heaps.push_back(heap);
+			}
+		}
+	}
 	for (const auto& use: snapshot.bindless_heaps) {
 		if (use.image >= program.info.images.size()) {
 			continue;

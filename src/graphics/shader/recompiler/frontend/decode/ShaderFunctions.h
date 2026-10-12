@@ -46,6 +46,11 @@ bool ReportShaderCallMiss(uint64_t shader_hash, const ShaderCallVariant& variant
                           bool* churned = nullptr);
 // The variants reported for the shader so far (ascending), or null.
 std::shared_ptr<const std::vector<ShaderCallVariant>> ShaderCallMissTargets(uint64_t shader_hash);
+// Whether a table call whose records carry a data pointer inlines each target once and leaves
+// the pointer to the shader (KYTY_CALL_RUNTIME_RECORDS, on by default) rather than one variant
+// specialized on each record. Tests switch it.
+bool ShaderCallRuntimeRecords();
+void SetShaderCallRuntimeRecords(bool value);
 
 // Expands scalar calls through immutable pointers or bounded scalar-buffer tables.
 // Table calls retain runtime selection and trap on targets outside the captured set.

@@ -252,13 +252,10 @@ uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
 // Set 1 (BindlessBindings.h): one runtime array per image type, aliasing the binding of its
 // dimension, and the translation buffer. Declared before the entry point collects globals.
 void DefineBindlessImages(EmitterState& state) {
-	for (const auto& image: state.program.info.images) {
-		if (!image.bindless) {
-			continue;
-		}
+	const auto define = [&](const IR::ImageResource& image) {
 		const auto type = ImageType(state, image);
 		if (state.bindless_image_variables.contains(type)) {
-			continue;
+			return;
 		}
 		uint32_t binding = IR::BindlessImages2D;
 		if (image.cube) {
@@ -282,6 +279,46 @@ void DefineBindlessImages(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
 		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
 		state.builder.RequireVersion(0x00010500u);
+	};
+	bool runtime = false;
+	for (const auto& image: state.program.info.images) {
+		if (!image.bindless) {
+			continue;
+		}
+		define(image);
+		if (image.runtime) {
+			// A runtime T# may name an integer texture: its loads read the slot through an
+			// alias of the binding with the texture's component type (EmitImage).
+			runtime = true;
+			for (const auto numeric_class:
+			     {Prospero::TextureNumericClass::Uint, Prospero::TextureNumericClass::Sint}) {
+				auto alias          = image;
+				alias.numeric_class = numeric_class;
+				alias.depth_compare = false;
+				define(alias);
+			}
+		}
+	}
+	if (runtime && state.runtime_image_table_variable == 0) {
+		const auto table = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state)),
+		    spv::StorageClassStorageBuffer);
+		state.builder.AddName(table, "runtime_image_table");
+		state.builder.AddAnnotation(spv::OpDecorate, table, spv::DecorationDescriptorSet,
+		                            IR::BindlessDescriptorSet);
+		state.builder.AddAnnotation(spv::OpDecorate, table, spv::DecorationBinding,
+		                            IR::BindlessRuntimeTable);
+		state.builder.AddAnnotation(spv::OpDecorate, table, spv::DecorationNonWritable);
+		state.runtime_image_table_variable = table;
+		const auto requests                = state.builder.DefineGlobalVariable(
+            TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state)),
+            spv::StorageClassStorageBuffer);
+		state.builder.AddName(requests, "runtime_image_requests");
+		state.builder.AddAnnotation(spv::OpDecorate, requests, spv::DecorationDescriptorSet,
+		                            IR::BindlessDescriptorSet);
+		state.builder.AddAnnotation(spv::OpDecorate, requests, spv::DecorationBinding,
+		                            IR::BindlessRuntimeRequests);
+		state.runtime_image_requests_variable = requests;
 	}
 	if (state.bindless_sampler_variable == 0 &&
 	    std::ranges::any_of(state.program.info.samplers, &IR::SamplerResource::bindless)) {

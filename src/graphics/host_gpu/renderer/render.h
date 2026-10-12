@@ -288,6 +288,7 @@ private:
 	                    int32_t host_vertex_offset, uint32_t host_first_instance, bool indirect);
 	uint64_t                              m_bindless_frame = UINT64_MAX;
 	std::vector<uint32_t>                 m_bindless_requests;
+	std::vector<std::pair<std::array<uint32_t, 8>, uint32_t>> m_runtime_image_requests;
 	std::vector<std::array<uint32_t, 8>>  m_bindless_window;
 	std::vector<std::pair<uint64_t, uint64_t>> m_bindless_written;
 	std::vector<ImageId>                       m_bindless_changed;

@@ -109,7 +109,7 @@ bool UsesFlattenedSrt(const Program& program) {
 		});
 	}) || std::ranges::any_of(program.info.buffers, uses_mapping) ||
 	       std::ranges::any_of(program.info.images, [&](const ImageResource& image) {
-		       return uses_mapping(image) || image.bindless;
+		       return uses_mapping(image) || (image.bindless && !image.runtime);
 	       }) ||
 	       std::ranges::any_of(program.info.samplers, &SamplerResource::bindless);
 }

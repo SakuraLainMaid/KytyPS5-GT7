@@ -1,10 +1,11 @@
 #include "graphics/guest_gpu/gpu_format.h"
-#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <optional>
@@ -882,6 +883,254 @@ static uint32_t BindlessSlot(ValueEmitContext& ctx, const IR::ImageResource& ima
 	return slot;
 }
 
+// Runtime images (ImageResource::runtime): the handle holds the eight T# dwords the shader loaded.
+static std::array<uint32_t, 8> RuntimeImageDwords(ValueEmitContext& ctx, IR::Value image_arg) {
+	const auto* handle = image_arg.ResolveInstruction();
+	EXIT_IF(handle == nullptr || handle->NumArgs() != 8u);
+	std::array<uint32_t, 8> dwords {};
+	for (uint32_t dword = 0; dword < 8u; dword++) {
+		dwords[dword] = ctx.Def(handle->Arg(dword));
+	}
+	return dwords;
+}
+
+// The set-1 array a runtime image's instruction reads (as DefineBindlessImages assigns it).
+static uint32_t RuntimeImageBinding(const IR::ImageResource& image) {
+	if (image.cube) return IR::BindlessImagesCube;
+	if (image.dimension == ImageDimension::Dim3D) return IR::BindlessImages3D;
+	if (image.dimension == ImageDimension::Dim2DArray ||
+	    image.dimension == ImageDimension::Dim2DMsaaArray)
+		return IR::BindlessImages2DArray;
+	return IR::BindlessImages2D;
+}
+
+static uint32_t LoadStorageWord(EmitterState& state, uint32_t variable, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          variable, ConstantU32(state, 0), index);
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	return value;
+}
+
+static void StoreStorageWord(EmitterState& state, uint32_t variable, uint32_t index,
+                             uint32_t value) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          variable, ConstantU32(state, 0), index);
+	state.builder.AddFunction(spv::OpStore, pointer, value);
+}
+
+static uint32_t AtomicStorageWord(EmitterState& state, spv::Op op, uint32_t variable,
+                                  uint32_t index, uint32_t value) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          variable, ConstantU32(state, 0), index);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(op, TypeU32(state), result, pointer,
+	                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0), value);
+	return result;
+}
+
+// The component class of the T#'s format (0 float, 1 uint, 2 sint, 3 none), from a table of
+// the 512 formats, two bits each, selected with a switch on the word.
+static uint32_t RuntimeImageNumericClass(EmitterState&                  state,
+                                         const std::array<uint32_t, 8>& dwords) {
+	static const std::array<uint32_t, 32> table = [] {
+		std::array<uint32_t, 32> words {};
+		for (uint32_t format = 0; format < 512u; format++) {
+			uint32_t value = 3u;
+			switch (
+			    Prospero::SampledTextureNumericClass(static_cast<Prospero::BufferFormat>(format))) {
+				case Prospero::TextureNumericClass::Float: value = 0u; break;
+				case Prospero::TextureNumericClass::Uint: value = 1u; break;
+				case Prospero::TextureNumericClass::Sint: value = 2u; break;
+				case Prospero::TextureNumericClass::Unsupported: value = 3u; break;
+			}
+			words[format / 16u] |= value << ((format % 16u) * 2u);
+		}
+		return words;
+	}();
+	const auto format =
+	    EmitBitFieldUExtract(state, dwords[1], ConstantU32(state, 20), ConstantU32(state, 9));
+	const auto word = EmitIndexSwitch(
+	    state,
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), format, ConstantU32(state, 4)), 32u,
+	    TypeU32(state), [&](uint32_t index) { return ConstantU32(state, table[index]); });
+	const auto shift =
+	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), format, ConstantU32(state, 15)),
+	           ConstantU32(state, 1));
+	return Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+	              Binary(state, spv::OpShiftRightLogical, TypeU32(state), word, shift),
+	              ConstantU32(state, 3));
+}
+
+// The bindless slot of a runtime image's T#. The runtime image table maps the eight dwords and
+// the binding to a translation entry, which holds the slot as a heap key's entry does: pending
+// entries flag the feedback buffer and sample the pending placeholder (slot 2). A T# the table
+// lacks samples it too, and is requested in the request buffer by the first invocation that
+// misses its home entry, for the host to resolve.
+static uint32_t RuntimeImageSlot(ValueEmitContext& ctx, const IR::ImageResource& image,
+                                 const std::array<uint32_t, 8>& dwords) {
+	auto& state = ctx.state;
+	EXIT_IF(state.runtime_image_table_variable == 0 || state.runtime_image_requests_variable == 0 ||
+	        state.bindless_translation_variable == 0);
+	const auto u32      = TypeU32(state);
+	const auto boolean  = TypeBool(state);
+	const auto binding  = ConstantU32(state, RuntimeImageBinding(image));
+	const auto multiply = [&](uint32_t value) {
+		return Binary(state, spv::OpIMul, u32, value, ConstantU32(state, 0x01000193u));
+	};
+	auto hash = ConstantU32(state, 0x811c9dc5u);
+	for (const auto dword: dwords) {
+		hash = multiply(Binary(state, spv::OpBitwiseXor, u32, hash, dword));
+	}
+	hash             = multiply(Binary(state, spv::OpBitwiseXor, u32, hash, binding));
+	hash             = Binary(state, spv::OpBitwiseXor, u32, hash,
+	                          Binary(state, spv::OpShiftRightLogical, u32, hash, ConstantU32(state, 15)));
+	const auto mask  = ConstantU32(state, IR::RuntimeImageEntries - 1u);
+	const auto home  = Binary(state, spv::OpBitwiseAnd, u32, hash, mask);
+	auto       found = state.builder.Constant(spv::OpConstantFalse, boolean);
+	auto       entry = ConstantU32(state, 0);
+	for (uint32_t probe = 0; probe < IR::RuntimeImageProbes; probe++) {
+		const auto index =
+		    probe == 0u
+		        ? home
+		        : Binary(state, spv::OpBitwiseAnd, u32,
+		                 Binary(state, spv::OpIAdd, u32, home, ConstantU32(state, probe)), mask);
+		const auto base =
+		    Binary(state, spv::OpIMul, u32, index, ConstantU32(state, IR::RuntimeImageEntryWords));
+		const auto word = [&](uint32_t offset) {
+			return LoadStorageWord(
+			    state, state.runtime_image_table_variable,
+			    Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, offset)));
+		};
+		const auto target = word(8u);
+		auto       match  = Binary(state, spv::OpLogicalAnd, boolean,
+		                           Binary(state, spv::OpINotEqual, boolean, target, ConstantU32(state, 0)),
+		                           Binary(state, spv::OpIEqual, boolean, word(9u), binding));
+		for (uint32_t dword = 0; dword < 8u; dword++) {
+			match = Binary(state, spv::OpLogicalAnd, boolean, match,
+			               Binary(state, spv::OpIEqual, boolean, word(dword), dwords[dword]));
+		}
+		const auto take = Binary(state, spv::OpLogicalAnd, boolean,
+		                         Unary(state, spv::OpLogicalNot, boolean, found), match);
+		entry           = Select(state, u32, take,
+		                         Binary(state, spv::OpISub, u32, target, ConstantU32(state, 1)), entry);
+		found           = Binary(state, spv::OpLogicalOr, boolean, found, match);
+	}
+	const auto raw = LoadStorageWord(state, state.bindless_translation_variable,
+	                                 Select(state, u32, found, entry, ConstantU32(state, 0)));
+	const auto pending =
+	    Binary(state, spv::OpLogicalOr, boolean, Unary(state, spv::OpLogicalNot, boolean, found),
+	           Binary(state, spv::OpIEqual, boolean, raw, ConstantU32(state, IR::BindlessPending)));
+	if (state.bindless_feedback_variable != 0) {
+		// As for a heap key: 1 asks the host to resolve the entry again, 0 marks it sampled.
+		EmitIfCondition(state, found, [&]() {
+			StoreStorageWord(
+			    state, state.bindless_feedback_variable, entry,
+			    Select(state, u32, pending, ConstantU32(state, 1), ConstantU32(state, 0)));
+		});
+	}
+	EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, found), [&]() {
+		const auto bit_word =
+		    Binary(state, spv::OpIAdd, u32,
+		           Binary(state, spv::OpShiftRightLogical, u32, home, ConstantU32(state, 5)),
+		           ConstantU32(state, IR::RuntimeImageBitsOffset));
+		const auto bit =
+		    Binary(state, spv::OpShiftLeftLogical, u32, ConstantU32(state, 1),
+		           Binary(state, spv::OpBitwiseAnd, u32, home, ConstantU32(state, 31)));
+		const auto old = AtomicStorageWord(state, spv::OpAtomicOr,
+		                                   state.runtime_image_requests_variable, bit_word, bit);
+		const auto first =
+		    Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, old, bit),
+		           ConstantU32(state, 0));
+		EmitIfCondition(state, first, [&]() {
+			const auto request =
+			    AtomicStorageWord(state, spv::OpAtomicIAdd, state.runtime_image_requests_variable,
+			                      ConstantU32(state, 0), ConstantU32(state, 1));
+			EmitIfCondition(
+			    state,
+			    Binary(state, spv::OpULessThan, boolean, request,
+			           ConstantU32(state, IR::RuntimeImageRequests)),
+			    [&]() {
+				    const auto record =
+				        Binary(state, spv::OpIAdd, u32,
+				               Binary(state, spv::OpIMul, u32, request,
+				                      ConstantU32(state, IR::RuntimeImageRequestWords)),
+				               ConstantU32(state, IR::RuntimeImageRingOffset));
+				    for (uint32_t dword = 0; dword < 8u; dword++) {
+					    StoreStorageWord(
+					        state, state.runtime_image_requests_variable,
+					        Binary(state, spv::OpIAdd, u32, record, ConstantU32(state, dword)),
+					        dwords[dword]);
+				    }
+				    StoreStorageWord(
+				        state, state.runtime_image_requests_variable,
+				        Binary(state, spv::OpIAdd, u32, record, ConstantU32(state, 8)),
+				        Binary(state, spv::OpIAdd, u32, binding, ConstantU32(state, 1)));
+			    });
+		});
+	});
+	const auto slot = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, u32, slot, pending, ConstantU32(state, 2u), raw);
+	state.builder.AddAnnotation(spv::OpDecorate, slot, spv::DecorationNonUniform);
+	return slot;
+}
+
+// IMAGE_GET_RESINFO of a runtime image, from its T#: {width, height, depth or layers, levels} of
+// the level BASE_LEVEL + lod, laid out as QueryDimensions lays out a view's size.
+static uint32_t RuntimeQueryDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                                       const IR::Inst& address, ImageDimension dimension,
+                                       const std::array<uint32_t, 8>& dwords) {
+	auto&      state = ctx.state;
+	const auto u32   = TypeU32(state);
+	const auto field = [&](uint32_t word, uint32_t first, uint32_t count) {
+		return EmitBitFieldUExtract(state, dwords[word], ConstantU32(state, first),
+		                            ConstantU32(state, count));
+	};
+	const auto add = [&](uint32_t a, uint32_t b) { return Binary(state, spv::OpIAdd, u32, a, b); };
+	const auto one = ConstantU32(state, 1);
+	const auto width = add(
+	    Binary(state, spv::OpBitwiseOr, u32, field(1, 30, 2),
+	           Binary(state, spv::OpShiftLeftLogical, u32, field(2, 0, 12), ConstantU32(state, 2))),
+	    one);
+	const auto height     = add(field(2, 14, 14), one);
+	const auto depth      = add(field(4, 0, 13), one);
+	const auto base_array = field(4, 16, 13);
+	const auto base_level = field(3, 12, 4);
+	const auto last_level = field(3, 16, 4);
+	const auto level =
+	    Binary(state, spv::OpBitwiseAnd, u32, add(base_level, AddressU32(ctx, mem, address, 0)),
+	           ConstantU32(state, 31));
+	const auto at_level = [&](uint32_t size) {
+		return EmitUMax32(state, Binary(state, spv::OpShiftRightLogical, u32, size, level), one);
+	};
+	const auto& info      = ImageDimensionInfoFor(dimension);
+	uint32_t    result[4] = {ConstantU32(state, 0), ConstantU32(state, 0), ConstantU32(state, 0),
+	                         ConstantU32(state, 0)};
+	const auto  layers = EmitUMax32(state, Binary(state, spv::OpISub, u32, depth, base_array), one);
+	result[0]          = at_level(width);
+	if (dimension == ImageDimension::Dim1DArray) {
+		result[1] = layers;
+	} else if (info.coordinate_components >= 2u) {
+		result[1] = at_level(height);
+	}
+	if (dimension == ImageDimension::Dim3D) {
+		result[2] = at_level(depth);
+	} else if (dimension == ImageDimension::Dim2DArray) {
+		result[2] = layers;
+	}
+	result[3] =
+	    Select(state, u32, Binary(state, spv::OpULessThan, TypeBool(state), last_level, base_level),
+	           one, add(Binary(state, spv::OpISub, u32, last_level, base_level), one));
+	const auto vector = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), vector, result[0],
+	                          result[1], result[2], result[3]);
+	return vector;
+}
+
 // The bindless sampler array slot of the sampler handle's key: region + key while the key is
 // inside the heap's entry count (both from the flattened SRT, patched by the host), otherwise
 // slot 0, the default sampler.
@@ -919,7 +1168,31 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  image_arg = inst.Arg(0);
 	ctx.ResourceIndex(image_arg, IR::ValueOpcode::GetImageResource);
 	const auto& image   = state.program.info.images.at(mem.resource);
-	state.bindless_slot = image.bindless ? BindlessSlot(ctx, image, image_arg) : 0u;
+	std::array<uint32_t, 8> runtime_dwords {};
+	uint32_t                runtime_class = 0;
+	if (image.runtime) {
+		runtime_dwords = RuntimeImageDwords(ctx, image_arg);
+		if (op == IR::ValueOpcode::ImageQueryDimensions) {
+			const auto* address = ctx.ImageAddress(inst.Arg(1));
+			ctx.Define(inst,
+			           RuntimeQueryDimensions(ctx, mem, *address, image.dimension, runtime_dwords));
+			return;
+		}
+		runtime_class       = RuntimeImageNumericClass(state, runtime_dwords);
+		state.bindless_slot = RuntimeImageSlot(ctx, image, runtime_dwords);
+		if (op != IR::ValueOpcode::ImageRead) {
+			// Sampling reads the float array: a texture of another class samples the placeholder.
+			const auto slot = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    spv::OpSelect, TypeU32(state), slot,
+			    Binary(state, spv::OpIEqual, TypeBool(state), runtime_class, ConstantU32(state, 0)),
+			    state.bindless_slot, ConstantU32(state, 2u));
+			state.builder.AddAnnotation(spv::OpDecorate, slot, spv::DecorationNonUniform);
+			state.bindless_slot = slot;
+		}
+	} else {
+		state.bindless_slot = image.bindless ? BindlessSlot(ctx, image, image_arg) : 0u;
+	}
 	state.bindless_sampler_slot = 0u;
 	if (image_info.needs_sampler && inst.NumArgs() > 1u &&
 	    mem.sampler < state.program.info.samplers.size() &&
@@ -955,6 +1228,52 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), result,
 		                          values[0], values[1], values[2], values[3]);
 		ctx.Define(inst, result);
+		return;
+	}
+	if (op == IR::ValueOpcode::ImageRead && image.runtime) {
+		// A load reads the slot through the alias of its texture's component class.
+		const auto dimension = image.dimension;
+		const auto condition = ctx.Arg(inst, 2);
+		ctx.Define(inst,
+		           EmitValueOrDefaultIfCondition(
+		               state, condition, TypeU32Vector(state, 4),
+		               ConstantU32CompositeZero(state, 4), [&]() {
+			               const auto coord = CoordU32(ctx, mem, *address, dimension);
+			               const auto lod   = LodU32(ctx, mem, *address, dimension);
+			               const auto slot  = state.bindless_slot;
+			               return EmitIndexSwitch(
+			                   state, runtime_class, 4u, TypeU32Vector(state, 4),
+			                   [&](uint32_t which) {
+				                   if (which == 3u) return ConstantU32CompositeZero(state, 4);
+				                   const auto numeric_class =
+				                       which == 0u   ? Prospero::TextureNumericClass::Float
+				                       : which == 1u ? Prospero::TextureNumericClass::Uint
+				                                     : Prospero::TextureNumericClass::Sint;
+				                   auto alias          = image;
+				                   alias.numeric_class = numeric_class;
+				                   if (which != 0u) alias.depth_compare = false;
+				                   const auto type     = ImageType(state, alias);
+				                   const auto variable = state.bindless_image_variables.find(type);
+				                   EXIT_IF(variable == state.bindless_image_variables.end());
+				                   const auto pointer = state.builder.AllocateId();
+				                   state.builder.AddFunction(
+				                       spv::OpAccessChain,
+				                       state.builder.Type(spv::OpTypePointer,
+				                                          spv::StorageClassUniformConstant, type),
+				                       pointer, variable->second, slot);
+				                   state.builder.AddAnnotation(spv::OpDecorate, pointer,
+				                                               spv::DecorationNonUniform);
+				                   const auto view = state.builder.AllocateId();
+				                   state.builder.AddFunction(spv::OpLoad, type, view, pointer);
+				                   state.builder.AddAnnotation(spv::OpDecorate, view,
+				                                               spv::DecorationNonUniform);
+				                   const auto color = state.builder.AllocateId();
+				                   state.builder.AddFunction(
+				                       spv::OpImageFetch, ImageVectorType(state, numeric_class, 4),
+				                       color, view, coord, spv::ImageOperandsLodMask, lod);
+				                   return ResultVector(ctx, color, numeric_class, false, mem);
+			                   });
+		               }));
 		return;
 	}
 	if (op == IR::ValueOpcode::ImageRead) {

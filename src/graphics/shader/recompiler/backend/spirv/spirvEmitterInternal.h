@@ -165,6 +165,12 @@ struct EmitterState {
 	uint32_t                                         bindless_slot                 = 0;
 	uint32_t                                         bindless_sampler_variable     = 0;
 	uint32_t                                         bindless_sampler_slot         = 0;
+	// Runtime images (ImageResource::runtime): the T# -> translation entry table and the buffer
+	// where shaders request T#s the table lacks.
+	uint32_t runtime_image_table_variable = 0;
+	// The buffer formats' layouts for formatted loads through GPU-selected V#s (a Private array).
+	uint32_t                   indirect_format_table                 = 0;
+	uint32_t                   runtime_image_requests_variable       = 0;
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   main_func                             = 0;
 	uint32_t                   mesh_guest_func                       = 0;

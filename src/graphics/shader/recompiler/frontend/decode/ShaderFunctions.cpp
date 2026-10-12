@@ -5,19 +5,20 @@
 
 #include <algorithm>
 #include <array>
-#include <cstddef>
+#include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
-#include <string_view>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string_view>
 #include <unordered_map>
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
@@ -38,6 +39,24 @@ size_t MaxSpecializedVariants() {
 		return std::min<size_t>(std::strtoul(text, nullptr, 10), MaxCallTargets);
 	}();
 	return value;
+}
+// A table call whose records carry a data pointer after the target (GT7's material records)
+// inlines each target function once and leaves the pointer to the shader: what the function
+// reads through it are loads at run time, its buffers GPU-selected V#s and its images runtime
+// images (ImageResource::runtime). One program then serves every table the shader is dispatched
+// over, however its records change. KYTY_CALL_RUNTIME_RECORDS=0 inlines a specialized variant
+// per record instead, with the pointer as a constant (KYTY_CALL_VARIANTS,
+// KYTY_CALL_SPECIALIZED_SETS).
+std::atomic_bool& RuntimeRecordsSwitch() {
+	static std::atomic_bool value = [] {
+		const char* text = std::getenv("KYTY_CALL_RUNTIME_RECORDS");
+		return text == nullptr || text[0] != '0';
+	}();
+	return value;
+}
+
+bool RuntimeRecords() {
+	return RuntimeRecordsSwitch().load(std::memory_order_relaxed);
 }
 // A table may hold more targets than one expansion inlines: the expansion then takes the
 // reported ones (ReportShaderCallMiss) and traps on the rest.
@@ -373,6 +392,9 @@ struct CallSite {
 	// call passes in the pair after the target's (GT7's material record pointer), which the
 	// inlined body then sees as constants. Unspecialized variants have zero data.
 	bool                 specialized = false;
+	// The table's records carry that pair (GT7's material record pointer), whether or not the
+	// variants specialize on it (KYTY_CALL_RUNTIME_RECORDS).
+	bool                 records = false;
 	std::vector<Variant> variants;  // ascending, the candidates
 	std::vector<Variant> preferred; // the reported variants among them (ascending), first
 	size_t               table_targets = 0; // the variants the table holds (for the log only)
@@ -384,7 +406,8 @@ struct CallSite {
 		return pc == other.pc && source_reg == other.source_reg && return_reg == other.return_reg &&
 		       dynamic == other.dynamic && (dynamic || addresses == other.addresses) &&
 		       pinned == other.pinned && specialized == other.specialized &&
-		       variants == other.variants && preferred == other.preferred;
+		       records == other.records && variants == other.variants &&
+		       preferred == other.preferred;
 	}
 };
 
@@ -562,6 +585,7 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 		std::set<uint64_t>              addresses;
 		std::set<CallSite::Variant>     variants;
 		bool                            specialized = false;
+		bool                            records     = false;
 		if (!dynamic) {
 			addresses.insert((uint64_t {*high} << 32u) | *low);
 		} else {
@@ -627,9 +651,9 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 			                                : std::optional<std::pair<size_t, uint32_t>> {};
 			const auto d1 = src + 3u < 106u ? origin(origin, src + 3u, i, first, 0)
 			                                : std::optional<std::pair<size_t, uint32_t>> {};
-			specialized = d0 && d1 && d0->first == lo->first && d1->first == lo->first &&
-			              d0->second == lo->second + 2u && d1->second == lo->second + 3u &&
-			              step >= 16u;
+			records       = d0 && d1 && d0->first == lo->first && d1->first == lo->first &&
+			          d0->second == lo->second + 2u && d1->second == lo->second + 3u && step >= 16u;
+			specialized = records && !RuntimeRecords();
 			for (uint64_t offset = first_slot; offset + (specialized ? 16u : 8u) <= size;
 			     offset += step) {
 				const uint64_t address =
@@ -648,6 +672,7 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 		CallSite site {inst.pc, src, dst, dynamic, {addresses.begin(), addresses.end()},
 		               {pinned.begin(), pinned.end()}};
 		site.specialized   = specialized;
+		site.records       = records;
 		site.variants      = {variants.begin(), variants.end()};
 		site.table_targets = variants.size();
 		sites.push_back(std::move(site));
@@ -655,7 +680,8 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 	return true;
 }
 
-// KYTY_CALL_LOOPS=1: a specialized table target with a loop is inlined too. Off by default:
+// KYTY_CALL_LOOPS=1: a target of a table with record data (specialized or not) that has a loop
+// is inlined too. Off by default:
 // GT7's lit material functions walk a per-pixel light list whose length they read from an image,
 // and every garage visit with them inlined hung the GPU in the material pass (2026-10-10): a
 // wrong length, from data the emulator does not reproduce, runs the loop for up to 65,535 rounds
@@ -773,9 +799,9 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 					if (why.empty()) why = "shader function is not expandable";
 				} else if (writes_dependency(target.function)) {
 					why = "shader function modifies a call-target dependency";
-				} else if (site.specialized && !InlineLoopingVariants() &&
+				} else if ((site.specialized || site.records) && !InlineLoopingVariants() &&
 				           HasBackEdge(target.function.instructions)) {
-					why = "specialized shader function has a loop";
+					why = "material shader function has a loop";
 				}
 				std::optional<size_t> index;
 				if (why.empty()) {
@@ -1274,6 +1300,14 @@ struct ShaderFunctionExpander::Impl {
 
 ShaderFunctionExpander::ShaderFunctionExpander(): m_impl(std::make_unique<Impl>()) {}
 ShaderFunctionExpander::~ShaderFunctionExpander() = default;
+
+bool ShaderCallRuntimeRecords() {
+	return RuntimeRecords();
+}
+
+void SetShaderCallRuntimeRecords(bool value) {
+	RuntimeRecordsSwitch().store(value, std::memory_order_relaxed);
+}
 
 bool ReportShaderCallMiss(uint64_t shader_hash, const ShaderCallVariant& target, bool* churned) {
 	if (churned != nullptr) *churned = false;

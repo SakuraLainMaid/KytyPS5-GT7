@@ -1047,12 +1047,13 @@ private:
 				const auto& a = *current.indirect_descriptor;
 				const auto& b = *descriptor.indirect_descriptor;
 				if (a.material_source != b.material_source || a.table_source != b.table_source ||
-				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
-				    a.selector_shift != b.selector_shift ||
-				    a.table_offset != b.table_offset || a.table_stride != b.table_stride ||
-				    a.workgroup_axis != b.workgroup_axis || a.sources != b.sources ||
-				    a.key_shift != b.key_shift || a.key_mask != b.key_mask ||
-				    a.bindless != b.bindless ||
+				    a.selector_stride != b.selector_stride ||
+				    a.selector_offset != b.selector_offset ||
+				    a.selector_shift != b.selector_shift || a.table_offset != b.table_offset ||
+				    a.table_stride != b.table_stride || a.workgroup_axis != b.workgroup_axis ||
+				    a.sources != b.sources || a.key_shift != b.key_shift ||
+				    a.key_mask != b.key_mask || a.bindless != b.bindless ||
+				    a.runtime != b.runtime ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_first.IsEmpty() != b.selector_first.IsEmpty() ||
 				    (!a.selector_first.IsEmpty() &&
@@ -3039,6 +3040,12 @@ private:
 		image.depth_compare  = depth;
 		image.r128           = memory.image_r128;
 		image.atomic64       = atomic64;
+		if (const auto* descriptor = Source(source); descriptor != nullptr &&
+		                                             descriptor->indirect_descriptor.has_value() &&
+		                                             descriptor->indirect_descriptor->runtime) {
+			image.bindless = true;
+			image.runtime  = true;
+		}
 		Merge(image, op, pc);
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
@@ -3228,7 +3235,7 @@ private:
 		const auto* indirect = handle != nullptr ? FindIndirectDescriptor(*handle) : nullptr;
 		if (indirect != nullptr) {
 			source = indirect->source;
-		} else {
+		} else if (handle == nullptr || !TryRuntimeImage(*handle, memory, op, flags.pc, source)) {
 			GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc,
 			          memory.resource * 4u, handle, source);
 		}
@@ -3272,6 +3279,70 @@ private:
 		return source < m_sources.size() ? &m_sources[source] : nullptr;
 	}
 
+	// KYTY_RUNTIME_IMAGES=0: a shader that reads an image through a T# it loads at run time gives
+	// up, as before.
+	static bool RuntimeImagesEnabled() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_RUNTIME_IMAGES");
+			return value == nullptr || value[0] != '0';
+		}();
+		return enabled;
+	}
+
+	// A T# that is neither a value the host can evaluate nor a heap entry at a key: eight dwords
+	// the shader loads at run time (GT7's material functions read theirs through the record
+	// pointer). With bindless images, a handle only read by size queries, loads and samples
+	// becomes the shared runtime image (ImageResource::runtime): the shader looks its dwords up in
+	// the runtime image table, which the host fills as shaders request T#s.
+	bool TryRuntimeImage(Inst& handle, const MemoryInfo& memory, ValueOpcode op, uint32_t pc,
+	                     uint32_t& source) {
+		if (!m_program.bindless_images || !RuntimeImagesEnabled() ||
+		    !Frontend::TranslationNonFatal() ||
+		    handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u ||
+		    memory.image_r128) {
+			return false;
+		}
+		const auto readable = [](ValueOpcode opcode) {
+			const auto info = ImageOpcodeInfoOf(opcode);
+			return info.access == ImageAccess::Read &&
+			       info.resource_class == ImageResourceClass::Sampled;
+		};
+		if (!readable(op) || memory.image_dimension == Decoder::ImageDimension::Unknown ||
+		    memory.image_dimension == Decoder::ImageDimension::Dim2DMsaa ||
+		    memory.image_dimension == Decoder::ImageDimension::Dim2DMsaaArray) {
+			return false;
+		}
+		for (const auto& use: handle.Uses()) {
+			if (use.operand != 0u || !readable(use.user->GetOpcode())) {
+				return false;
+			}
+		}
+		DescriptorSource descriptor;
+		MakeSource(handle, 8u, false, false, memory.resource * 4u, descriptor, pc);
+		uint32_t bad_dword = 0;
+		if (ValidateSource(descriptor, bad_dword)) {
+			return false; // the host evaluates it
+		}
+		for (uint32_t dword = 0; dword < 8u; dword++) {
+			if (handle.Arg(dword).Resolve().GetType() != Type::U32) {
+				return false;
+			}
+		}
+		DescriptorSource runtime;
+		runtime.dword_count = 8u;
+		runtime.dwords.fill(Value(0u));
+		runtime.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor {});
+		runtime.indirect_descriptor->runtime = true;
+		source                               = InternSource(runtime);
+		if (!m_logged_runtime_image) {
+			m_logged_runtime_image = true;
+			LOGF("shader resource tracking: hash=0x%016" PRIx64 " pc=0x%08x runtime image: the T# "
+			     "is loaded at run time and looked up in the runtime image table\n",
+			     m_program.shader_hash, pc);
+		}
+		return true;
+	}
+
 	void LinkImageAliases() {
 		for (auto& buffer: m_info.buffers) {
 			const auto* buffer_source = Source(buffer.source);
@@ -3310,6 +3381,7 @@ private:
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
+	bool                                            m_logged_runtime_image = false;
 	std::vector<BindlessSamplerPlan>           m_bindless_samplers;
 	std::map<const Inst*, int>                 m_indirect_rejects;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;

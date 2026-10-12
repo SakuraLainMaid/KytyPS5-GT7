@@ -38,6 +38,7 @@ struct ResourceSpecialization {
 		// fewer fragments than coverage samples, so samples share fragments; 0 otherwise.
 		uint8_t                       fmask_fragments            = 0;
 		bool                          bindless                   = false;
+		bool                          runtime                        = false;
 		bool                          operator==(const Image&) const = default;
 	};
 

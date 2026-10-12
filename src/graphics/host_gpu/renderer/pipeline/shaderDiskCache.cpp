@@ -122,6 +122,7 @@ void Visit(Io& io, T& v) {
 	io(v.indirect_mapping_offset);
 	io(v.indirect_search_iterations);
 	io(v.bindless);
+	io(v.runtime);
 	io(v.indirect_resources);
 }
 
@@ -230,6 +231,7 @@ void Visit(Io& io, T& v) {
 	io(v.key_shift);
 	io(v.key_mask);
 	io(v.bindless);
+	io(v.runtime);
 	io(v.key_count);
 	io(v.selector_first);
 	io(v.selector_mask);
@@ -323,6 +325,7 @@ void Visit(Io& io, T& v) {
 	io(v.fmask);
 	io(v.fmask_fragments);
 	io(v.bindless);
+	io(v.runtime);
 }
 
 template <typename Io, typename T>
