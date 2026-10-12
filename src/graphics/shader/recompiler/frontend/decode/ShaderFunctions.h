@@ -55,11 +55,11 @@ void SetShaderCallRuntimeRecords(bool value);
 // A material function with a loop is left to the miss path; KYTY_CALL_LOOPS=1 inlines it (see
 // InlineLoopingVariants in ShaderFunctions.cpp for why that is not the default), with its loops
 // bounded: the expansion brackets its body with these two S_NOPs (the immediates real code never
-// uses), and the translation ends a loop whose header lies between them once the invocation has
-// taken ShaderCallLoopCap() back edges in such loops (KYTY_CALL_LOOP_CAP, 1024 by default; 0
-// leaves them unbounded). A count read from data the emulator does not reproduce (a placeholder
-// texture, say) then costs a bounded number of rounds instead of hanging the GPU. Tests switch
-// the inlining.
+// uses), and the translation leaves every loop with all its code between them at its header
+// once the invocation has run ShaderCallLoopCap() rounds of such loops (KYTY_CALL_LOOP_CAP, 1024
+// by default; 0 leaves them unbounded; BudgetLoopHeaders in Translate.cpp). A count read from
+// data the emulator does not reproduce (a placeholder texture, say) then costs a bounded number
+// of rounds instead of hanging the GPU. Tests switch the inlining.
 bool               ShaderCallLoopsInlined();
 void               SetShaderCallLoopsInlined(bool value);
 constexpr uint32_t ShaderCallLoopBodyBegin = 0xbf80c0deu;

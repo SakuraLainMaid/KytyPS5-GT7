@@ -786,9 +786,7 @@ void Translator::WriteCompareResult(const Decoder::Operand& operand, IR::U1 valu
 }
 
 void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
-                                    IR::BlockInfo&                                 info,
-                                    std::span<const std::pair<uint32_t, uint32_t>> bounded,
-                                    uint32_t loop_cap, uint32_t header_cap) {
+                                    IR::BlockInfo& info, uint32_t header_cap) {
 	const auto native_condition = [&](CFG::BranchCondition kind) -> IR::U1 {
 		IR::U1 condition;
 		switch (kind) {
@@ -838,9 +836,6 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 	if (term.kind == CFG::TerminatorKind::ConditionalBranch) {
 		auto condition = term.expression != UINT32_MAX ? expression(expression, term.expression)
 		                                               : native_condition(term.condition);
-		if (!bounded.empty()) {
-			condition = BoundLoopCondition(graph, source, condition, bounded, loop_cap);
-		}
 		// A loop header that enters its body on a condition (BudgetLoopHeaders): every round
 		// of the loop draws on the invocation's budget, and the loop ends at its merge once the
 		// budget is spent.
@@ -851,62 +846,6 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 		info.condition = condition;
 		ir.Emit(IR::ValueOpcode::Reference, {condition});
 	}
-}
-
-// A loop of a bracketed material body runs only while the invocation's loop budget lasts
-// (LoopBudgetTick): a branch out of it to its merge (the structured form of the guest's exit
-// test, usually at the bottom of each round) is taken once the budget is spent, and so is a
-// latch's branch back to the header withheld. Both edges exist already, so the bound adds no
-// control flow; the budget is the same in every lane of a wave, as the branches are scalar.
-IR::U1 Translator::BoundLoopCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
-                                      IR::U1                                         condition,
-                                      std::span<const std::pair<uint32_t, uint32_t>> bounded,
-                                      uint32_t                                       loop_cap) {
-	// A loop is bounded when its first instructions lie in a bracketed body: the header's own,
-	// or, for the empty header the structurizer adds, those of the block it enters.
-	const auto in_body = [&](const CFG::BasicBlock& header) {
-		const auto* first = &header;
-		for (uint32_t step = 0; first != nullptr && first->inst_begin == first->inst_end &&
-		                        first->terminator.kind == CFG::TerminatorKind::Branch && step < 8;
-		     step++) {
-			first = graph.FindBlock(first->terminator.true_block);
-		}
-		return first != nullptr && first->inst_begin != first->inst_end &&
-		       std::ranges::any_of(bounded, [&](const auto& range) {
-			       return first->start_pc >= range.first && first->start_pc < range.second;
-		       });
-	};
-	const auto tick = [&]() {
-		return IR::U1(ir.Emit(IR::ValueOpcode::LoopBudgetTick, {IR::Value(loop_cap)}));
-	};
-	const auto& term = source.terminator;
-	// The latch of a bounded loop, branching back to its header.
-	const auto back_edge = [&](uint32_t id) {
-		const auto* block = graph.FindBlock(id);
-		return block != nullptr && block->terminator.loop_header &&
-		       block->terminator.continue_block == source.id && in_body(*block);
-	};
-	// The merge of a bounded loop: a branch there leaves the loop.
-	const auto exit_edge = [&](uint32_t id) {
-		return id != UINT32_MAX &&
-		       std::ranges::any_of(graph.blocks, [&](const CFG::BasicBlock& block) {
-			       return block.terminator.loop_header && block.terminator.merge_block == id &&
-			              in_body(block);
-		       });
-	};
-	if (back_edge(term.true_block)) {
-		return ir.LogicalAnd(condition, tick());
-	}
-	if (back_edge(term.false_block)) {
-		return ir.LogicalOr(condition, ir.LogicalNot(tick()));
-	}
-	if (exit_edge(term.true_block)) {
-		return ir.LogicalOr(condition, ir.LogicalNot(tick()));
-	}
-	if (exit_edge(term.false_block)) {
-		return ir.LogicalAnd(condition, tick());
-	}
-	return condition;
 }
 
 namespace {
@@ -1244,18 +1183,39 @@ const std::vector<ProbePoint>& ProbePoints() {
 
 namespace {
 
-// A ray tracing shader's loops each run only while the invocation's loop budget lasts
+// The blocks of the structured loop `header` heads: those that reach its continue block
+// without passing the header.
+std::vector<const CFG::BasicBlock*> LoopBlocks(const CFG::Graph&      graph,
+                                               const CFG::BasicBlock& header) {
+	std::vector<const CFG::BasicBlock*> blocks;
+	std::vector<uint32_t>               pending {header.terminator.continue_block};
+	std::unordered_map<uint32_t, bool>  seen {{header.id, true}};
+	while (!pending.empty()) {
+		const auto id = pending.back();
+		pending.pop_back();
+		if (!seen.emplace(id, true).second) continue;
+		const auto* block = graph.FindBlock(id);
+		if (block == nullptr) continue;
+		blocks.push_back(block);
+		pending.insert(pending.end(), block->predecessors.begin(), block->predecessors.end());
+	}
+	return blocks;
+}
+
+// Loops whose rounds draw on the invocation's loop budget: a ray tracing shader's, all of them
 // (Decoder::ShaderRayLoopCap): its traversal follows node data, and a node list read as zero
-// (memory the emulator does not have yet) never ends. Every loop header of the structured graph
-// that its loop returns to enters the body on a condition (true here; AddBranchCondition adds
-// the budget) and leaves to the loop's merge otherwise, as SPIR-V allows (OpLoopMerge, then
-// OpBranchConditional). So every round of every loop passes the budget, whatever the loop's
-// shape: a latch that branches back unconditionally, a loop entered in the middle. A construct
-// the structurizer runs once (its continue block goes to the merge) is left alone. The budget
-// is the invocation's and the same in every lane of a wave (the branches are scalar): the ray
-// tracing passes seen so far run one wave per workgroup, so no barrier waits on a wave that has
-// left its loop.
-void BudgetLoopHeaders(CFG::Graph& graph) {
+// (memory the emulator does not have yet) never ends; and those of the looping material bodies
+// the function expansion bracketed (Decoder::ShaderCallLoopBodyBegin, ShaderCallLoopCap). Every
+// such loop's header enters the body on a condition (true here; AddBranchCondition adds the
+// budget) and leaves to the loop's merge otherwise, as SPIR-V allows (OpLoopMerge, then
+// OpBranchConditional). So every round of the loop passes the budget, whatever its shape: a
+// latch that branches back unconditionally, a loop entered in the middle. A construct the
+// structurizer runs once (its continue block goes to the merge) is left alone. The budget is the
+// invocation's and the same in every lane of a wave (the branches are scalar): the ray tracing
+// passes seen so far run one wave per workgroup, and a material body's loop with a barrier is
+// left alone, so no barrier waits on a wave that has left its loop.
+template <typename Budgeted>
+void BudgetLoopHeaders(CFG::Graph& graph, const Budgeted& budgeted) {
 	using ExprOp = CFG::ConditionExpression::Op;
 	auto truth   = static_cast<uint32_t>(graph.expressions.size());
 	for (uint32_t index = 0; index < graph.expressions.size(); index++) {
@@ -1281,7 +1241,7 @@ void BudgetLoopHeaders(CFG::Graph& graph) {
 		                      (latch->terminator.kind == CFG::TerminatorKind::ConditionalBranch &&
 		                       latch->terminator.false_block == block.id));
 		auto* merge = graph.FindBlock(term.merge_block);
-		if (!repeats || merge == nullptr) {
+		if (!repeats || merge == nullptr || !budgeted(LoopBlocks(graph, block))) {
 			continue;
 		}
 		term.kind        = CFG::TerminatorKind::ConditionalBranch;
@@ -1306,16 +1266,53 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	const bool ray_tracing = std::ranges::any_of(decoded.instructions, [](const auto& inst) {
 		return inst.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY;
 	});
-	// (Without structured control flow, the dispatcher bounds the invocation's block transitions
-	// itself: MaxDispatcherTransitions in spirvEmitterProgram.cpp.)
-	const auto ray_cap       = ray_tracing ? Decoder::ShaderRayLoopCap() : 0u;
-	const bool header_budget = ray_cap != 0u && !source_cfg.irreducible && !source_cfg.unsupported;
-	CFG::Graph budgeted;
-	if (header_budget) {
-		budgeted = source_cfg;
-		BudgetLoopHeaders(budgeted);
+	// The looping material bodies the function expansion bracketed, as pc ranges.
+	std::vector<std::pair<uint32_t, uint32_t>> bracketed;
+	for (const auto& instruction: decoded.instructions) {
+		if (instruction.opcode != Decoder::Opcode::S_NOP) continue;
+		if (instruction.raw[0] == Decoder::ShaderCallLoopBodyBegin) {
+			bracketed.emplace_back(instruction.pc, UINT32_MAX);
+		} else if (instruction.raw[0] == Decoder::ShaderCallLoopBodyEnd && !bracketed.empty() &&
+		           bracketed.back().second == UINT32_MAX) {
+			bracketed.back().second = instruction.pc;
+		}
 	}
-	const auto& cfg = header_budget ? budgeted : source_cfg;
+	// Every loop of a ray tracing shader, and the loops of bracketed bodies, end once the
+	// invocation's loop budget is spent (BudgetLoopHeaders). One budget, so one cap: a ray tracing
+	// shader's when it has one. (Without structured control flow, the dispatcher bounds the
+	// invocation's block transitions itself: MaxDispatcherTransitions in spirvEmitterProgram.cpp.)
+	const auto ray_cap    = ray_tracing ? Decoder::ShaderRayLoopCap() : 0u;
+	const auto body_cap   = bracketed.empty() ? 0u : Decoder::ShaderCallLoopCap();
+	const auto loop_cap   = ray_cap != 0u ? ray_cap : body_cap;
+	const bool structured = !source_cfg.irreducible && !source_cfg.unsupported;
+	CFG::Graph budgeted;
+	if (loop_cap != 0u && structured) {
+		budgeted = source_cfg;
+		// A material body's loop has all its code in the body. (The loops around the call, its
+		// waterfall among them, are left alone: a spent budget then still calls each remaining
+		// material, its loops cut short, and the waterfall ends as its flag is cleared where the
+		// call returns, Decoder::WaterfallFlag.)
+		// Nor one with a barrier: the waves of a workgroup spend their budgets apart.
+		const auto in_body = [&](const CFG::BasicBlock* block) {
+			for (auto index = block->inst_begin; index < block->inst_end; index++) {
+				if (decoded.instructions[index].opcode == Decoder::Opcode::S_BARRIER) return false;
+			}
+			return block->inst_begin == block->inst_end ||
+			       std::ranges::any_of(bracketed, [&](const auto& range) {
+				       return block->start_pc >= range.first && block->start_pc < range.second;
+			       });
+		};
+		BudgetLoopHeaders(budgeted, [&](const std::vector<const CFG::BasicBlock*>& blocks) {
+			return ray_cap != 0u ||
+			       (std::ranges::any_of(blocks,
+			                            [](const CFG::BasicBlock* block) {
+				                            return block->inst_begin != block->inst_end;
+			                            }) &&
+			        std::ranges::all_of(blocks, in_body));
+		});
+	}
+	const bool  header_budget = loop_cap != 0u && structured;
+	const auto& cfg           = header_budget ? budgeted : source_cfg;
 
 	IR::Program result;
 	result.stage               = options.stage;
@@ -1716,21 +1713,6 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 		return result;
 	}();
-	// The looping material bodies the function expansion bracketed: their loops are bounded. (A
-	// ray tracing shader's loops all are, at their headers, BudgetLoopHeaders: one budget, with
-	// one cap.)
-	std::vector<std::pair<uint32_t, uint32_t>> bounded;
-	if (Decoder::ShaderCallLoopCap() != 0u && !header_budget) {
-		for (const auto& instruction: decoded.instructions) {
-			if (instruction.opcode != Decoder::Opcode::S_NOP) continue;
-			if (instruction.raw[0] == Decoder::ShaderCallLoopBodyBegin) {
-				bounded.emplace_back(instruction.pc, UINT32_MAX);
-			} else if (instruction.raw[0] == Decoder::ShaderCallLoopBodyEnd && !bounded.empty() &&
-			           bounded.back().second == UINT32_MAX) {
-				bounded.back().second = instruction.pc;
-			}
-		}
-	}
 	const auto& probes = ProbePoints();
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
@@ -1779,8 +1761,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				}
 			}
 		}
-		translator.AddBranchCondition(cfg, cfg_block, result.block_info[typed_index], bounded,
-		                              Decoder::ShaderCallLoopCap(), header_budget ? ray_cap : 0u);
+		translator.AddBranchCondition(cfg, cfg_block, result.block_info[typed_index],
+		                              header_budget ? loop_cap : 0u);
 	}
 	if (IR::IrValidationEnabled()) {
 		IR::ValidateProgram(result, false);

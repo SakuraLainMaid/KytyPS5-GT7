@@ -739,13 +739,17 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 
 // A target of a table with record data (specialized or not) that has a loop is left to the miss
 // path unless KYTY_CALL_LOOPS=1, which inlines it with its loops bounded (ShaderCallLoopCap).
-// Bounding the loops was not enough: every garage visit and music rally load with them inlined
-// lost the device in GT7's material pass (2026-10-12). Its looping material functions use VGPRs
-// from v32 up, and the pass keeps its call loop's "lanes left" flag in v32 (cleared before the
-// call, tested after it), so once one of them ran the call loop never finished. A callee that
-// overwrites the flag would hang the console too: the pass presumably never calls them there,
-// and why the emulator's lanes select them is open. On the miss path the waves that select one
-// end there, unshaded (the unpainted cars).
+// Bounding the back edges was not enough: every garage visit and music rally load with them
+// inlined lost the device in GT7's material pass (2026-10-12). Its looping material functions use
+// VGPRs from v32 up, and a pass that keeps its call loop's "lanes left" flag in v32 (cleared
+// before the call, tested after it) never finished its call loop once one of them ran. A callee
+// that overwrites the flag would hang the console too: the pass presumably never calls them
+// there, and the emulator's lanes selected them from inputs it had not drawn (the ray tracing
+// pass was skipped then). Since then the flag is cleared again where the calls return
+// (WaterfallFlag), the loops end at their headers once the budget is spent (BudgetLoopHeaders in
+// Translate.cpp), and a pointer outside guest memory no longer indexes past the page table
+// (DefineGetBdaPointer); whether that is enough is what KYTY_CALL_LOOPS=1 tests. On the miss
+// path the lanes that select one go unshaded (the unpainted cars).
 std::atomic_bool& LoopingVariantsSwitch() {
 	static std::atomic_bool value = [] {
 		const char* text = std::getenv("KYTY_CALL_LOOPS");
@@ -765,6 +769,64 @@ uint32_t LoopCap() {
 		return static_cast<uint32_t>(std::strtoul(text, nullptr, 10));
 	}();
 	return value;
+}
+
+// The VGPR a waterfall around the table call at `call` keeps its "lanes left" flag in, or
+// UINT32_MAX. GT7's material passes call each material's function for its lanes in turn:
+//   loop: V_READFIRSTLANE_B32 s, vKey; S_MOV_B64 sE, exec; V_CMPX_EQ_U32 exec, s, vKey
+//         V_MOV_B32 vF, 0            (these lanes are done)
+//         ... scalar setup ... S_SWAPPC_B64
+//         S_MOV_B64 exec, sE; V_CMPX_NE_U32 exec, 0, vF; S_CBRANCH_EXECNZ loop
+// A callee that left vF set would have its lanes called again, forever. Only this shape counts:
+// the exec restore, the test and the branch back to (or before) the clear right after the call,
+// and nothing but scalar instructions, none of them a branch target, between the clear and the
+// call. (An out-flag the callee is meant to set looks different: its test is not followed by a
+// branch back over the clear.)
+uint32_t WaterfallFlag(const std::vector<Instruction>& instructions, size_t call) {
+	const auto zero = [](const Operand& operand) {
+		return operand.kind == OperandKind::IntegerInlineConstant && operand.value == 0;
+	};
+	const auto next = [&](size_t k) {
+		while (k < instructions.size() && (instructions[k].opcode == Opcode::S_WAITCNT ||
+		                                   instructions[k].opcode == Opcode::S_NOP)) {
+			k++;
+		}
+		return k;
+	};
+	const auto restore = next(call + 1u);
+	if (restore >= instructions.size() || instructions[restore].opcode != Opcode::S_MOV_B64 ||
+	    instructions[restore].dst.kind != OperandKind::ExecLo) {
+		return UINT32_MAX;
+	}
+	const auto test = next(restore + 1u);
+	if (test >= instructions.size() || instructions[test].opcode != Opcode::V_CMPX_NE_U32 ||
+	    !zero(instructions[test].src0) || instructions[test].src1.kind != OperandKind::Vgpr) {
+		return UINT32_MAX;
+	}
+	const auto flag   = instructions[test].src1.reg;
+	const auto branch = next(test + 1u);
+	if (branch >= instructions.size() || instructions[branch].opcode != Opcode::S_CBRANCH_EXECNZ) {
+		return UINT32_MAX;
+	}
+	for (size_t k = call; k-- > 0 && k + 24u > call;) {
+		const auto& inst = instructions[k];
+		if (inst.opcode == Opcode::V_MOV_B32 && inst.dst.kind == OperandKind::Vgpr &&
+		    inst.dst.reg == flag && zero(inst.src0)) {
+			const auto clear = inst.pc;
+			const auto end   = instructions[call].pc;
+			const bool entered =
+			    std::any_of(instructions.begin(), instructions.end(), [&](const auto& other) {
+				    return IsDirectBranch(other.opcode) && other.branch_target > clear &&
+				           other.branch_target <= end;
+			    });
+			return instructions[branch].branch_target <= clear && !entered ? flag : UINT32_MAX;
+		}
+		if (!magic_enum::enum_name(inst.opcode).starts_with("S_") || IsDirectBranch(inst.opcode) ||
+		    IsCall(inst.raw[0])) {
+			break;
+		}
+	}
+	return UINT32_MAX;
 }
 
 bool HasBackEdge(const std::vector<Instruction>& instructions) {
@@ -1131,6 +1193,15 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 			}
 			for (const auto at: returns)
 				relocations.emplace_back(at, result.size());
+			// Every callee leaves a waterfall's flag clear on the console (WaterfallFlag): its
+			// lanes would be called forever otherwise. An inlined body that sets it here, run
+			// on data the emulator does not reproduce, hung the GPU in GT7's material pass
+			// (2026-10-12): the flag is cleared again where the bodies and the miss path return.
+			const auto flag = WaterfallFlag(
+			    program.instructions, static_cast<size_t>(&inst - program.instructions.data()));
+			if (flag != UINT32_MAX && !call.targets.empty()) {
+				result.push_back(0x7e000280u | (flag << 17u)); // V_MOV_B32 v[flag], 0
+			}
 		}
 		if (result.size() > MaxExpandedWords) {
 			reason = "expanded shader exceeds the bounded code size";

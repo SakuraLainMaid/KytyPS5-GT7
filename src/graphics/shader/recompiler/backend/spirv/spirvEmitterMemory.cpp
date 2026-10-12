@@ -1589,24 +1589,40 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpFunctionParameter, type, address);
 	EmitLabel(state, entry_label);
 
-	const auto extended = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address,
-	                             ConstantDeviceAddress(state, BufferCachePages::kExtendedMemoryBase));
-	const auto packed = Select(state, type, extended,
-	                           Binary(state, spv::OpISub, type, address,
-	                                  ConstantDeviceAddress(state,
-	                                      BufferCachePages::kExtendedMemoryBase - BufferCachePages::kLowerAddressSize)),
-	                           address);
-	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, packed,
-	                                  ConstantDeviceAddress(state, BufferCachePages::kPageBits));
-	const auto page          = Unary(state, spv::OpUConvert, TypeU32(state), page64);
+	// Only the guest's two GPU-visible windows have pages: the lower 1 TiB and the extended
+	// memory window. Any other address (a pointer read from data the emulator does not reproduce)
+	// has no page-table entry: packed, its page lies past the table (or wraps into it once
+	// truncated), so the table load and the fault record would reach past their buffers, which
+	// faults the device. Such an address reads as missing and records no fault.
+	const auto lower = Binary(state, spv::OpULessThan, TypeBool(state), address,
+	                          ConstantDeviceAddress(state, BufferCachePages::kLowerAddressSize));
+	const auto into_ext =
+	    Binary(state, spv::OpISub, type, address,
+	           ConstantDeviceAddress(state, BufferCachePages::kExtendedMemoryBase));
+	const auto extended =
+	    Binary(state, spv::OpULessThan, TypeBool(state), into_ext,
+	           ConstantDeviceAddress(state, BufferCachePages::kExtendedMemorySize));
+	const auto in_range = Binary(state, spv::OpLogicalOr, TypeBool(state), lower, extended);
+	const auto packed =
+	    Select(state, type, extended,
+	           Binary(state, spv::OpIAdd, type, into_ext,
+	                  ConstantDeviceAddress(state, BufferCachePages::kLowerAddressSize)),
+	           address);
+	const auto page64 = Binary(state, spv::OpShiftRightLogical, type, packed,
+	                           ConstantDeviceAddress(state, BufferCachePages::kPageBits));
+	const auto page =
+	    Select(state, TypeU32(state), in_range,
+	           Unary(state, spv::OpUConvert, TypeU32(state), page64), ConstantU32(state, 0));
 	const auto entry_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state, 64),
 	                          entry_pointer, state.bda_pagetable_variable, ConstantU32(state, 0),
 	                          page);
 	const auto base = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, type, base, entry_pointer);
-	const auto missing =
-	    Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantDeviceAddress(state, 0));
+	const auto missing = Binary(
+	    state, spv::OpLogicalOr, TypeBool(state),
+	    Unary(state, spv::OpLogicalNot, TypeBool(state), in_range),
+	    Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantDeviceAddress(state, 0)));
 	const auto fault_label     = state.builder.AllocateId();
 	const auto available_label = state.builder.AllocateId();
 	const auto merge_label     = state.builder.AllocateId();
@@ -1614,7 +1630,7 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpBranchConditional, missing, fault_label, available_label);
 
 	EmitLabel(state, fault_label);
-	RecordBdaFault(state, page);
+	EmitIfCondition(state, in_range, [&]() { RecordBdaFault(state, page); });
 	const auto fault_exit = state.current_label;
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 
