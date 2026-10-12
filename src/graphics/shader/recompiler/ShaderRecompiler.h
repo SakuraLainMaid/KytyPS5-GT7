@@ -52,6 +52,9 @@ struct CompileResult {
 // Diagnostics (KYTY_PROBE, Translate.cpp): the probe points set for the shader, as text for its
 // disk cache key; empty when it has none.
 [[nodiscard]] std::string ShaderProbeKey(uint64_t shader_hash);
+// Diagnostics (KYTY_DUMP_SHADER_HASHES): whether the shader's guest code is dumped when it is
+// translated; its disk cache key then differs, so it is translated.
+[[nodiscard]] bool ShaderDumpRequested(uint64_t shader_hash);
 
 } // namespace Libs::Graphics::ShaderRecompiler
 

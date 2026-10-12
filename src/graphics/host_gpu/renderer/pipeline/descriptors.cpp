@@ -79,12 +79,40 @@ void LogWords(const uint32_t* words, size_t count) {
 
 } // namespace
 
-static uint64_t WatchedShaderHash() {
-	static const uint64_t hash = [] {
-		const char* value = std::getenv("KYTY_WATCH_SHADER");
-		return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+// KYTY_WATCH_SHADER=<hash>[,<hash>...] (hex): the bindings of these shaders are logged
+// (PrepareBindings); the first also names the shader KYTY_WATCH_SHADER_FRAME and KYTY_DUMP_GUEST's
+// relative frames count from.
+static const std::vector<uint64_t>& WatchedShaderHashes() {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> result;
+		const char*           value = std::getenv("KYTY_WATCH_SHADER");
+		while (value != nullptr && *value != '\0') {
+			char*      end  = nullptr;
+			const auto hash = std::strtoull(value, &end, 16);
+			if (end == value) break;
+			if (hash != 0) result.push_back(hash);
+			value = *end == ',' ? end + 1 : nullptr;
+		}
+		return result;
 	}();
-	return hash;
+	return hashes;
+}
+
+static uint64_t WatchedShaderHash() {
+	const auto& hashes = WatchedShaderHashes();
+	return hashes.empty() ? 0ull : hashes.front();
+}
+
+// The how-manieth use of a watched shader this is (UINT32_MAX: not watched).
+static uint32_t WatchedShaderUse(uint64_t hash) {
+	const auto& hashes = WatchedShaderHashes();
+	if (hash == 0 || std::ranges::find(hashes, hash) == hashes.end()) {
+		return UINT32_MAX;
+	}
+	static std::mutex                             mutex;
+	static std::unordered_map<uint64_t, uint32_t> uses;
+	const std::lock_guard                         lock(mutex);
+	return uses[hash]++;
 }
 
 static std::atomic<uint64_t> g_watched_first_frame {UINT64_MAX};
@@ -2035,17 +2063,14 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
 	const DiagShaderScope diag_shader_scope(program.shader_hash);
-	// Diagnostics: KYTY_WATCH_SHADER=<hash> logs the buffer and texture descriptors a shader is
-	// bound with (first few uses; KYTY_WATCH_SHADER_EVERY=<n> adds every n-th use, up to 8 more).
-	const uint64_t        watch_shader = WatchedShaderHash();
+	// Diagnostics: KYTY_WATCH_SHADER=<hash>[,<hash>...] logs the buffer and texture descriptors
+	// these shaders are bound with (first few uses of each; KYTY_WATCH_SHADER_EVERY=<n> adds every
+	// n-th use, up to 8 more), with the shaders that last wrote each buffer.
 	static const uint32_t watch_every = [] {
 		const char* value = std::getenv("KYTY_WATCH_SHADER_EVERY");
 		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
 	}();
-	static std::atomic<uint32_t> watched_uses {0};
-	const auto                   watched_use = watch_shader != 0 && program.shader_hash == watch_shader
-	                                               ? watched_uses.fetch_add(1)
-	                                               : UINT32_MAX;
+	const auto                   watched_use = WatchedShaderUse(program.shader_hash);
 	static std::atomic<uint32_t> frame_uses {0};
 	const bool in_watched_frame =
 	    watched_use != UINT32_MAX &&
@@ -2066,14 +2091,22 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			// Whether the GPU has written bytes of the buffer that the CPU copy lacks.
 			const uint64_t bytes =
 			    std::max<uint64_t>(r.Stride(), 1u) * static_cast<uint64_t>(r.NumRecords());
-			const bool gpu_written = r.Base48() != 0 && bytes != 0 &&
-			                         m_context.GetBufferCache().HasGpuDirtyBytes(r.Base48(), bytes);
+			auto&      cache = m_context.GetBufferCache();
+			const bool gpu_written =
+			    r.Base48() != 0 && bytes != 0 && cache.HasGpuDirtyBytes(r.Base48(), bytes);
+			const bool cpu_modified =
+			    r.Base48() != 0 && bytes != 0 && cache.IsRegionCpuModified(r.Base48(), bytes);
+			const auto writers = r.Base48() != 0 && bytes != 0
+			                         ? BufferCache::GpuWritersOf(r.Base48(), bytes)
+			                         : std::string();
 			LOGF("  buffer[%zu]: pc=0x%x formatted=%d written=%d base=0x%012" PRIx64
-			     " stride=%u records=%u format=%u dst_sel=%u%u%u%u gpu_written=%d\n",
+			     " stride=%u records=%u format=%u dst_sel=%u%u%u%u gpu_written=%d cpu_modified=%d"
+			     " writers=%s\n",
 			     i, program.info.buffers[i].first_use_pc, program.info.buffers[i].formatted ? 1 : 0,
 			     program.info.buffers[i].written ? 1 : 0, r.Base48(), r.Stride(), r.NumRecords(),
 			     r.RawFormat(), r.DstSelX(), r.DstSelY(), r.DstSelZ(), r.DstSelW(),
-			     gpu_written ? 1 : 0);
+			     gpu_written ? 1 : 0, cpu_modified ? 1 : 0,
+			     writers.empty() ? "-" : writers.c_str());
 			// Small buffers (constants, tables) are listed in full, as guest memory holds them.
 			if (r.Base48() != 0 && bytes != 0 && bytes <= 4096 && !gpu_written) {
 				std::vector<uint32_t> words((bytes + 3) / 4);

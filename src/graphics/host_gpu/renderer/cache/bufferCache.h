@@ -16,6 +16,7 @@
 #include <memory>
 #include <shared_mutex>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -143,6 +144,9 @@ public:
 	// Diagnostics: the last writer of a GPU-written range, and game-thread downloads by writer.
 	static void                     RecordGpuWriter(uint64_t vaddr, uint64_t size, uint64_t shader);
 	static void                     ReportGameThreadDownload(uint64_t vaddr, uint64_t bytes);
+	// Diagnostics: the shaders (hex, "copy" for copies, fills and label writes) whose last
+	// recorded writes overlap [vaddr, vaddr + size), at most four; empty when none.
+	[[nodiscard]] static std::string GpuWritersOf(uint64_t vaddr, uint64_t size);
 
 private:
 	friend struct BufferCacheTestAccess;

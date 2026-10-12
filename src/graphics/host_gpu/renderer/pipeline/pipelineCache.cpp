@@ -1053,11 +1053,15 @@ struct PipelineCache::ProgramCache {
 		writer.PutWords(code);
 		writer.PutWords(params.back_code);
 		ShaderDiskCache::AppendInputKey(writer, input_info);
-		// A probed shader (KYTY_PROBE) keys its points: probing one shader keeps the others.
+		// A probed shader (KYTY_PROBE) keys its points, and a dumped one (KYTY_DUMP_SHADER_HASHES)
+		// its request, so it translates: diagnosing one shader keeps the others.
 		if (const auto probe = ShaderRecompiler::ShaderProbeKey(options.shader_hash);
 		    !probe.empty()) {
 			writer.Put<uint8_t>('D');
 			writer.PutBytes({reinterpret_cast<const uint8_t*>(probe.data()), probe.size()});
+		}
+		if (ShaderRecompiler::ShaderDumpRequested(options.shader_hash)) {
+			writer.Put<uint8_t>('X');
 		}
 		key = std::move(writer.bytes);
 	}

@@ -1187,6 +1187,26 @@ void BufferCache::RecordGpuWriter(uint64_t vaddr, uint64_t size, uint64_t shader
 	g_writers[vaddr] = {vaddr + size, shader};
 }
 
+std::string BufferCache::GpuWritersOf(uint64_t vaddr, uint64_t size) {
+	std::lock_guard       lock(g_writers_mutex);
+	std::vector<uint64_t> shaders;
+	// Ranges are keyed by their start; one that starts below vaddr may still reach into it.
+	constexpr uint64_t reach = uint64_t {1} << 28u;
+	for (auto it = g_writers.lower_bound(vaddr > reach ? vaddr - reach : 0);
+	     it != g_writers.end() && it->first < vaddr + size && shaders.size() < 4; ++it) {
+		if (it->second.end <= vaddr) continue;
+		if (std::ranges::find(shaders, it->second.shader) == shaders.end()) {
+			shaders.push_back(it->second.shader);
+		}
+	}
+	std::string text;
+	for (const auto shader: shaders) {
+		text += text.empty() ? "" : ",";
+		text += shader == 0 ? std::string("copy") : fmt::format("{:016x}", shader);
+	}
+	return text;
+}
+
 void BufferCache::ReportGameThreadDownload(uint64_t vaddr, uint64_t bytes) {
 	std::lock_guard lock(g_writers_mutex);
 	uint64_t        shader = UINT64_MAX; // no record

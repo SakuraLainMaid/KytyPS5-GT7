@@ -38420,10 +38420,10 @@ void CheckResourcePlanHandoff() {
 // float buffer stores encode the 11- and 10-bit floats. KYTY_PROBE (main sets
 // it before any shader is translated): the probed shader counts the lanes at
 // the point and records the registers into the fault buffer, in both emulated
-// wave halves.
+// wave halves; a write point (@w) follows each instruction that writes memory.
 constexpr uint64_t ProbeTestHash = 0x7ab1f0ull;
 constexpr const char *ProbeTestSetting =
-    "7ab1f0@8:v1,s2,s106,s107;7ab1f0@8:v1-v3";
+    "7ab1f0@8:v1,s2,s106,s107;7ab1f0@8:v1-v3;7ab1f0@w";
 
 void SetProbeSetting() {
 #if defined(_WIN32)
@@ -38440,13 +38440,15 @@ void CheckShaderProbe() {
     test.name = wave == 32u ? "ShaderProbeWave32" : "ShaderProbeWave64";
     AppendVMovLiteral(&test.code, 1, 0x1234u); // pc 0
     AppendSMovLiteral(&test.code, 2, 0x5678u); // pc 8: the probes follow it
+    AppendStoreVgpr(&test.code, 1, 0); // the write point follows the store
     AppendEnd(&test.code);
-    test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::S_ENDPGM};
+    test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_STORE_DWORD,
+                    O::S_ENDPGM};
     test.compute_info.wave_size = wave;
     test.has_compute_info = true;
     test.compile_only = true;
     test.shader_hash = ProbeTestHash;
-    test.ir_counts = {{"ShaderProbe", 2}};
+    test.ir_counts = {{"ShaderProbe", 3}};
     test.required_spirv = {"OpAtomicIAdd", "OpBitCount"};
     (void)CompileCase(test);
     test.shader_hash = ProbeTestHash + 1u;

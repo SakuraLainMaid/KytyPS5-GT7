@@ -81,9 +81,9 @@ void ReportProbes(const uint8_t* area) {
 		const char* setting = std::getenv("KYTY_PROBE");
 		LOGF("Shader probe: KYTY_PROBE=%s\n", setting != nullptr ? setting : "");
 	}
-	LOGF("Shader probe: read %" PRIu64 ", lanes at each point: %u %u %u %u\n", submission, hits[0],
-	     hits[1], hits[2], hits[3]);
-	static_assert(kShaderProbePoints == 4);
+	static_assert(kShaderProbePoints == 8);
+	LOGF("Shader probe: read %" PRIu64 ", lanes at each point: %u %u %u %u %u %u %u %u\n",
+	     submission, hits[0], hits[1], hits[2], hits[3], hits[4], hits[5], hits[6], hits[7]);
 	for (uint32_t index = 0; index < kShaderProbeSlots; ++index) {
 		ShaderProbeRecord record;
 		std::memcpy(&record, area + offsetof(ShaderTrapArea, probes) + index * sizeof(record),

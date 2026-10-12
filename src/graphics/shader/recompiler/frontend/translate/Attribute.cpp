@@ -109,6 +109,8 @@ void Translator::Probe(uint32_t pc, uint32_t point, std::span<const uint32_t> re
 				values[index] = ir.GetVccLo();
 			} else if (sgpr == 107u) {
 				values[index] = ir.GetVccHi();
+			} else if (sgpr == 124u) {
+				values[index] = ir.GetM0();
 			}
 		} else if (reg < IR::NumVectorRegs) {
 			values[index] = ir.GetVectorReg(static_cast<IR::VectorReg>(reg));

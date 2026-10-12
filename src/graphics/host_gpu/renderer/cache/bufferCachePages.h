@@ -68,7 +68,7 @@ struct ShaderProbeRecord {
 	uint32_t reserved[3] {};
 	uint32_t values[12] {};
 };
-inline constexpr uint32_t kShaderProbePoints        = 4;
+inline constexpr uint32_t kShaderProbePoints        = 8;
 inline constexpr uint32_t kShaderProbeSlotsPerPoint = 16;
 inline constexpr uint32_t kShaderProbeEarly         = 4;
 inline constexpr uint32_t kShaderProbeSlots  = kShaderProbePoints * kShaderProbeSlotsPerPoint;

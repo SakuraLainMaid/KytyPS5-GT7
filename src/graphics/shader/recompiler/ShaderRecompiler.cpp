@@ -26,11 +26,13 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fmt/format.h>
 #include <map>
 #include <mutex>
 #include <set>
 #include <span>
+#include <string>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler {
@@ -43,13 +45,34 @@ const char* GetDumpLabel(const CompileOptions& options) {
 
 const char* StageName(ShaderType stage);
 
+// KYTY_DUMP_SHADER_HASHES="hash,hash,...": the shaders whose guest code is dumped when they are
+// translated (into KYTY_DUMP_GAVE_UP, or shader-dumps without it), for shaders that compile. The
+// name is written in two pieces so the shader cache's scan of switches leaves it out of every
+// shader's key: only the listed shaders change (their source keys carry the request, see
+// ShaderDumpRequested), so they translate again and dump.
+const std::string& DumpShaderHashes() {
+	static const std::string value = [] {
+		const auto  name = std::string("KYTY_") + "DUMP_SHADER_HASHES";
+		const char* text = std::getenv(name.c_str());
+		return text != nullptr ? std::string(text) : std::string();
+	}();
+	return value;
+}
+
 // KYTY_DUMP_GAVE_UP=<folder>: write the guest code of every shader that gives up to
 // <folder>/<stage>_<hash>.bin, so it can be disassembled offline (llvm-mc -triple=amdgcn).
-void DumpGaveUpCode(const CompileOptions& options, std::span<const uint32_t> code) {
+// Shaders KYTY_DUMP_SHADER_HASHES names are written there too, or to shader-dumps.
+void DumpGaveUpCode(const CompileOptions& options, std::span<const uint32_t> code,
+                    bool requested = false) {
 	const char* folder = std::getenv("KYTY_DUMP_GAVE_UP");
+	if (folder == nullptr && requested) {
+		folder = "shader-dumps";
+	}
 	if (folder == nullptr || code.empty()) {
 		return;
 	}
+	std::error_code created;
+	std::filesystem::create_directories(folder, created);
 	const auto path = fmt::format("{}/{}_{:016x}.bin", folder, StageName(options.stage),
 	                              options.shader_hash);
 	if (FILE* file = std::fopen(path.c_str(), "wb"); file != nullptr) {
@@ -536,6 +559,12 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 
 } // namespace
 
+bool ShaderDumpRequested(uint64_t shader_hash) {
+	const auto& list = DumpShaderHashes();
+	return shader_hash != 0 && !list.empty() &&
+	       list.find(fmt::format("{:016x}", shader_hash)) != std::string::npos;
+}
+
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
 	const Frontend::TranslationNonFatalScope non_fatal_scope(options.non_fatal);
 	if (code.empty()) {
@@ -583,13 +612,9 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
 
-	// KYTY_DUMP_SHADER_HASHES="hash,hash,...": dump these shaders' code too (into
-	// KYTY_DUMP_GAVE_UP), for shaders that compile but are skipped later.
-	if (const char* list = std::getenv("KYTY_DUMP_SHADER_HASHES");
-	    list != nullptr &&
-	    std::string_view(list).find(fmt::format("{:016x}", options.shader_hash)) !=
-	        std::string_view::npos) {
-		DumpGaveUpCode(options, code);
+	// KYTY_DUMP_SHADER_HASHES (DumpShaderHashes): dump these shaders' code too.
+	if (ShaderDumpRequested(options.shader_hash)) {
+		DumpGaveUpCode(options, code, true);
 	}
 	std::string decoded_dump;
 	if (options.dump_ir) {

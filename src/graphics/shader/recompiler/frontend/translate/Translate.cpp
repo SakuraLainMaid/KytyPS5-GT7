@@ -8,8 +8,10 @@
 #include <bit>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -1069,18 +1071,115 @@ void ValidateTranslateOptions(const TranslateOptions& options) {
 } // namespace
 
 struct ProbePoint {
-	uint64_t              hash = 0;
-	uint32_t              pc   = 0;
+	uint64_t              hash   = 0;
+	uint32_t              pc     = 0;
+	bool                  writes = false; // <hash>@w: every instruction that writes memory
 	std::vector<uint32_t> registers;
 };
 
+namespace {
+
+// The registers a write point (KYTY_PROBE <hash>@w) records after an instruction that writes
+// memory: its address registers, the first four SGPRs of its resource and its offset SGPR, then its
+// data, which an atomic that returns has replaced with the value it read. GDS operations and the
+// append counters record m0, their address, their data and what they returned. None for any other
+// instruction.
+std::vector<uint32_t> WriteProbeRegisters(const Decoder::Instruction& inst) {
+	using Decoder::Opcode;
+	using Decoder::OperandKind;
+	constexpr size_t      limit = 12;
+	std::vector<uint32_t> registers;
+
+	const auto vector = [&](const Decoder::Operand& operand, uint32_t count) {
+		if (operand.kind != OperandKind::Vgpr) return;
+		for (uint32_t i = 0; i < count && registers.size() < limit; i++) {
+			registers.push_back(operand.reg + i);
+		}
+	};
+	const auto scalar = [&](const Decoder::Operand& operand, uint32_t count) {
+		if (operand.kind == OperandKind::M0 && registers.size() < limit) {
+			registers.push_back(Translator::ProbeScalar | 124u);
+			return;
+		}
+		if (operand.kind != OperandKind::Sgpr) return;
+		for (uint32_t i = 0; i < count && registers.size() < limit; i++) {
+			registers.push_back(Translator::ProbeScalar | (operand.reg + i));
+		}
+	};
+	const auto op   = inst.opcode;
+	const auto data = std::max(inst.data_dwords, 1u);
+	switch (inst.family) {
+		case Decoder::Family::MUBUF:
+		case Decoder::Family::MTBUF:
+			if (!((op >= Opcode::BUFFER_STORE_FORMAT_X && op <= Opcode::BUFFER_STORE_FORMAT_XYZW) ||
+			      (op >= Opcode::BUFFER_STORE_BYTE && op <= Opcode::BUFFER_STORE_DWORDX4) ||
+			      (op >= Opcode::TBUFFER_STORE_FORMAT_X &&
+			       op <= Opcode::TBUFFER_STORE_FORMAT_XYZW) ||
+			      (op >= Opcode::BUFFER_ATOMIC_SWAP && op <= Opcode::BUFFER_ATOMIC_FMAX))) {
+				break;
+			}
+			vector(inst.src0, (inst.idxen ? 1u : 0u) + (inst.offen ? 1u : 0u));
+			scalar(inst.src1, 4u);
+			scalar(inst.src2, 1u);
+			vector(inst.dst, data);
+			break;
+		case Decoder::Family::MIMG: {
+			if (op != Opcode::IMAGE_STORE && op != Opcode::IMAGE_STORE_MIP &&
+			    !(op >= Opcode::IMAGE_ATOMIC_SWAP && op <= Opcode::IMAGE_ATOMIC_FMAX)) {
+				break;
+			}
+			const auto components = std::min(inst.image_address_components, 4u);
+			if (inst.image_nsa_dwords == 0u) {
+				vector(inst.src0, components);
+			} else {
+				vector(inst.src0, 1u);
+				for (uint32_t i = 1; i < components && registers.size() < limit; i++) {
+					registers.push_back(inst.image_nsa_addr[i - 1u]);
+				}
+			}
+			scalar(inst.src1, 4u);
+			vector(inst.dst, data);
+			break;
+		}
+		case Decoder::Family::FLAT:
+			if (op < Opcode::FLAT_STORE_BYTE || op > Opcode::FLAT_STORE_DWORDX4) break;
+			vector(inst.src0, 1u);
+			if (inst.src1.kind == OperandKind::Vgpr) {
+				vector(inst.src1, 1u);
+			} else {
+				scalar(inst.src1, 2u);
+			}
+			vector(inst.dst, data);
+			break;
+		case Decoder::Family::DS: {
+			const bool counter = op == Opcode::DS_APPEND || op == Opcode::DS_CONSUME;
+			if (!inst.gds && !counter) break;
+			registers.push_back(Translator::ProbeScalar | 124u);
+			if (!counter) {
+				vector(inst.src0, 1u);
+				vector(inst.src1, 1u);
+			}
+			if (counter || magic_enum::enum_name(op).find("RTN") != std::string_view::npos) {
+				vector(inst.dst, 1u);
+			}
+			break;
+		}
+		default: break;
+	}
+	return registers;
+}
+
+} // namespace
+
 // Diagnostics: KYTY_PROBE=<shader hash>@<pc>:<reg>[,<reg>...][;<hash>@<pc>:...] (hex hash and pc;
-// registers v<n>, s<n> (s106 and s107 are vcc_lo and vcc_hi) or ranges v<n>-v<m>, at most 12; at
-// most Translator::ProbePoints points)
+// registers v<n>, s<n> (s106 and s107 are vcc_lo and vcc_hi, s124 is m0) or ranges v<n>-v<m>, at
+// most 12; at most Translator::ProbePoints points)
 // records those registers of the active lanes after the instruction at pc; the host logs them
-// ("Shader probe:"). The name is written in two pieces so the shader cache's scan of switches
-// (shader_cache_version.cmake) leaves it out of the key of every shader: only the probed shaders
-// change, and their source keys carry the points (ShaderProbeKey).
+// ("Shader probe:"). A point <hash>@w instead follows every instruction of the shader that writes
+// memory, each with its own registers (WriteProbeRegisters), the pcs telling them apart. The name
+// is written in two pieces so the shader cache's scan of switches (shader_cache_version.cmake)
+// leaves it out of the key of every shader: only the probed shaders change, and their source keys
+// carry the points (ShaderProbeKey).
 const std::vector<ProbePoint>& ProbePoints() {
 	static const std::vector<ProbePoint> points = [] {
 		std::vector<ProbePoint> parsed;
@@ -1098,11 +1197,17 @@ const std::vector<ProbePoint>& ProbePoints() {
 			start            = end + 1;
 			const auto at    = item.find('@');
 			const auto colon = item.find(':');
-			if (at == std::string::npos || colon == std::string::npos || colon < at) continue;
+			if (at == std::string::npos) continue;
 			ProbePoint point;
 			point.hash = std::strtoull(item.substr(0, at).c_str(), nullptr, 16);
-			point.pc   = static_cast<uint32_t>(
-                std::strtoul(item.substr(at + 1, colon - at - 1).c_str(), nullptr, 16));
+			if (item.compare(at + 1, std::string::npos, "w") == 0) {
+				point.writes = true;
+				parsed.push_back(std::move(point));
+				continue;
+			}
+			if (colon == std::string::npos || colon < at) continue;
+			point.pc = static_cast<uint32_t>(
+			    std::strtoul(item.substr(at + 1, colon - at - 1).c_str(), nullptr, 16));
 			size_t reg_start = colon + 1;
 			while (reg_start < item.size() && point.registers.size() < 12u) {
 				auto reg_end = item.find(',', reg_start);
@@ -1575,7 +1680,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			translator.TranslateInstruction(instruction);
 			for (uint32_t point = 0; point < probes.size(); point++) {
 				const auto& probe = probes[point];
-				if (probe.hash == result.shader_hash && probe.pc == instruction.pc) {
+				if (probe.hash != result.shader_hash) continue;
+				if (probe.writes) {
+					const auto registers = WriteProbeRegisters(instruction);
+					if (!registers.empty()) translator.Probe(instruction.pc, point, registers);
+				} else if (probe.pc == instruction.pc) {
 					translator.Probe(instruction.pc, point, probe.registers);
 				}
 			}
@@ -1609,7 +1718,8 @@ std::string ShaderProbeKey(uint64_t shader_hash) {
 	const auto& points = Frontend::ProbePoints();
 	for (uint32_t point = 0; point < points.size(); point++) {
 		if (points[point].hash != shader_hash) continue;
-		key += std::to_string(point) + '@' + std::to_string(points[point].pc) + ':';
+		key += std::to_string(point) + '@' +
+		       (points[point].writes ? std::string("w") : std::to_string(points[point].pc)) + ':';
 		for (const auto reg: points[point].registers) {
 			key += std::to_string(reg) + ',';
 		}
