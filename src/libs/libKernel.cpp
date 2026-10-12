@@ -2934,7 +2934,7 @@ int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject** fiber) {
 	const auto* context = FiberGetThreadContext();
 	*fiber              = (context != nullptr ? context->current_fiber : nullptr);
 
-	return (*fiber != nullptr ? OK : FIBER_ERROR_PERMISSION);
+	return OK;
 }
 
 int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_on_run) {
