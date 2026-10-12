@@ -393,7 +393,7 @@ static_assert(sizeof(IR::BufferWrite) == 72);
 static_assert(sizeof(IR::UniformFill) == 28);
 static_assert(sizeof(IR::UniformFillPlan) == 96);
 static_assert(sizeof(IR::ResourceSpecialization::Buffer) == 28);
-static_assert(sizeof(IR::ResourceSpecialization::Image) == 36);
+static_assert(sizeof(IR::ResourceSpecialization::Image) == 40);
 static_assert(sizeof(IR::ResourceSpecialization::Sampler) == 8);
 static_assert(sizeof(IR::ResourceSpecialization) == 72);
 static_assert(sizeof(IR::ResourcePlan) == 856);
