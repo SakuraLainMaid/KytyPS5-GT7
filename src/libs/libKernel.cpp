@@ -30,9 +30,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -2304,6 +2306,12 @@ constexpr uint32_t FIBER_STATE_RUNNING     = 1;
 constexpr uint32_t FIBER_STATE_IDLE        = 2;
 constexpr uint32_t FIBER_STATE_TERMINATED  = 3;
 constexpr uint32_t FIBER_FLAG_SET_FPU_REGS = 0x100;
+// What the library loads at a fiber's start when FIBER_FLAG_SET_FPU_REGS is set.
+constexpr uint32_t FIBER_DEFAULT_MXCSR = 0x9fc0;
+constexpr uint16_t FIBER_DEFAULT_FPUCW = 0x037f;
+// The stack a fiber without a context of its own runs on; on the console it shares the thread's.
+constexpr uint64_t FIBER_STACKLESS_SIZE  = 0x100000;
+constexpr uint64_t FIBER_STACK_CAP_BYTES = 0x80000000;
 
 using FiberEntry = KYTY_SYSV_ABI void (*)(uint64_t arg_on_initialize, uint64_t arg_on_run);
 
@@ -2322,9 +2330,13 @@ struct FiberCpuContext {
 	uint64_t r15;
 	uint64_t rsp;
 	uint64_t rip;
+	uint32_t mxcsr;
+	uint16_t fpucw;
+	uint16_t padding;
 };
 
-static_assert(sizeof(FiberCpuContext) == 80);
+static_assert(sizeof(FiberCpuContext) == 88);
+static_assert(offsetof(FiberCpuContext, mxcsr) == 80 && offsetof(FiberCpuContext, fpucw) == 84);
 
 struct FiberObject {
 	uint32_t        magic_start;
@@ -2364,6 +2376,22 @@ static_assert(sizeof(FiberInfo) == 128);
 static bool FiberIsValid(const FiberObject* fiber) {
 	return fiber != nullptr && fiber->magic_start == FIBER_MAGIC_START &&
 	       fiber->magic_end == FIBER_MAGIC_END;
+}
+
+static int32_t FiberCheck(const FiberObject* fiber) {
+	if (fiber == nullptr) {
+		return FIBER_ERROR_NULL;
+	}
+	if ((reinterpret_cast<uint64_t>(fiber) & 7u) != 0) {
+		return FIBER_ERROR_ALIGNMENT;
+	}
+	return FiberIsValid(fiber) ? OK : FIBER_ERROR_INVALID;
+}
+
+// A fiber initialized without a context runs on the thread's stack on the console and keeps no
+// continuation: returning or switching away from it ends its run, and the next run starts over.
+static bool FiberIsStackless(const FiberObject* fiber) {
+	return fiber->addr_context == nullptr;
 }
 
 struct FiberThreadContext {
@@ -2454,6 +2482,8 @@ static void FiberSetContextValid(FiberObject* fiber, bool valid) {
 	             "movq %r11, 64(%r10)\n\t"
 	             "movq (%rsp), %r11\n\t"
 	             "movq %r11, 72(%r10)\n\t"
+	             "stmxcsr 80(%r10)\n\t"
+	             "fnstcw 84(%r10)\n\t"
 	             "xorl %eax, %eax\n\t"
 	             "retq\n");
 }
@@ -2471,10 +2501,22 @@ FiberRestoreContext(FiberCpuContext* /*ctx*/, uint64_t /*ret*/) {
 	             "movq 40(%r10), %r13\n\t"
 	             "movq 48(%r10), %r14\n\t"
 	             "movq 56(%r10), %r15\n\t"
+	             "ldmxcsr 80(%r10)\n\t"
+	             "fldcw 84(%r10)\n\t"
 	             "movq 64(%r10), %rsp\n\t"
 	             "jmp *%r11\n");
 }
+
+static void FiberCaptureFpuState(FiberCpuContext* ctx) {
+	asm volatile("stmxcsr %0\n\t"
+	             "fnstcw %1\n\t"
+	             : "=m"(ctx->mxcsr), "=m"(ctx->fpucw));
+}
 #else
+static void FiberCaptureFpuState(FiberCpuContext* ctx) {
+	(void)ctx;
+}
+
 static int FiberSaveContext(FiberCpuContext* ctx) {
 	(void)ctx;
 	return 0;
@@ -2487,13 +2529,124 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 }
 #endif
 
+// Fibers run on stacks the emulator maps, from the region thread stacks live in, rather than on
+// the memory the game handed over. Host code runs on whatever stack the guest is on: every HLE
+// call, and on Windows the dispatch of every fault, including those GPU tracking raises on
+// purpose. A game's fiber stack is sized for the console, where none of that touches it, and it
+// lives in game memory that GPU tracking can protect; the kernel cannot dispatch a fault onto a
+// protected or exhausted stack and ends the process without a word. The stack gets the headroom a
+// thread stack gets. KYTY_FIBER_STACK_EXTRA_KB sets that headroom; 0 runs fibers on the game's
+// stacks as before.
+struct FiberHostStack {
+	uint64_t addr = 0;
+	uint64_t size = 0;
+};
+
+static std::mutex                                             g_fiber_stack_mutex;
+static std::unordered_map<const FiberObject*, FiberHostStack> g_fiber_stacks;
+static uint64_t                                               g_fiber_stack_bytes = 0;
+static uint32_t                                               g_fiber_stack_maps  = 0;
+
+static uint64_t FiberStackExtra() {
+	static const uint64_t extra = [] {
+		const char* value = std::getenv("KYTY_FIBER_STACK_EXTRA_KB");
+		if (value == nullptr || *value == '\0') {
+			return LibKernel::PthreadGuestStackExtra();
+		}
+		return static_cast<uint64_t>(std::strtoull(value, nullptr, 10)) * 1024u;
+	}();
+	return extra;
+}
+
+static uint64_t FiberGameStackTop(const FiberObject* fiber) {
+	return reinterpret_cast<uint64_t>(fiber->addr_context) + fiber->size_context;
+}
+
+// The top of the stack a fiber starts on. Only called while nothing runs on the fiber's stack.
+static uint64_t FiberStackTop(FiberObject* fiber) {
+	const auto extra = FiberStackExtra();
+	if (extra == 0 && !FiberIsStackless(fiber)) {
+		return FiberGameStackTop(fiber);
+	}
+	const auto wanted =
+	    (FiberIsStackless(fiber) ? FIBER_STACKLESS_SIZE : fiber->size_context) + extra;
+
+	std::lock_guard lock(g_fiber_stack_mutex);
+	auto&           stack = g_fiber_stacks[fiber];
+	if (stack.size < wanted) {
+		if (stack.addr != 0) {
+			LibKernel::PthreadFreeFiberStack(stack.addr, stack.size);
+			g_fiber_stack_bytes -= stack.size;
+			stack = {};
+		}
+		// A fiber object freed without being finalized keeps its stack; past the cap, fibers new
+		// to the table run on their own stacks rather than the emulator's memory growing on.
+		const bool over_cap =
+		    !FiberIsStackless(fiber) && g_fiber_stack_bytes + wanted > FIBER_STACK_CAP_BYTES;
+		if (over_cap || !LibKernel::PthreadAllocateFiberStack(wanted, &stack.addr, &stack.size)) {
+			g_fiber_stacks.erase(fiber);
+			if (FiberIsStackless(fiber)) {
+				EXIT("Fiber: no room for a stack for fiber '%s'\n", fiber->name);
+			}
+			static std::atomic_bool reported {false};
+			if (!reported.exchange(true)) {
+				const auto line = fmt::format(
+				    "Fiber stacks: no room for another ({} MB on {} fibers); '{}' and later ones "
+				    "run on their own stacks\n",
+				    g_fiber_stack_bytes / (1024u * 1024u), g_fiber_stacks.size(), fiber->name);
+				std::fputs(line.c_str(), stdout);
+				LOGF("%s", line.c_str());
+			}
+			return FiberGameStackTop(fiber);
+		}
+		g_fiber_stack_bytes += stack.size;
+		g_fiber_stack_maps++;
+		if ((g_fiber_stack_maps & (g_fiber_stack_maps - 1u)) == 0) {
+			const auto line = fmt::format(
+			    "Fiber stacks: {} mapped, {} fibers on them ({} MB); the newest, '{}', has {} KB "
+			    "of its own\n",
+			    g_fiber_stack_maps, g_fiber_stacks.size(), g_fiber_stack_bytes / (1024u * 1024u),
+			    fiber->name, fiber->size_context / 1024u);
+			std::fputs(line.c_str(), stdout);
+			LOGF("%s", line.c_str());
+		}
+	}
+	return stack.addr + stack.size;
+}
+
+// Called once nothing can run on the fiber's stack any more.
+static void FiberReleaseStack(const FiberObject* fiber) {
+	std::lock_guard lock(g_fiber_stack_mutex);
+	auto            it = g_fiber_stacks.find(fiber);
+	if (it == g_fiber_stacks.end()) {
+		return;
+	}
+	LibKernel::PthreadFreeFiberStack(it->second.addr, it->second.size);
+	g_fiber_stack_bytes -= it->second.size;
+	g_fiber_stacks.erase(it);
+}
+
+static void FiberReportNoCurrentFiber(const char* function) {
+	static std::atomic_bool reported {false};
+	if (!reported.exchange(true)) {
+		const auto line = fmt::format(
+		    "Fiber: {} called while the thread's fiber run has no current fiber\n", function);
+		std::fputs(line.c_str(), stdout);
+		LOGF("%s", line.c_str());
+	}
+}
+
 [[noreturn]] static KYTY_SYSV_ABI void FiberStartTrampoline(FiberObject* fiber);
 
 [[noreturn]] static KYTY_SYSV_ABI void FiberStartOnGuestStack(FiberObject* fiber) {
 	FiberCpuContext ctx {};
-	const auto      stack_top = reinterpret_cast<uintptr_t>(fiber->addr_context) +
-	                            static_cast<uintptr_t>(fiber->size_context);
-	auto            rsp       = (stack_top & ~static_cast<uintptr_t>(0x0f));
+	FiberCaptureFpuState(&ctx);
+	if ((fiber->flags & FIBER_FLAG_SET_FPU_REGS) != 0) {
+		ctx.mxcsr = FIBER_DEFAULT_MXCSR;
+		ctx.fpucw = FIBER_DEFAULT_FPUCW;
+	}
+	const auto stack_top = FiberStackTop(fiber);
+	auto       rsp       = (stack_top & ~static_cast<uintptr_t>(0x0f));
 	rsp -= sizeof(uint64_t);
 	*reinterpret_cast<uint64_t*>(rsp) = 0;
 
@@ -2502,6 +2655,14 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 	ctx.rdi = reinterpret_cast<uint64_t>(fiber);
 
 	FiberRestoreContext(&ctx, 1);
+}
+
+// Resume the fiber where it stopped, or start it.
+[[noreturn]] static KYTY_SYSV_ABI void FiberEnter(FiberObject* fiber) {
+	if (fiber->context_valid) {
+		FiberRestoreContext(&fiber->saved_context, 1);
+	}
+	FiberStartOnGuestStack(fiber);
 }
 
 [[noreturn]] static KYTY_SYSV_ABI void FiberStartTrampoline(FiberObject* fiber) {
@@ -2616,18 +2777,49 @@ int32_t KYTY_SYSV_ABI FiberFinalize(FiberObject* fiber) {
 	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_TERMINATED)) {
 		return FIBER_ERROR_STATE;
 	}
+	FiberReleaseStack(fiber);
 
 	return OK;
 }
 
-int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t* arg_on_return) {
-	PRINT_NAME();
-
-	if (!FiberIsValid(fiber)) {
+// The library's _sceFiberAttachContext: a fiber initialized without a context can be given one
+// when it is run or switched to.
+static int32_t FiberAttachContext(FiberObject* fiber, void* addr_context, uint64_t size_context) {
+	if (addr_context == nullptr && size_context == 0) {
+		return OK;
+	}
+	if (size_context != 0 && size_context < FIBER_CONTEXT_MIN_SIZE) {
+		return FIBER_ERROR_RANGE;
+	}
+	if ((size_context & 15u) != 0 || addr_context == nullptr || size_context == 0) {
 		return FIBER_ERROR_INVALID;
+	}
+	if ((reinterpret_cast<uint64_t>(addr_context) & 15u) != 0) {
+		return FIBER_ERROR_ALIGNMENT;
+	}
+	if (fiber->addr_context != nullptr) {
+		return FIBER_ERROR_INVALID;
+	}
+
+	fiber->addr_context                   = addr_context;
+	fiber->size_context                   = size_context;
+	fiber->context_start                  = addr_context;
+	fiber->context_end                    = static_cast<uint8_t*>(addr_context) + size_context;
+	*static_cast<uint64_t*>(addr_context) = FIBER_STACK_MAGIC;
+
+	return OK;
+}
+
+static int32_t FiberRunWithContext(FiberObject* fiber, void* addr_context, uint64_t size_context,
+                                   uint64_t arg_on_run, uint64_t* arg_on_return) {
+	if (const auto result = FiberCheck(fiber); result != OK) {
+		return result;
 	}
 	if (FiberGetThreadContext() != nullptr) {
 		return FIBER_ERROR_PERMISSION;
+	}
+	if (const auto result = FiberAttachContext(fiber, addr_context, size_context); result != OK) {
+		return result;
 	}
 	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_RUNNING)) {
 		return FIBER_ERROR_STATE;
@@ -2640,10 +2832,7 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 	FiberSetThreadContext(&context);
 
 	if (FiberSaveContext(&context.cpu_context) == 0) {
-		if (fiber->context_valid) {
-			FiberRestoreContext(&fiber->saved_context, 1);
-		}
-		FiberStartOnGuestStack(fiber);
+		FiberEnter(fiber);
 	}
 
 	auto* returned_fiber  = (context.returned_fiber != nullptr ? context.returned_fiber : fiber);
@@ -2661,34 +2850,54 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 	return return_code;
 }
 
-int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
-                                  uint64_t* arg_on_return) {
+int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t* arg_on_return) {
 	PRINT_NAME();
 
-	if (!FiberIsValid(fiber)) {
-		return FIBER_ERROR_INVALID;
+	return FiberRunWithContext(fiber, nullptr, 0, arg_on_run, arg_on_return);
+}
+
+// _sceFiberAttachContextAndRun: what the SDK's sceFiberRun calls, with a context to attach.
+int32_t KYTY_SYSV_ABI FiberRunImpl(FiberObject* fiber, void* addr_context, uint64_t size_context,
+                                   uint64_t arg_on_run, uint64_t* arg_on_return) {
+	PRINT_NAME();
+
+	return FiberRunWithContext(fiber, addr_context, size_context, arg_on_run, arg_on_return);
+}
+
+static int32_t FiberSwitchWithContext(FiberObject* fiber, void* addr_context, uint64_t size_context,
+                                      uint64_t arg_on_run, uint64_t* arg_on_return) {
+	if (const auto result = FiberCheck(fiber); result != OK) {
+		return result;
 	}
 	auto* context = FiberGetThreadContext();
 	if (context == nullptr) {
 		return FIBER_ERROR_PERMISSION;
 	}
-
+	auto* caller = context->current_fiber;
+	if (caller == nullptr) {
+		FiberReportNoCurrentFiber("FiberSwitch");
+		return FIBER_ERROR_PERMISSION;
+	}
+	if (const auto result = FiberAttachContext(fiber, addr_context, size_context); result != OK) {
+		return result;
+	}
 	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_RUNNING)) {
 		return FIBER_ERROR_STATE;
 	}
 
-	auto* caller = context->current_fiber;
-
 	fiber->arg_on_run    = arg_on_run;
 	fiber->arg_on_return = 0;
+
+	if (FiberIsStackless(caller)) {
+		FiberSetContextValid(caller, false);
+		context->pending_idle_fiber = caller;
+		FiberEnter(fiber);
+	}
 
 	if (FiberSaveContext(&caller->saved_context) == 0) {
 		FiberSetContextValid(caller, true);
 		context->pending_idle_fiber = caller;
-		if (fiber->context_valid) {
-			FiberRestoreContext(&fiber->saved_context, 1);
-		}
-		FiberStartOnGuestStack(fiber);
+		FiberEnter(fiber);
 	}
 
 	FiberCompleteSwitch(caller);
@@ -2700,6 +2909,21 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 	return OK;
 }
 
+int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
+                                  uint64_t* arg_on_return) {
+	PRINT_NAME();
+
+	return FiberSwitchWithContext(fiber, nullptr, 0, arg_on_run, arg_on_return);
+}
+
+// _sceFiberAttachContextAndSwitch: what the SDK's sceFiberSwitch calls, with a context to attach.
+int32_t KYTY_SYSV_ABI FiberSwitchImpl(FiberObject* fiber, void* addr_context, uint64_t size_context,
+                                      uint64_t arg_on_run, uint64_t* arg_on_return) {
+	PRINT_NAME();
+
+	return FiberSwitchWithContext(fiber, addr_context, size_context, arg_on_run, arg_on_return);
+}
+
 int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject** fiber) {
 	PRINT_NAME();
 
@@ -2708,9 +2932,9 @@ int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject** fiber) {
 	}
 
 	const auto* context = FiberGetThreadContext();
-	*fiber = context != nullptr ? context->current_fiber : nullptr;
+	*fiber              = (context != nullptr ? context->current_fiber : nullptr);
 
-	return OK;
+	return (*fiber != nullptr ? OK : FIBER_ERROR_PERMISSION);
 }
 
 int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_on_run) {
@@ -2721,12 +2945,23 @@ int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_
 		return FIBER_ERROR_PERMISSION;
 	}
 
-	auto* fiber          = context->current_fiber;
+	auto* fiber = context->current_fiber;
+	if (fiber == nullptr) {
+		FiberReportNoCurrentFiber("FiberReturnToThread");
+		return FIBER_ERROR_PERMISSION;
+	}
 	fiber->arg_on_return = arg_on_return;
+
+	if (FiberIsStackless(fiber)) {
+		FiberSetContextValid(fiber, false);
+		context->returned_fiber     = fiber;
+		context->pending_idle_fiber = fiber;
+		FiberRestoreContext(&context->cpu_context, 1);
+	}
 
 	if (FiberSaveContext(&fiber->saved_context) == 0) {
 		FiberSetContextValid(fiber, true);
-		context->returned_fiber = fiber;
+		context->returned_fiber     = fiber;
 		context->pending_idle_fiber = fiber;
 		FiberRestoreContext(&context->cpu_context, 1);
 	}
@@ -3052,8 +3287,8 @@ LIB_DEFINE(InitFiber_1) {
 	LIB_FUNC("PFT2S-tJ7Uk", Fiber::FiberSwitch);
 	LIB_FUNC("p+zLIOg27zU", Fiber::FiberGetSelf);
 	LIB_FUNC("B0ZX2hx9DMw", Fiber::FiberReturnToThread);
-	LIB_FUNC("avfGJ94g36Q", Fiber::FiberRun);
-	LIB_FUNC("ZqhZFuzKT6U", Fiber::FiberSwitch);
+	LIB_FUNC("avfGJ94g36Q", Fiber::FiberRunImpl);
+	LIB_FUNC("ZqhZFuzKT6U", Fiber::FiberSwitchImpl);
 	LIB_FUNC("uq2Y5BFz0PE", Fiber::FiberGetInfo);
 	LIB_FUNC("Lcqty+QNWFc", Fiber::FiberStartContextSizeCheck);
 	LIB_FUNC("Kj4nXMpnM8Y", Fiber::FiberStopContextSizeCheck);

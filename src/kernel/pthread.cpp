@@ -693,23 +693,9 @@ static size_t RoundStackSize(size_t size) {
 	return ((size + PTHREAD_STACK_PAGE - 1) / PTHREAD_STACK_PAGE) * PTHREAD_STACK_PAGE;
 }
 
-static int CreateGuestStack(PthreadAttr attr) {
-	if (attr == nullptr) {
-		return KERNEL_ERROR_EINVAL;
-	}
-
-	if (attr->stack_addr != nullptr) {
-		attr->guard_size     = 0;
-		attr->stack_user     = true;
-		attr->stack_map_addr = 0;
-		attr->stack_map_size = 0;
-		return OK;
-	}
-
-	const auto stack_size = RoundStackSize(attr->stack_size);
-	const auto guard_size = RoundStackSize(attr->guard_size);
-	const auto map_size   = stack_size + guard_size;
-
+// A stack mapping from the region guest stacks live in, reused from the cache when one of the same
+// shape was freed. The guard pages at its bottom are protected. Returns 0 when there is no room.
+static uint64_t MapGuestStack(size_t map_size, size_t guard_size, const char* name) {
 	uint64_t stack_addr = 0;
 	bool     cached     = false;
 	{
@@ -729,28 +715,50 @@ static int CreateGuestStack(PthreadAttr attr) {
 				g_guest_stack_last = PTHREAD_STACK_TOP - PTHREAD_STACK_INITIAL - PTHREAD_STACK_PAGE;
 			}
 			if (map_size > g_guest_stack_last - PTHREAD_STACK_BOTTOM) {
-				return KERNEL_ERROR_EAGAIN;
+				return 0;
 			}
 			stack_addr = g_guest_stack_last - map_size;
 			g_guest_stack_last -= map_size;
 		}
 	}
 
-	int result = OK;
 	if (!cached) {
-		stack_addr = Memory::AllocateGuestStackMemory(
-		    stack_addr, map_size, Common::VirtualMemory::Mode::ReadWrite, "stack");
+		stack_addr = Memory::AllocateGuestStackMemory(stack_addr, map_size,
+		                                              Common::VirtualMemory::Mode::ReadWrite, name);
 		if (stack_addr == 0) {
-			return KERNEL_ERROR_EAGAIN;
+			return 0;
 		}
 	}
 
-	if (guard_size != 0) {
-		result = Memory::KernelMprotect(reinterpret_cast<void*>(stack_addr), guard_size, 0);
-		if (result != OK) {
-			Memory::KernelMunmap(stack_addr, map_size);
-			return KERNEL_ERROR_EAGAIN;
-		}
+	if (guard_size != 0 &&
+	    Memory::KernelMprotect(reinterpret_cast<void*>(stack_addr), guard_size, 0) != OK) {
+		Memory::KernelMunmap(stack_addr, map_size);
+		return 0;
+	}
+
+	return stack_addr;
+}
+
+static int CreateGuestStack(PthreadAttr attr) {
+	if (attr == nullptr) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	if (attr->stack_addr != nullptr) {
+		attr->guard_size     = 0;
+		attr->stack_user     = true;
+		attr->stack_map_addr = 0;
+		attr->stack_map_size = 0;
+		return OK;
+	}
+
+	const auto stack_size = RoundStackSize(attr->stack_size);
+	const auto guard_size = RoundStackSize(attr->guard_size);
+	const auto map_size   = stack_size + guard_size;
+
+	const auto stack_addr = MapGuestStack(map_size, guard_size, "stack");
+	if (stack_addr == 0) {
+		return KERNEL_ERROR_EAGAIN;
 	}
 
 	attr->stack_addr     = reinterpret_cast<void*>(stack_addr + guard_size);
@@ -779,6 +787,34 @@ static void FreeGuestStack(PthreadAttr attr) {
 	attr->stack_addr     = nullptr;
 	attr->stack_map_addr = 0;
 	attr->stack_map_size = 0;
+}
+
+bool PthreadAllocateFiberStack(uint64_t size, uint64_t* stack_addr, uint64_t* stack_size) {
+	if (stack_addr == nullptr || stack_size == nullptr || size == 0) {
+		return false;
+	}
+	const auto stack_bytes = RoundStackSize(size);
+	const auto map_addr =
+	    MapGuestStack(stack_bytes + PTHREAD_STACK_PAGE, PTHREAD_STACK_PAGE, "fiber stack");
+	if (map_addr == 0) {
+		return false;
+	}
+	*stack_addr = map_addr + PTHREAD_STACK_PAGE;
+	*stack_size = stack_bytes;
+	return true;
+}
+
+void PthreadFreeFiberStack(uint64_t stack_addr, uint64_t stack_size) {
+	if (stack_addr == 0 || stack_size == 0) {
+		return;
+	}
+	Common::LockGuard lock(g_guest_stack_mutex);
+	g_guest_stack_cache.push_back(
+	    {stack_addr - PTHREAD_STACK_PAGE, stack_size + PTHREAD_STACK_PAGE, PTHREAD_STACK_PAGE});
+}
+
+uint64_t PthreadGuestStackExtra() {
+	return PTHREAD_STACK_EXTRA;
 }
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)

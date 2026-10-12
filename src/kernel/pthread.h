@@ -116,6 +116,12 @@ void                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);
 bool                  PthreadTakePendingSignal(Pthread thread, int signum);
 bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_size);
+// Fiber stacks come from the region thread stacks live in: GPU tracking never protects it, so a
+// fault raised on a fiber can always be dispatched. The bottom guard page is protected.
+bool PthreadAllocateFiberStack(uint64_t size, uint64_t* stack_addr, uint64_t* stack_size);
+void PthreadFreeFiberStack(uint64_t stack_addr, uint64_t stack_size);
+// The headroom thread stacks get beyond what the game asks for, for host code on a guest stack.
+uint64_t PthreadGuestStackExtra();
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_address,
                                   uint64_t* map_size);
