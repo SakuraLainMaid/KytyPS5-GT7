@@ -2429,8 +2429,30 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
-		if (image.info.data.address != address) {
+		// A write at the image's base is the same resource seen as a buffer. One elsewhere in or
+		// around it leaves an image the GPU drew or stored alone (the buffer does not hold those
+		// texels), but a texture whose texels are still the guest bytes takes the write: the
+		// buffer holds those bytes and the write. GT7 builds its light grid (an R32G32_UINT
+		// array its lit shaders read as a texture) with a compute pass that writes a larger
+		// buffer around it; left stale, its lit shaders found no lights in it (2026-10-12).
+		const bool guest_texels =
+		    !image.IsGpuModified() && !image.usage.render_target && !image.usage.depth_target &&
+		    !image.usage.storage && !image.usage.video_out && image.info.samples == 1 &&
+		    image.info.metadata.compression == VideoOutCompression::Uncompressed &&
+		    image.Overlaps(address, size);
+		if (image.info.data.address != address && !guest_texels) {
 			continue;
+		}
+		if (image.info.data.address != address) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+				LOGF("TextureCache: GPU buffer write 0x%016" PRIx64 "+0x%" PRIx64
+				     " covers texture 0x%016" PRIx64 "+0x%" PRIx64
+				     " (%ux%u, %u layers, format %u): the texture takes the write\n",
+				     address, size, image.info.data.address, image.info.data.size,
+				     image.info.extent.width, image.info.extent.height, image.info.resources.layers,
+				     static_cast<uint32_t>(image.info.pixel_format));
+			}
 		}
 		if (image.IsGpuModified()) {
 			image.ClearGpuModified();
