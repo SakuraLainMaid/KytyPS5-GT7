@@ -231,6 +231,8 @@ struct Call {
 	uint32_t                return_reg;
 	bool                    dynamic;
 	std::vector<CallTarget> targets;
+	// A ray tracing shader's hit call that returns at once (RayHitCallsReturn).
+	bool null_callee = false;
 	// Table calls: the inlined variants, each with the index of its function in `targets`.
 	bool                                                specialized = false;
 	// A material table (records after the targets): its looping bodies are bracketed for the
@@ -401,6 +403,9 @@ struct CallSite {
 	std::vector<Variant> variants;  // ascending, the candidates
 	std::vector<Variant> preferred; // the reported variants among them (ascending), first
 	size_t               table_targets = 0; // the variants the table holds (for the log only)
+	// A ray tracing shader's hit call, which returns at once (RayHitCallsReturn): nothing is
+	// resolved for it.
+	bool null_callee = false;
 
 	// The table size (and a table call's distinct targets, which only the log uses) are left
 	// out: a table that grows (GT7 streams materials in) while offering the same variants keeps
@@ -410,9 +415,58 @@ struct CallSite {
 		       dynamic == other.dynamic && (dynamic || addresses == other.addresses) &&
 		       pinned == other.pinned && specialized == other.specialized &&
 		       records == other.records && variants == other.variants &&
-		       preferred == other.preferred;
+		       preferred == other.preferred && null_callee == other.null_callee;
 	}
 };
+
+// KYTY_RAY_HIT_CALLS=1: a ray tracing shader's calls are inlined like any other (every table
+// target, or the shader gives up). By default they return at once (RayHitCallsReturn).
+bool RayHitCallsInlined() {
+	static const bool value = [] {
+		const char* text = std::getenv("KYTY_RAY_HIT_CALLS");
+		return text != nullptr && text[0] == '1';
+	}();
+	return value;
+}
+
+bool HasBvhIntersection(const std::vector<Instruction>& instructions) {
+	return std::any_of(instructions.begin(), instructions.end(), [](const auto& inst) {
+		return inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY;
+	});
+}
+
+// A ray tracing shader's calls are its hit functions: GT7's traversal calls one for a candidate
+// on geometry that is not opaque (an alpha test), with v7 = 1 ("accept") set before the call, and
+// keeps the candidate if the function leaves v7 non-zero. They return at once here, so every
+// candidate counts, as if all geometry were opaque: the shader then depends on its code alone,
+// where inlining the functions made it depend on tables that change from scene to scene (one
+// program per set, or the shader gave up), and its traversal loops are bounded instead
+// (ShaderRayLoopCap). Before, the whole pass was skipped: GT7's reflection rays never ran, and
+// the material passes that shade their hits (the car paint's reflections) found an empty list.
+bool RayHitCallsReturn(const ShaderAnalysis& analysis) {
+	return !RayHitCallsInlined() && HasBvhIntersection(analysis.program.instructions);
+}
+
+// Each call of the shader, as a call that returns at once (RayHitCallsReturn).
+bool NullCallSites(const ShaderAnalysis& analysis, std::vector<CallSite>& sites,
+                   std::string& reason) {
+	for (const auto& inst: analysis.program.instructions) {
+		if (!IsCall(inst.raw[0])) continue;
+		const auto src = inst.raw[0] & 255u;
+		const auto dst = (inst.raw[0] >> 16u) & 127u;
+		if (src >= 105u || dst >= 105u) {
+			reason = "shader call uses a special scalar register pair";
+			return false;
+		}
+		CallSite site;
+		site.pc          = inst.pc;
+		site.source_reg  = src;
+		site.return_reg  = dst;
+		site.null_callee = true;
+		sites.push_back(std::move(site));
+	}
+	return true;
+}
 
 // Resolves each call's targets from the user data and the memory holding call tables. Which
 // registers it consults depends on the code alone; their values reach the result only through
@@ -775,6 +829,11 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 	};
 	for (const auto& site: sites) {
 		Call call {site.source_reg, site.return_reg, site.dynamic, {}};
+		if (site.null_callee) {
+			call.null_callee = true;
+			calls.emplace(site.pc, std::move(call));
+			continue;
+		}
 		if (!site.dynamic) {
 			for (const auto address: site.addresses) {
 				CallTarget target {address, {}};
@@ -853,15 +912,10 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 		return false;
 	}
 	// A table target left out takes the miss path, which returns as if the callee did nothing.
-	// The material waterfalls do not depend on what their callee does, but a ray traversal loop
-	// does (its hit functions end the traversal): a partial expansion of one hung the GPU. Such
-	// a shader needs every target, or it gives up as before.
-	const auto has_bvh = [](const std::vector<Instruction>& instructions) {
-		return std::any_of(instructions.begin(), instructions.end(), [](const auto& inst) {
-			return inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY;
-		});
-	};
-	if (st.Partial() && has_bvh(program.instructions)) {
+	// A partial expansion of a ray tracing shader once hung the GPU (2026-10-10), so with
+	// KYTY_RAY_HIT_CALLS=1 such a shader needs every target, or it gives up as before. (By
+	// default its calls return at once and its loops are bounded: RayHitCallsReturn.)
+	if (st.Partial() && HasBvhIntersection(program.instructions)) {
 		reason = "ray tracing shader with table call targets left out";
 		return false;
 	}
@@ -905,6 +959,13 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 					main_branches.emplace_back(result.size(), inst.branch_target);
 				result.insert(result.end(), inst.raw, inst.raw + inst.word_count);
 			}
+		} else if (found->second.null_callee) {
+			// A function that returns at once: the call leaves its return address in the pair,
+			// and nothing else changes (S_MOV leaves SCC alone, as SWAPPC does).
+			const auto&    call      = found->second;
+			const uint64_t return_pc = base + inst.pc + inst.word_count * 4u;
+			EmitMove(result, call.return_reg, static_cast<uint32_t>(return_pc));
+			EmitMove(result, call.return_reg + 1u, static_cast<uint32_t>(return_pc >> 32u));
 		} else {
 			const auto&           call      = found->second;
 			const uint64_t        return_pc = base + inst.pc + inst.word_count * 4u;
@@ -1274,9 +1335,16 @@ bool InlineShaderFunctions(std::span<const uint32_t> code, uint64_t base,
 	}
 	std::vector<CallSite> sites;
 	std::set<uint32_t>    dependencies;
-	bool ok = ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason);
+	const bool            null_calls = RayHitCallsReturn(analysis);
+
+	bool ok = false;
+	if (null_calls) {
+		ok = NullCallSites(analysis, sites, reason);
+	} else {
+		ok = ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason);
+	}
 	if (ok) {
-		SelectTableTargets(sites, nullptr);
+		if (!null_calls) SelectTableTargets(sites, nullptr);
 		ok = BuildExpansion(analysis, base, sites, dependencies, read, wave_size, expanded, reason);
 	}
 	if (consulted_user_data != nullptr) {
@@ -1337,6 +1405,15 @@ bool ShaderCallRuntimeRecords() {
 
 uint32_t ShaderCallLoopCap() {
 	return LoopCap();
+}
+
+uint32_t ShaderRayLoopCap() {
+	static const uint32_t value = [] {
+		const char* text = std::getenv("KYTY_RAY_LOOP_CAP");
+		if (text == nullptr || text[0] == '\0') return 4096u;
+		return static_cast<uint32_t>(std::strtoul(text, nullptr, 10));
+	}();
+	return value;
 }
 
 void SetShaderCallRuntimeRecords(bool value) {
@@ -1475,15 +1552,19 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	}
 	std::vector<CallSite> sites;
 	std::set<uint32_t>    dependencies;
-	if (!ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason)) {
-		return false;
-	}
-	{
+	const bool            null_calls = RayHitCallsReturn(analysis);
+	if (null_calls) {
+		if (!NullCallSites(analysis, sites, reason)) return false;
+	} else {
+		if (!ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies,
+		                  reason)) {
+			return false;
+		}
 		const auto reported = shader_hash != 0 ? ShaderCallMissTargets(shader_hash) : nullptr;
 		SelectTableTargets(sites, reported.get(), shader_hash != 0 && RuntimeRecords());
 	}
 	std::string drop_note;
-	if (shader_hash != 0) {
+	if (shader_hash != 0 && !null_calls) {
 		// The specialized variants this expansion would inline, over all its table calls.
 		std::vector<ShaderCallVariant> offered;
 		for (const auto& site: sites) {
@@ -1544,6 +1625,11 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	const auto builds = ++shader.builds;
 	if (summary != nullptr && expansion.ok && stats.Partial()) {
 		*summary = DescribeStats(stats, expansion.code.size());
+	}
+	if (summary != nullptr && expansion.ok && null_calls && builds == 1) {
+		*summary = "ray tracing shader: its " + std::to_string(expansion.sites.size()) +
+		           " hit function call(s) return at once, so every hit counts as opaque, and its "
+		           "loops are bounded (KYTY_RAY_HIT_CALLS=1 inlines the functions instead)";
 	}
 	if (summary != nullptr && !drop_note.empty()) {
 		*summary += (summary->empty() ? "" : "; ") + drop_note;

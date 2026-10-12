@@ -182,6 +182,7 @@ void Visit(Io& io, T& v) {
 	io(v.instance_offset_sgpr);
 	io(v.has_bitwise_xor);
 	io(v.uses_dma);
+	io(v.uses_bvh);
 }
 
 template <typename Io, typename T>

@@ -163,6 +163,9 @@ struct ShaderVertexInputInfo {
 	ShaderTessellationInputInfo tess;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
+	// PrepareProgram could not describe the vertex inputs (null vertex tables): the draw is
+	// skipped. Not part of any key, as no program is built for it.
+	bool prepare_failed = false;
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {

@@ -787,7 +787,8 @@ void Translator::WriteCompareResult(const Decoder::Operand& operand, IR::U1 valu
 
 void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
                                     IR::BlockInfo&                                 info,
-                                    std::span<const std::pair<uint32_t, uint32_t>> bounded) {
+                                    std::span<const std::pair<uint32_t, uint32_t>> bounded,
+                                    uint32_t loop_cap, uint32_t header_cap) {
 	const auto native_condition = [&](CFG::BranchCondition kind) -> IR::U1 {
 		IR::U1 condition;
 		switch (kind) {
@@ -838,7 +839,14 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 		auto condition = term.expression != UINT32_MAX ? expression(expression, term.expression)
 		                                               : native_condition(term.condition);
 		if (!bounded.empty()) {
-			condition = BoundLoopCondition(graph, source, condition, bounded);
+			condition = BoundLoopCondition(graph, source, condition, bounded, loop_cap);
+		}
+		// A loop header that enters its body on a condition (BudgetLoopHeaders): every round
+		// of the loop draws on the invocation's budget, and the loop ends at its merge once the
+		// budget is spent.
+		if (header_cap != 0u && term.loop_header && term.false_block == term.merge_block) {
+			condition = ir.LogicalAnd(condition, IR::U1(ir.Emit(IR::ValueOpcode::LoopBudgetTick,
+			                                                    {IR::Value(header_cap)})));
 		}
 		info.condition = condition;
 		ir.Emit(IR::ValueOpcode::Reference, {condition});
@@ -852,7 +860,8 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 // control flow; the budget is the same in every lane of a wave, as the branches are scalar.
 IR::U1 Translator::BoundLoopCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
                                       IR::U1                                         condition,
-                                      std::span<const std::pair<uint32_t, uint32_t>> bounded) {
+                                      std::span<const std::pair<uint32_t, uint32_t>> bounded,
+                                      uint32_t                                       loop_cap) {
 	// A loop is bounded when its first instructions lie in a bracketed body: the header's own,
 	// or, for the empty header the structurizer adds, those of the block it enters.
 	const auto in_body = [&](const CFG::BasicBlock& header) {
@@ -868,8 +877,7 @@ IR::U1 Translator::BoundLoopCondition(const CFG::Graph& graph, const CFG::BasicB
 		       });
 	};
 	const auto tick = [&]() {
-		return IR::U1(
-		    ir.Emit(IR::ValueOpcode::LoopBudgetTick, {IR::Value(Decoder::ShaderCallLoopCap())}));
+		return IR::U1(ir.Emit(IR::ValueOpcode::LoopBudgetTick, {IR::Value(loop_cap)}));
 	};
 	const auto& term = source.terminator;
 	// The latch of a bounded loop, branching back to its header.
@@ -1234,12 +1242,80 @@ const std::vector<ProbePoint>& ProbePoints() {
 	return points;
 }
 
-IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
+namespace {
+
+// A ray tracing shader's loops each run only while the invocation's loop budget lasts
+// (Decoder::ShaderRayLoopCap): its traversal follows node data, and a node list read as zero
+// (memory the emulator does not have yet) never ends. Every loop header of the structured graph
+// that its loop returns to enters the body on a condition (true here; AddBranchCondition adds
+// the budget) and leaves to the loop's merge otherwise, as SPIR-V allows (OpLoopMerge, then
+// OpBranchConditional). So every round of every loop passes the budget, whatever the loop's
+// shape: a latch that branches back unconditionally, a loop entered in the middle. A construct
+// the structurizer runs once (its continue block goes to the merge) is left alone. The budget
+// is the invocation's and the same in every lane of a wave (the branches are scalar): the ray
+// tracing passes seen so far run one wave per workgroup, so no barrier waits on a wave that has
+// left its loop.
+void BudgetLoopHeaders(CFG::Graph& graph) {
+	using ExprOp = CFG::ConditionExpression::Op;
+	auto truth   = static_cast<uint32_t>(graph.expressions.size());
+	for (uint32_t index = 0; index < graph.expressions.size(); index++) {
+		const auto& expression = graph.expressions[index];
+		if (expression.op == ExprOp::Constant && expression.lhs != 0) {
+			truth = index;
+			break;
+		}
+	}
+	if (truth == graph.expressions.size()) {
+		graph.expressions.push_back({ExprOp::Constant, 1u});
+	}
+	for (auto& block: graph.blocks) {
+		auto& term = block.terminator;
+		if (!term.loop_header || term.kind != CFG::TerminatorKind::Branch ||
+		    term.true_block == UINT32_MAX || term.merge_block == UINT32_MAX ||
+		    term.true_block == term.merge_block) {
+			continue;
+		}
+		const auto* latch   = graph.FindBlock(term.continue_block);
+		const bool  repeats = latch != nullptr &&
+		                     (latch->terminator.true_block == block.id ||
+		                      (latch->terminator.kind == CFG::TerminatorKind::ConditionalBranch &&
+		                       latch->terminator.false_block == block.id));
+		auto* merge = graph.FindBlock(term.merge_block);
+		if (!repeats || merge == nullptr) {
+			continue;
+		}
+		term.kind        = CFG::TerminatorKind::ConditionalBranch;
+		term.condition   = CFG::BranchCondition::Expression;
+		term.expression  = truth;
+		term.false_block = term.merge_block;
+		block.successors = {term.true_block, term.merge_block};
+		if (std::ranges::find(merge->predecessors, block.id) == merge->predecessors.end()) {
+			merge->predecessors.push_back(block.id);
+		}
+	}
+}
+
+} // namespace
+
+IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& source_cfg,
                              const TranslateOptions& options) {
 	ValidateTranslateOptions(options);
-	if (cfg.blocks.empty()) {
+	if (source_cfg.blocks.empty()) {
 		EXIT("cannot translate an empty CFG");
 	}
+	const bool ray_tracing = std::ranges::any_of(decoded.instructions, [](const auto& inst) {
+		return inst.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY;
+	});
+	// (Without structured control flow, the dispatcher bounds the invocation's block transitions
+	// itself: MaxDispatcherTransitions in spirvEmitterProgram.cpp.)
+	const auto ray_cap       = ray_tracing ? Decoder::ShaderRayLoopCap() : 0u;
+	const bool header_budget = ray_cap != 0u && !source_cfg.irreducible && !source_cfg.unsupported;
+	CFG::Graph budgeted;
+	if (header_budget) {
+		budgeted = source_cfg;
+		BudgetLoopHeaders(budgeted);
+	}
+	const auto& cfg = header_budget ? budgeted : source_cfg;
 
 	IR::Program result;
 	result.stage               = options.stage;
@@ -1640,9 +1716,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 		return result;
 	}();
-	// The looping material bodies the function expansion bracketed: their loops are bounded.
+	// The looping material bodies the function expansion bracketed: their loops are bounded. (A
+	// ray tracing shader's loops all are, at their headers, BudgetLoopHeaders: one budget, with
+	// one cap.)
 	std::vector<std::pair<uint32_t, uint32_t>> bounded;
-	if (Decoder::ShaderCallLoopCap() != 0u) {
+	if (Decoder::ShaderCallLoopCap() != 0u && !header_budget) {
 		for (const auto& instruction: decoded.instructions) {
 			if (instruction.opcode != Decoder::Opcode::S_NOP) continue;
 			if (instruction.raw[0] == Decoder::ShaderCallLoopBodyBegin) {
@@ -1701,7 +1779,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				}
 			}
 		}
-		translator.AddBranchCondition(cfg, cfg_block, result.block_info[typed_index], bounded);
+		translator.AddBranchCondition(cfg, cfg_block, result.block_info[typed_index], bounded,
+		                              Decoder::ShaderCallLoopCap(), header_budget ? ray_cap : 0u);
 	}
 	if (IR::IrValidationEnabled()) {
 		IR::ValidateProgram(result, false);

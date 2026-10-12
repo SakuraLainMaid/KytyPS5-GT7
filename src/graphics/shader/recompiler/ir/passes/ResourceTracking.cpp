@@ -389,6 +389,7 @@ public:
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
 		m_info.uses_dma = false;
+		m_info.uses_bvh = false;
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 
@@ -3128,6 +3129,7 @@ private:
 		if (op == ValueOpcode::BvhIntersect || op == ValueOpcode::ShaderTrap ||
 		    op == ValueOpcode::ShaderProbe) {
 			m_info.uses_dma = true;
+			m_info.uses_bvh |= op == ValueOpcode::BvhIntersect;
 			return;
 		}
 		const auto buffer       = BufferAccessOf(op);

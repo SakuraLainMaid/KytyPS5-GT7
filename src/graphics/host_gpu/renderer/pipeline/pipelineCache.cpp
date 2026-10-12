@@ -2258,6 +2258,18 @@ bool PipelineCache::DescribeGraphicsStages(
 		}
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
+		if (vertex_info[0].prepare_failed) {
+			// Skipped like the draws of a shader that gives up, and reported once per shader.
+			static std::mutex                   logged_mutex;
+			static std::unordered_set<uint64_t> logged;
+			std::lock_guard                     lock(logged_mutex);
+			if (logged.insert(vertex_params[0].hash).second) {
+				LOGF("vertex shader 0x%016" PRIx64 " at 0x%016" PRIx64
+				     ": its vertex inputs could not be described, draws skipped\n",
+				     vertex_params[0].hash, vertex_regs.es_regs.data_addr);
+			}
+			return false;
+		}
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {

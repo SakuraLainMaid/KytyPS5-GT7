@@ -181,11 +181,37 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
 	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
 	const auto pointer = FaultElementPointer(state, word);
-	const auto value   = state.builder.AllocateId();
-	// Different invocations can fault on distinct pages in the same bitset word.
-	// A load/OR/store loses one of those pages, preventing a complete retry.
-	state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), value, pointer,
-	                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0), bit);
+	// A page already recorded takes no atomic: a bounded loop over memory the emulator does not
+	// have yet (a ray's nodes, until the host maps the faulted pages) faults on it every round,
+	// in every lane, and atomics on one word serialize. A stale read only costs the atomic.
+	const auto recorded = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), recorded, pointer);
+	const auto missing = Binary(state, spv::OpIEqual, TypeBool(state),
+	                            Binary(state, spv::OpBitwiseAnd, TypeU32(state), recorded, bit),
+	                            ConstantU32(state, 0));
+	EmitIfCondition(state, missing, [&]() {
+		const auto value = state.builder.AllocateId();
+		// Different invocations can fault on distinct pages in the same bitset word.
+		// A load/OR/store loses one of those pages, preventing a complete retry.
+		state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), value, pointer,
+		                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0), bit);
+		if (state.program.info.uses_bvh) {
+			// A page this ray tracing shader recorded first (ShaderTrapArea::ray_faults).
+			constexpr auto word =
+			    static_cast<uint32_t>(BufferCachePages::kNumPages / 8 / sizeof(uint32_t) +
+			                          offsetof(ShaderTrapArea, ray_faults) / sizeof(uint32_t));
+			const auto first = Binary(state, spv::OpIEqual, TypeBool(state),
+			                          Binary(state, spv::OpBitwiseAnd, TypeU32(state), value, bit),
+			                          ConstantU32(state, 0));
+			EmitIfCondition(state, first, [&]() {
+				const auto count = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), count,
+				                          FaultElementPointer(state, ConstantU32(state, word)),
+				                          ConstantU32(state, spv::ScopeDevice),
+				                          ConstantU32(state, 0), ConstantU32(state, 1));
+			});
+		}
+	});
 }
 
 uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address) {
@@ -1589,6 +1615,7 @@ void DefineGetBdaPointer(EmitterState& state) {
 
 	EmitLabel(state, fault_label);
 	RecordBdaFault(state, page);
+	const auto fault_exit = state.current_label;
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 
 	EmitLabel(state, available_label);
@@ -1599,8 +1626,8 @@ void DefineGetBdaPointer(EmitterState& state) {
 
 	EmitLabel(state, merge_label);
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpPhi, type, result, ConstantDeviceAddress(state, 0),
-	                          fault_label, available, available_label);
+	state.builder.AddFunction(spv::OpPhi, type, result, ConstantDeviceAddress(state, 0), fault_exit,
+	                          available, available_label);
 	state.builder.AddFunction(spv::OpReturnValue, result);
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }

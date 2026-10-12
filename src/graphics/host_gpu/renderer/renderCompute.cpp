@@ -132,15 +132,21 @@ DispatchRecoveryPolicy& RecoveryPolicy() {
 // A missing BDA page returns zero during the first attempt. Preserve every
 // externally writable buffer, including atomic destinations, so that attempt
 // can be rolled back before any dependent dispatch observes its results.
+// A ray tracing shader is left out: its traversal finds the BVH a level per attempt, up to
+// MaxPageFaults pages each, so a scene the GPU has not touched yet would drain the GPU dozens
+// of times in one dispatch and could pass the 128 attempts Retry allows (the emulator exits
+// there). It runs once instead, as one writing images does: a ray that reaches a missing node
+// misses for that frame, and the pages it faulted on are mapped after the submission.
 class DispatchBufferRecovery {
 public:
 	DispatchBufferRecovery(RenderContext& context, const PreparedBindings& bindings,
 	                       uint64_t shader_address)
 	    : m_context(context), m_shader_address(shader_address) {
 		const auto& program = *bindings.runtime->program;
-		m_enabled           = program.info.uses_dma &&
-		                      std::none_of(program.info.images.begin(), program.info.images.end(),
-		                                   [](const auto& image) { return image.written; });
+		const bool  writes_images =
+		    std::any_of(program.info.images.begin(), program.info.images.end(),
+		                [](const auto& image) { return image.written; });
+		m_enabled = program.info.uses_dma && !program.info.uses_bvh && !writes_images;
 		if (!m_enabled) return;
 		auto& cache     = context.GetBufferCache();
 		auto& scheduler = context.GetCommandScheduler();

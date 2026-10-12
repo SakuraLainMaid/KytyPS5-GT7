@@ -38462,6 +38462,142 @@ void CheckShaderProbe() {
   std::printf("[host]    %-32s ok\n", "ShaderProbe");
 }
 
+// A ray tracing shader's hit calls (GT7's any-hit tests) return at once by default
+// (KYTY_RAY_HIT_CALLS unset): the call needs no target the expansion can resolve, leaves its
+// return address in the pair, depends on the code alone. Every loop is bounded at its header
+// (Decoder::ShaderRayLoopCap), whatever its shape: a do-while, a loop entered in the middle, a
+// loop with an unconditional latch. The same call outside a ray tracing shader still gives up.
+void CheckRayTracingHitCallsReturn() {
+  constexpr const char *name = "RayTracingHitCallsReturn";
+  namespace D = ShaderRecompiler::Decoder;
+  const D::ShaderCodeReader read = [](uint64_t, std::span<uint32_t>) { return false; };
+  constexpr u32 swappc = EncodeSop1(0x21u, 14, 14); // s_swappc_b64 s[14:15], s[14:15]
+  size_t call_index = 0;
+  const auto branch = [](std::vector<u32> *code, u32 opcode, size_t target) {
+    const auto word = static_cast<int32_t>(code->size());
+    code->push_back(EncodeSopp(
+        opcode, static_cast<u32>(static_cast<int32_t>(target) - (word + 1)) & 0xffffu));
+  };
+  const auto build = [&](bool ray_tracing) {
+    std::vector<u32> code{EncodeSMovB32(12, InlineU32(0))}; // s_mov_b32 s12, 0
+    // A do-while around the ray and its hit call.
+    const auto loop = code.size();
+    if (ray_tracing) {
+      // image_bvh_intersect_ray v[16:19], v[20:30], s[32:35], its result stored
+      code.insert(code.end(), {0xf1989f01u, 0x00081014u});
+      AppendStoreVgpr(&code, 16, 0);
+    }
+    code.push_back(EncodeVop1(0x02u, 14, Vgpr(1))); // v_readfirstlane_b32 s14, v1
+    code.push_back(EncodeVop1(0x02u, 15, Vgpr(2))); // v_readfirstlane_b32 s15, v2
+    call_index = code.size();
+    code.push_back(swappc);
+    code.push_back(EncodeSop2(0x00u, 12, 12, InlineU32(1))); // s_add_u32 s12, s12, 1
+    code.push_back(EncodeSopc(0x0au, 12, InlineU32(2)));     // s_cmp_lt_u32 s12, 2
+    branch(&code, 0x05u, loop);                               // s_cbranch_scc1 loop
+    if (ray_tracing) {
+      // A loop entered in the middle: s_branch test; body: ...; test: s_cbranch_scc1 body.
+      code.push_back(EncodeSMovB32(13, InlineU32(0))); // s_mov_b32 s13, 0
+      const auto jump = code.size();
+      code.push_back(0);
+      const auto body = code.size();
+      code.push_back(EncodeSop2(0x00u, 13, 13, InlineU32(1))); // s_add_u32 s13, s13, 1
+      const auto test = code.size();
+      code[jump] = EncodeSopp(0x02u, static_cast<u32>(test - (jump + 1)));
+      code.push_back(EncodeSopc(0x0au, 13, InlineU32(3))); // s_cmp_lt_u32 s13, 3
+      branch(&code, 0x05u, body);                           // s_cbranch_scc1 body
+      // Two latches, one of them unconditional.
+      code.push_back(EncodeSMovB32(16, InlineU32(0))); // s_mov_b32 s16, 0
+      const auto again = code.size();
+      code.push_back(EncodeSop2(0x00u, 16, 16, InlineU32(1))); // s_add_u32 s16, s16, 1
+      code.push_back(EncodeSopc(0x0au, 16, InlineU32(2)));     // s_cmp_lt_u32 s16, 2
+      const auto skip = code.size();
+      code.push_back(0); // s_cbranch_scc0 later
+      branch(&code, 0x02u, again); // s_branch again
+      code[skip] = EncodeSopp(0x04u, static_cast<u32>(code.size() - (skip + 1)));
+      code.push_back(EncodeSopc(0x0au, 16, InlineU32(4))); // s_cmp_lt_u32 s16, 4
+      branch(&code, 0x05u, again);                          // s_cbranch_scc1 again
+      AppendStoreSgpr(&code, 16, 1);
+    }
+    AppendEnd(&code);
+    return code;
+  };
+
+  const auto plain = build(false);
+  std::vector<u32> expanded;
+  std::string reason;
+  bool ok = D::InlineShaderFunctions(plain, reinterpret_cast<uint64_t>(plain.data()), {}, read,
+                                     expanded, reason, 64);
+  Require(name, "plain shader", !ok && !reason.empty(),
+          "a call with no resolvable target outside a ray tracing shader did not give up");
+
+  const auto rt = build(true);
+  const uint64_t base = reinterpret_cast<uint64_t>(rt.data());
+  const uint64_t return_pc = base + (call_index + 1u) * 4u;
+  const std::array<u32, 4> moves{0xbe8003ffu | (14u << 16u), u32(return_pc),
+                                 0xbe8003ffu | (15u << 16u), u32(return_pc >> 32u)};
+  for (const auto &user_data : {std::vector<u32>{}, std::vector<u32>{1u, 2u, 3u, 4u}}) {
+    expanded.clear();
+    reason.clear();
+    std::vector<uint32_t> consulted{99u};
+    ok = D::InlineShaderFunctions(rt, base, user_data, read, expanded, reason, 64, &consulted);
+    Require(name, "hit call returns",
+            ok && std::count(expanded.begin(), expanded.end(), swappc) == 0 &&
+                std::search(expanded.begin(), expanded.end(), moves.begin(), moves.end()) !=
+                    expanded.end() &&
+                consulted.empty(),
+            "the hit call did not become a return to the next instruction (" + reason + ")");
+  }
+  D::ShaderFunctionExpander expander;
+  std::vector<u32> cached;
+  std::string summary;
+  ok = expander.Expand(rt, base, {}, read, cached, reason, 64, 0x7ab1f1ull, &summary);
+  Require(name, "expander", ok && cached == expanded &&
+                                summary.find("return at once") != std::string::npos,
+          "the cached expansion differs or does not report the returning hit calls");
+
+  TestCase test;
+  test.name = name;
+  test.code = expanded;
+  test.compute_info.wave_size = 64;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.compile_only = true;
+  test.ir_counts = {{"BvhIntersect", 1}};
+  for (const u32 subgroup : {32u, 64u}) {
+    const auto compiled = CompileCase(test, subgroup);
+    size_t ticks = 0;
+    for (const auto *block : compiled.program.blocks) {
+      for (const auto &inst : *block) {
+        ticks += inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::LoopBudgetTick ? 1u : 0u;
+      }
+    }
+    // Every loop its latch returns to enters its body on the budget.
+    size_t loops = 0;
+    bool headers_bounded = true;
+    const auto &infos = compiled.program.block_info;
+    for (const auto &info : infos) {
+      const auto &term = info.terminator;
+      if (!term.loop_header) continue;
+      const auto latch = std::ranges::find(infos, term.continue_block, &ShaderRecompiler::IR::BlockInfo::id);
+      const bool repeats = latch != infos.end() &&
+                           (latch->terminator.true_block == info.id ||
+                            latch->terminator.false_block == info.id);
+      if (!repeats) continue;
+      loops++;
+      headers_bounded &=
+          term.kind == ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch &&
+          term.false_block == term.merge_block;
+    }
+    Require(name, "loop budget",
+            D::ShaderRayLoopCap() == 0u || (loops >= 3u && headers_bounded && ticks == loops),
+            "a loop does not draw on the budget at its header (" + std::to_string(loops) +
+                " loops, " + std::to_string(ticks) + " ticks)");
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckFloatStoreClamp() {
   constexpr const char *name = "FloatStoreClamp";
   using O = ShaderOpcode;
@@ -40844,6 +40980,7 @@ int main(int argc, char **argv) {
   CheckShaderFunctionRuntimeRecords();
   CheckFloatStoreClamp();
   CheckShaderProbe();
+  CheckRayTracingHitCallsReturn();
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());

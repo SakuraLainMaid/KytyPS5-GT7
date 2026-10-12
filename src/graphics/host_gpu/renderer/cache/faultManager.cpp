@@ -284,11 +284,23 @@ void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 		}
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
+		uint32_t    ray_faults = 0;
+		std::memcpy(&ray_faults, mapped + PageFaultAreaSize + offsetof(ShaderTrapArea, ray_faults),
+		            sizeof(ray_faults));
 		if (report != nullptr) {
 			report->page_count = faults[0];
 			report->trap       = trap;
-		} else if (faults[0] != 0) {
+		} else if (faults[0] > ray_faults) {
 			m_unattributed_faults.fetch_add(1, std::memory_order_release);
+		} else if (faults[0] != 0) {
+			// Counted, the faults of rays that reach BVH memory for the first time (a new scene)
+			// would re-arm every dispatch recovery trusts, each frame until the BVH is mapped.
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("Ray tracing page faults: %" PRIu64 " pages mapped for the rays, dispatch "
+				     "recovery not re-armed\n",
+				     faults[0]);
+			}
 		}
 		// The parser's counter can exceed its bounded output array. Never consume
 		// unrecorded addresses as pages (or read beyond the mapped readback area).

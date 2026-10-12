@@ -79,10 +79,17 @@ struct ShaderTrapArea {
 	ShaderTrapRecord   record;
 	ShaderCallMissSlot misses[kShaderCallMissSlots];
 	uint32_t           probe_count[kShaderProbePoints] {};
-	uint32_t           probe_reserved[16 - kShaderProbePoints] {};
+	// The faulted pages a ray tracing shader (ShaderInfo::uses_bvh) recorded first: its rays
+	// reached BVH memory not mapped yet. The host maps them as usual, and when they are all the
+	// window's faults, does not count them as residency changing under the dispatches recovery
+	// trusts (FaultManager).
+	uint32_t           ray_faults = 0;
+	uint32_t           probe_reserved[15 - kShaderProbePoints] {};
 	ShaderProbeRecord  probes[kShaderProbeSlots];
 };
 static_assert(offsetof(ShaderTrapArea, misses) == sizeof(ShaderTrapRecord));
+static_assert(offsetof(ShaderTrapArea, probes) ==
+              offsetof(ShaderTrapArea, probe_count) + 16 * sizeof(uint32_t));
 
 } // namespace Libs::Graphics
 

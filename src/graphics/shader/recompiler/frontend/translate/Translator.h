@@ -21,10 +21,14 @@ public:
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
 	// bounded: the pc ranges of the looping material bodies the expansion bracketed
-	// (Decoder::ShaderCallLoopBodyBegin); a loop with its header in one is bounded.
+	// (Decoder::ShaderCallLoopBodyBegin); a loop with its header in one is bounded, ending once
+	// the invocation has taken loop_cap back edges in them. header_cap, when not 0: a loop
+	// header that enters its body on a condition (a ray tracing shader's, BudgetLoopHeaders in
+	// Translate.cpp) does so only while the invocation has that many rounds left in its loops.
 	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
 	                        IR::BlockInfo&                                 info,
-	                        std::span<const std::pair<uint32_t, uint32_t>> bounded = {});
+	                        std::span<const std::pair<uint32_t, uint32_t>> bounded = {},
+	                        uint32_t loop_cap = 0, uint32_t header_cap = 0);
 	// Diagnostics (KYTY_FORCE_PC): overwrites the first destination dwords of an instruction
 	// with constants after it is translated.
 	void ForceDestination(const Decoder::Instruction& inst, const std::vector<uint32_t>& values);
@@ -39,7 +43,8 @@ public:
 private:
 	IR::U1 BoundLoopCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
 	                          IR::U1                                         condition,
-	                          std::span<const std::pair<uint32_t, uint32_t>> bounded);
+	                          std::span<const std::pair<uint32_t, uint32_t>> bounded,
+	                          uint32_t                                       loop_cap);
 	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);
 	Decoder::Operand DestinationOperand(const Decoder::Instruction& inst);
 	Decoder::Operand OffsetOperand(const Decoder::Operand& operand, uint32_t offset);

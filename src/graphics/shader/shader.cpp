@@ -469,6 +469,15 @@ static uint32_t ShaderCalcPsSystemInputBase(const HW::ShaderRegisters& regs) {
 	return reg;
 }
 
+// Whether this is the first report of `kind` for the shader: a draw that fails to describe its
+// vertex inputs is skipped (PrepareProgram), and a scene can issue it every frame.
+static bool FirstVertexInputReport(uint64_t shader_addr, uint32_t kind) {
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> reported;
+	std::lock_guard                     lock(mutex);
+	return reported.insert(shader_addr ^ (static_cast<uint64_t>(kind) << 56u)).second;
+}
+
 static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserSgprInfo& user_sgpr,
                                            uint32_t user_sgpr_num, const HW::ShaderRegisters& sh,
                                            const ShaderMappedData& data,
@@ -482,7 +491,7 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 	EXIT_NOT_IMPLEMENTED(shader_addr == 0);
 	info.scratch_size_dwords = data.scratch_size_dwords;
 
-	if (data.user_data == nullptr) {
+	if (data.user_data == nullptr && FirstVertexInputReport(shader_addr, 0)) {
 		LOGF("ShaderGetVertexInputInfo(): no AGC user data for shader=0x%016" PRIx64
 		     " user_sgpr_num=%u\n",
 		     shader_addr, user_sgpr_num);
@@ -490,8 +499,10 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 	ShaderVertexMetadata metadata;
 	std::string          metadata_error;
 	if (!ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, metadata, &metadata_error)) {
-		LOGF("ShaderGetVertexInputInfo(): invalid AGC metadata shader=0x%016" PRIx64 ": %s\n",
-		     shader_addr, metadata_error.c_str());
+		if (FirstVertexInputReport(shader_addr, 1)) {
+			LOGF("ShaderGetVertexInputInfo(): invalid AGC metadata shader=0x%016" PRIx64 ": %s\n",
+			     shader_addr, metadata_error.c_str());
+		}
 		return false;
 	}
 
@@ -509,8 +520,12 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg + 1]) << 32u));
 
 		if (attrib == nullptr || buffer == nullptr) {
-			LOGF("ShaderGetVertexInputInfo(): null vertex table pointer shader=0x%016" PRIx64 "\n",
-			     shader_addr);
+			if (FirstVertexInputReport(shader_addr, 2)) {
+				LOGF("ShaderGetVertexInputInfo(): null vertex table pointer shader=0x%016" PRIx64
+				     " attrib_reg=%d buffer_reg=%d user_sgpr_num=%u\n",
+				     shader_addr, metadata.vertex_attrib_reg, metadata.vertex_buffer_reg,
+				     user_sgpr_num);
+			}
 			return false;
 		}
 		ShaderApplyAttribSemantics(info, metadata.input_semantics, attrib, buffer);
@@ -723,7 +738,11 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	if (!merged) {
 		if (!ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,
 		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info)) {
-			EXIT("failed to prepare vertex shader program\n");
+			// Vertex tables the guest left null, or metadata that does not parse (logged above):
+			// the draw is skipped, as a shader that gives up (DescribeGraphicsStages). GT7 issued
+			// such a draw on entering its garage, which ended the emulator here.
+			info.prepare_failed = true;
+			return params;
 		}
 		info.wave_size = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
 		return params;

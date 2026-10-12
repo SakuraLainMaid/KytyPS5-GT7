@@ -522,6 +522,10 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	// The shader intersects rays with a BVH (BvhIntersect): its dispatches run once with the
+	// pages they find, rather than retry until every node they reach is resident
+	// (DispatchBufferRecovery).
+	bool uses_bvh = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

@@ -7,7 +7,8 @@
 // Diagnostics: KYTY_GPU_TIMING=<first frame>:<frames> times every draw and dispatch on the host
 // GPU (timestamps before and after, which the per-command barriers make exact) and logs, per
 // presented frame in that window, the GPU time of the costliest shaders and of everything
-// between commands. Off by default.
+// between commands. Off by default. KYTY_GPU_TIMING=+<n>:<frames> starts the window n frames
+// after the first use of the KYTY_WATCH_SHADER shader (the first one it names).
 namespace Libs::Graphics {
 
 class CommandBuffer;

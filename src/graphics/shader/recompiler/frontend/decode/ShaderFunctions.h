@@ -65,6 +65,13 @@ void               SetShaderCallLoopsInlined(bool value);
 constexpr uint32_t ShaderCallLoopBodyBegin = 0xbf80c0deu;
 constexpr uint32_t ShaderCallLoopBodyEnd   = 0xbf80c0dfu;
 uint32_t           ShaderCallLoopCap();
+// A ray tracing shader (one with IMAGE_BVH_INTERSECT_RAY) runs this many rounds of its loops per
+// invocation, all its loops together, and then leaves each loop at its header
+// (KYTY_RAY_LOOP_CAP, 4096 by default; 0 leaves them unbounded; BudgetLoopHeaders in
+// Translate.cpp): its traversal follows node data, and a node list the emulator reads as zero
+// (memory it does not have) never ends. Its calls are its hit functions, which return at once
+// unless KYTY_RAY_HIT_CALLS=1 (RayHitCallsReturn in ShaderFunctions.cpp).
+uint32_t ShaderRayLoopCap();
 
 // Expands scalar calls through immutable pointers or bounded scalar-buffer tables.
 // Table calls retain runtime selection and trap on targets outside the captured set.

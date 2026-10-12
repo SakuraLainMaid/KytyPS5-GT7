@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
@@ -63,6 +64,8 @@ State& GetState() {
 struct Window {
 	uint64_t first = 0;
 	uint64_t count = 0;
+	// first counts from the first use of the watched shader (WatchedShaderFirstFrame).
+	bool relative = false;
 };
 
 const Window& GetWindow() {
@@ -70,8 +73,9 @@ const Window& GetWindow() {
 		Window result;
 		const char* value = std::getenv("KYTY_GPU_TIMING");
 		if (value != nullptr) {
-			char* end    = nullptr;
-			result.first = std::strtoull(value, &end, 10);
+			result.relative = *value == '+';
+			char* end       = nullptr;
+			result.first    = std::strtoull(result.relative ? value + 1 : value, &end, 10);
 			result.count = end != nullptr && *end == ':' ? std::strtoull(end + 1, nullptr, 10) : 1;
 		}
 		return result;
@@ -228,7 +232,12 @@ void Present(uint64_t frame) {
 			     stat.ms, stat.count);
 		}
 	}
-	const bool active = frame >= window.first && frame - window.first < window.count;
+	auto first = window.first;
+	if (window.relative) {
+		const auto watched = WatchedShaderFirstFrame();
+		first              = watched != UINT64_MAX ? watched + window.first : UINT64_MAX;
+	}
+	const bool active = first != UINT64_MAX && frame >= first && frame - first < window.count;
 	Detail::g_active.store(active, std::memory_order_relaxed);
 }
 
