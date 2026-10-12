@@ -105,6 +105,10 @@ void Translator::Probe(uint32_t pc, uint32_t point, std::span<const uint32_t> re
 			const auto sgpr = reg & ~ProbeScalar;
 			if (sgpr < IR::NumScalarRegs) {
 				values[index] = ir.GetScalarReg(static_cast<IR::ScalarReg>(sgpr));
+			} else if (sgpr == 106u) {
+				values[index] = ir.GetVccLo();
+			} else if (sgpr == 107u) {
+				values[index] = ir.GetVccHi();
 			}
 		} else if (reg < IR::NumVectorRegs) {
 			values[index] = ir.GetVectorReg(static_cast<IR::VectorReg>(reg));

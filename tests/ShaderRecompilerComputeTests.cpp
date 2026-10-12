@@ -1512,16 +1512,30 @@ void CheckShaderFunctionTableVariants() {
   Require(name, "one selection tree", count(expanded, 0xbf068080u) == 0,
           "a dead incoming SCC still produced a second selection tree");
 
-  // A callee with a loop is inlined between the loop-bound brackets (KYTY_CALL_LOOPS=0 leaves it
-  // to the miss path).
+  // A callee with a loop is left to the miss path; KYTY_CALL_LOOPS=1 inlines it
+  // between the loop-bound brackets.
   constexpr uint64_t callee_loop = 0x10001000ull;
   store(callee_loop, {EncodeVop1(0x01u, 0, InlineU32(1)), EncodeSopp(0x05u, 0xfffeu),
                       EncodeSop1(0x20u, 0, 14)});
   for (u32 e = 0; e < 2; ++e) {
     store(table + e * 16u, {u32(callee_loop), u32(callee_loop >> 32u), 0x7000u + e * 0x100u, 0x7u});
   }
+  const bool loops_inlined =
+      ShaderRecompiler::Decoder::ShaderCallLoopsInlined();
+  ShaderRecompiler::Decoder::SetShaderCallLoopsInlined(false);
   ok = ShaderRecompiler::Decoder::InlineShaderFunctions(
       code, reinterpret_cast<uint64_t>(code.data()), user_data, read, expanded, reason, 64);
+  Require(name, "looping callee on the miss path",
+          ok && count(expanded, body) == 0 && count(expanded, trap) > 0 &&
+              count(expanded,
+                    ShaderRecompiler::Decoder::ShaderCallLoopBodyBegin) == 0,
+          "a specialized callee with a loop was inlined although looping "
+          "callees are off");
+  ShaderRecompiler::Decoder::SetShaderCallLoopsInlined(true);
+  ok = ShaderRecompiler::Decoder::InlineShaderFunctions(
+      code, reinterpret_cast<uint64_t>(code.data()), user_data, read, expanded,
+      reason, 64);
+  ShaderRecompiler::Decoder::SetShaderCallLoopsInlined(loops_inlined);
   Require(name, "looping callee bounded",
           ok && count(expanded, body) == 2 &&
               count(expanded, ShaderRecompiler::Decoder::ShaderCallLoopBodyBegin) == 2 &&
@@ -1726,12 +1740,40 @@ void CheckShaderFunctionRuntimeRecords() {
   fill_records(20, 0xa000u, true);
   (void)ShaderRecompiler::Decoder::ReportShaderCallMiss(hash, {callee_loop, 0xa200u, 0x7u});
   absorb();
+  // Looping functions stay on the miss path by default (a fresh expander: the
+  // switch is not part of an expansion's key, as it never changes while the
+  // emulator runs).
+  const u32 loop_body = EncodeSop2(0x01u, 20, 20, InlineU32(1));
+  const bool loops_inlined =
+      ShaderRecompiler::Decoder::ShaderCallLoopsInlined();
+  ShaderRecompiler::Decoder::SetShaderCallLoopsInlined(false);
+  {
+    ShaderRecompiler::Decoder::ShaderFunctionExpander fresh;
+    std::vector<u32> left;
+    ok = fresh.Expand(code, reinterpret_cast<uint64_t>(code.data()), user_data,
+                      read, left, reason, 64, hash, &summary);
+    Require(
+        name, "looping function on the miss path",
+        ok && count(left, loop_body) == 0 &&
+            count(left, ShaderRecompiler::Decoder::ShaderCallLoopBodyBegin) ==
+                0 &&
+            count(left, body_a) == 1 &&
+            summary.find("material shader function has a loop") !=
+                std::string::npos,
+        "a reported looping function was inlined although looping callees are "
+        "off");
+  }
+  ShaderRecompiler::Decoder::SetShaderCallLoopsInlined(true);
   ok = expand();
   Require(name, "looping function bounded",
-          ok && count(expanded, ShaderRecompiler::Decoder::ShaderCallLoopBodyBegin) == 1 &&
-              count(expanded, ShaderRecompiler::Decoder::ShaderCallLoopBodyEnd) == 1 &&
-              count(expanded, EncodeSop2(0x01u, 20, 20, InlineU32(1))) == 1,
-          "a reported looping function was not inlined between the loop-bound brackets");
+          ok &&
+              count(expanded,
+                    ShaderRecompiler::Decoder::ShaderCallLoopBodyBegin) == 1 &&
+              count(expanded,
+                    ShaderRecompiler::Decoder::ShaderCallLoopBodyEnd) == 1 &&
+              count(expanded, loop_body) == 1,
+          "a reported looping function was not inlined between the loop-bound "
+          "brackets");
   ShaderComputeInputInfo compute{};
   compute.threads_num[0] = 64;
   compute.threads_num[1] = 1;
@@ -1752,6 +1794,7 @@ void CheckShaderFunctionRuntimeRecords() {
   Require(name, "loop budget", !translated.unsupported && ticks == 1u,
           "the bounded loop's exit does not draw on the loop budget (" + std::to_string(ticks) +
               " ticks)");
+  ShaderRecompiler::Decoder::SetShaderCallLoopsInlined(loops_inlined);
   ShaderRecompiler::Decoder::SetShaderCallRuntimeRecords(runtime_records);
   std::printf("[host]    %-32s ok\n", name);
 }
@@ -38379,7 +38422,8 @@ void CheckResourcePlanHandoff() {
 // the point and records the registers into the fault buffer, in both emulated
 // wave halves.
 constexpr uint64_t ProbeTestHash = 0x7ab1f0ull;
-constexpr const char *ProbeTestSetting = "7ab1f0@8:v1,s2;7ab1f0@8:v1-v3";
+constexpr const char *ProbeTestSetting =
+    "7ab1f0@8:v1,s2,s106,s107;7ab1f0@8:v1-v3";
 
 void SetProbeSetting() {
 #if defined(_WIN32)

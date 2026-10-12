@@ -683,19 +683,25 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 	return true;
 }
 
-// A target of a table with record data (specialized or not) that has a loop is inlined, its
-// loops bounded (ShaderCallLoopCap). GT7's lit material functions walk a per-pixel light list
-// whose length they read from an image, and every garage visit with them inlined unbounded hung
-// the GPU in the material pass (2026-10-10): a wrong length, from data the emulator does not
-// reproduce, ran the loop for up to 65,535 rounds a pixel. Its car paint functions loop too, so
-// leaving looping functions to the miss path left every car unpainted. KYTY_CALL_LOOPS=0 still
-// does.
-bool InlineLoopingVariants() {
-	static const bool value = [] {
+// A target of a table with record data (specialized or not) that has a loop is left to the miss
+// path unless KYTY_CALL_LOOPS=1, which inlines it with its loops bounded (ShaderCallLoopCap).
+// Bounding the loops was not enough: every garage visit and music rally load with them inlined
+// lost the device in GT7's material pass (2026-10-12). Its looping material functions use VGPRs
+// from v32 up, and the pass keeps its call loop's "lanes left" flag in v32 (cleared before the
+// call, tested after it), so once one of them ran the call loop never finished. A callee that
+// overwrites the flag would hang the console too: the pass presumably never calls them there,
+// and why the emulator's lanes select them is open. On the miss path the waves that select one
+// end there, unshaded (the unpainted cars).
+std::atomic_bool& LoopingVariantsSwitch() {
+	static std::atomic_bool value = [] {
 		const char* text = std::getenv("KYTY_CALL_LOOPS");
-		return text == nullptr || text[0] != '0';
+		return text != nullptr && text[0] == '1';
 	}();
 	return value;
+}
+
+bool InlineLoopingVariants() {
+	return LoopingVariantsSwitch().load(std::memory_order_relaxed);
 }
 
 uint32_t LoopCap() {
@@ -1335,6 +1341,14 @@ uint32_t ShaderCallLoopCap() {
 
 void SetShaderCallRuntimeRecords(bool value) {
 	RuntimeRecordsSwitch().store(value, std::memory_order_relaxed);
+}
+
+bool ShaderCallLoopsInlined() {
+	return InlineLoopingVariants();
+}
+
+void SetShaderCallLoopsInlined(bool value) {
+	LoopingVariantsSwitch().store(value, std::memory_order_relaxed);
 }
 
 bool ReportShaderCallMiss(uint64_t shader_hash, const ShaderCallVariant& reported, bool* churned) {

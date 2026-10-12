@@ -1075,7 +1075,8 @@ struct ProbePoint {
 };
 
 // Diagnostics: KYTY_PROBE=<shader hash>@<pc>:<reg>[,<reg>...][;<hash>@<pc>:...] (hex hash and pc;
-// registers v<n>, s<n> or ranges v<n>-v<m>, at most 12; at most Translator::ProbePoints points)
+// registers v<n>, s<n> (s106 and s107 are vcc_lo and vcc_hi) or ranges v<n>-v<m>, at most 12; at
+// most Translator::ProbePoints points)
 // records those registers of the active lanes after the instruction at pc; the host logs them
 // ("Shader probe:"). The name is written in two pieces so the shader cache's scan of switches
 // (shader_cache_version.cmake) leaves it out of the key of every shader: only the probed shaders
