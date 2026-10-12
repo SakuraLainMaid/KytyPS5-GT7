@@ -3,8 +3,8 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <array>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -93,6 +93,28 @@ void Translator::ForceVectorRegisters(uint32_t first, const std::vector<uint32_t
 	for (uint32_t component = 0; component < values.size(); component++) {
 		WriteRawU32(OffsetOperand(reg, component), IR::U32(IR::Value(values[component])));
 	}
+}
+
+void Translator::Probe(uint32_t pc, uint32_t point, std::span<const uint32_t> registers) {
+	std::array<IR::Value, 12> values {};
+	for (size_t index = 0; index < values.size(); index++) {
+		values[index] = IR::Value(0u);
+		if (index >= registers.size()) continue;
+		const auto reg = registers[index];
+		if ((reg & ProbeScalar) != 0u) {
+			const auto sgpr = reg & ~ProbeScalar;
+			if (sgpr < IR::NumScalarRegs) {
+				values[index] = ir.GetScalarReg(static_cast<IR::ScalarReg>(sgpr));
+			}
+		} else if (reg < IR::NumVectorRegs) {
+			values[index] = ir.GetVectorReg(static_cast<IR::VectorReg>(reg));
+		}
+	}
+	const auto count = static_cast<uint32_t>(std::min<size_t>(registers.size(), values.size()));
+	ir.Emit(IR::ValueOpcode::ShaderProbe,
+	        {IR::Value(pc), ir.GetExec(), IR::Value(point), IR::Value(count), values[0], values[1],
+	         values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9],
+	         values[10], values[11]});
 }
 
 void Translator::V_INTERP_P1_F32() {}

@@ -7,6 +7,7 @@
 #include "graphics/shader/shader.h"
 
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
@@ -48,6 +49,9 @@ struct CompileResult {
                                            const CompileOptions& options,
                                            const IR::ResourceSpecialization& specialization,
 	                                       uint32_t push_data_start_dword = 0);
+// Diagnostics (KYTY_PROBE, Translate.cpp): the probe points set for the shader, as text for its
+// disk cache key; empty when it has none.
+[[nodiscard]] std::string ShaderProbeKey(uint64_t shader_hash);
 
 } // namespace Libs::Graphics::ShaderRecompiler
 

@@ -6,6 +6,10 @@ VALUE_OPCODE(Reference, Void, U1)
 VALUE_OPCODE(ReferenceU32, Void, U32)
 VALUE_OPCODE(ConditionRef, U1, U1)
 VALUE_OPCODE(ShaderTrap, Void, U32, U32, U32, U32, U32, U32)
+// Diagnostics (KYTY_PROBE): pc, whether this lane records, the probe point, the value count, then
+// the values.
+VALUE_OPCODE(ShaderProbe, Void, U32, U1, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32,
+             U32, U32)
 
 // Translation and register-state pseudo operations.
 VALUE_OPCODE(GetUserData, U32, ScalarReg)

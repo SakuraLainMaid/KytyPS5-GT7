@@ -54,9 +54,33 @@ inline constexpr uint32_t kShaderCallMissSlots  = 256;
 inline constexpr uint32_t kShaderCallMissProbes = 8;
 static_assert(sizeof(ShaderCallMissSlot) == 32);
 
+// Diagnostics (KYTY_PROBE, Translate.cpp): register values a shader recorded at a pc. Each of up
+// to kShaderProbePoints probe points counts the active lanes that reach it in its probe_count,
+// and a lane's hit number picks its record among the point's kShaderProbeSlotsPerPoint: the first
+// kShaderProbeEarly hits, then the hits numbered by a power of 4 (4, 16, ... 4^12), so the samples
+// spread over every draw of the submission. The host logs them after the submission.
+struct ShaderProbeRecord {
+	uint32_t shader_hash_low  = 0;
+	uint32_t shader_hash_high = 0;
+	uint32_t pc               = 0;
+	uint32_t count            = 0; // the values recorded
+	uint32_t hit              = 0; // the lane's hit number at its point
+	uint32_t reserved[3] {};
+	uint32_t values[12] {};
+};
+inline constexpr uint32_t kShaderProbePoints        = 4;
+inline constexpr uint32_t kShaderProbeSlotsPerPoint = 16;
+inline constexpr uint32_t kShaderProbeEarly         = 4;
+inline constexpr uint32_t kShaderProbeSlots  = kShaderProbePoints * kShaderProbeSlotsPerPoint;
+inline constexpr uint32_t kShaderProbeValues = 12;
+static_assert(sizeof(ShaderProbeRecord) == 80);
+
 struct ShaderTrapArea {
 	ShaderTrapRecord   record;
 	ShaderCallMissSlot misses[kShaderCallMissSlots];
+	uint32_t           probe_count[kShaderProbePoints] {};
+	uint32_t           probe_reserved[16 - kShaderProbePoints] {};
+	ShaderProbeRecord  probes[kShaderProbeSlots];
 };
 static_assert(offsetof(ShaderTrapArea, misses) == sizeof(ShaderTrapRecord));
 

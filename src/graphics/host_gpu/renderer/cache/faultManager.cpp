@@ -6,18 +6,22 @@
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
-#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 
 #include <algorithm>
 #include <atomic>
 #include <bit>
-#include <cstddef>
+#include <chrono>
 #include <cinttypes>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 
 namespace Libs::Graphics {
 
@@ -56,6 +60,49 @@ void ReportCallMisses(const uint8_t* slots) {
 				     hash, target, slot.data1, slot.data0, count);
 			}
 		}
+	}
+}
+
+// Diagnostics (KYTY_PROBE): the registers the probed shaders recorded (ShaderProbeRecord). The
+// first 16 fault-buffer reads that saw a probe log every record, later ones one every 3 seconds,
+// so a run shows the values both at the start and as scenes change.
+void ReportProbes(const uint8_t* area) {
+	uint32_t hits[kShaderProbePoints] {};
+	std::memcpy(hits, area + offsetof(ShaderTrapArea, probe_count), sizeof(hits));
+	if (std::ranges::all_of(hits, [](uint32_t count) { return count == 0; })) return;
+	static std::mutex                            mutex;
+	const std::lock_guard                        lock(mutex);
+	static uint64_t                              submission = 0;
+	static std::chrono::steady_clock::time_point last;
+	const auto                                   now = std::chrono::steady_clock::now();
+	if (submission++ >= 16 && now - last < std::chrono::seconds(3)) return;
+	last = now;
+	if (submission == 1) {
+		const char* setting = std::getenv("KYTY_PROBE");
+		LOGF("Shader probe: KYTY_PROBE=%s\n", setting != nullptr ? setting : "");
+	}
+	LOGF("Shader probe: read %" PRIu64 ", lanes at each point: %u %u %u %u\n", submission, hits[0],
+	     hits[1], hits[2], hits[3]);
+	static_assert(kShaderProbePoints == 4);
+	for (uint32_t index = 0; index < kShaderProbeSlots; ++index) {
+		ShaderProbeRecord record;
+		std::memcpy(&record, area + offsetof(ShaderTrapArea, probes) + index * sizeof(record),
+		            sizeof(record));
+		if (record.shader_hash_low == 0 && record.shader_hash_high == 0) continue;
+		char       text[kShaderProbeValues * 40] {};
+		size_t     used   = 0;
+		const auto values = std::min(record.count, kShaderProbeValues);
+		for (uint32_t value = 0; value < values && used < sizeof(text); value++) {
+			const auto bits = record.values[value];
+			const auto written =
+			    std::snprintf(text + used, sizeof(text) - used, " [%u]=0x%08x(%g)", value, bits,
+			                  static_cast<double>(std::bit_cast<float>(bits)));
+			if (written <= 0) break;
+			used += static_cast<size_t>(written);
+		}
+		LOGF("Shader probe: point %u hash=%08x%08x pc=0x%x hit=%u%s\n",
+		     index / kShaderProbeSlotsPerPoint, record.shader_hash_high, record.shader_hash_low,
+		     record.pc, record.hit, text);
 	}
 }
 
@@ -227,6 +274,7 @@ void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 		ShaderTrapRecord trap;
 		std::memcpy(&trap, mapped + PageFaultAreaSize, sizeof(trap));
 		ReportCallMisses(mapped + PageFaultAreaSize + offsetof(ShaderTrapArea, misses));
+		ReportProbes(mapped + PageFaultAreaSize);
 		if (trap.claimed != 0 && report == nullptr) {
 			const auto  hash    = (uint64_t {trap.shader_hash_high} << 32) | trap.shader_hash_low;
 			const auto* pending = std::bit_cast<const uint64_t*>(mapped);

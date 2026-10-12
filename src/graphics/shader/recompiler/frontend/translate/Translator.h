@@ -29,6 +29,12 @@ public:
 	// with constants after it is translated.
 	void ForceDestination(const Decoder::Instruction& inst, const std::vector<uint32_t>& values);
 	void ForceVectorRegisters(uint32_t first, const std::vector<uint32_t>& values);
+	// Diagnostics (KYTY_PROBE): records the registers (a VGPR index, or ProbeScalar | an SGPR
+	// index) of the active lanes after the instruction at pc, as the given probe point, for the
+	// host to log.
+	static constexpr uint32_t ProbeScalar = 0x80000000u;
+	static constexpr uint32_t ProbePoints = 4; // kShaderProbePoints, bufferCachePages.h
+	void Probe(uint32_t pc, uint32_t point, std::span<const uint32_t> registers);
 
 private:
 	IR::U1 BoundLoopCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,

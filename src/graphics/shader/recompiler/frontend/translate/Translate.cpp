@@ -7,6 +7,7 @@
 #include <array>
 #include <bit>
 #include <cstdlib>
+#include <string>
 #include <unordered_map>
 #include <utility>
 
@@ -1067,6 +1068,66 @@ void ValidateTranslateOptions(const TranslateOptions& options) {
 
 } // namespace
 
+struct ProbePoint {
+	uint64_t              hash = 0;
+	uint32_t              pc   = 0;
+	std::vector<uint32_t> registers;
+};
+
+// Diagnostics: KYTY_PROBE=<shader hash>@<pc>:<reg>[,<reg>...][;<hash>@<pc>:...] (hex hash and pc;
+// registers v<n>, s<n> or ranges v<n>-v<m>, at most 12; at most Translator::ProbePoints points)
+// records those registers of the active lanes after the instruction at pc; the host logs them
+// ("Shader probe:"). The name is written in two pieces so the shader cache's scan of switches
+// (shader_cache_version.cmake) leaves it out of the key of every shader: only the probed shaders
+// change, and their source keys carry the points (ShaderProbeKey).
+const std::vector<ProbePoint>& ProbePoints() {
+	static const std::vector<ProbePoint> points = [] {
+		std::vector<ProbePoint> parsed;
+		const auto              name  = std::string("KYTY_") + "PROBE";
+		const char*             value = std::getenv(name.c_str());
+		if (value == nullptr) {
+			return parsed;
+		}
+		const std::string text(value);
+		size_t            start = 0;
+		while (start < text.size() && parsed.size() < Translator::ProbePoints) {
+			auto end = text.find(';', start);
+			if (end == std::string::npos) end = text.size();
+			const auto item  = text.substr(start, end - start);
+			start            = end + 1;
+			const auto at    = item.find('@');
+			const auto colon = item.find(':');
+			if (at == std::string::npos || colon == std::string::npos || colon < at) continue;
+			ProbePoint point;
+			point.hash = std::strtoull(item.substr(0, at).c_str(), nullptr, 16);
+			point.pc   = static_cast<uint32_t>(
+                std::strtoul(item.substr(at + 1, colon - at - 1).c_str(), nullptr, 16));
+			size_t reg_start = colon + 1;
+			while (reg_start < item.size() && point.registers.size() < 12u) {
+				auto reg_end = item.find(',', reg_start);
+				if (reg_end == std::string::npos) reg_end = item.size();
+				const auto token = item.substr(reg_start, reg_end - reg_start);
+				reg_start        = reg_end + 1;
+				if (token.size() < 2 || (token[0] != 'v' && token[0] != 's')) continue;
+				const bool scalar = token[0] == 's';
+				char*      rest   = nullptr;
+				const auto first =
+				    static_cast<uint32_t>(std::strtoul(token.c_str() + 1, &rest, 10));
+				uint32_t last = first;
+				if (rest != nullptr && rest[0] == '-' && rest[1] == token[0]) {
+					last = static_cast<uint32_t>(std::strtoul(rest + 2, nullptr, 10));
+				}
+				for (uint32_t reg = first; reg <= last && point.registers.size() < 12u; reg++) {
+					point.registers.push_back(scalar ? (Translator::ProbeScalar | reg) : reg);
+				}
+			}
+			parsed.push_back(std::move(point));
+		}
+		return parsed;
+	}();
+	return points;
+}
+
 IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
                              const TranslateOptions& options) {
 	ValidateTranslateOptions(options);
@@ -1486,6 +1547,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 		}
 	}
+	const auto& probes = ProbePoints();
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
 		Translator translator(result, result.blocks[typed_index], vector_limit, flush_f32_inputs);
@@ -1510,6 +1572,12 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				continue;
 			}
 			translator.TranslateInstruction(instruction);
+			for (uint32_t point = 0; point < probes.size(); point++) {
+				const auto& probe = probes[point];
+				if (probe.hash == result.shader_hash && probe.pc == instruction.pc) {
+					translator.Probe(instruction.pc, point, probe.registers);
+				}
+			}
 			if (forced.hash != 0 && forced.hash == result.shader_hash) {
 				for (const auto& forced_result: forced.results) {
 					if (forced_result.pc != instruction.pc) {
@@ -1532,3 +1600,21 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend
+
+namespace Libs::Graphics::ShaderRecompiler {
+
+std::string ShaderProbeKey(uint64_t shader_hash) {
+	std::string key;
+	const auto& points = Frontend::ProbePoints();
+	for (uint32_t point = 0; point < points.size(); point++) {
+		if (points[point].hash != shader_hash) continue;
+		key += std::to_string(point) + '@' + std::to_string(points[point].pc) + ':';
+		for (const auto reg: points[point].registers) {
+			key += std::to_string(reg) + ',';
+		}
+		key += ';';
+	}
+	return key;
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler

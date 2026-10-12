@@ -1813,6 +1813,7 @@ struct TestCase {
   std::vector<std::pair<std::string, size_t>> ir_counts;
   u32 expected_mip_descriptors = 0;
   std::optional<std::vector<u32>> expected_buffer_resources;
+  uint64_t shader_hash = 0;
 };
 
 struct GraphicsCase {
@@ -2087,6 +2088,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   compute_info.host_subgroup_size = host_subgroup_size;
   options.input_info.compute = &compute_info;
   options.user_data = user_data;
+  options.shader_hash = test.shader_hash;
 
   if (test.has_compute_info) {
     options.wave_size = test.compute_info.wave_size;
@@ -38368,10 +38370,52 @@ void CheckResourcePlanHandoff() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
-// Half-float stores clamp beyond the half range to the largest half, as the guest GPU's
-// conversion does where the host's gives infinity (IR::FloatStoreClampEnabled): storage images of
-// a 16-bit float format, 32-bit exports to half-float targets and formatted buffer stores. Packed
-// unsigned float buffer stores encode the 11- and 10-bit floats.
+// Half-float stores clamp beyond the half range to the largest half, as the
+// guest GPU's conversion does where the host's gives infinity
+// (IR::FloatStoreClampEnabled): storage images of a 16-bit float format, 32-bit
+// exports to half-float targets and formatted buffer stores. Packed unsigned
+// float buffer stores encode the 11- and 10-bit floats. KYTY_PROBE (main sets
+// it before any shader is translated): the probed shader counts the lanes at
+// the point and records the registers into the fault buffer, in both emulated
+// wave halves.
+constexpr uint64_t ProbeTestHash = 0x7ab1f0ull;
+constexpr const char *ProbeTestSetting = "7ab1f0@8:v1,s2;7ab1f0@8:v1-v3";
+
+void SetProbeSetting() {
+#if defined(_WIN32)
+  (void)_putenv_s("KYTY_PROBE", ProbeTestSetting);
+#else
+  (void)setenv("KYTY_PROBE", ProbeTestSetting, 1);
+#endif
+}
+
+void CheckShaderProbe() {
+  using O = ShaderOpcode;
+  for (const u32 wave : {32u, 64u}) {
+    TestCase test;
+    test.name = wave == 32u ? "ShaderProbeWave32" : "ShaderProbeWave64";
+    AppendVMovLiteral(&test.code, 1, 0x1234u); // pc 0
+    AppendSMovLiteral(&test.code, 2, 0x5678u); // pc 8: the probes follow it
+    AppendEnd(&test.code);
+    test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::S_ENDPGM};
+    test.compute_info.wave_size = wave;
+    test.has_compute_info = true;
+    test.compile_only = true;
+    test.shader_hash = ProbeTestHash;
+    test.ir_counts = {{"ShaderProbe", 2}};
+    test.required_spirv = {"OpAtomicIAdd", "OpBitCount"};
+    (void)CompileCase(test);
+    test.shader_hash = ProbeTestHash + 1u;
+    test.name =
+        wave == 32u ? "ShaderProbeOtherShader32" : "ShaderProbeOtherShader64";
+    test.ir_counts = {{"ShaderProbe", 0}};
+    test.required_spirv = {};
+    test.forbidden_spirv = {"OpBitCount"};
+    (void)CompileCase(test);
+  }
+  std::printf("[host]    %-32s ok\n", "ShaderProbe");
+}
+
 void CheckFloatStoreClamp() {
   constexpr const char *name = "FloatStoreClamp";
   using O = ShaderOpcode;
@@ -40697,6 +40741,7 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  SetProbeSetting();
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
@@ -40752,6 +40797,7 @@ int main(int argc, char **argv) {
   CheckShaderFunctionTableVariants();
   CheckShaderFunctionRuntimeRecords();
   CheckFloatStoreClamp();
+  CheckShaderProbe();
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());

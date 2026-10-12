@@ -1469,6 +1469,85 @@ void EmitShaderTrap(EmitterState& state, uint32_t pc, uint32_t code, uint32_t ta
 	probe(probe, 0);
 }
 
+// Diagnostics (KYTY_PROBE): an active lane counts its hit in its point's probe_count and, for the
+// hits that pick a record (ShaderProbeRecord), stores the shader, pc and values there. Each
+// emulated wave half records its own lanes.
+void EmitShaderProbe(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&          state       = ctx.state;
+	constexpr auto record_word = BufferCachePages::kNumPages / 8 / sizeof(uint32_t);
+	constexpr auto count_word =
+	    record_word + offsetof(ShaderTrapArea, probe_count) / sizeof(uint32_t);
+	constexpr auto probes_word = record_word + offsetof(ShaderTrapArea, probes) / sizeof(uint32_t);
+	constexpr auto slot_words  = sizeof(ShaderProbeRecord) / sizeof(uint32_t);
+	// The power-of-4 hits after the early ones: 4^1 takes the first record after them.
+	constexpr uint32_t last_power = kShaderProbeSlotsPerPoint - kShaderProbeEarly;
+	static_assert(kShaderProbeEarly == 4u && last_power <= 15u);
+	const auto pc    = inst.Arg(0).Resolve();
+	const auto point = inst.Arg(2).Resolve();
+	const auto count = inst.Arg(3).Resolve();
+	EXIT_IF(!pc.IsImmediate() || !point.IsImmediate() || !count.IsImmediate());
+	EXIT_IF(point.U32() >= kShaderProbePoints);
+	const auto values  = std::min(count.U32(), kShaderProbeValues);
+	const auto u32     = TypeU32(state);
+	const auto boolean = TypeBool(state);
+	EmitIfCondition(state, ctx.Arg(inst, 1), [&]() {
+		const auto hit = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpAtomicIAdd, u32, hit,
+		    FaultElementPointer(
+		        state, ConstantU32(state, static_cast<uint32_t>(count_word) + point.U32())),
+		    ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0), ConstantU32(state, 1));
+		const auto early =
+		    Binary(state, spv::OpULessThan, boolean, hit, ConstantU32(state, kShaderProbeEarly));
+		const auto before = Binary(state, spv::OpISub, u32, hit, ConstantU32(state, 1));
+		// A power of 4: one bit, at an even position. Its log2 is the bit count of the number
+		// before it.
+		const auto power = Binary(
+		    state, spv::OpLogicalAnd, boolean,
+		    Binary(state, spv::OpIEqual, boolean,
+		           Binary(state, spv::OpBitwiseAnd, u32, hit, before), ConstantU32(state, 0)),
+		    Binary(state, spv::OpINotEqual, boolean,
+		           Binary(state, spv::OpBitwiseAnd, u32, hit, ConstantU32(state, 0x55555555u)),
+		           ConstantU32(state, 0)));
+		const auto exponent =
+		    Binary(state, spv::OpShiftRightLogical, u32, Unary(state, spv::OpBitCount, u32, before),
+		           ConstantU32(state, 1));
+		const auto late   = Binary(state, spv::OpLogicalAnd, boolean, power,
+		                           Binary(state, spv::OpULessThanEqual, boolean, exponent,
+		                                  ConstantU32(state, last_power)));
+		const auto record = Binary(state, spv::OpLogicalOr, boolean, early, late);
+		EmitIfCondition(state, record, [&]() {
+			const auto slot = Binary(state, spv::OpIAdd, u32,
+			                         ConstantU32(state, point.U32() * kShaderProbeSlotsPerPoint),
+			                         Select(state, u32, early, hit,
+			                                Binary(state, spv::OpIAdd, u32, exponent,
+			                                       ConstantU32(state, kShaderProbeEarly - 1u))));
+			const auto base =
+			    Binary(state, spv::OpIAdd, u32, ConstantU32(state, probes_word),
+			           Binary(state, spv::OpIMul, u32, slot, ConstantU32(state, slot_words)));
+			const auto store = [&](size_t word, uint32_t value) {
+				state.builder.AddFunction(
+				    spv::OpStore,
+				    FaultElementPointer(state,
+				                        Binary(state, spv::OpIAdd, u32, base,
+				                               ConstantU32(state, static_cast<uint32_t>(word)))),
+				    value);
+			};
+			constexpr auto word = [](size_t offset) { return offset / sizeof(uint32_t); };
+			store(word(offsetof(ShaderProbeRecord, shader_hash_low)),
+			      ConstantU32(state, static_cast<uint32_t>(state.program.shader_hash)));
+			store(word(offsetof(ShaderProbeRecord, shader_hash_high)),
+			      ConstantU32(state, static_cast<uint32_t>(state.program.shader_hash >> 32)));
+			store(word(offsetof(ShaderProbeRecord, pc)), ConstantU32(state, pc.U32()));
+			store(word(offsetof(ShaderProbeRecord, count)), ConstantU32(state, values));
+			store(word(offsetof(ShaderProbeRecord, hit)), hit);
+			for (uint32_t index = 0; index < values; index++) {
+				store(word(offsetof(ShaderProbeRecord, values)) + index, ctx.Arg(inst, 4u + index));
+			}
+		});
+	});
+}
+
 void DefineGetBdaPointer(EmitterState& state) {
 	if (!state.program.info.uses_dma) {
 		return;
