@@ -7129,6 +7129,54 @@ public:
                            : "overlapping buffer write replaced untouched GPU image texels");
       }
 
+      // A texture whose texels are still the guest bytes takes a GPU buffer write that covers it
+      // from outside its base (GT7's light grid, inside a larger buffer a compute pass writes),
+      // or touches a part of it.
+      {
+        constexpr uint64_t guest_texture_offset = 0x1a20000;
+        constexpr uint32_t guest_value = 0x0badf00du;
+        constexpr uint32_t around_value = 0x600dcafeu;
+        constexpr uint32_t part_value = 0x5eed1234u;
+        for (uint32_t texel = 0; texel < 4; ++texel) {
+          std::memcpy(memory + guest_texture_offset + 0x40 + texel * 4, &guest_value,
+                      sizeof(guest_value));
+        }
+        auto guest_desc = MakeLinearDesc(
+            base + guest_texture_offset + 0x40, 4 * sizeof(uint32_t), vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D, {4, 1, 1}, 1, 4, 1);
+        const auto guest_image = texture_cache.FindImage(guest_desc);
+        (void)texture_cache.FindTexture(guest_image, guest_desc);
+        Require(name, "guest texture upload",
+                ReadCachedTexel(name, context, guest_image, {}, {4, 1, 1}) ==
+                    std::vector<u32>(4, guest_value),
+                "the guest texture did not upload its bytes");
+        // A buffer from 0x40 bytes before the texture to past its end, written on the GPU.
+        auto around = resources.GetBufferCache().ObtainBuffer(base + guest_texture_offset, 0xc0,
+                                                              true, false);
+        Require(name, "covering buffer allocation", around.first != nullptr,
+                "failed to allocate the buffer around the texture");
+        around.first->Fill(around.second, 0xc0, around_value);
+        texture_cache.InvalidateMemoryFromGPU(base + guest_texture_offset, 0xc0);
+        (void)texture_cache.FindTexture(guest_image, guest_desc);
+        Require(name, "covering buffer write refreshes a guest texture",
+                ReadCachedTexel(name, context, guest_image, {}, {4, 1, 1}) ==
+                    std::vector<u32>(4, around_value),
+                "a GPU buffer write around a guest texture left it stale");
+        // One texel written, the others as before.
+        auto part = resources.GetBufferCache().ObtainBuffer(
+            base + guest_texture_offset + 0x48, sizeof(uint32_t), true, false);
+        Require(name, "partial buffer allocation", part.first != nullptr,
+                "failed to allocate the partial texture write");
+        part.first->Fill(part.second, sizeof(uint32_t), part_value);
+        texture_cache.InvalidateMemoryFromGPU(base + guest_texture_offset + 0x48,
+                                              sizeof(uint32_t));
+        (void)texture_cache.FindTexture(guest_image, guest_desc);
+        Require(name, "partial buffer write refreshes a guest texture",
+                ReadCachedTexel(name, context, guest_image, {}, {4, 1, 1}) ==
+                    std::vector<u32>{around_value, around_value, part_value, around_value},
+                "a GPU buffer write into part of a guest texture left it stale");
+      }
+
       constexpr uint64_t exact_buffer_offset = 0x90000;
       constexpr uint32_t exact_buffer_value = 0x3f234567u;
       std::memcpy(memory + exact_buffer_offset, &exact_buffer_value,
@@ -38663,6 +38711,34 @@ void CheckRayTracingHitCallsReturn() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// The 2_10_10_10 layout (its 2-bit component first, at the bottom) as a render target, here
+// with the reversed channel order GT7 uses when a race is left, and as a texture of the same
+// memory: the host's A2B10G10R10 holds the 2-bit component in alpha, both ways the same.
+void CheckTenBitRenderTargetFormat() {
+  constexpr const char *name = "TenBitRenderTarget";
+  namespace P = Libs::Graphics::Prospero;
+  const auto target = Libs::Graphics::TextureGetRenderTargetFormat(
+      P::ChannelLayout::k2_10_10_10, P::ChannelType::kUNorm, P::ChannelOrder::kReversed);
+  // Host R, G, B, A hold the shader's B, G, R, A: storage 1, 2, 3, 0, reversed.
+  Require(name, "reversed UNorm target",
+          target.format == vk::Format::eA2B10G10R10UnormPack32 &&
+              target.bytes_per_element == 4u &&
+              target.export_mapping == P::ColorMappingBgra,
+          "the reversed 2_10_10_10 UNorm target did not map to A2B10G10R10");
+  const auto standard = Libs::Graphics::TextureGetRenderTargetFormat(
+      P::ChannelLayout::k2_10_10_10, P::ChannelType::kUInt, P::ChannelOrder::kStandard);
+  Require(name, "standard UInt target",
+          standard.format == vk::Format::eA2B10G10R10UintPack32 &&
+              standard.export_mapping == P::ColorComponentMapping{0x39u},
+          "the 2_10_10_10 UInt target did not keep its 2-bit component in alpha");
+  const auto texture = Libs::Graphics::TextureGetSurfaceFormatInfo(P::BufferFormat::k2_10_10_10UNorm);
+  Require(name, "texture of the target",
+          texture.vk_format == vk::Format::eA2B10G10R10UnormPack32 &&
+              texture.host_to_storage == P::ColorComponentMapping{0x39u},
+          "a 2_10_10_10 texture does not read the components its target wrote");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckFloatStoreClamp() {
   constexpr const char *name = "FloatStoreClamp";
   using O = ShaderOpcode;
@@ -41059,6 +41135,7 @@ int main(int argc, char **argv) {
   CheckShaderFunctionTableCallInLoop();
   CheckShaderFunctionTableVariants();
   CheckShaderFunctionRuntimeRecords();
+  CheckTenBitRenderTargetFormat();
   CheckFloatStoreClamp();
   CheckShaderProbe();
   CheckRayTracingHitCallsReturn();
