@@ -1909,6 +1909,35 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	return ok;
 }
 
+const char* UnsupportedResourceSpecialization(const Program&                program,
+                                              const ResourceSpecialization& specialization) {
+	// ApplyResourceSpecialization's check, before it changes anything: enumerated candidates only
+	// sample (EmitImageSample), and an image load or query through one stopped the emulator in
+	// GT7's cafe. The shader is skipped for this specialization instead.
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto op = inst.GetOpcode();
+			if (ImageOpcodeInfoOf(op).access == ImageAccess::None ||
+			    op == ValueOpcode::ImageSampleRaw) {
+				continue;
+			}
+			const auto index = inst.Flags<MemoryFlags>().index;
+			if (index >= program.memory_info.size()) {
+				continue;
+			}
+			const auto resource = program.memory_info[index].resource;
+			if (resource >= specialization.images.size()) {
+				continue;
+			}
+			const auto& image = specialization.images[resource];
+			if (!image.fmask && !image.bindless && image.indirect_root == resource) {
+				return "an image of an enumerated material table is read other than by a sample";
+			}
+		}
+	}
+	return nullptr;
+}
+
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete ||
 	        program.binding_layout_complete);

@@ -806,6 +806,12 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	KYTY_PROFILER_PHASE(phases, "Shader: specialize and bind", profiler::colors::Green100);
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
+	if (const auto* reason = IR::UnsupportedResourceSpecialization(ir, specialization);
+	    reason != nullptr) {
+		CompileResult unsupported;
+		unsupported.unsupported = reason;
+		return unsupported;
+	}
 	IR::ApplyResourceSpecialization(ir, specialization);
 	// The resource plan owns host descriptor evaluation now. Keep only dependencies consumed
 	// by GPU memory operations; bound descriptor dwords must not retain shader instructions.

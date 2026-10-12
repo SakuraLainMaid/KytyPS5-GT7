@@ -909,6 +909,7 @@ struct PipelineCache::ProgramCache {
 	static constexpr std::size_t MaxStaticKeyWords = 32 + ShaderVertexInputInfo::RES_MAX * 6;
 
 	struct Compiled {
+		const char*                              unsupported = nullptr;
 		std::vector<uint32_t>                    spirv;
 		ShaderRecompiler::IR::CompiledShaderInfo program;
 	};
@@ -919,6 +920,9 @@ struct PipelineCache::ProgramCache {
 	                           uint32_t push_data_start_dword) {
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
+		if (result.unsupported != nullptr) {
+			return {.unsupported = result.unsupported};
+		}
 		last_spirv_words = result.spirv.size();
 		return {.spirv   = std::move(result.spirv),
 		        .program = std::move(result.program).TakeCompiledInfo()};
@@ -1490,6 +1494,17 @@ struct PipelineCache::ProgramCache {
 		}
 		auto compiled = CompileTranslated(options, std::move(translated),
 		                                  entry->second.specialization, push_data_cursor);
+		if (compiled.unsupported != nullptr) {
+			// Skipped, as a shader that gives up is, instead of ending the emulator.
+			const char* label = options.dump_label != nullptr ? options.dump_label : "Shader";
+			::printf("%s gave up hash=0x%016" PRIx64 ": %s\n", label, params.hash,
+			         compiled.unsupported);
+			LOGF("%s gave up hash=0x%016" PRIx64 ": %s\n", label, params.hash,
+			     compiled.unsupported);
+			Profiler::Add(Profiler::Counter::SkippedGaveUp);
+			unsupported.insert(lookup_key);
+			return ShaderProgram {};
+		}
 		std::vector<uint8_t> permutation_payload;
 		if (disk != nullptr) {
 			ShaderDiskCache::EncodePermutationRecord(compiled.spirv, compiled.program,

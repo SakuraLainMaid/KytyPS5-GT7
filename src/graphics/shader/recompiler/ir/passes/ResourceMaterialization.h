@@ -70,6 +70,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 int LastIndirectImageFailureLine();
 
 // Applies an already-derived specialization to native IR before layout and emission.
+// Why ApplyResourceSpecialization cannot apply this specialization to the program, or null.
+[[nodiscard]] const char* UnsupportedResourceSpecialization(
+    const Program& program, const ResourceSpecialization& specialization);
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -60,7 +60,12 @@ void main() {
             }
         }
     }
-    if (selected >= 0) {
+    // One code throughout is consumed whether or not this binding could clear with it, as the
+    // host's download consumes it (the bytes are clean afterwards, so no later binding checks
+    // them): a register clear (0x20) that a storage or texture binding cannot decode was left in
+    // place, and the next render-target binding cleared the target over what a compute pass had
+    // written into it since (black and overexposed frames at Tokyo Expressway).
+    if (s_mismatch == 0u && code != 0xffu) {
         for (uint i = index; i < pc.words; i += 256u) {
             metadata.words[i] = 0xffffffffu;
         }

@@ -2320,18 +2320,6 @@ private:
 			indirect.bindless     = true;
 			material_source       = {};
 		}
-		// Only samples switch between enumerated candidates (EmitImageSample;
-		// ApplyResourceSpecialization stops on any other access to an indirect root): a load
-		// through an enumerated material table ended the emulator in GT7's cafe
-		// (ResourceMaterialization.cpp:2091), as a gather through a finite image did at
-		// Wolverine's boot. Such a handle is rejected, and the shader gives up instead.
-		if (!indirect.bindless && std::ranges::any_of(handle.Uses(), [](const Use& use) {
-			    const auto op = use.user->GetOpcode();
-			    return ImageOpcodeInfoOf(op).access != ImageAccess::None &&
-			           op != ValueOpcode::ImageSampleRaw;
-		    })) {
-			return RejectIndirect(handle, __LINE__);
-		}
 		indirect.table_source = InternSource(table_source);
 		DescriptorSource image_source;
 		image_source.dword_count = 8u;

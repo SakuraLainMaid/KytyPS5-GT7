@@ -34,6 +34,8 @@ struct TranslateResult {
 };
 
 struct CompileResult {
+	// Set when the specialization cannot be applied (UnsupportedResourceSpecialization): no SPIR-V.
+	const char*            unsupported = nullptr;
 	std::vector<uint32_t>  spirv;
 	std::string            decoded_dump;
 	std::string            ir_dump;
