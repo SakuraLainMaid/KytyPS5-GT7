@@ -915,6 +915,9 @@ SpirvStoredBuiltInElements(const std::vector<uint32_t> &binary,
   return elements;
 }
 
+// Whether the value stored to the BuiltIn is `operation` with those literals as its last
+// operands. A layer index goes through the bound-layer clamp first (OpSelect(in range, index,
+// 0)), which this looks through.
 bool SpirvBuiltInStoreUsesOperation(const std::vector<uint32_t> &binary,
                                     uint32_t builtin, uint32_t operation,
                                     std::initializer_list<uint32_t> literals) {
@@ -922,6 +925,7 @@ bool SpirvBuiltInStoreUsesOperation(const std::vector<uint32_t> &binary,
   std::unordered_map<uint32_t, uint32_t> constants;
   std::unordered_map<uint32_t, std::vector<uint32_t>> operations;
   std::unordered_map<uint32_t, uint32_t> stores;
+  std::unordered_map<uint32_t, uint32_t> selects;
   for (size_t i = 5; i < binary.size();) {
     const uint32_t opcode = binary[i] & 0xffffu;
     const uint32_t count = binary[i] >> 16u;
@@ -937,6 +941,8 @@ bool SpirvBuiltInStoreUsesOperation(const std::vector<uint32_t> &binary,
       operations[binary[i + 2]] = {binary.begin() + i + 4, binary.begin() + i + count};
     } else if (opcode == 62u && count >= 3u) {
       stores[binary[i + 1]] = binary[i + 2];
+    } else if (opcode == 169u && count == 6u) {
+      selects[binary[i + 2]] = binary[i + 4];
     }
     i += count;
   }
@@ -945,7 +951,11 @@ bool SpirvBuiltInStoreUsesOperation(const std::vector<uint32_t> &binary,
     if (store == stores.end()) {
       continue;
     }
-    const auto value = operations.find(store->second);
+    auto stored = store->second;
+    if (const auto select = selects.find(stored); select != selects.end()) {
+      stored = select->second;
+    }
+    const auto value = operations.find(stored);
     if (value == operations.end()) {
       continue;
     }

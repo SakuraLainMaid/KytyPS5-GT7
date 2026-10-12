@@ -40926,6 +40926,22 @@ int main(int argc, char **argv) {
   SetProbeSetting();
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  // Without a GPU: every case translated, compiled and its SPIR-V validated, for NVIDIA's host
+  // subgroup of 32 (a wave64 as two lanes per invocation) and for 64. The text and count
+  // expectations are left out: some depend on the device the harness creates.
+  if (argc == 2 && std::strcmp(argv[1], "--compile-all") == 0) {
+    for (auto test : MakeCases()) {
+      test.required_spirv.clear();
+      test.forbidden_spirv.clear();
+      test.ir_counts.clear();
+      test.decoded_counts.clear();
+      for (const u32 subgroup : {32u, 64u}) {
+        (void)CompileCase(test, subgroup);
+      }
+      std::printf("[compile] %-32s ok\n", test.name);
+    }
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeThreadDimensions(vulkan);
