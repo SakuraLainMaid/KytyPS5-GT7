@@ -52,6 +52,17 @@ std::shared_ptr<const std::vector<ShaderCallVariant>> ShaderCallMissTargets(uint
 bool ShaderCallRuntimeRecords();
 void SetShaderCallRuntimeRecords(bool value);
 
+// A material function with a loop is inlined (KYTY_CALL_LOOPS=0 leaves it to the miss path, as
+// before), and its loops are bounded: the expansion brackets its body with these two S_NOPs (the
+// immediates real code never uses), and the translation ends a loop whose header lies between
+// them once the invocation has taken ShaderCallLoopCap() back edges in such loops
+// (KYTY_CALL_LOOP_CAP, 1024 by default; 0 leaves them unbounded). A count read from data the
+// emulator does not reproduce (a placeholder texture, say) then costs a bounded number of rounds
+// instead of hanging the GPU.
+constexpr uint32_t ShaderCallLoopBodyBegin = 0xbf80c0deu;
+constexpr uint32_t ShaderCallLoopBodyEnd   = 0xbf80c0dfu;
+uint32_t           ShaderCallLoopCap();
+
 // Expands scalar calls through immutable pointers or bounded scalar-buffer tables.
 // Table calls retain runtime selection and trap on targets outside the captured set.
 // Empty output means no calls; unresolved calls never discard guest instructions.
@@ -78,8 +89,11 @@ public:
 	            const ShaderCodeReader& read, std::vector<uint32_t>& expanded, std::string& reason,
 	            uint32_t wave_size);
 	// With the shader's hash: table calls over the bound inline the targets reported missing for
-	// it (ShaderCallMissTargets). summary, when given, receives a line about a new expansion that
-	// leaves table targets out (empty otherwise).
+	// it (ShaderCallMissTargets), and so do the material table calls of runtime records, whatever
+	// their size: the expansion then depends on the targets the shader runs, not on the table,
+	// and a scene with new materials rebuilds only the shaders that call them. summary, when
+	// given, receives a line about a new expansion that leaves table targets out (empty
+	// otherwise).
 	bool Expand(std::span<const uint32_t> code, uint64_t base, std::span<const uint32_t> user_data,
 	            const ShaderCodeReader& read, std::vector<uint32_t>& expanded, std::string& reason,
 	            uint32_t wave_size, uint64_t shader_hash, std::string* summary);

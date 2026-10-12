@@ -989,6 +989,33 @@ uint32_t EmitGetShaderBase(ValueEmitContext& ctx) {
 	return ctx.Def(IR::Value(uint64_t {0}));
 }
 
+// True, and one less in the budget, while the invocation has back edges left for the loops of
+// bracketed material bodies (Decoder::ShaderCallLoopCap): a Private variable, so every bounded
+// loop of the invocation draws on the same budget. Both emulated wave halves take the first
+// half's decision, as for a branch condition.
+uint32_t EmitLoopBudgetTick(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (ctx.half != 0 && ctx.other_half != nullptr) return ctx.other_half->Def(IR::Value(&inst));
+	auto& state = ctx.state;
+	if (state.loop_budget_variable == 0) {
+		const auto cap = inst.Arg(0).Resolve();
+		EXIT_IF(!cap.IsImmediate());
+		state.loop_budget_variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassPrivate, TypeU32(state)), spv::StorageClassPrivate,
+		    ConstantU32(state, cap.U32()));
+		state.builder.AddName(state.loop_budget_variable, "loop_budget");
+	}
+	const auto budget = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), budget, state.loop_budget_variable);
+	const auto left =
+	    Binary(state, spv::OpINotEqual, TypeBool(state), budget, ConstantU32(state, 0));
+	const auto next =
+	    Select(state, TypeU32(state), left,
+	           Binary(state, spv::OpISub, TypeU32(state), budget, ConstantU32(state, 1)),
+	           ConstantU32(state, 0));
+	state.builder.AddFunction(spv::OpStore, state.loop_budget_variable, next);
+	return left;
+}
+
 uint32_t EmitReadClockRealtime64(ValueEmitContext& ctx) {
 	// S_MEMREALTIME is a free-running counter at 100 MHz. Read the device clock once as a
 	// uvec2 so the two halves cannot tear, then bring it down toward the guest's rate with a

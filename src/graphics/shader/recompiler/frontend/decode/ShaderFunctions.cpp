@@ -233,6 +233,9 @@ struct Call {
 	std::vector<CallTarget> targets;
 	// Table calls: the inlined variants, each with the index of its function in `targets`.
 	bool                                                specialized = false;
+	// A material table (records after the targets): its looping bodies are bracketed for the
+	// loop bound (ShaderCallLoopBodyBegin).
+	bool                                              records = false;
 	std::vector<std::pair<ShaderCallVariant, size_t>> variants;
 };
 
@@ -680,16 +683,26 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 	return true;
 }
 
-// KYTY_CALL_LOOPS=1: a target of a table with record data (specialized or not) that has a loop
-// is inlined too. Off by default:
-// GT7's lit material functions walk a per-pixel light list whose length they read from an image,
-// and every garage visit with them inlined hung the GPU in the material pass (2026-10-10): a
-// wrong length, from data the emulator does not reproduce, runs the loop for up to 65,535 rounds
-// a pixel. Left out, the target takes the miss path, as one over the table bound does.
+// A target of a table with record data (specialized or not) that has a loop is inlined, its
+// loops bounded (ShaderCallLoopCap). GT7's lit material functions walk a per-pixel light list
+// whose length they read from an image, and every garage visit with them inlined unbounded hung
+// the GPU in the material pass (2026-10-10): a wrong length, from data the emulator does not
+// reproduce, ran the loop for up to 65,535 rounds a pixel. Its car paint functions loop too, so
+// leaving looping functions to the miss path left every car unpainted. KYTY_CALL_LOOPS=0 still
+// does.
 bool InlineLoopingVariants() {
 	static const bool value = [] {
 		const char* text = std::getenv("KYTY_CALL_LOOPS");
-		return text != nullptr && text[0] == '1';
+		return text == nullptr || text[0] != '0';
+	}();
+	return value;
+}
+
+uint32_t LoopCap() {
+	static const uint32_t value = [] {
+		const char* text = std::getenv("KYTY_CALL_LOOP_CAP");
+		if (text == nullptr || text[0] == '\0') return 1024u;
+		return static_cast<uint32_t>(std::strtoul(text, nullptr, 10));
 	}();
 	return value;
 }
@@ -773,6 +786,7 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 		st.table_targets += site.table_targets;
 		st.candidates += site.variants.size();
 		call.specialized = site.specialized;
+		call.records                         = site.records || site.specialized;
 		std::vector<CallSite::Variant> order = site.preferred;
 		for (const auto& variant: site.variants)
 			if (!std::binary_search(site.preferred.begin(), site.preferred.end(), variant))
@@ -892,6 +906,10 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 			auto                  emit_target = [&](const CallTarget& target) -> bool {
 				EmitMove(result, call.return_reg, static_cast<uint32_t>(return_pc));
 				EmitMove(result, call.return_reg + 1u, static_cast<uint32_t>(return_pc >> 32u));
+				// A looping material body is bracketed for the loop bound.
+				const bool bounded = call.dynamic && call.records && LoopCap() != 0u &&
+				                     HasBackEdge(target.function.instructions);
+				if (bounded) result.push_back(ShaderCallLoopBodyBegin);
 				std::map<uint32_t, uint32_t>               local_pc;
 				std::vector<std::pair<uint32_t, uint32_t>> branches;
 				for (const auto& body: target.function.instructions) {
@@ -911,6 +929,7 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 				for (const auto& [at, target]: branches) {
 					relocations.emplace_back(at, local_pc.at(target));
 				}
+				if (bounded) result.push_back(ShaderCallLoopBodyEnd);
 				return true;
 			};
 			if (call.dynamic) {
@@ -1092,13 +1111,18 @@ bool LearnSpecializedVariants() {
 
 // Bounds the table calls: a table over MaxCallTargets offers only its reported variants (none,
 // for a specialized one, unless LearnSpecializedVariants). An unspecialized site matches reports
-// by target alone.
-void SelectTableTargets(std::vector<CallSite>& sites,
-                        const std::vector<ShaderCallVariant>* reported) {
+// by target alone. reported_only: a material table of runtime records offers only its reported
+// targets whatever its size, so that its expansion follows the targets the shader runs and not
+// what the table holds (GT7's scenes each bring a table: with every target of a small table
+// inlined, each scene change rebuilt all 28 material shaders, minutes of freezing).
+void SelectTableTargets(std::vector<CallSite>&                sites,
+                        const std::vector<ShaderCallVariant>* reported,
+                        bool                                  reported_only = false) {
 	for (auto& site: sites) {
 		if (!site.dynamic) continue;
 		site.preferred.clear();
-		const bool over_bound = site.variants.size() > MaxCallTargets;
+		const bool over_bound = site.variants.size() > MaxCallTargets ||
+		                        (reported_only && site.records && !site.specialized);
 		if (reported != nullptr && (!over_bound || !site.specialized || LearnSpecializedVariants())) {
 			if (site.specialized) {
 				std::set_intersection(site.variants.begin(), site.variants.end(),
@@ -1305,12 +1329,21 @@ bool ShaderCallRuntimeRecords() {
 	return RuntimeRecords();
 }
 
+uint32_t ShaderCallLoopCap() {
+	return LoopCap();
+}
+
 void SetShaderCallRuntimeRecords(bool value) {
 	RuntimeRecordsSwitch().store(value, std::memory_order_relaxed);
 }
 
-bool ReportShaderCallMiss(uint64_t shader_hash, const ShaderCallVariant& target, bool* churned) {
+bool ReportShaderCallMiss(uint64_t shader_hash, const ShaderCallVariant& reported, bool* churned) {
 	if (churned != nullptr) *churned = false;
+	// With runtime records no expansion specializes on the record pointer: a target is one
+	// report, however many records name it (each counted apart, the busiest material functions
+	// looked like churn and were dropped).
+	const ShaderCallVariant target =
+	    RuntimeRecords() ? ShaderCallVariant {reported.target, 0u, 0u} : reported;
 	auto&           registry = CallMissRegistry::Get();
 	std::lock_guard lock(registry.mutex);
 	auto&           shader = registry.shaders[shader_hash];
@@ -1433,7 +1466,7 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	}
 	{
 		const auto reported = shader_hash != 0 ? ShaderCallMissTargets(shader_hash) : nullptr;
-		SelectTableTargets(sites, reported.get());
+		SelectTableTargets(sites, reported.get(), shader_hash != 0 && RuntimeRecords());
 	}
 	std::string drop_note;
 	if (shader_hash != 0) {

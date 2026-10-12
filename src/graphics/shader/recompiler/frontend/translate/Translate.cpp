@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/shader.h"
 
@@ -782,7 +783,8 @@ void Translator::WriteCompareResult(const Decoder::Operand& operand, IR::U1 valu
 }
 
 void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
-                                    IR::BlockInfo& info) {
+                                    IR::BlockInfo&                                 info,
+                                    std::span<const std::pair<uint32_t, uint32_t>> bounded) {
 	const auto native_condition = [&](CFG::BranchCondition kind) -> IR::U1 {
 		IR::U1 condition;
 		switch (kind) {
@@ -830,12 +832,70 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 		return;
 	}
 	if (term.kind == CFG::TerminatorKind::ConditionalBranch) {
-		const auto condition = term.expression != UINT32_MAX
-		                           ? expression(expression, term.expression)
-		                           : native_condition(term.condition);
+		auto condition = term.expression != UINT32_MAX ? expression(expression, term.expression)
+		                                               : native_condition(term.condition);
+		if (!bounded.empty()) {
+			condition = BoundLoopCondition(graph, source, condition, bounded);
+		}
 		info.condition = condition;
 		ir.Emit(IR::ValueOpcode::Reference, {condition});
 	}
+}
+
+// A loop of a bracketed material body runs only while the invocation's loop budget lasts
+// (LoopBudgetTick): a branch out of it to its merge (the structured form of the guest's exit
+// test, usually at the bottom of each round) is taken once the budget is spent, and so is a
+// latch's branch back to the header withheld. Both edges exist already, so the bound adds no
+// control flow; the budget is the same in every lane of a wave, as the branches are scalar.
+IR::U1 Translator::BoundLoopCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
+                                      IR::U1                                         condition,
+                                      std::span<const std::pair<uint32_t, uint32_t>> bounded) {
+	// A loop is bounded when its first instructions lie in a bracketed body: the header's own,
+	// or, for the empty header the structurizer adds, those of the block it enters.
+	const auto in_body = [&](const CFG::BasicBlock& header) {
+		const auto* first = &header;
+		for (uint32_t step = 0; first != nullptr && first->inst_begin == first->inst_end &&
+		                        first->terminator.kind == CFG::TerminatorKind::Branch && step < 8;
+		     step++) {
+			first = graph.FindBlock(first->terminator.true_block);
+		}
+		return first != nullptr && first->inst_begin != first->inst_end &&
+		       std::ranges::any_of(bounded, [&](const auto& range) {
+			       return first->start_pc >= range.first && first->start_pc < range.second;
+		       });
+	};
+	const auto tick = [&]() {
+		return IR::U1(
+		    ir.Emit(IR::ValueOpcode::LoopBudgetTick, {IR::Value(Decoder::ShaderCallLoopCap())}));
+	};
+	const auto& term = source.terminator;
+	// The latch of a bounded loop, branching back to its header.
+	const auto back_edge = [&](uint32_t id) {
+		const auto* block = graph.FindBlock(id);
+		return block != nullptr && block->terminator.loop_header &&
+		       block->terminator.continue_block == source.id && in_body(*block);
+	};
+	// The merge of a bounded loop: a branch there leaves the loop.
+	const auto exit_edge = [&](uint32_t id) {
+		return id != UINT32_MAX &&
+		       std::ranges::any_of(graph.blocks, [&](const CFG::BasicBlock& block) {
+			       return block.terminator.loop_header && block.terminator.merge_block == id &&
+			              in_body(block);
+		       });
+	};
+	if (back_edge(term.true_block)) {
+		return ir.LogicalAnd(condition, tick());
+	}
+	if (back_edge(term.false_block)) {
+		return ir.LogicalOr(condition, ir.LogicalNot(tick()));
+	}
+	if (exit_edge(term.true_block)) {
+		return ir.LogicalOr(condition, ir.LogicalNot(tick()));
+	}
+	if (exit_edge(term.false_block)) {
+		return ir.LogicalAnd(condition, tick());
+	}
+	return condition;
 }
 
 namespace {
@@ -1413,6 +1473,19 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 		return result;
 	}();
+	// The looping material bodies the function expansion bracketed: their loops are bounded.
+	std::vector<std::pair<uint32_t, uint32_t>> bounded;
+	if (Decoder::ShaderCallLoopCap() != 0u) {
+		for (const auto& instruction: decoded.instructions) {
+			if (instruction.opcode != Decoder::Opcode::S_NOP) continue;
+			if (instruction.raw[0] == Decoder::ShaderCallLoopBodyBegin) {
+				bounded.emplace_back(instruction.pc, UINT32_MAX);
+			} else if (instruction.raw[0] == Decoder::ShaderCallLoopBodyEnd && !bounded.empty() &&
+			           bounded.back().second == UINT32_MAX) {
+				bounded.back().second = instruction.pc;
+			}
+		}
+	}
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
 		Translator translator(result, result.blocks[typed_index], vector_limit, flush_f32_inputs);
@@ -1450,7 +1523,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				}
 			}
 		}
-		translator.AddBranchCondition(cfg, cfg_block, result.block_info[typed_index]);
+		translator.AddBranchCondition(cfg, cfg_block, result.block_info[typed_index], bounded);
 	}
 	if (IR::IrValidationEnabled()) {
 		IR::ValidateProgram(result, false);

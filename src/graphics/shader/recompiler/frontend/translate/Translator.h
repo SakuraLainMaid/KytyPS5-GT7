@@ -4,6 +4,8 @@
 #include "graphics/shader/recompiler/ir/IREmitter.h"
 
 #include <array>
+#include <span>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -18,13 +20,20 @@ public:
 	void TranslateInstruction(const Decoder::Instruction& inst);
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
-	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source, IR::BlockInfo& info);
+	// bounded: the pc ranges of the looping material bodies the expansion bracketed
+	// (Decoder::ShaderCallLoopBodyBegin); a loop with its header in one is bounded.
+	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
+	                        IR::BlockInfo&                                 info,
+	                        std::span<const std::pair<uint32_t, uint32_t>> bounded = {});
 	// Diagnostics (KYTY_FORCE_PC): overwrites the first destination dwords of an instruction
 	// with constants after it is translated.
 	void ForceDestination(const Decoder::Instruction& inst, const std::vector<uint32_t>& values);
 	void ForceVectorRegisters(uint32_t first, const std::vector<uint32_t>& values);
 
 private:
+	IR::U1 BoundLoopCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
+	                          IR::U1                                         condition,
+	                          std::span<const std::pair<uint32_t, uint32_t>> bounded);
 	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);
 	Decoder::Operand DestinationOperand(const Decoder::Instruction& inst);
 	Decoder::Operand OffsetOperand(const Decoder::Operand& operand, uint32_t offset);

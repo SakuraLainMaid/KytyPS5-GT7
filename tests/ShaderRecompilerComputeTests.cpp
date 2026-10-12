@@ -1512,7 +1512,8 @@ void CheckShaderFunctionTableVariants() {
   Require(name, "one selection tree", count(expanded, 0xbf068080u) == 0,
           "a dead incoming SCC still produced a second selection tree");
 
-  // A callee with a loop is left to the miss path (KYTY_CALL_LOOPS=1 inlines it).
+  // A callee with a loop is inlined between the loop-bound brackets (KYTY_CALL_LOOPS=0 leaves it
+  // to the miss path).
   constexpr uint64_t callee_loop = 0x10001000ull;
   store(callee_loop, {EncodeVop1(0x01u, 0, InlineU32(1)), EncodeSopp(0x05u, 0xfffeu),
                       EncodeSop1(0x20u, 0, 14)});
@@ -1521,9 +1522,11 @@ void CheckShaderFunctionTableVariants() {
   }
   ok = ShaderRecompiler::Decoder::InlineShaderFunctions(
       code, reinterpret_cast<uint64_t>(code.data()), user_data, read, expanded, reason, 64);
-  Require(name, "looping callee left out",
-          ok && count(expanded, body) == 0 && count(expanded, trap) > 0,
-          "a specialized callee with a loop was inlined");
+  Require(name, "looping callee bounded",
+          ok && count(expanded, body) == 2 &&
+              count(expanded, ShaderRecompiler::Decoder::ShaderCallLoopBodyBegin) == 2 &&
+              count(expanded, ShaderRecompiler::Decoder::ShaderCallLoopBodyEnd) == 2,
+          "a specialized callee with a loop was not inlined between the loop-bound brackets");
 
   fill_table(300);
   const uint64_t hash = 0x7ab1e5ull;
@@ -1607,16 +1610,18 @@ void CheckShaderFunctionTableVariants() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
-// The default for GT7's material tables: each target function is inlined once and the record
-// pointer stays a register, so records that change (the garage reallocating them, race
-// materials every frame) keep one program, and a table of more records than the variant bound
-// still inlines every function.
+// The default for material tables: each target function the shader runs is inlined once and
+// the record pointer stays a register, so records that change (the garage reallocating them,
+// race materials every frame) keep one program. Only reported targets are inlined, whatever the
+// table size, so a scene with another table keeps the program while its shader runs the same
+// functions; a looping function is inlined with its loops bounded.
 void CheckShaderFunctionRuntimeRecords() {
   constexpr const char *name = "ShaderFunctionRuntimeRecords";
   const bool runtime_records = ShaderRecompiler::Decoder::ShaderCallRuntimeRecords();
   ShaderRecompiler::Decoder::SetShaderCallRuntimeRecords(true);
   constexpr uint64_t callee_a = 0x10000000ull;
   constexpr uint64_t callee_b = 0x10000100ull;
+  constexpr uint64_t callee_loop = 0x10000200ull;
   constexpr uint64_t srt = 0x20000000ull;
   constexpr uint64_t table = 0x20000100ull;
   std::map<uint64_t, u32> memory;
@@ -1628,10 +1633,15 @@ void CheckShaderFunctionRuntimeRecords() {
   };
   store(callee_a, {EncodeVop1(0x01u, 0, InlineU32(1)), EncodeSop1(0x20u, 0, 14)});
   store(callee_b, {EncodeVop1(0x01u, 1, InlineU32(2)), EncodeSop1(0x20u, 0, 14)});
-  const auto fill_records = [&](u32 entries, u32 data) {
+  // s_mov_b32 s20, 4; loop: s_sub_u32 s20, s20, 1; s_cmp_lg_u32 s20, 0; s_cbranch_scc1 loop
+  store(callee_loop, {EncodeSMovB32(20, InlineU32(4)), EncodeSop2(0x01u, 20, 20, InlineU32(1)),
+                      EncodeSopc(0x07u, 20, InlineU32(0)),
+                      EncodeSopp(0x05u, static_cast<u32>(1 - 4) & 0xffffu),
+                      EncodeSop1(0x20u, 0, 14)});
+  const auto fill_records = [&](u32 entries, u32 data, bool loop = false) {
     store(srt + 0x40, {u32(table), u32(table >> 32u), entries * 16u, 0u});
     for (u32 e = 0; e < entries; ++e) {
-      const uint64_t target = (e % 2u) != 0u ? callee_b : callee_a;
+      const uint64_t target = loop && e == 2u ? callee_loop : (e % 2u) != 0u ? callee_b : callee_a;
       store(table + e * 16u, {u32(target), u32(target >> 32u), data + e * 0x100u, 0x7u});
     }
   };
@@ -1673,19 +1683,75 @@ void CheckShaderFunctionRuntimeRecords() {
   std::string summary;
   std::vector<u32> expanded;
   const uint64_t hash = 0x7ab1e8ull;
+  const auto expand = [&]() {
+    return expander.Expand(code, reinterpret_cast<uint64_t>(code.data()), user_data, read,
+                           expanded, reason, 64, hash, &summary);
+  };
+  const auto absorb = [&]() {
+    // Reports gather for a batch window before an expansion takes them.
+    std::this_thread::sleep_for(std::chrono::milliseconds(350));
+    (void)ShaderRecompiler::Decoder::ShaderCallMissTargets(hash);
+  };
   fill_records(300, 0x7000u);
-  bool ok = expander.Expand(code, reinterpret_cast<uint64_t>(code.data()), user_data, read,
-                            expanded, reason, 64, hash, &summary);
+  bool ok = expand();
+  Require(name, "nothing before reports",
+          ok && count(expanded, body_a) == 0 && count(expanded, body_b) == 0,
+          "a material table inlined targets before the shader reported running them");
+  // Each target reported once, however many records name it.
+  for (const u32 data : {0x7000u, 0x7200u, 0x7400u}) {
+    (void)ShaderRecompiler::Decoder::ReportShaderCallMiss(hash, {callee_a, data, 0x7u});
+  }
+  (void)ShaderRecompiler::Decoder::ReportShaderCallMiss(hash, {callee_b, 0x7100u, 0x7u});
+  absorb();
+  const auto reported = ShaderRecompiler::Decoder::ShaderCallMissTargets(hash);
+  Require(name, "reports by target",
+          reported != nullptr && reported->size() == 2u &&
+              std::all_of(reported->begin(), reported->end(),
+                          [](const auto &v) { return v.data0 == 0u && v.data1 == 0u; }),
+          "reports of one target with several records counted apart");
+  ok = expand();
   const auto first = expanded;
   Require(name, "each function once",
           ok && count(expanded, body_a) == 1 && count(expanded, body_b) == 1 &&
               count(expanded, move_s16) == 0 && count(expanded, 0x7000u) == 0,
-          "a table of 300 records did not inline each of its two functions once, unspecialized");
+          "a table of 300 records did not inline each reported function once, unspecialized");
   fill_records(300, 0x9000u);
-  ok = expander.Expand(code, reinterpret_cast<uint64_t>(code.data()), user_data, read, expanded,
-                       reason, 64, hash, &summary);
+  ok = expand();
   Require(name, "new records, same program", ok && expanded == first,
           "records with new data expanded to new code");
+  fill_records(20, 0xa000u);
+  ok = expand();
+  Require(name, "another table, same program", ok && expanded == first,
+          "a smaller table naming the same functions expanded to new code");
+  fill_records(20, 0xa000u, true);
+  (void)ShaderRecompiler::Decoder::ReportShaderCallMiss(hash, {callee_loop, 0xa200u, 0x7u});
+  absorb();
+  ok = expand();
+  Require(name, "looping function bounded",
+          ok && count(expanded, ShaderRecompiler::Decoder::ShaderCallLoopBodyBegin) == 1 &&
+              count(expanded, ShaderRecompiler::Decoder::ShaderCallLoopBodyEnd) == 1 &&
+              count(expanded, EncodeSop2(0x01u, 20, 20, InlineU32(1))) == 1,
+          "a reported looping function was not inlined between the loop-bound brackets");
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = 1;
+  compute.threads_num[2] = 1;
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.wave_size = 64;
+  options.dump_ir = false;
+  options.user_data = user_data;
+  options.input_info.compute = &compute;
+  const auto translated = ShaderRecompiler::TranslateProgram(expanded, options);
+  size_t ticks = 0;
+  for (const auto *block : translated.program.blocks) {
+    for (const auto &inst : *block) {
+      ticks += inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::LoopBudgetTick ? 1u : 0u;
+    }
+  }
+  Require(name, "loop budget", !translated.unsupported && ticks == 1u,
+          "the bounded loop's exit does not draw on the loop budget (" + std::to_string(ticks) +
+              " ticks)");
   ShaderRecompiler::Decoder::SetShaderCallRuntimeRecords(runtime_records);
   std::printf("[host]    %-32s ok\n", name);
 }

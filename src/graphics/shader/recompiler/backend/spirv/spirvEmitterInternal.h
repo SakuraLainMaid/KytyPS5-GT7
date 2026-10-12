@@ -170,6 +170,8 @@ struct EmitterState {
 	uint32_t runtime_image_table_variable = 0;
 	// The buffer formats' layouts for formatted loads through GPU-selected V#s (a Private array).
 	uint32_t                   indirect_format_table                 = 0;
+	// The invocation's loop budget (LoopBudgetTick): a Private u32 holding what is left.
+	uint32_t                   loop_budget_variable                  = 0;
 	uint32_t                   runtime_image_requests_variable       = 0;
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   main_func                             = 0;
