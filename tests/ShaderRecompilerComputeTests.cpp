@@ -1791,9 +1791,74 @@ void CheckShaderFunctionRuntimeRecords() {
       ticks += inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::LoopBudgetTick ? 1u : 0u;
     }
   }
+  // The callee's loop draws on the budget at its header; the loop around the
+  // call does not (it still calls each remaining target once the budget is
+  // spent).
   Require(name, "loop budget", !translated.unsupported && ticks == 1u,
-          "the bounded loop's exit does not draw on the loop budget (" + std::to_string(ticks) +
-              " ticks)");
+          "only the bounded body's loop should draw on the loop budget (" +
+              std::to_string(ticks) + " ticks)");
+  // A waterfall's "lanes left" flag (cleared before the call, tested after it,
+  // the loop repeated while lanes are left) is cleared again where the call
+  // returns, whatever the callee left in it. A flag tested otherwise is not.
+  {
+    const u32 call_word = EncodeSop1(0x21u, 14, 14);
+    const u32 clear_flag = EncodeVop1(0x01u, 5, InlineU32(0)); // v_mov_b32 v5, 0
+    enum class Shape { Waterfall, ExitTest, RepeatCall };
+    // Waterfall: the flag is cleared at the top of the loop the branch repeats.
+    // ExitTest: an out-flag tested after the call, which skips a use of it.
+    // RepeatCall: the flag cleared once, before the loop: a loop that repeats
+    // the call while the callee asks.
+    const auto build = [&](Shape shape) {
+      std::vector<u32> words;
+      int32_t head = -1;
+      for (size_t k = 0; k + 1 < code.size(); ++k) { // all but the end
+        const auto word = code[k];
+        if (k == 4u) {
+          if (shape == Shape::RepeatCall) words.push_back(clear_flag);
+          head = static_cast<int32_t>(words.size());
+        }
+        if (word == call_word) {
+          words.push_back(EncodeSop1(0x04u, 22, 126)); // s_mov_b64 s[22:23], exec
+          if (shape != Shape::RepeatCall) words.push_back(clear_flag);
+          words.push_back(word);
+          words.push_back(EncodeSop1(0x04u, 126, 22));        // s_mov_b64 exec, s[22:23]
+          words.push_back(EncodeVopc(0xd5u, InlineU32(0), 5)); // v_cmpx_ne_u32 exec, 0, v5
+          const auto at = static_cast<int32_t>(words.size());
+          if (shape == Shape::ExitTest) {
+            // s_cbranch_execz over the next instruction (a use of the out-flag)
+            words.push_back(EncodeSopp(0x08u, 1u));
+            words.push_back(EncodeVop1(0x01u, 6, InlineU32(3)));
+          } else {
+            // s_cbranch_execnz back to the loop head
+            words.push_back(EncodeSopp(0x09u, static_cast<u32>(head - (at + 1)) & 0xffffu));
+          }
+        } else if (word == code[static_cast<size_t>(branch_word)]) {
+          const auto at = static_cast<int32_t>(words.size());
+          words.push_back(EncodeSopp(0x05u, static_cast<u32>(head - (at + 1)) & 0xffffu));
+        } else {
+          words.push_back(word);
+        }
+      }
+      AppendEnd(&words);
+      return words;
+    };
+    for (const auto shape : {Shape::Waterfall, Shape::ExitTest, Shape::RepeatCall}) {
+      const auto program = build(shape);
+      ShaderRecompiler::Decoder::ShaderFunctionExpander fresh;
+      std::vector<u32> out;
+      ok = fresh.Expand(program, reinterpret_cast<uint64_t>(program.data()), user_data, read,
+                        out, reason, 64, hash, &summary);
+      const auto expected = shape == Shape::Waterfall ? 2 : 1;
+      Require(name,
+              shape == Shape::Waterfall  ? "waterfall flag cleared on return"
+              : shape == Shape::ExitTest ? "out-flag left alone"
+                                         : "repeated call left alone",
+              ok && count(out, clear_flag) == expected,
+              "the flag was cleared where the call returns " +
+                  std::to_string(count(out, clear_flag) - 1) + " times, not " +
+                  std::to_string(expected - 1) + " (" + reason + ")");
+    }
+  }
   ShaderRecompiler::Decoder::SetShaderCallLoopsInlined(loops_inlined);
   ShaderRecompiler::Decoder::SetShaderCallRuntimeRecords(runtime_records);
   std::printf("[host]    %-32s ok\n", name);
