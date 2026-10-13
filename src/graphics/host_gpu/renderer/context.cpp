@@ -82,8 +82,25 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 		                                                 .arg4      = arg4});
 		m_debug_marker = marker;
 		if (marker != nullptr) {
-			Recorder().setCheckpointNV(marker);
+			Recorder().setCheckpointNV(DiagnosticCheckpointMarker(*marker));
 		}
+	}
+}
+
+void CommandBuffer::MarkTransfer(CommandBufferDebugOp op, uint64_t destination, uint64_t source,
+                                 uint32_t arg0, uint32_t arg1, uint32_t arg2) const {
+	if (!m_graphics.diagnostic_checkpoints_enabled || IsInvalid()) {
+		return;
+	}
+	auto* marker = RecordDiagnosticCheckpoint({.op        = static_cast<uint32_t>(op),
+	                                           .submit_id = m_debug_submit_id,
+	                                           .arg0      = arg0,
+	                                           .arg1      = arg1,
+	                                           .arg2      = arg2,
+	                                           .arg4      = destination,
+	                                           .arg5      = source});
+	if (marker != nullptr) {
+		Recorder().setCheckpointNV(DiagnosticCheckpointMarker(*marker));
 	}
 }
 
@@ -162,6 +179,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
+	ScrubDeadRenderingViews(rendering, "a draw's rendering");
 	Recorder().beginRendering(rendering);
 	m_render_state = state;
 	m_rendering    = true;

@@ -311,6 +311,10 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	dependency.pBufferMemoryBarriers    = &buffer_barrier;
 	dependency.imageMemoryBarrierCount  = static_cast<uint32_t>(image_barriers.size());
 	dependency.pImageMemoryBarriers     = image_barriers.data();
+	m_scheduler.Current().MarkTransfer(CommandBufferDebugOp::ImageUpload, info.data.address, 0,
+	                                   static_cast<uint32_t>(copies.size()),
+	                                   static_cast<uint32_t>(std::min<uint64_t>(size, UINT32_MAX)),
+	                                   static_cast<uint32_t>(backing.format));
 	auto command                        = m_scheduler.Current().Recorder();
 	command.pipelineBarrier2(dependency);
 	command.copyBufferToImage(buffer, backing.image, vk::ImageLayout::eTransferDstOptimal,
@@ -351,6 +355,10 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	dependency.pBufferMemoryBarriers    = &buffer_barrier;
 	dependency.imageMemoryBarrierCount  = static_cast<uint32_t>(image_barriers.size());
 	dependency.pImageMemoryBarriers     = image_barriers.data();
+	m_scheduler.Current().MarkTransfer(CommandBufferDebugOp::ImageDownload, 0, info.data.address,
+	                                   static_cast<uint32_t>(copies.size()),
+	                                   static_cast<uint32_t>(std::min<uint64_t>(size, UINT32_MAX)),
+	                                   static_cast<uint32_t>(backing.format));
 	auto command                        = m_scheduler.Current().Recorder();
 	command.pipelineBarrier2(dependency);
 	command.copyImageToBuffer(backing.image, vk::ImageLayout::eTransferSrcOptimal, buffer,
@@ -430,6 +438,10 @@ void Image::CopyImage(Image& source) {
 	if (copies.empty()) {
 		return;
 	}
+	m_scheduler.Current().MarkTransfer(
+	    CommandBufferDebugOp::ImageCopy, info.data.address, source.info.data.address,
+	    static_cast<uint32_t>(copies.size()), static_cast<uint32_t>(source.backing.format),
+	    static_cast<uint32_t>(backing.format));
 	auto command = m_scheduler.Current().Recorder();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
@@ -472,6 +484,9 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 	const vk::Extent3D resolve_extent {info.extent.width, info.extent.height, 1};
 
 	m_scheduler.EndRendering();
+	m_scheduler.Current().MarkTransfer(CommandBufferDebugOp::ImageResolve, info.data.address,
+	                                   source.info.data.address, source.backing.samples, layers,
+	                                   static_cast<uint32_t>(backing.format));
 	auto command = m_scheduler.Current().Recorder();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
 	               resolved_source_range, command);
@@ -541,6 +556,10 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
 	dependency.bufferMemoryBarrierCount = 1;
 	dependency.pBufferMemoryBarriers    = &barrier;
+	m_scheduler.Current().MarkTransfer(CommandBufferDebugOp::ImageCopyThroughBuffer,
+	                                   info.data.address, source.info.data.address, levels,
+	                                   static_cast<uint32_t>(source.backing.format),
+	                                   static_cast<uint32_t>(backing.format));
 	auto command                        = m_scheduler.Current().Recorder();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
@@ -633,6 +652,9 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 		copy.dstSubresource = {aspect, mip, layer, destination_layers};
 		copy.extent         = {width, height, depth};
 	}
+	m_scheduler.Current().MarkTransfer(CommandBufferDebugOp::ImageMipCopy, info.data.address,
+	                                   source.info.data.address, mip, layer,
+	                                   static_cast<uint32_t>(backing.format));
 	auto command = m_scheduler.Current().Recorder();
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
@@ -887,6 +909,7 @@ private:
 			}
 			for (const auto& cached: oldest->views) {
 				if (cached.view != nullptr) {
+					NoteImageViewDestroyed(cached.view, 0, oldest->key.format);
 					graphics.device.destroyImageView(cached.view, nullptr);
 				}
 			}
@@ -999,6 +1022,7 @@ Image::~Image() {
 	}
 	for (const auto& cached: views) {
 		if (cached.view != nullptr) {
+			NoteImageViewDestroyed(cached.view, info.data.address, info.pixel_format);
 			m_graphics.device.destroyImageView(cached.view, nullptr);
 		}
 	}

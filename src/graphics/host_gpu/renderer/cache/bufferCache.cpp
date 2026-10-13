@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/timeline.h"
@@ -1419,14 +1420,28 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		     " size=0x%016" PRIx64 " src_gds=%d dst_gds=%d\n",
 		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
 	}
-	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
-	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+	const bool cpu_copy = src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
+	                      !IsRegionGpuModified(src_vaddr, size) &&
+	                      !m_texture_cache.FindImageFromRange(src_vaddr, size);
+	if (FrameGraph::Logging()) {
+		FrameGraph::BeginOp();
+		FrameGraph::Log("dma 0x%012" PRIx64 "%s <- 0x%012" PRIx64 "%s, 0x%" PRIx64 " bytes, %s%s",
+		                dst_vaddr, dst_gds ? " (gds)" : "", src_vaddr, src_gds ? " (gds)" : "",
+		                size, cpu_copy ? "on the CPU" : "on the GPU",
+		                dst_memory && m_texture_cache.FindImageFromRange(dst_vaddr, size)
+		                    ? ", into an image's memory"
+		                    : "");
+	}
+	if (cpu_copy) {
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
 		return;
 	}
 
 	auto& command = m_scheduler.Current();
+	command.MarkTransfer(CommandBufferDebugOp::BufferCopy, dst_vaddr, src_vaddr,
+	                     static_cast<uint32_t>(std::min<uint64_t>(size, UINT32_MAX)),
+	                     dst_gds ? 1u : 0u, src_gds ? 1u : 0u);
 	if (dst_memory) {
 		m_texture_cache.InvalidateMemoryFromGPU(dst_vaddr, size);
 	}
@@ -1467,17 +1482,28 @@ bool BufferCache::HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size) {
+	const std::pair<uint64_t, uint64_t> range {vaddr, size};
+	DownloadRangesForDiagnostics(std::span {&range, 1u});
+}
+
+void BufferCache::DownloadRangesForDiagnostics(
+    std::span<const std::pair<uint64_t, uint64_t>> ranges) {
 	std::vector<std::pair<uint64_t, uint64_t>> downloaded;
-	auto                                       it = m_buffers.upper_bound(vaddr);
-	if (it != m_buffers.begin()) {
-		--it;
-	}
-	for (; it != m_buffers.end() && it->first < vaddr + size; ++it) {
-		auto&      buffer = m_slot_buffers[it->second];
-		const auto begin  = std::max(vaddr, buffer.CpuAddress());
-		const auto end    = std::min(vaddr + size, buffer.CpuAddress() + buffer.Size());
-		if (begin < end && DownloadBufferMemory<true>(buffer, begin, end - begin)) {
-			downloaded.emplace_back(begin, end - begin);
+	for (const auto& [vaddr, size]: ranges) {
+		if (size == 0) {
+			continue;
+		}
+		auto it = m_buffers.upper_bound(vaddr);
+		if (it != m_buffers.begin()) {
+			--it;
+		}
+		for (; it != m_buffers.end() && it->first < vaddr + size; ++it) {
+			auto&      buffer = m_slot_buffers[it->second];
+			const auto begin  = std::max(vaddr, buffer.CpuAddress());
+			const auto end    = std::min(vaddr + size, buffer.CpuAddress() + buffer.Size());
+			if (begin < end && DownloadBufferMemory<true>(buffer, begin, end - begin)) {
+				downloaded.emplace_back(begin, end - begin);
+			}
 		}
 	}
 	if (downloaded.empty()) {

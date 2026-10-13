@@ -386,6 +386,10 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 
 	auto& scheduler = m_context.GetCommandScheduler();
 	scheduler.EndRendering();
+	scheduler.Current().MarkTransfer(CommandBufferDebugOp::DepthCopy, destination.info.data.address,
+	                                 source.info.data.address, read_desc.view_info.base_level,
+	                                 read_desc.view_info.layer_count,
+	                                 static_cast<uint32_t>(source.backing.format));
 	const auto command = scheduler.Current().Recorder();
 	const ImageSubresourceRange range {read_desc.view_info.base_level, 1,
 	                                  read_desc.view_info.base_layer,

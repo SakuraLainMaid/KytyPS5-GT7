@@ -138,6 +138,8 @@ public:
 	// Diagnostics, GPU thread: makes guest memory current for [vaddr, vaddr + size) by
 	// downloading what the GPU wrote there (drains the GPU).
 	void                            DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size);
+	// The same for many ranges (address, size), with one wait.
+	void DownloadRangesForDiagnostics(std::span<const std::pair<uint64_t, uint64_t>> ranges);
 
 	// Diagnostics: the guest shader whose bindings are being prepared on this thread, if any.
 	inline static thread_local uint64_t s_diag_shader_hash = 0;

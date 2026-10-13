@@ -53,6 +53,16 @@ enum class CommandBufferDebugOp : uint32_t {
 	EopOnlyFlip,
 	DispatchIndirect,
 	Unknown,
+	// Transfers (CommandBuffer::MarkTransfer), for device-loss reports.
+	ImageUpload,
+	ImageDownload,
+	ImageCopy,
+	ImageResolve,
+	ImageCopyThroughBuffer,
+	ImageMipCopy,
+	ImageClear,
+	BufferCopy,
+	DepthCopy,
 };
 
 enum class DrawOffsetSource : uint8_t {
@@ -128,6 +138,11 @@ public:
 
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
+	// A checkpoint before a transfer (an upload, copy, clear, ...): the destination's guest
+	// address, the source's (if any) and three numbers. Leaves the running draw's debug info and
+	// annotations alone.
+	void MarkTransfer(CommandBufferDebugOp op, uint64_t destination, uint64_t source = 0,
+	                  uint32_t arg0 = 0, uint32_t arg1 = 0, uint32_t arg2 = 0) const;
 	// Adds the running draw's shaders and sample counts to the checkpoint SetDebugInfo recorded
 	// last (no-op without NV diagnostic checkpoints).
 	// Puts the last annotation on the checkpoint SetDebugInfo recorded last (a later phase of
@@ -266,6 +281,10 @@ private:
 	                                               std::span<PreparedBindings* const> stages = {});
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
 	                                              uint32_t render_target_slice_offset);
+	// A draw the guest uses for another operation (a metadata clear, a copy, a resolve) runs as
+	// that: what it was, or null for a draw to run.
+	[[nodiscard]] const char* ConsumeDrawAsOperation(CommandBuffer& buffer,
+	                                                 uint32_t       render_target_slice_offset);
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();

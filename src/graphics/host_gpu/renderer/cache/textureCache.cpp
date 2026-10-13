@@ -571,6 +571,34 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 	}
 }
 
+TextureCache::DiagnosticState TextureCache::DiagnosticImageState(ImageId id) {
+	DiagnosticState  state;
+	std::scoped_lock lock {m_lock};
+	const auto*      image = m_slot_images.try_get(id);
+	if (image == nullptr) {
+		return state;
+	}
+	state.valid        = true;
+	state.gpu_written  = image->IsGpuModified();
+	state.buffer_write = image->IsBufferModified();
+	state.cpu_dirty    = image->IsCpuDirty();
+	if (!image->registered || image->info.data.Empty()) {
+		return state;
+	}
+	FindImagesInRegion(image->info.data.address, image->info.data.size, false)
+	    .ForEach([&](ImageId other) {
+		    const auto* overlap = other != id ? m_slot_images.try_get(other) : nullptr;
+		    if (overlap == nullptr) {
+			    return;
+		    }
+		    if (state.overlaps++ == 0) {
+			    state.first_overlap = overlap->info.data.address;
+		    }
+		    state.gpu_overlaps += overlap->IsGpuModified() ? 1u : 0u;
+	    });
+	return state;
+}
+
 TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64_t size,
                                                         bool page_overlap) const {
 	ImagePageTable::PageRange pages {};
@@ -2100,6 +2128,10 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 	                               range.levelCount == image.info.resources.levels &&
 	                               range.baseArrayLayer == 0 && range.layerCount == layers;
 	const bool full_image = range.aspectMask == aspects && full_subresources;
+	command.MarkTransfer(CommandBufferDebugOp::ImageClear, image.info.data.address, 0,
+	                     range.baseMipLevel | (range.levelCount << 16u),
+	                     range.baseArrayLayer | (range.layerCount << 16u),
+	                     static_cast<uint32_t>(format));
 	TrackImage(id);
 	if (!full_image && (image.IsBufferModified() || image.IsCpuDirty())) {
 		InitializeImage(id);

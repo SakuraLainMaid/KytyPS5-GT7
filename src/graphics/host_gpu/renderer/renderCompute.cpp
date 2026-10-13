@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/timeline.h"
@@ -476,6 +477,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
 	                    sh_ctx.GetCs().cs_regs.data_addr);
+	if (FrameGraph::Logging()) {
+		FrameGraph::BeginOp();
+		FrameGraph::Log("dispatch groups=%ux%ux%u mode=0x%x cs at 0x%012" PRIx64, thread_group_x,
+		                thread_group_y, thread_group_z, mode, sh_ctx.GetCs().cs_regs.data_addr);
+	}
 
 	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
 		static std::atomic<uint32_t> log_count {0};
@@ -504,6 +510,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// KYTY_EARLY_DISPATCH_SKIP=0 drops them in ProgramCache::Get as before.
 	if (EarlyDispatchSkip() && PipelineCache::IsSkipListed(sh_ctx.GetCs().cs_regs.data_addr)) {
 		Profiler::Add(Profiler::Counter::SkippedSkipList);
+		if (FrameGraph::Logging()) {
+			FrameGraph::Log("  not run: skip-listed");
+		}
 		ResetBindings();
 		return;
 	}
@@ -555,6 +564,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		std::snprintf(groups, sizeof(groups), "%ux%ux%u", thread_group_x, thread_group_y,
 		              thread_group_z);
 		LogSkippedDispatch(cs_regs, groups);
+		if (FrameGraph::Logging()) {
+			FrameGraph::Log("  not run: no program (%016" PRIx64 ")",
+			                ShaderDeclaredHash(cs_regs.cs_regs.data_addr));
+			FrameGraph::NoteShader("CS", ShaderDeclaredHash(cs_regs.cs_regs.data_addr),
+			                       cs_regs.cs_regs.data_addr, nullptr, 0);
+		}
 		ResetBindings();
 		return;
 	}
@@ -572,6 +587,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		    (TryConsumeComputeMetaClear(input_info, buffer) ||
 		     TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
 		                                 thread_group_z, mode))) {
+			if (FrameGraph::Logging()) {
+				FrameGraph::Log("  consumed as a clear: cs %016" PRIx64, program.shader_hash);
+			}
 			ResetBindings();
 			return;
 		}
@@ -600,6 +618,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& pipeline =
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
+	if (FrameGraph::Logging()) {
+		FrameGraph::Log("  cs %016" PRIx64 " groups %ux%ux%u threads %ux%ux%u", program.shader_hash,
+		                thread_group_x, thread_group_y, thread_group_z, input_info.threads_num[0],
+		                input_info.threads_num[1], input_info.threads_num[2]);
+		FrameGraph::NoteShader("CS", ShaderDeclaredHash(cs_regs.cs_regs.data_addr),
+		                       cs_regs.cs_regs.data_addr, nullptr, 0);
+		FrameGraph::SetShowBuffers(true);
+	}
 	PrepareBindings(input_info.stage, bindings);
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
 		std::copy(std::begin(input_info.dispatch_threads_num), std::end(input_info.dispatch_threads_num),
@@ -699,6 +725,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+		// A checkpoint right before the dispatch: preparing its bindings may have recorded
+		// transfers (and their checkpoints) after the first one.
+		buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id,
+		                    thread_group_x, thread_group_y, thread_group_z, mode,
+		                    sh_ctx.GetCs().cs_regs.data_addr);
 		// Device loss reports name the dispatch's shader (the CS hash in the VS slot).
 		buffer.AnnotateDiagnosticCheckpoint(program.shader_hash, 0, 0, 0);
 		GpuTiming::Before(m_context, buffer);
@@ -730,11 +761,21 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
 	Common::LockGuard lock(m_context.GetMutex());
 	const auto&       cs_regs = buffer.GetShaders().GetCs();
+	if (FrameGraph::Logging()) {
+		FrameGraph::BeginOp();
+		FrameGraph::Log("dispatch indirect args 0x%012" PRIx64 " mode=0x%x cs at 0x%012" PRIx64,
+		                args_addr, mode, cs_regs.cs_regs.data_addr);
+		FrameGraph::SetShowBuffers(true);
+		FrameGraph::NoteBuffer(args_addr, 12);
+	}
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
 	}
 	if (EarlyDispatchSkip() && PipelineCache::IsSkipListed(cs_regs.cs_regs.data_addr)) {
 		Profiler::Add(Profiler::Counter::SkippedSkipList);
+		if (FrameGraph::Logging()) {
+			FrameGraph::Log("  not run: skip-listed");
+		}
 		ResetBindings();
 		return;
 	}
@@ -745,6 +786,12 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	if (!compute_program) {
 		LogSkippedDispatch(cs_regs, "indirect");
+		if (FrameGraph::Logging()) {
+			FrameGraph::Log("  not run: no program (%016" PRIx64 ")",
+			                ShaderDeclaredHash(cs_regs.cs_regs.data_addr));
+			FrameGraph::NoteShader("CS", ShaderDeclaredHash(cs_regs.cs_regs.data_addr),
+			                       cs_regs.cs_regs.data_addr, nullptr, 0);
+		}
 		ResetBindings();
 		return;
 	}
@@ -755,6 +802,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
+	if (FrameGraph::Logging()) {
+		FrameGraph::Log("  cs %016" PRIx64 " threads %ux%ux%u",
+		                input_info.stage.program->shader_hash, input_info.threads_num[0],
+		                input_info.threads_num[1], input_info.threads_num[2]);
+		FrameGraph::NoteShader("CS", ShaderDeclaredHash(cs_regs.cs_regs.data_addr),
+		                       cs_regs.cs_regs.data_addr, nullptr, 0);
+	}
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
@@ -816,6 +870,12 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		        vk::PipelineStageFlagBits::eTransfer,
 		    vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr, 0, nullptr);
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+		// A checkpoint right before the dispatch: preparing its bindings may have recorded
+		// transfers (and their checkpoints) after the first one.
+		buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect),
+		                    submit_id, static_cast<uint32_t>(args_addr),
+		                    static_cast<uint32_t>(args_addr >> 32u), 0, mode,
+		                    cs_regs.cs_regs.data_addr);
 		// Device loss reports name the dispatch's shader (the CS hash in the VS slot).
 		buffer.AnnotateDiagnosticCheckpoint(program.shader_hash, 0, 0, 0);
 		GpuTiming::Before(m_context, buffer);

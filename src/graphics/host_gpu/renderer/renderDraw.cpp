@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -49,8 +50,11 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
+
+#include <fmt/format.h>
 
 namespace Libs::Graphics {
 
@@ -1095,6 +1099,44 @@ void RenderExecutor::LogWatchedDraw(const DrawCallInfo& draw, const DrawRenderSt
 	     base_vertex, first_vertex, host_vertex_offset, host_first_instance, indirect ? 1 : 0);
 }
 
+// Diagnostics: draws into 2_10_10_10 color targets. GT7 renders to one when a race is left, and
+// the device faults soon after (2026-10-13): the first 16 are logged; KYTY_SKIP_10BIT_TARGETS=1
+// skips them (true), to see whether the fault follows them.
+static bool TenBitTargetDraw(const DrawCallInfo& draw, const DrawRenderState& state) {
+	static const bool skip = [] {
+		const char* value = std::getenv("KYTY_SKIP_10BIT_TARGETS");
+		return value != nullptr && value[0] == '1';
+	}();
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		const auto& color  = state.color_info[i];
+		const auto  format = color.desc.info.guest_format;
+		if (format < Prospero::BufferFormat::k2_10_10_10UNorm ||
+		    format > Prospero::BufferFormat::k2_10_10_10SInt) {
+			continue;
+		}
+		static std::atomic<uint32_t> seen {0};
+		const auto                   count = seen.fetch_add(1, std::memory_order_relaxed) + 1u;
+		if (count <= 16u || (count & (count - 1u)) == 0) {
+			const auto extent = color.Extent();
+			LOGF("Render target: 10-bit target draw %u%s: %s count=%u slot %u 0x%016" PRIx64
+			     " %ux%u samples=%u guest format %u host %d (of %u color targets, depth "
+			     "0x%016" PRIx64 " samples %u) VS 0x%016" PRIx64 " PS 0x%016" PRIx64 "\n",
+			     count, skip ? " (skipped)" : "", draw.Name(), draw.index_count, color.target_slot,
+			     color.desc.info.data.address, extent.width, extent.height, color.desc.info.samples,
+			     static_cast<uint32_t>(format), static_cast<int>(color.desc.info.pixel_format),
+			     state.color_count,
+			     state.depth_info.image_id ? state.depth_info.desc.info.data.address : 0,
+			     state.depth_info.image_id ? state.depth_info.desc.info.samples : 0,
+			     state.vertex_info[0].stage ? state.vertex_info[0].stage.program->shader_hash : 0,
+			     state.ps_active && state.ps_input_info.stage
+			         ? state.ps_input_info.stage.program->shader_hash
+			         : 0);
+		}
+		return skip;
+	}
+	return false;
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
@@ -1106,6 +1148,14 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	RefreshShaders(buffer, draw, color_output_mask, state);
 	LogDrawCensus(buffer, draw, state);
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
+		if (FrameGraph::Logging()) {
+			FrameGraph::Log("  not drawn: no %s program (vs 0x%012" PRIx64 " ps 0x%012" PRIx64 ")",
+			                !state.programs.vertex[0] ? "vertex" : "pixel",
+			                buffer.GetShaders().GetVs().gs_regs.data_addr != 0
+			                    ? buffer.GetShaders().GetVs().gs_regs.data_addr
+			                    : buffer.GetShaders().GetVs().es_regs.data_addr,
+			                buffer.GetShaders().GetPs().ps_regs.data_addr);
+		}
 		return false;
 	}
 	uint32_t mrt_mask = 0;
@@ -1137,6 +1187,15 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, 0);
+		if (FrameGraph::Logging()) {
+			FrameGraph::Log("  not drawn: no render targets and no pixel shader");
+		}
+		return false;
+	}
+	if (TenBitTargetDraw(draw, state)) {
+		if (FrameGraph::Logging()) {
+			FrameGraph::Log("  not drawn: a 10-bit target (KYTY_SKIP_10BIT_TARGETS)");
+		}
 		return false;
 	}
 
@@ -1239,6 +1298,68 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, const CommandRecorder
 	}
 }
 
+// Diagnostics (the frame graph): the draw's shaders, render targets and depth state, before its
+// stages' bindings (PrepareBindings); the shaders' code is dumped. Dispatch-like draws (a few
+// vertices, or no depth target) show their buffers' contents after the frame.
+static void LogFrameGraphDraw(RenderContext& context, const CommandBuffer& buffer,
+                              const DrawCallInfo& draw, const DrawRenderState& state,
+                              std::span<const ShaderVertexInputInfo> vertex_stages,
+                              vk::PrimitiveTopology                  topology) {
+	std::string stages;
+	for (const auto& stage: vertex_stages) {
+		stages += fmt::format(" {:016x}", stage.stage.program->shader_hash);
+	}
+	const auto ps = state.ps_active && state.ps_input_info.stage
+	                    ? state.ps_input_info.stage.program->shader_hash
+	                    : 0;
+	FrameGraph::Log("  shaders: vertex%s ps %016" PRIx64 " topology %d", stages.c_str(), ps,
+	                static_cast<int>(topology));
+	auto& textures = context.GetTextureCache();
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		const auto& color   = state.color_info[i];
+		const auto& info    = color.desc.info;
+		const auto  extent  = color.Extent();
+		const auto  cached  = color.image_id ? textures.DiagnosticImageState(color.image_id)
+		                                     : TextureCache::DiagnosticState {};
+		const char  flags[] = {cached.gpu_written ? 'G' : '-', cached.buffer_write ? 'B' : '-',
+                              cached.cpu_dirty ? 'C' : '-', '\0'};
+		FrameGraph::Log(
+		    "  rt slot %u: 0x%012" PRIx64 "+0x%" PRIx64
+		    " %ux%u mip %u layer %u fmt %d guest %u samples %u tile %u [%s] overlaps %u (%u "
+		    "GPU-written)",
+		    color.target_slot, info.data.address, info.data.size, extent.width, extent.height,
+		    color.guest_mip_level, color.guest_array_layer, static_cast<int>(info.pixel_format),
+		    static_cast<uint32_t>(info.guest_format), info.samples,
+		    static_cast<uint32_t>(info.tile_mode), flags, cached.overlaps, cached.gpu_overlaps);
+	}
+	if (state.depth_info.image_id) {
+		const auto& depth = state.depth_info;
+		const auto& info  = depth.desc.info;
+		FrameGraph::Log(
+		    "  depth: 0x%012" PRIx64 "+0x%" PRIx64
+		    " %ux%u fmt %d samples %u test %d write %d op %d bounds %d stencil %d clear %d",
+		    info.data.address, info.data.size, info.extent.width, info.extent.height,
+		    static_cast<int>(info.pixel_format), info.samples, depth.depth_test_enable ? 1 : 0,
+		    depth.depth_write_enable ? 1 : 0, static_cast<int>(depth.depth_compare_op),
+		    depth.depth_bounds_test_enable ? 1 : 0, depth.stencil_test_enable ? 1 : 0,
+		    depth.depth_clear_enable ? 1 : 0);
+	}
+	const auto& shaders = buffer.GetShaders();
+	const auto  note    = [](const char* stage, uint64_t address) {
+        if (address != 0) {
+            FrameGraph::NoteShader(stage, ShaderDeclaredHash(address), address, nullptr, 0);
+        }
+	};
+	note("ES", shaders.GetVs().es_regs.data_addr);
+	note("LS", shaders.GetVs().ls_regs.data_addr);
+	note("HS", shaders.GetVs().hs_regs.data_addr);
+	note("GS", shaders.GetVs().gs_regs.data_addr);
+	if (state.ps_active) {
+		note("PS", shaders.GetPs().ps_regs.data_addr);
+	}
+	FrameGraph::SetShowBuffers(draw.index_count <= 6 || !state.depth_info.image_id);
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -1269,6 +1390,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		const auto& mesh       = state.vertex_info[0].mesh;
 		const auto  primitives = mesh.InputPrimitiveCount(draw.index_count);
 		if (primitives == 0 || draw.instance_count == 0) {
+			if (FrameGraph::Logging()) {
+				FrameGraph::Log("  not drawn: no primitives");
+			}
 			return;
 		}
 		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
@@ -1297,6 +1421,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		(void)m_context.GetBufferCache().FindBuffer(
 		    index_source.address, static_cast<uint64_t>(draw.index_count) *
 		                              index_source.guest_element_size);
+	}
+	if (FrameGraph::Logging()) {
+		LogFrameGraphDraw(m_context, buffer, draw, state, vertex_stages, topology);
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto&                            bindings = m_graphics_bindings;
@@ -1344,6 +1471,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs, may_defer);
 	if (deferred_pipeline == nullptr) {
+		if (FrameGraph::Logging()) {
+			FrameGraph::Log("  skipped: its pipeline is still compiling");
+		}
 		return;
 	}
 	auto& pipeline = *deferred_pipeline;
@@ -1381,6 +1511,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			targets.color_address = color.desc.info.data.address;
 			targets.color_extent  = pack(extent.width, extent.height);
 			targets.color_format  = static_cast<uint32_t>(color.desc.info.pixel_format);
+		}
+		for (uint32_t i = 1; i < state.color_count && i <= DiagnosticTargets::MoreColors; i++) {
+			const auto& color              = state.color_info[i];
+			const auto  extent             = color.Extent();
+			targets.more_addresses[i - 1u] = color.desc.info.data.address;
+			targets.more_extents[i - 1u]   = pack(extent.width, extent.height);
+			targets.more_formats[i - 1u]   = static_cast<uint32_t>(color.desc.info.pixel_format);
+			targets.more_slots[i - 1u]     = color.target_slot | (color.desc.info.samples << 8u);
 		}
 		if (state.depth_info.image_id) {
 			const auto& depth     = state.depth_info.desc.info;
@@ -1637,6 +1775,23 @@ static bool GpuIndexedArgsSupported(const CommandBuffer& buffer, uint32_t index_
 	return (reset & index_mask) == index_mask;
 }
 
+const char* RenderExecutor::ConsumeDrawAsOperation(CommandBuffer& buffer,
+                                                   uint32_t       render_target_slice_offset) {
+	if (ConsumeMetadataColorOperation(buffer)) {
+		return "a metadata color operation";
+	}
+	if (ConsumeDepthColorCopy(buffer)) {
+		return "a depth-to-color copy";
+	}
+	if (DepthStencilCopy(buffer)) {
+		return "a depth/stencil copy";
+	}
+	if (ResolveColorTargets(buffer, render_target_slice_offset)) {
+		return "a resolve";
+	}
+	return nullptr;
+}
+
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& guest_args) {
 	KYTY_PROFILER_FUNCTION();
@@ -1663,14 +1818,23 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || ConsumeDepthColorCopy(buffer) ||
-	    DepthStencilCopy(buffer) ||
-	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+	if (FrameGraph::Logging()) {
+		FrameGraph::BeginOp();
+		FrameGraph::Log("draw %s count=%u instances=%u", "DrawIndex", args.index_count,
+		                args.instance_count);
+	}
+	if (const char* consumed = ConsumeDrawAsOperation(buffer, args.render_target_slice_offset)) {
+		if (FrameGraph::Logging()) {
+			FrameGraph::Log("  consumed as %s", consumed);
+		}
 		ResetBindings();
 		return;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		if (FrameGraph::Logging()) {
+			FrameGraph::Log("  not drawn: no vertex shader");
+		}
 		return;
 	}
 
@@ -1697,6 +1861,10 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {
+		if (FrameGraph::Logging()) {
+			FrameGraph::Log("  not drawn: primitive type %u",
+			                static_cast<uint32_t>(ucfg.GetPrimType()));
+		}
 		return;
 	}
 
@@ -1796,14 +1964,23 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || ConsumeDepthColorCopy(buffer) ||
-	    DepthStencilCopy(buffer) ||
-	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+	if (FrameGraph::Logging()) {
+		FrameGraph::BeginOp();
+		FrameGraph::Log("draw %s count=%u instances=%u", "DrawIndexAuto", args.vertex_count,
+		                args.instance_count);
+	}
+	if (const char* consumed = ConsumeDrawAsOperation(buffer, args.render_target_slice_offset)) {
+		if (FrameGraph::Logging()) {
+			FrameGraph::Log("  consumed as %s", consumed);
+		}
 		ResetBindings();
 		return;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		if (FrameGraph::Logging()) {
+			FrameGraph::Log("  not drawn: no vertex shader");
+		}
 		return;
 	}
 
@@ -1829,6 +2006,10 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {
+		if (FrameGraph::Logging()) {
+			FrameGraph::Log("  not drawn: primitive type %u",
+			                static_cast<uint32_t>(ucfg.GetPrimType()));
+		}
 		ResetBindings();
 		return;
 	}

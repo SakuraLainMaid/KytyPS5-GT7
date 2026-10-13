@@ -430,6 +430,7 @@ void BindlessTable::CreatePlaceholders(CommandScheduler& /*scheduler*/) {
 		RequireVulkanSuccess(
 		    m_graphics.device.createImageView(&view, nullptr, &m_placeholder_views[i]),
 		    "create bindless placeholder view");
+		NoteImageViewCreated(m_placeholder_views[i]);
 	}
 
 	// One fenced submission, before any rendering: clears and a buffer fill are not allowed

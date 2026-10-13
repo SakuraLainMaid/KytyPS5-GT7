@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
@@ -834,6 +835,16 @@ static uint64_t MappedShaderHash(uint64_t addr) {
 
 uint64_t ShaderDeclaredHash(uint64_t shader_addr) {
 	return MappedShaderHash(shader_addr);
+}
+
+// Declared in frameGraph.h (diagnostics): not part of the recompiler's interface.
+uint32_t ShaderCodeSizeBytes(uint64_t shader_addr) {
+	std::scoped_lock lock(g_shader_map_mutex);
+	if (g_shader_map == nullptr) {
+		return 0;
+	}
+	const auto iter = g_shader_map->find(shader_addr);
+	return iter != g_shader_map->end() ? iter->second.data.code_size_bytes : 0u;
 }
 
 // Tessellation program pairs the analysis has already rejected, keyed by the registered LS/HS

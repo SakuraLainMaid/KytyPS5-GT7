@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_COMMANDRECORDER_H_
 
 #include "common/assert.h"
+#include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -122,6 +123,7 @@ public:
 		}
 		const auto* copy = StashWrites(writes, count);
 		m_scheduler->Record([=](vk::CommandBuffer command) {
+			ScrubDeadDescriptorViews(copy, count, "recorded descriptors");
 			command.pushDescriptorSetKHR(bind_point, layout, set, count, copy);
 		});
 	}
@@ -137,6 +139,7 @@ public:
 		}
 		const auto* copy = StashWrites(writes, count);
 		m_scheduler->Record([=](vk::CommandBuffer command) {
+			ScrubDeadDescriptorViews(copy, count, "recorded descriptors");
 			device.updateDescriptorSets(count, copy, 0, nullptr);
 			command.bindDescriptorSets(bind_point, layout, 0, 1, &set, 0, nullptr);
 		});
@@ -313,7 +316,11 @@ public:
 		    m_scheduler->Stash(info.pDepthAttachment, info.pDepthAttachment != nullptr ? 1u : 0u);
 		copy.pStencilAttachment = m_scheduler->Stash(info.pStencilAttachment,
 		                                             info.pStencilAttachment != nullptr ? 1u : 0u);
-		m_scheduler->Record([copy](vk::CommandBuffer command) { command.beginRendering(copy); });
+		m_scheduler->Record([copy](vk::CommandBuffer command) {
+			// The views may have been destroyed since the call was queued.
+			ScrubDeadRenderingViews(copy, "a recorded rendering");
+			command.beginRendering(copy);
+		});
 	}
 	void endRendering() const {
 		Run([](vk::CommandBuffer command) { command.endRendering(); });

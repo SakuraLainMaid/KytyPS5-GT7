@@ -654,6 +654,7 @@ void Swapchain::Create() {
 		RequireVulkanSuccess(graphics.device.createImageView(&view, nullptr, &m_image_views[i]),
 		                     "vkCreateImageView");
 		EXIT_IF(m_image_views[i] == nullptr);
+		NoteImageViewCreated(m_image_views[i]);
 	}
 
 	vk::SemaphoreCreateInfo semaphore_info {};
@@ -878,6 +879,7 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 		view.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
 		RequireVulkanSuccess(device.createImageView(&view, nullptr, &frame.view),
 		                     "create video-out overlay image view");
+		NoteImageViewCreated(frame.view);
 	}
 	const vk::DescriptorImageInfo image {m_overlay_sampler, frame.view,
 	                                     vk::ImageLayout::eShaderReadOnlyOptimal};

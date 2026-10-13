@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -2056,6 +2057,118 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 	}
 }
 
+static const char* FrameGraphStage(ShaderType stage) {
+	switch (stage) {
+		case ShaderType::Compute: return "cs";
+		case ShaderType::Vertex: return "vs";
+		case ShaderType::Local: return "ls";
+		case ShaderType::TessellationControl: return "hs";
+		case ShaderType::TessellationEvaluation: return "tes";
+		case ShaderType::Mesh: return "ms";
+		case ShaderType::Pixel: return "ps";
+		default: return "?";
+	}
+}
+
+// Diagnostics (the frame graph): a stage's textures (with their cache states), buffers and user
+// data; the buffers and the user-data pointers are noted for the end-of-frame contents.
+static void LogFrameGraphStage(RenderContext& context, const ShaderStageRuntime& runtime,
+                               const PreparedBindings& prepared) {
+	const auto& program  = *runtime.program;
+	const auto& snapshot = *runtime.resources;
+	const char* stage    = FrameGraphStage(program.stage);
+	auto&       textures = context.GetTextureCache();
+	auto&       buffers  = context.GetBufferCache();
+	FrameGraph::Log(
+	    "  %s %016" PRIx64 ": %zu textures, %zu buffers, %zu user data, %zu bindless heaps", stage,
+	    program.shader_hash, program.info.images.size(), program.info.buffers.size(),
+	    snapshot.user_data.size(), snapshot.bindless_heaps.size());
+	for (size_t i = 0; i < prepared.images.size() && i < program.info.images.size(); i++) {
+		const auto& binding  = prepared.images[i];
+		const auto& resource = program.info.images[i];
+		const auto& info     = binding.desc.info;
+		const auto& view     = binding.desc.view_info;
+		const auto  state    = binding.image_id ? textures.DiagnosticImageState(binding.image_id)
+		                                        : TextureCache::DiagnosticState {};
+		const char  flags[]  = {state.gpu_written ? 'G' : '-', state.buffer_write ? 'B' : '-',
+                              state.cpu_dirty ? 'C' : '-', '\0'};
+		FrameGraph::Log(
+		    "  %s tex[%zu] %s%s%s%s 0x%012" PRIx64 "+0x%" PRIx64
+		    " %ux%ux%u layers %u mips %u view %u+%u/%u+%u fmt %d guest %u tile %u type %u [%s] "
+		    "overlaps %u (%u GPU-written, 0x%012" PRIx64 ")",
+		    stage, i, resource.written ? "write" : "read", resource.bindless ? " bindless" : "",
+		    resource.runtime ? " runtime" : "",
+		    binding.desc.type == TextureCache::BindingType::Storage ? " storage" : "",
+		    info.data.address, info.data.size, info.extent.width, info.extent.height,
+		    info.extent.depth, info.resources.layers, info.resources.levels, view.base_level,
+		    view.level_count, view.base_layer, view.layer_count,
+		    static_cast<int>(info.pixel_format), static_cast<uint32_t>(info.guest_format),
+		    static_cast<uint32_t>(info.tile_mode), static_cast<uint32_t>(info.type),
+		    state.valid ? flags : "none", state.overlaps, state.gpu_overlaps, state.first_overlap);
+	}
+	for (size_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); i++) {
+		const auto     r = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
+		const uint64_t bytes =
+		    std::max<uint64_t>(r.Stride(), 1u) * static_cast<uint64_t>(r.NumRecords());
+		// As FindBuffers binds it: the mapped part only (an unused V# may hold anything, and the
+		// memory tracker ends the emulator on a range outside guest memory).
+		const uint64_t mapped = r.Base48() >= BufferCache::CACHING_PAGESIZE && bytes != 0
+		                            ? Libs::LibKernel::Memory::TryClampRangeSize(r.Base48(), bytes)
+		                            : 0;
+		const bool     gpu    = mapped != 0 && buffers.HasGpuDirtyBytes(r.Base48(), mapped);
+		const bool     cpu    = mapped != 0 && buffers.IsRegionCpuModified(r.Base48(), mapped);
+		const auto     writers =
+            mapped != 0 && gpu ? BufferCache::GpuWritersOf(r.Base48(), mapped) : std::string();
+		FrameGraph::Log("  %s buf[%zu] %s%s 0x%012" PRIx64 "+0x%" PRIx64 " (mapped 0x%" PRIx64
+		                ") stride %u records %u fmt %u [%c%c] writers %s",
+		                stage, i, program.info.buffers[i].written ? "write" : "read",
+		                program.info.buffers[i].formatted ? " formatted" : "", r.Base48(), bytes,
+		                mapped, r.Stride(), r.NumRecords(), r.RawFormat(), gpu ? 'G' : '-',
+		                cpu ? 'C' : '-', writers.empty() ? "-" : writers.c_str());
+		if (mapped != 0) {
+			FrameGraph::NoteBuffer(r.Base48(), mapped);
+		}
+	}
+	const auto& user = snapshot.user_data;
+	for (size_t row = 0; row < user.size(); row += 16) {
+		std::string line;
+		for (size_t k = row; k < std::min(user.size(), row + 16); k++) {
+			line += fmt::format(" {:08x}", user[k]);
+		}
+		FrameGraph::Log("  %s user s%zu:%s", stage, program.user_data_base + row, line.c_str());
+	}
+	// Pointers (a dword pair holding a mapped guest address) and V#s the shader may read its
+	// constants through with scalar loads.
+	for (size_t reg = 0; reg + 1 < user.size(); reg += 2) {
+		const uint64_t address = user[reg] | (static_cast<uint64_t>(user[reg + 1]) << 32u);
+		if ((user[reg] & 3u) == 0 && user[reg + 1] != 0 && user[reg + 1] <= 0xffu &&
+		    Libs::LibKernel::Memory::TryClampRangeSize(address, 4) != 0) {
+			FrameGraph::Log("  %s user pointer s[%zu:%zu] 0x%012" PRIx64 "%s", stage,
+			                program.user_data_base + reg, program.user_data_base + reg + 1, address,
+			                buffers.HasGpuDirtyBytes(address, FrameGraph::KeepBytes) ? " [G]" : "");
+			FrameGraph::NoteBuffer(address, FrameGraph::KeepBytes);
+		}
+	}
+	for (size_t reg = 0; reg + 4 <= user.size(); reg += 4) {
+		ShaderBufferResource r;
+		r.fields[0] = user[reg];
+		r.fields[1] = user[reg + 1];
+		r.fields[2] = user[reg + 2];
+		r.fields[3] = user[reg + 3];
+		const uint64_t size =
+		    r.Stride() != 0 ? static_cast<uint64_t>(r.Stride()) * r.NumRecords() : r.NumRecords();
+		if (r.Base48() < 0x100000000ull || size == 0 || size > (1ull << 32u) ||
+		    Libs::LibKernel::Memory::TryClampRangeSize(r.Base48(), 4) == 0) {
+			continue;
+		}
+		FrameGraph::Log("  %s user V# s[%zu:%zu] 0x%012" PRIx64 "+0x%" PRIx64
+		                " stride %u records %u",
+		                stage, program.user_data_base + reg, program.user_data_base + reg + 3,
+		                r.Base48(), size, r.Stride(), r.NumRecords());
+		FrameGraph::NoteBuffer(r.Base48(), size);
+	}
+}
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
@@ -2094,8 +2207,12 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			auto&      cache = m_context.GetBufferCache();
 			const bool gpu_written =
 			    r.Base48() != 0 && bytes != 0 && cache.HasGpuDirtyBytes(r.Base48(), bytes);
-			const bool cpu_modified =
-			    r.Base48() != 0 && bytes != 0 && cache.IsRegionCpuModified(r.Base48(), bytes);
+			// The tracker ends the emulator on a range outside guest memory: the mapped part.
+			const uint64_t mapped =
+			    r.Base48() >= BufferCache::CACHING_PAGESIZE && bytes != 0
+			        ? Libs::LibKernel::Memory::TryClampRangeSize(r.Base48(), bytes)
+			        : 0;
+			const bool cpu_modified = mapped != 0 && cache.IsRegionCpuModified(r.Base48(), mapped);
 			const auto writers = r.Base48() != 0 && bytes != 0
 			                         ? BufferCache::GpuWritersOf(r.Base48(), bytes)
 			                         : std::string();
@@ -2200,6 +2317,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
+	}
+	if (FrameGraph::Logging()) {
+		LogFrameGraphStage(m_context, runtime, prepared);
 	}
 }
 
@@ -2811,6 +2931,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 
 	if (!m_descriptor_writes.empty()) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
+		ScrubDeadDescriptorViews(m_descriptor_writes.data(),
+		                         static_cast<uint32_t>(m_descriptor_writes.size()),
+		                         "a draw's descriptors");
 		if (pipeline.uses_push_descriptors) {
 			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
 			                               static_cast<uint32_t>(m_descriptor_writes.size()),

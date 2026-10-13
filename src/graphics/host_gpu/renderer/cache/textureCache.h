@@ -102,6 +102,19 @@ public:
 		return m_total_used_memory - std::min(m_total_used_memory, m_pinned_bytes);
 	}
 
+	// Diagnostics (the frame graph): an image's cache state, and the other images over its guest
+	// range (how many of them hold contents the GPU wrote).
+	struct DiagnosticState {
+		bool     valid         = false;
+		bool     gpu_written   = false; // its contents were written on the GPU
+		bool     buffer_write  = false; // GPU buffer writes cover bytes of it
+		bool     cpu_dirty     = false; // the guest wrote bytes of it since the last upload
+		uint32_t overlaps      = 0;
+		uint32_t gpu_overlaps  = 0;
+		uint64_t first_overlap = 0; // the guest address of one of them
+	};
+	[[nodiscard]] DiagnosticState DiagnosticImageState(ImageId id);
+
 private:
 	enum class TransferDirection { Upload, Download };
 	struct TextureTransfer;

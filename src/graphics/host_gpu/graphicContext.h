@@ -6,7 +6,9 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <array>
 #include <atomic>
+#include <cstdint>
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -32,6 +34,12 @@ struct DiagnosticTargets {
 	// Bits 0-7: color attachments; bit 8: color 0 clears; bits 9, 10: depth, stencil clear;
 	// bit 11: has stencil.
 	uint32_t flags         = 0;
+	// The color attachments after the first (slot | samples << 8 in more_slots).
+	static constexpr uint32_t        MoreColors = 3;
+	std::array<uint64_t, MoreColors> more_addresses {};
+	std::array<uint32_t, MoreColors> more_extents {};
+	std::array<uint32_t, MoreColors> more_formats {};
+	std::array<uint32_t, MoreColors> more_slots {};
 };
 
 struct DiagnosticCheckpoint {
@@ -42,6 +50,8 @@ struct DiagnosticCheckpoint {
 	uint32_t arg2      = 0;
 	uint32_t arg3      = 0;
 	uint64_t arg4      = 0;
+	// Transfers (CommandBuffer::MarkTransfer): the second guest address (a copy's source).
+	uint64_t arg5      = 0;
 	uint64_t sequence  = 0;
 	// Filled in once a draw has chosen its pipeline (CommandBuffer::AnnotateDiagnosticCheckpoint),
 	// so a device-loss report names the shaders that were running.
@@ -56,12 +66,32 @@ struct DiagnosticCheckpoint {
 
 struct GraphicContext;
 
-// Returns a stable marker for vkCmdSetCheckpointNV.
+// Records a checkpoint in the ring and returns its slot (for annotations). vkCmdSetCheckpointNV
+// takes DiagnosticCheckpointMarker of it, its sequence: a device-loss report then knows when the
+// slot has been reused for a later checkpoint.
 [[nodiscard]] DiagnosticCheckpoint*
 RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint);
+[[nodiscard]] inline const void*
+DiagnosticCheckpointMarker(const DiagnosticCheckpoint& checkpoint) {
+	return reinterpret_cast<const void*>(static_cast<uintptr_t>(checkpoint.sequence));
+}
 // After a device loss: VK_EXT_device_fault info, the NVIDIA crash dump written to
-// _device_fault.nv-gpudmp, and the queue's last diagnostic checkpoints.
+// _device_fault.nv-gpudmp, the queue's last diagnostic checkpoints, and every checkpoint the GPU
+// had started but not finished (with a few before and after), from the ring.
 void DumpDeviceLossDiagnostics(GraphicContext& graphics);
+
+// Diagnostics: image views the renderer destroyed (the guest address of the image they viewed,
+// 0 when not known). A command that names one (a stale handle) is reported; the Scrub functions
+// replace it with a null view, which reads zero and discards writes, instead of leaving it to
+// fault the GPU. They change the arrays the pointers name. A view created again with a destroyed
+// handle is live again.
+void NoteImageViewCreated(vk::ImageView view);
+void NoteImageViewDestroyed(vk::ImageView view, uint64_t guest_address, vk::Format format);
+[[nodiscard]] bool DiagnosticViewIsLive(vk::ImageView view);
+void               ScrubDeadRenderingViews(const vk::RenderingInfo& info, const char* where);
+// Storage image descriptors only.
+void ScrubDeadDescriptorViews(const vk::WriteDescriptorSet* writes, uint32_t count,
+                              const char* where);
 
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;
