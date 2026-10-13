@@ -7129,10 +7129,10 @@ public:
                            : "overlapping buffer write replaced untouched GPU image texels");
       }
 
-      // A texture whose texels are still the guest bytes takes a GPU buffer write that covers it
-      // from outside its base (GT7's light grid, inside a larger buffer a compute pass writes),
-      // or touches a part of it.
-      {
+      // With KYTY_TEXTURE_BUFFER_WRITES=1, a texture whose texels are still the guest bytes
+      // takes a GPU buffer write that covers it from outside its base, or touches a part of it.
+      if (const char *switch_text = std::getenv("KYTY_TEXTURE_BUFFER_WRITES");
+          switch_text != nullptr && switch_text[0] == '1') {
         constexpr uint64_t guest_texture_offset = 0x1a20000;
         constexpr uint32_t guest_value = 0x0badf00du;
         constexpr uint32_t around_value = 0x600dcafeu;

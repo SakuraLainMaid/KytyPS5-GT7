@@ -2431,13 +2431,19 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		auto& image = m_slot_images[id];
 		// A write at the image's base is the same resource seen as a buffer. One elsewhere in or
 		// around it leaves an image the GPU drew or stored alone (the buffer does not hold those
-		// texels), but a texture whose texels are still the guest bytes takes the write: the
-		// buffer holds those bytes and the write. GT7 builds its light grid (an R32G32_UINT
-		// array its lit shaders read as a texture) with a compute pass that writes a larger
-		// buffer around it; left stale, its lit shaders found no lights in it (2026-10-12).
+		// texels). KYTY_TEXTURE_BUFFER_WRITES=1 lets a texture whose texels are still the guest
+		// bytes take such a write too (the buffer holds those bytes and the write). Off by
+		// default: with it, GT7 lost the device in a race or on leaving one, at the same draw
+		// every time (2026-10-12), and its lights, the reason for it, never came from a GPU
+		// buffer write (the game hands its lit shaders one or two lights).
+		static const bool texture_buffer_writes = [] {
+			const char* text = std::getenv("KYTY_TEXTURE_BUFFER_WRITES");
+			return text != nullptr && text[0] == '1';
+		}();
 		const bool guest_texels =
-		    !image.IsGpuModified() && !image.usage.render_target && !image.usage.depth_target &&
-		    !image.usage.storage && !image.usage.video_out && image.info.samples == 1 &&
+		    texture_buffer_writes && !image.IsGpuModified() && !image.usage.render_target &&
+		    !image.usage.depth_target && !image.usage.storage && !image.usage.video_out &&
+		    image.info.samples == 1 &&
 		    image.info.metadata.compression == VideoOutCompression::Uncompressed &&
 		    image.Overlaps(address, size);
 		if (image.info.data.address != address && !guest_texels) {
