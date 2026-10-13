@@ -1167,9 +1167,20 @@ static bool HwShIsUserAccumulatorRange(uint32_t first, uint32_t count, uint32_t 
 	return first >= base && first - base < 4u && count <= 4u - (first - base);
 }
 
-static void HwShIgnoreUserAccumulatorRegister([[maybe_unused]] uint32_t cmd_offset,
-                                               uint32_t value) {
-	EXIT_NOT_IMPLEMENTED((value & ~0x7fu) != 0);
+// The user accumulator registers are ignored; only their low 7 bits are defined. A value with
+// others set has come from a register list the game was rewriting as the GPU read it (the stale
+// indirect lists dropped elsewhere): GT7 ended the emulator here at launch once (2026-10-12).
+// Logged a few times and ignored like any other value.
+static void HwShIgnoreUserAccumulatorRegister(uint32_t cmd_offset, uint32_t value) {
+	if ((value & ~0x7fu) == 0) {
+		return;
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+		LOGF("\t temporary: ignoring user accumulator register 0x%04" PRIx32 " = 0x%08" PRIx32
+		     " (undefined bits set)\n",
+		     cmd_offset, value);
+	}
 }
 
 KYTY_HW_SH_PARSER(HwShIgnoreUserAccumulator) {

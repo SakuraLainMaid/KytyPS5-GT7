@@ -28,6 +28,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
@@ -35,6 +37,7 @@
 #include <mutex>
 #include <semaphore>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -1754,7 +1757,15 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 
 			// Until host occlusion queries are implemented, publish an always-visible result. The
 			// PS5 layout contains one interleaved begin/end pair per DB, and bit 63 marks a result
-			// ready.
+			// ready. Each dump advances every DB's counter by KYTY_OCCLUSION_SAMPLES (1 by
+			// default), so a query between two dumps reads that many samples per DB: one sample a
+			// DB is barely visible to a game that weighs visibility by the samples (an experiment:
+			// GT7's tunnels and nights lack their lights).
+			static const uint64_t step = [] {
+				const char* text  = std::getenv("KYTY_OCCLUSION_SAMPLES");
+				const auto  value = text != nullptr ? std::strtoull(text, nullptr, 10) : 0;
+				return value != 0 ? value : uint64_t {1};
+			}();
 			constexpr uint64_t ready_bit    = 1ull << 63u;
 			constexpr uint64_t counter_mask = ready_bit - 1u;
 			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
@@ -1762,7 +1773,28 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			for (uint32_t db = 0; db < 16u; db++) {
 				results[db * 2u] = value;
 			}
-			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
+			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + step) & counter_mask;
+			// Diagnostics: how many dumps the game makes, at how many addresses, every ~5 s.
+			static std::atomic<uint64_t>        dumps {0};
+			static std::atomic<int64_t>         window_start {0};
+			static std::mutex                   addresses_mutex;
+			static std::unordered_set<uint64_t> addresses;
+			const auto n   = dumps.fetch_add(1, std::memory_order_relaxed) + 1;
+			const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+			                     std::chrono::steady_clock::now().time_since_epoch())
+			                     .count();
+			std::lock_guard lock(addresses_mutex);
+			addresses.insert(event_address & ~uint64_t {0xff});
+			auto start = window_start.load(std::memory_order_relaxed);
+			if (start == 0) {
+				window_start.store(now, std::memory_order_relaxed);
+			} else if (now - start >= 5000) {
+				window_start.store(now, std::memory_order_relaxed);
+				LOGF("Occlusion queries: %" PRIu64 " counter dumps so far, %zu query blocks in the "
+				     "last %" PRId64 " ms, %" PRIu64 " samples per DB a dump\n",
+				     n, addresses.size(), now - start, step);
+				addresses.clear();
+			}
 			break;
 		}
 		default:
