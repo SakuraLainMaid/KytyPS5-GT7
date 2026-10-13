@@ -47,6 +47,7 @@
 #include <span>
 #include <string>
 #include <spirv-tools/libspirv.hpp>
+#include <spirv/unified1/spirv.hpp>
 #include <string_view>
 #include <thread>
 #include <unordered_set>
@@ -401,11 +402,9 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 	file.Write(code.data(), code.size_bytes());
 }
 
-bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
-                         const std::vector<uint32_t>& spirv) {
-	if (!Config::ShaderValidationEnabled()) {
-		return true;
-	}
+// The SPIR-V validator's verdict, whatever --shader-validation says (failures are logged).
+bool ValidateShaderSpirvNow(const char* label, uint64_t shader_hash,
+                            const std::vector<uint32_t>& spirv) {
 	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
 	std::string          messages;
 	tools.SetMessageConsumer([&messages](spv_message_level_t, const char*,
@@ -431,7 +430,257 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	return false;
 }
 
+bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
+                         const std::vector<uint32_t>& spirv) {
+	return !Config::ShaderValidationEnabled() || ValidateShaderSpirvNow(label, shader_hash, spirv);
+}
+
+// What SpirvWithoutSampleId learns from parsing a module (SPIRV-Tools tells literal operands from
+// <id> operands, which a word-by-word scan cannot: the variable's id is small, and so are storage
+// classes, extended instruction numbers and memory operands).
+struct SampleIdScan {
+	uint32_t sample_id   = 0;
+	bool     unsupported = false; // another per-sample input, or SampleId where it is not rewritten
+	bool     other_use   = false; // the variable named other than by a load, decoration, name or
+	                              // the entry point's interface
+};
+
+bool IsIdOperand(spv_operand_type_t type) {
+	switch (type) {
+		case SPV_OPERAND_TYPE_ID:
+		case SPV_OPERAND_TYPE_TYPE_ID:
+		case SPV_OPERAND_TYPE_MEMORY_SEMANTICS_ID:
+		case SPV_OPERAND_TYPE_SCOPE_ID:
+		case SPV_OPERAND_TYPE_OPTIONAL_ID:
+		case SPV_OPERAND_TYPE_VARIABLE_ID: return true;
+		default: return false;
+	}
+}
+
+// First pass: the variable decorated BuiltIn SampleId, and anything else that shades per sample.
+spv_result_t ScanSampleIdDecorations(void* user_data, const spv_parsed_instruction_t* inst) {
+	auto&       scan  = *static_cast<SampleIdScan*>(user_data);
+	const auto* words = inst->words;
+	switch (static_cast<spv::Op>(inst->opcode)) {
+		case spv::OpDecorate:
+			if (inst->num_words >= 3 && words[2] == spv::DecorationSample) {
+				scan.unsupported = true;
+			}
+			if (inst->num_words >= 4 && words[2] == spv::DecorationBuiltIn) {
+				if (words[3] == spv::BuiltInSampleId) {
+					if (scan.sample_id != 0 && scan.sample_id != words[1]) {
+						scan.unsupported = true;
+					}
+					scan.sample_id = words[1];
+				} else if (words[3] == spv::BuiltInSamplePosition) {
+					scan.unsupported = true;
+				}
+			}
+			break;
+		case spv::OpMemberDecorate:
+			if ((inst->num_words >= 4 && words[3] == spv::DecorationSample) ||
+			    (inst->num_words >= 5 && words[3] == spv::DecorationBuiltIn &&
+			     (words[4] == spv::BuiltInSampleId || words[4] == spv::BuiltInSamplePosition))) {
+				scan.unsupported = true;
+			}
+			break;
+		// A decoration group could decorate the variable (or another input) without naming it.
+		case spv::OpGroupDecorate:
+		case spv::OpGroupMemberDecorate: scan.unsupported = true; break;
+		default: break;
+	}
+	return SPV_SUCCESS;
+}
+
+// Second pass: every <id> operand naming the variable, other than the forms that are rewritten.
+spv_result_t ScanSampleIdUses(void* user_data, const spv_parsed_instruction_t* inst) {
+	auto& scan = *static_cast<SampleIdScan*>(user_data);
+	switch (static_cast<spv::Op>(inst->opcode)) {
+		case spv::OpDecorate:
+		case spv::OpName:
+		case spv::OpEntryPoint: return SPV_SUCCESS;
+		default: break;
+	}
+	for (uint16_t i = 0; i < inst->num_operands; i++) {
+		const auto& operand = inst->operands[i];
+		if (!IsIdOperand(operand.type) || inst->words[operand.offset] != scan.sample_id) {
+			continue;
+		}
+		// A load from the variable (its pointer operand) is what the rewrite keeps.
+		if (static_cast<spv::Op>(inst->opcode) == spv::OpLoad && operand.offset == 3) {
+			continue;
+		}
+		scan.other_use = true;
+	}
+	return SPV_SUCCESS;
+}
+
+// One parse of a module by SPIRV-Tools (every SPIR-V version the emitter writes), with operand
+// types; false when it does not parse.
+bool ParseSpirv(std::span<const uint32_t> spirv, SampleIdScan& scan,
+                spv_parsed_instruction_fn_t callback) {
+	static const spv_context context    = spvContextCreate(SPV_ENV_UNIVERSAL_1_6);
+	spv_diagnostic           diagnostic = nullptr;
+	const auto               result =
+	    spvBinaryParse(context, &scan, spirv.data(), spirv.size(), nullptr, callback, &diagnostic);
+	spvDiagnosticDestroy(diagnostic);
+	return result == SPV_SUCCESS;
+}
+
 } // namespace
+
+bool EqaaPerSampleShading() {
+	static const bool value = [] {
+		const char* text = std::getenv("KYTY_EQAA_PER_SAMPLE");
+		return text != nullptr && text[0] == '1';
+	}();
+	return value;
+}
+
+std::vector<uint32_t> SpirvWithoutSampleId(std::span<const uint32_t> spirv) {
+	constexpr uint32_t HeaderWords = 5;
+	if (spirv.size() < HeaderWords || spirv[0] != spv::MagicNumber) {
+		return {};
+	}
+	SampleIdScan scan;
+	if (!ParseSpirv(spirv, scan, ScanSampleIdDecorations) || scan.sample_id == 0 ||
+	    scan.unsupported || !ParseSpirv(spirv, scan, ScanSampleIdUses) || scan.other_use) {
+		return {};
+	}
+	const uint32_t sample_id = scan.sample_id;
+
+	struct Instruction {
+		size_t   offset;
+		uint32_t count;
+		spv::Op  opcode;
+	};
+	std::vector<Instruction> instructions;
+	for (size_t offset = HeaderWords; offset < spirv.size();) {
+		const uint32_t count = spirv[offset] >> spv::WordCountShift;
+		if (count == 0 || offset + count > spirv.size()) {
+			return {};
+		}
+		instructions.push_back(
+		    {offset, count, static_cast<spv::Op>(spirv[offset] & spv::OpCodeMask)});
+		offset += count;
+	}
+	const auto words = [&](const Instruction& inst) {
+		return spirv.subspan(inst.offset, inst.count);
+	};
+	// Its declaration: an Input variable of a pointer to a 32-bit integer.
+	const Instruction* variable = nullptr;
+	uint32_t           pointer  = 0;
+	for (const auto& inst: instructions) {
+		const auto w = words(inst);
+		if (inst.opcode == spv::OpVariable && w.size() == 4 && w[2] == sample_id) {
+			if (w[3] != spv::StorageClassInput) {
+				return {};
+			}
+			variable = &inst;
+			pointer  = w[1];
+		}
+	}
+	if (variable == nullptr) {
+		return {};
+	}
+	uint32_t integer = 0;
+	for (const auto& inst: instructions) {
+		const auto w = words(inst);
+		if (inst.opcode == spv::OpTypePointer && w.size() == 4 && w[1] == pointer &&
+		    w[2] == spv::StorageClassInput) {
+			integer = w[3];
+		}
+	}
+	bool integer_ok = false;
+	for (const auto& inst: instructions) {
+		const auto w = words(inst);
+		if (inst.opcode == spv::OpTypeInt && w.size() == 4 && w[1] == integer && w[2] == 32) {
+			integer_ok = true;
+		}
+	}
+	if (!integer_ok) {
+		return {};
+	}
+	// A Private pointer to the integer and a 0 of it: existing ones declared before the variable
+	// where the module has them, new ones (declared just before it) otherwise.
+	uint32_t bound        = spirv[3];
+	uint32_t private_type = 0;
+	uint32_t zero         = 0;
+	for (const auto& inst: instructions) {
+		if (&inst == variable) {
+			break;
+		}
+		const auto w = words(inst);
+		if (inst.opcode == spv::OpTypePointer && w.size() == 4 &&
+		    w[2] == spv::StorageClassPrivate && w[3] == integer && private_type == 0) {
+			private_type = w[1];
+		} else if (inst.opcode == spv::OpConstant && w.size() == 4 && w[1] == integer &&
+		           w[3] == 0 && zero == 0) {
+			zero = w[2];
+		}
+	}
+	const bool new_private = private_type == 0;
+	const bool new_zero    = zero == 0;
+	if (new_private) {
+		private_type = bound++;
+	}
+	if (new_zero) {
+		zero = bound++;
+	}
+	const bool interface_lists_private = spirv[1] >= 0x00010400u;
+
+	std::vector<uint32_t> out(spirv.begin(), spirv.begin() + HeaderWords);
+	out[3] = bound;
+	out.reserve(spirv.size() + 16);
+	const auto append = [&](std::initializer_list<uint32_t> list) {
+		out.insert(out.end(), list.begin(), list.end());
+	};
+	for (const auto& inst: instructions) {
+		const auto w = words(inst);
+		if (inst.opcode == spv::OpDecorate && w[1] == sample_id) {
+			continue; // BuiltIn, Flat
+		}
+		if (inst.opcode == spv::OpCapability && w.size() == 2 &&
+		    w[1] == spv::CapabilitySampleRateShading) {
+			continue; // nothing else needs it (no other per-sample input, see the scan)
+		}
+		if (inst.opcode == spv::OpEntryPoint && !interface_lists_private) {
+			// Before SPIR-V 1.4 the interface lists Input and Output variables only.
+			size_t name_end = 3;
+			while (name_end < w.size()) {
+				const auto word = w[name_end++];
+				if ((word & 0xff000000u) == 0) {
+					break; // the word holding the name's terminating zero
+				}
+			}
+			std::vector<uint32_t> rewritten(w.begin(),
+			                                w.begin() + static_cast<ptrdiff_t>(name_end));
+			for (size_t i = name_end; i < w.size(); i++) {
+				if (w[i] != sample_id) {
+					rewritten.push_back(w[i]);
+				}
+			}
+			rewritten[0] = (static_cast<uint32_t>(rewritten.size()) << spv::WordCountShift) |
+			               spv::OpEntryPoint;
+			out.insert(out.end(), rewritten.begin(), rewritten.end());
+			continue;
+		}
+		if (&inst == variable) {
+			if (new_private) {
+				append({(4u << spv::WordCountShift) | spv::OpTypePointer, private_type,
+				        spv::StorageClassPrivate, integer});
+			}
+			if (new_zero) {
+				append({(4u << spv::WordCountShift) | spv::OpConstant, integer, zero, 0u});
+			}
+			append({(5u << spv::WordCountShift) | spv::OpVariable, private_type, sample_id,
+			        spv::StorageClassPrivate, zero});
+			continue;
+		}
+		out.insert(out.end(), w.begin(), w.end());
+	}
+	return out;
+}
 
 // A/B switch for background pipeline compiles (KYTY_ASYNC_PIPELINES=0 compiles every graphics
 // pipeline on the GPU thread, as before) and how long a draw waits for a new one
@@ -948,6 +1197,15 @@ struct PipelineCache::ProgramCache {
 		KYTY_PROFILER_PHASE(phases, "Shader: module create", profiler::colors::Blue300);
 		const auto module = CompileSPV(spirv, device);
 		EXIT_IF(module == nullptr);
+		vk::ShaderModule pixel_rate_module = nullptr;
+		if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			if (pixel_rate_variants &&
+			    std::ranges::any_of(program.info.inputs, [](const auto& input) {
+				    return input.kind == ShaderRecompiler::IR::StageInputKind::SampleId;
+			    })) {
+				pixel_rate_module = CompilePixelRateVariant(options, spirv);
+			}
+		}
 		phases.End();
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
@@ -956,10 +1214,11 @@ struct PipelineCache::ProgramCache {
 		source.permutations.push_back({
 		    .specialization = source.specialization,
 		    .program        = std::move(program),
-		    .handle         = {.id          = ++next_shader_id,
-		                       .module      = module,
-		                       .spirv_words = static_cast<uint32_t>(spirv.size()),
-		                       .hash        = options.shader_hash},
+		    .handle         = {.id                = ++next_shader_id,
+		                       .module            = module,
+		                       .spirv_words       = static_cast<uint32_t>(spirv.size()),
+		                       .hash              = options.shader_hash,
+		                       .pixel_rate_module = pixel_rate_module},
 		});
 		const auto& permutation = source.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &source.resources};
@@ -1580,8 +1839,47 @@ struct PipelineCache::ProgramCache {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
 				device.destroyShaderModule(permutation.handle.module, nullptr);
+				if (permutation.handle.pixel_rate_module != nullptr) {
+					device.destroyShaderModule(permutation.handle.pixel_rate_module, nullptr);
+				}
 			}
 		}
+	}
+
+	// The module NV mixed-sample draws use for a pixel shader that reads its sample index
+	// (SpirvWithoutSampleId), or null. Reported for the first shaders that get one.
+	vk::ShaderModule CompilePixelRateVariant(const ShaderRecompiler::CompileOptions& options,
+	                                         const std::vector<uint32_t>&            spirv) {
+		auto variant = SpirvWithoutSampleId(spirv);
+		if (variant.empty()) {
+			LOGF("Pipeline: pixel shader 0x%016" PRIx64
+			     " reads its sample index in a form the per-pixel copy does not rewrite; its EQAA "
+			     "draws are skipped\n",
+			     options.shader_hash);
+			return nullptr;
+		}
+		// The rewrite is mechanical, but a broken copy is a broken pipeline: the validator checks
+		// the first copies whatever --shader-validation says, and every copy after one fails.
+		constexpr uint32_t CheckedCopies = 32;
+		if (pixel_rate_checked < CheckedCopies || pixel_rate_failed ||
+		    Config::ShaderValidationEnabled()) {
+			if (!ValidateShaderSpirvNow(options.dump_label, options.shader_hash, variant)) {
+				pixel_rate_failed = true;
+				LOGF("Pipeline: the per-pixel copy of pixel shader 0x%016" PRIx64
+				     " is not valid SPIR-V; its EQAA draws are skipped\n",
+				     options.shader_hash);
+				return nullptr;
+			}
+			pixel_rate_checked++;
+		}
+		const auto                   variant_module = CompileSPV(variant, device);
+		static std::atomic<uint32_t> logged {0};
+		if (variant_module != nullptr && logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("Pipeline: pixel shader 0x%016" PRIx64
+			     " reads its sample index: EQAA draws run a per-pixel copy (index 0)\n",
+			     options.shader_hash);
+		}
+		return variant_module;
 	}
 
 	// Shader function expansion decodes the shader and every callee, and a shader with table
@@ -1643,6 +1941,11 @@ struct PipelineCache::ProgramCache {
 	vk::Device                                                  device;
 	bool                                                        shader_clock = false;
 	bool                                                        bindless_images = false;
+	// The device draws EQAA through NV mixed samples: pixel shaders that read their sample index
+	// get a per-pixel copy too (CompilePixelRateVariant), the first ones validated.
+	bool                                                        pixel_rate_variants = false;
+	uint32_t                                                    pixel_rate_checked  = 0;
+	bool                                                        pixel_rate_failed   = false;
 	uint64_t                                                    next_shader_id = 0;
 	// SPIR-V size of the last permutation compiled (for the profiler).
 	size_t                                                      last_spirv_words = 0;
@@ -2044,6 +2347,9 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
               .float_image_atomics = Config::FloatImageAtomicsEnabled()},
           ShaderDiskCacheDirectory())) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	m_program_cache->pixel_rate_variants =
+	    graphics.mixed_attachment_samples == GraphicContext::MixedAttachmentSamples::Nv &&
+	    !EqaaPerSampleShading();
 	InitializeDriverCache();
 	if (g_async_pipelines) {
 		const auto threads = std::clamp(std::thread::hardware_concurrency() / 4u, 1u, 4u);

@@ -114,9 +114,22 @@ struct ShaderProgram {
 	vk::ShaderModule module = nullptr;
 	uint32_t         spirv_words = 0;
 	uint64_t         hash        = 0;
+	// A pixel shader that reads its sample index, as one that runs once per pixel with the index
+	// reading 0 (SpirvWithoutSampleId); null otherwise. For NV mixed-sample draws.
+	vk::ShaderModule pixel_rate_module = nullptr;
 
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
+
+// The SPIR-V of a pixel shader that reads the SampleId built-in, with that input gone and its
+// reads giving 0; empty when the shader has no SampleId input or uses it in a way this does not
+// rewrite. A SampleId input makes the fragment shader run once per sample, and NV mixed samples
+// (fewer color samples than raster samples, PS5 EQAA) forbids per-sample shading unless coverage
+// reduction truncates (VUID-VkPipelineMultisampleStateCreateInfo-rasterizationSamples-01415).
+[[nodiscard]] std::vector<uint32_t> SpirvWithoutSampleId(std::span<const uint32_t> spirv);
+// KYTY_EQAA_PER_SAMPLE=1 (for testing): NV mixed-sample draws keep pixel shaders that read their
+// sample index as they are, per-sample shading included, which NVIDIA does not allow there.
+[[nodiscard]] bool EqaaPerSampleShading();
 
 // Everything vkCreateGraphicsPipelines reads for one graphics pipeline, owned in one place so the
 // driver compile can run on a worker thread (the structures point into each other: it stays

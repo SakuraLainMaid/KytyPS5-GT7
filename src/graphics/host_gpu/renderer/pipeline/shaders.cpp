@@ -344,9 +344,39 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 		                                      .pName  = "main"};
 	}
 	if (ps_active) {
-		build.stages[shader_stage_count++] = {.stage  = vk::ShaderStageFlagBits::eFragment,
-		                                      .module = pixel_program.module,
-		                                      .pName  = "main"};
+		// EQAA through NV mixed samples (fewer color than raster samples) must not shade per
+		// sample (VUID-VkPipelineMultisampleStateCreateInfo-rasterizationSamples-01415), and a
+		// shader reading SampleId does: its per-pixel copy runs instead. GT7's G-buffer shaders
+		// read it, and their draws lost the device on leaving a race in Frame Rate mode, where
+		// the game renders at 1920x2160 with 2 depth samples per color sample (2026-10-13).
+		auto       module = pixel_program.module;
+		const bool nv_mixed =
+		    build.rendering.color_samples != 0 &&
+		    graphics.mixed_attachment_samples == GraphicContext::MixedAttachmentSamples::Nv;
+		if (nv_mixed && pixel_program.pixel_rate_module != nullptr) {
+			module = pixel_program.pixel_rate_module;
+		}
+		if (nv_mixed) {
+			const bool reads_sample_id = std::ranges::any_of(
+			    ps_input_info->stage.program->info.inputs, [](const auto& input) {
+				    return input.kind == ShaderRecompiler::IR::StageInputKind::SampleId;
+			    });
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("Pipeline: NV mixed samples (color %u, depth %u): pixel shader 0x%016" PRIx64
+				     " %s\n",
+				     build.rendering.color_samples, build.rendering.depth_samples,
+				     pixel_program.hash,
+				     module != pixel_program.module ? "runs its per-pixel copy (sample index 0)"
+				     : !reads_sample_id             ? "does not read its sample index"
+				     : EqaaPerSampleShading()
+				         ? "keeps its per-sample shading (KYTY_EQAA_PER_SAMPLE=1)"
+				         : "reads its sample index and has no per-pixel copy: per-sample shading "
+				           "with mixed samples");
+			}
+		}
+		build.stages[shader_stage_count++] = {
+		    .stage = vk::ShaderStageFlagBits::eFragment, .module = module, .pName = "main"};
 	}
 	// One guest wave per host subgroup where the device lets the stage require it (mesh and
 	// pixel shaders on AMD); GraphicsSubgroupSize and the mesh's host_subgroup_size agree.

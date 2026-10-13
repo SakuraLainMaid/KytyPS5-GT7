@@ -2105,6 +2105,13 @@ static void LogFrameGraphStage(RenderContext& context, const ShaderStageRuntime&
 		    static_cast<int>(info.pixel_format), static_cast<uint32_t>(info.guest_format),
 		    static_cast<uint32_t>(info.tile_mode), static_cast<uint32_t>(info.type),
 		    state.valid ? flags : "none", state.overlaps, state.gpu_overlaps, state.first_overlap);
+		// A small linear image a shader stores to, the kind the CPU reads back: shown after the
+		// frame as guest memory holds it.
+		if (resource.written && binding.desc.type == TextureCache::BindingType::Storage &&
+		    info.tile_mode == Prospero::TileMode::kLinear && info.data.size <= 64u * 1024u) {
+			FrameGraph::NoteReadback(info.data.address, info.data.size,
+			                         textures.ReadsBackForCpu(info));
+		}
 	}
 	for (size_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); i++) {
 		const auto     r = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);

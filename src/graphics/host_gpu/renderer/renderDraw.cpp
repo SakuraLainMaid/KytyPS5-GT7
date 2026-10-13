@@ -1331,6 +1331,12 @@ static void LogFrameGraphDraw(RenderContext& context, const CommandBuffer& buffe
 		    color.guest_mip_level, color.guest_array_layer, static_cast<int>(info.pixel_format),
 		    static_cast<uint32_t>(info.guest_format), info.samples,
 		    static_cast<uint32_t>(info.tile_mode), flags, cached.overlaps, cached.gpu_overlaps);
+		// A small linear target, the kind the CPU reads back: shown after the frame as guest
+		// memory holds it.
+		if (info.tile_mode == Prospero::TileMode::kLinear && info.data.size <= 64u * 1024u) {
+			FrameGraph::NoteReadback(info.data.address, info.data.size,
+			                         textures.ReadsBackForCpu(info));
+		}
 	}
 	if (state.depth_info.image_id) {
 		const auto& depth = state.depth_info;
@@ -1425,6 +1431,43 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (FrameGraph::Logging()) {
 		LogFrameGraphDraw(m_context, buffer, draw, state, vertex_stages, topology);
 	}
+	// EQAA (fewer color than depth samples). KYTY_FRAME_GRAPH_EQAA=1: the first such draw (GT7's
+	// 1920x2160 rendering after a race in Frame Rate mode) asks for a frame capture (F9's).
+	// Through NV mixed samples it may not shade per sample: a pixel shader reading its sample
+	// index runs its per-pixel copy (shaders.cpp), and one without that copy (the rewrite gave
+	// up) is skipped instead of losing the device, before anything is bound for it.
+	if (state.color_count != 0 && state.depth_info.image_id &&
+	    state.depth_info.desc.view_info.format != vk::Format::eUndefined &&
+	    state.color_info[0].desc.info.samples < state.depth_info.desc.info.samples) {
+		static const bool capture = [] {
+			const char* value = std::getenv("KYTY_FRAME_GRAPH_EQAA");
+			return value != nullptr && value[0] == '1';
+		}();
+		static std::atomic_bool requested {false};
+		if (capture && !requested.exchange(true, std::memory_order_relaxed)) {
+			LOGF("FG 0 first EQAA draw (KYTY_FRAME_GRAPH_EQAA): capturing the next frame\n");
+			FrameGraph::RequestCapture();
+		}
+		if (state.ps_active &&
+		    buffer.GetGraphics().mixed_attachment_samples ==
+		        GraphicContext::MixedAttachmentSamples::Nv &&
+		    state.programs.pixel.pixel_rate_module == nullptr && !EqaaPerSampleShading() &&
+		    std::ranges::any_of(
+		        state.ps_input_info.stage.program->info.inputs, [](const auto& input) {
+			        return input.kind == ShaderRecompiler::IR::StageInputKind::SampleId;
+		        })) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("Pipeline: EQAA draw skipped: pixel shader 0x%016" PRIx64
+				     " reads its sample index and has no per-pixel copy\n",
+				     state.ps_input_info.stage.program->shader_hash);
+			}
+			if (FrameGraph::Logging()) {
+				FrameGraph::Log("  skipped: an EQAA draw whose pixel shader shades per sample");
+			}
+			return;
+		}
+	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
@@ -1465,7 +1508,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		may_defer = may_defer && !writes_memory(stage.stage);
 	}
 	// Glyphs and cached layers: drawn once into small targets (SmallColorTargetDraw).
-	may_defer = may_defer && !SmallColorTargetDraw(buffer.GetRegisters());
+	may_defer               = may_defer && !SmallColorTargetDraw(buffer.GetRegisters());
 	auto* deferred_pipeline = m_context.GetPipelineCache().TryGetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,

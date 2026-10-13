@@ -47,6 +47,11 @@ void                      NoteBuffer(uint64_t address, uint64_t size);
 // Whether the current operation's buffers are shown (dispatches and full-screen draws).
 void               SetShowBuffers(bool show);
 [[nodiscard]] bool ShowBuffers();
+// A small linear image the GPU writes, the kind games read back on the CPU: its guest memory after
+// the frame, up to ReadbackBytes, once the read-backs (TextureCache::ReadsBackForCpu) landed;
+// read_back says whether this one is read back (if not, the CPU sees stale bytes).
+inline constexpr uint64_t ReadbackBytes = 8192;
+void                      NoteReadback(uint64_t address, uint64_t size, bool read_back);
 
 // A shader the frame runs: its guest code is dumped once per capture.
 void NoteShader(const char* stage, uint64_t hash, uint64_t code_address, const uint32_t* user_data,

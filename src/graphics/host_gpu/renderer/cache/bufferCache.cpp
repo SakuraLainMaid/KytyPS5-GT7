@@ -1517,6 +1517,12 @@ void BufferCache::DownloadRangesForDiagnostics(
 	}
 }
 
+void BufferCache::WaitForDiagnostics() {
+	const auto tick = m_scheduler.CurrentTick();
+	m_scheduler.Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
+}
+
 bool BufferCache::IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const {
 	std::shared_lock lock(m_dirty_ranges_mutex);
 	return !m_gpu_modified_ranges.Intersects(vaddr, size) &&

@@ -89,6 +89,53 @@ constexpr uint64_t AliasFramesBeforeRemoval = 4;
 	return true;
 }
 
+// HashGuestBacking's hash of bytes in host memory.
+[[nodiscard]] uint64_t HashBytes(const uint8_t* bytes, uint64_t size) {
+	constexpr uint64_t Chunk = 64 * 1024;
+	uint64_t           seed  = 0;
+	for (uint64_t done = 0; done < size;) {
+		const auto part = std::min(size - done, Chunk);
+		seed            = XXH3_64bits_withSeed(bytes + done, static_cast<size_t>(part), seed);
+		done += part;
+	}
+	return seed;
+}
+
+// The hash of the bytes the last read-back for the CPU wrote at a guest address (priority
+// thread): a read-back recorded before that one landed sees these bytes, not a guest write.
+// Entries go when the memory is unmapped.
+struct LandedReadbacks {
+	std::mutex                   mutex;
+	std::map<uint64_t, uint64_t> hashes;
+};
+
+LandedReadbacks& GetLandedReadbacks() {
+	// Never destroyed: read-backs may still land during static destruction.
+	static auto* landed = new LandedReadbacks;
+	return *landed;
+}
+
+[[nodiscard]] uint64_t LandedReadbackHash(uint64_t address) {
+	auto&           landed = GetLandedReadbacks();
+	std::lock_guard lock(landed.mutex);
+	const auto      found = landed.hashes.find(address);
+	return found != landed.hashes.end() ? found->second : 0;
+}
+
+void NoteLandedReadback(uint64_t address, const uint8_t* bytes, uint64_t size) {
+	const auto      hash   = HashBytes(bytes, size);
+	auto&           landed = GetLandedReadbacks();
+	std::lock_guard lock(landed.mutex);
+	landed.hashes[address] = hash;
+}
+
+void ForgetLandedReadbacks(uint64_t address, uint64_t size) {
+	auto&           landed = GetLandedReadbacks();
+	std::lock_guard lock(landed.mutex);
+	landed.hashes.erase(landed.hashes.lower_bound(address),
+	                    landed.hashes.lower_bound(address + size));
+}
+
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
 	const auto& metadata = desc.info.metadata;
@@ -562,12 +609,47 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	}
 }
 
+// KYTY_READBACK_SMALL_IMAGES_KB (default 64, 0: off): GPU-written linear images up to this size
+// are copied back to guest memory after each submission, as --readback-linear-images does for
+// every linear image. A small linear target or storage image nothing on the GPU reads is how a
+// game reads GPU results on the CPU: GT7 writes 16x16 and 32x32 reductions of its scene colour
+// and depth each frame for the CPU, which sets the white balance (and more) from them. Without
+// this the CPU read stale bytes; small render targets are never evicted, so never written back.
+static uint64_t SmallReadbackBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_READBACK_SMALL_IMAGES_KB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 64ull) << 10u;
+	}();
+	return bytes;
+}
+
+bool TextureCache::ReadsBackForCpu(const ImageInfo& info) const {
+	return !info.IsTiled() && !info.data.Empty() &&
+	       (m_readback_linear_images ||
+	        (info.data.size <= SmallReadbackBytes() && info.samples == 1));
+}
+
 void TextureCache::TrackImageDownload(ImageId id, Image& image) {
-	if (m_readback_linear_images && !image.info.IsTiled() && !image.info.data.Empty()) {
-		if (!image.IsGpuModified()) {
-			EXIT("TextureCache: cannot enroll a non-GPU-owned image for download\n");
+	if (!ReadsBackForCpu(image.info)) {
+		return;
+	}
+	if (!image.IsGpuModified()) {
+		EXIT("TextureCache: cannot enroll a non-GPU-owned image for download\n");
+	}
+	m_download_images.insert(id);
+	if (!m_readback_linear_images) {
+		// The first images read back, each once (under m_lock).
+		static std::unordered_set<uint64_t> logged;
+		if (logged.size() < 16 && logged.insert(image.info.data.address).second) {
+			LOGF("TextureCache: read back for the CPU: 0x%012" PRIx64 "+0x%" PRIx64
+			     " %ux%u format %d%s\n",
+			     image.info.data.address, image.info.data.size, image.info.extent.width,
+			     image.info.extent.height, static_cast<int>(image.info.pixel_format),
+			     logged.size() == 1
+			         ? " (GPU-written linear images up to KYTY_READBACK_SMALL_IMAGES_KB, default "
+			           "64, go back to guest memory after each submission)"
+			         : "");
 		}
-		m_download_images.insert(id);
 	}
 }
 
@@ -2401,11 +2483,14 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
-	const bool guard      = evicting && EvictWriteBackGuard();
-	uint64_t   guest_hash = 0;
-	if (guard && !HashGuestBacking(range.address, range.size, guest_hash)) {
-		return false;
-	}
+	const bool guard = evicting && EvictWriteBackGuard();
+	// A small read-back for the CPU lands after the guest may already have seen the GPU finish
+	// (labels are written as they are recorded): a CPU that read the bytes and then changed them
+	// (cleared them, say) keeps its change. Bytes an earlier read-back left are not the guest's.
+	// A CPU write that leaves the bytes as they were goes unnoticed.
+	const bool readback_guard = !evicting && range.size <= SmallReadbackBytes();
+	// The hash of the guest bytes this copy holds (not a second read of guest memory).
+	const uint64_t guest_hash = guard || readback_guard ? HashBytes(mapped, range.size) : 0;
 	download->Flush(offset, range.size);
 
 	DownloadImage(image, *download, offset, range.size, std::move(transfer));
@@ -2428,7 +2513,7 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 		*landed     = landed_flag;
 	}
 	m_scheduler.DeferPriorityOperation([download, dedicated, range, mapped, offset, guard,
-	                                    guest_hash, landed_flag] {
+	                                    readback_guard, guest_hash, landed_flag] {
 		struct Landed {
 			const std::shared_ptr<std::atomic<bool>>& flag;
 			~Landed() {
@@ -2449,7 +2534,21 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 			}
 			return;
 		}
+		if (readback_guard &&
+		    (!HashGuestBacking(range.address, range.size, current) ||
+		     (current != guest_hash && current != LandedReadbackHash(range.address)))) {
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("TextureCache: read-back for the CPU dropped, guest=0x%016" PRIx64
+				     " size=0x%" PRIx64 ": the guest wrote the bytes after it was recorded\n",
+				     range.address, range.size);
+			}
+			return;
+		}
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		if (readback_guard) {
+			NoteLandedReadback(range.address, mapped, range.size);
+		}
 	});
 	return true;
 }
@@ -2465,9 +2564,9 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		// around it leaves an image the GPU drew or stored alone (the buffer does not hold those
 		// texels). KYTY_TEXTURE_BUFFER_WRITES=1 lets a texture whose texels are still the guest
 		// bytes take such a write too (the buffer holds those bytes and the write). Off by
-		// default: with it, GT7 lost the device in a race or on leaving one, at the same draw
-		// every time (2026-10-12), and its lights, the reason for it, never came from a GPU
-		// buffer write (the game hands its lit shaders one or two lights).
+		// default: GT7's lights, the reason for it, never came from a GPU buffer write (the game
+		// hands its lit shaders one or two lights). The device loss on leaving a race that was
+		// blamed on it went on without it (EQAA draws shading per sample, shaders.cpp).
 		static const bool texture_buffer_writes = [] {
 			const char* text = std::getenv("KYTY_TEXTURE_BUFFER_WRITES");
 			return text != nullptr && text[0] == '1';
@@ -2568,6 +2667,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
 	std::scoped_lock lock {m_lock};
+	ForgetLandedReadbacks(address, size);
 	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
 		const auto base = metadata->first;
 		if (base >= address && base < address + size) {

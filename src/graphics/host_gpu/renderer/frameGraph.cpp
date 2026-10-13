@@ -31,11 +31,13 @@ uint32_t                     g_op           = 0;
 bool                         g_show_buffers = false;
 uint64_t                     g_lines        = 0;
 bool                         g_truncated    = false;
-std::map<uint64_t, uint64_t> g_buffers; // guest address -> bytes kept
+std::map<uint64_t, uint64_t>                  g_buffers;   // guest address -> bytes kept
+std::map<uint64_t, std::pair<uint64_t, bool>> g_readbacks; // small linear images: bytes, read back
 std::set<uint64_t>           g_shaders;
 
 constexpr uint64_t MaxLines       = 600000;
 constexpr size_t   MaxBuffers     = 8192;
+constexpr size_t   MaxReadbacks   = 64;
 constexpr uint64_t MaxBufferLines = 120000;
 
 // KYTY_FRAME_GRAPH=<frame>[,<frame>...]: the frame ends (counted from the start) after which a
@@ -58,6 +60,44 @@ const std::vector<uint64_t>& ScheduledFrames() {
 	return frames;
 }
 
+// One region's words, 16 a line: "FG 0 buf 0x<address> +0x<offset>: <words>".
+bool LogWords(uint64_t address, uint64_t bytes, std::vector<uint32_t>& words, uint64_t& lines) {
+	words.assign((bytes + 3u) / 4u, 0);
+	if (words.empty() || !LibKernel::Memory::TryReadBacking(address, words.data(), bytes)) {
+		LOGF("FG 0 buf 0x%012" PRIx64 "+0x%" PRIx64 ": not readable\n", address, bytes);
+		return false;
+	}
+	for (size_t row = 0; row < words.size(); row += 16) {
+		char   line[16 * 9 + 1] {};
+		size_t used = 0;
+		for (size_t k = row; k < std::min(words.size(), row + 16); k++) {
+			used += static_cast<size_t>(
+			    std::snprintf(line + used, sizeof(line) - used, " %08x", words[k]));
+		}
+		LOGF("FG 0 buf 0x%012" PRIx64 " +0x%03zx:%s\n", address, row * 4u, line);
+		lines++;
+	}
+	return true;
+}
+
+// The images read back for the CPU, as guest memory holds them once those read-backs landed.
+void LogReadbacks(BufferCache& cache) {
+	if (g_readbacks.empty()) {
+		return;
+	}
+	cache.WaitForDiagnostics();
+	LOGF("FG 0 readback images: %zu, the first %" PRIu64 " bytes of each\n", g_readbacks.size(),
+	     ReadbackBytes);
+	std::vector<uint32_t> words;
+	uint64_t              lines = 0;
+	for (const auto& [address, kept]: g_readbacks) {
+		const auto& [bytes, read_back] = kept;
+		LOGF("FG 0 readback 0x%012" PRIx64 "+0x%" PRIx64 " %s\n", address, bytes,
+		     read_back ? "read back" : "not read back (the CPU sees what was there)");
+		(void)LogWords(address, bytes, words, lines);
+	}
+}
+
 void LogBuffers(BufferCache& cache) {
 	std::vector<std::pair<uint64_t, uint64_t>> ranges(g_buffers.begin(), g_buffers.end());
 	// The GPU's writes first (one wait for all of them).
@@ -70,21 +110,7 @@ void LogBuffers(BufferCache& cache) {
 			LOGF("FG 0 (the buffer contents stop here: %" PRIu64 " lines)\n", MaxBufferLines);
 			break;
 		}
-		words.assign((bytes + 3u) / 4u, 0);
-		if (words.empty() || !LibKernel::Memory::TryReadBacking(address, words.data(), bytes)) {
-			LOGF("FG 0 buf 0x%012" PRIx64 "+0x%" PRIx64 ": not readable\n", address, bytes);
-			continue;
-		}
-		for (size_t row = 0; row < words.size(); row += 16) {
-			char   line[16 * 9 + 1] {};
-			size_t used = 0;
-			for (size_t k = row; k < std::min(words.size(), row + 16); k++) {
-				used += static_cast<size_t>(
-				    std::snprintf(line + used, sizeof(line) - used, " %08x", words[k]));
-			}
-			LOGF("FG 0 buf 0x%012" PRIx64 " +0x%03zx:%s\n", address, row * 4u, line);
-			lines++;
-		}
+		(void)LogWords(address, bytes, words, lines);
 	}
 }
 
@@ -104,8 +130,10 @@ void OnFrameBoundary(BufferCache& cache) {
 		LOGF("FG 0 end of frame: capture %u, %u operations%s\n", g_capture, g_op,
 		     g_truncated ? " (lines truncated)" : "");
 		LogBuffers(cache);
+		LogReadbacks(cache);
 		LOGF("FG 0 end capture %u (%zu shaders dumped)\n", g_capture, g_shaders.size());
 		g_buffers.clear();
+		g_readbacks.clear();
 		// The next frame may be captured too.
 	}
 	const auto& frames    = ScheduledFrames();
@@ -119,6 +147,7 @@ void OnFrameBoundary(BufferCache& cache) {
 	g_truncated    = false;
 	g_show_buffers = false;
 	g_buffers.clear();
+	g_readbacks.clear();
 	g_shaders.clear();
 	LOGF("FG 0 begin capture %u after frame end %" PRIu64 "\n", g_capture, g_frame_ends);
 	g_active.store(true, std::memory_order_relaxed);
@@ -166,6 +195,18 @@ void NoteBuffer(uint64_t address, uint64_t size) {
 	}
 	if (g_buffers.size() < MaxBuffers) {
 		g_buffers.emplace(address, bytes);
+	}
+}
+
+void NoteReadback(uint64_t address, uint64_t size, bool read_back) {
+	if (!Logging() || address == 0 || size == 0) {
+		return;
+	}
+	const auto bytes = std::min(size, ReadbackBytes) & ~uint64_t {3};
+	if (bytes != 0 && (g_readbacks.size() < MaxReadbacks || g_readbacks.contains(address))) {
+		auto& kept  = g_readbacks[address];
+		kept.first  = std::max(kept.first, bytes);
+		kept.second = kept.second || read_back;
 	}
 }
 

@@ -79,6 +79,10 @@ public:
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
+	// Whether the GPU's writes to an image like this go back to guest memory after each
+	// submission, for the CPU to read: linear images up to KYTY_READBACK_SMALL_IMAGES_KB, or every
+	// linear one with --readback-linear-images.
+	[[nodiscard]] bool ReadsBackForCpu(const ImageInfo& info) const;
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
 	// The guest no longer refers to this bindless image from any heap entry (it replaced or
