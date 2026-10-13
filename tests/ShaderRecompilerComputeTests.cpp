@@ -38800,6 +38800,157 @@ void CheckDeadImageViewScrub() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// EQAA through NV mixed samples must not shade per sample, and a SampleId input
+// does: the per-pixel copy of such a pixel shader (SpirvWithoutSampleId) is
+// valid SPIR-V with no SampleId built-in, in a SPIR-V 1.3 module (the entry
+// point's interface loses the variable) and in a 1.5 one (the layer read: the
+// interface lists every global, the variable stays as a Private 0).
+void CheckPixelRateSampleIdVariant() {
+  constexpr const char *name = "PixelRateSampleIdVariant";
+  const auto disassemble = [&](const std::vector<u32> &spirv) {
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string text;
+    Require(name, "SPIR-V disassembly", tools.Disassemble(spirv, &text),
+            "failed to disassemble SPIR-V");
+    return text;
+  };
+  const auto entry_point = [](const std::string &text) {
+    const auto begin = text.find("OpEntryPoint");
+    return begin == std::string::npos
+               ? std::string()
+               : text.substr(begin, text.find('\n', begin) - begin);
+  };
+  const auto check = [&](const char *what, const std::vector<u32> &spirv,
+                         bool keeps_interface_entry) {
+    const auto before = disassemble(spirv);
+    Require(name, what, before.find("BuiltIn SampleId") != std::string::npos,
+            "the fragment case does not read SampleId");
+    const auto variant = Libs::Graphics::SpirvWithoutSampleId(spirv);
+    Require(name, what, !variant.empty(),
+            "a shader reading SampleId was not rewritten");
+    ValidateSpirv(name, variant);
+    const auto after = disassemble(variant);
+    Require(name, what,
+            after.find("SampleId") == std::string::npos &&
+                after.find("SampleRateShading") == std::string::npos &&
+                after.find("Private") != std::string::npos,
+            "the copy still reads SampleId (or declares SampleRateShading), or "
+            "its sample index is not a Private 0");
+    const bool listed =
+        entry_point(after).find("%gl_SampleID") != std::string::npos;
+    Require(name, what, listed == keeps_interface_entry,
+            keeps_interface_entry
+                ? "a SPIR-V 1.4+ interface dropped the Private variable"
+                : "a SPIR-V 1.3 interface still lists the variable");
+    Require(name, what, Libs::Graphics::SpirvWithoutSampleId(variant).empty(),
+            "the copy was rewritten again");
+  };
+
+  check("SPIR-V 1.3", CompileFragmentCase(GraphicsAncillarySampleId()).spirv,
+        false);
+
+  GraphicsCase layered;
+  layered.name = "PixelRateSampleIdLayer";
+  layered.pixel_ancillary = true;
+  AppendVop3(&layered.fragment_code, 0x148, 4, Vgpr(2), InlineU32(16),
+             InlineU32(11));
+  AppendVop3(&layered.fragment_code, 0x148, 5, Vgpr(2), InlineU32(8),
+             InlineU32(4));
+  layered.fragment_code.push_back(EncodeVop1(0x06, 0, Vgpr(4)));
+  layered.fragment_code.push_back(EncodeVop1(0x06, 1, Vgpr(5)));
+  AppendVMovLiteral(&layered.fragment_code, 2, 0);
+  AppendVMovLiteral(&layered.fragment_code, 3, 0x3f800000u);
+  layered.fragment_code.push_back(EncodeExp0(0x00, 0xf));
+  layered.fragment_code.push_back(EncodeExp1(0, 1, 2, 3));
+  AppendEnd(&layered.fragment_code);
+  const auto layered_spirv = CompileFragmentCase(layered).spirv;
+  Require(name, "SPIR-V 1.5",
+          layered_spirv.size() > 1 && layered_spirv[1] >= 0x00010400u,
+          "the layered case is not a SPIR-V 1.4+ module");
+  check("SPIR-V 1.5", layered_spirv, true);
+
+  Require(name, "no sample index",
+          Libs::Graphics::SpirvWithoutSampleId(
+              CompileFragmentCase(GraphicsAncillaryLayer(false)).spirv)
+              .empty(),
+          "a shader without SampleId got a per-pixel copy");
+
+  // The emitter declares the variable early, so its id is small, and so are
+  // literal operands: here it is %9, as are the PushConstant storage class and
+  // GLSL.std.450 Ceil. Only <id> operands count as other uses of it.
+  const auto colliding = [&](const char *what, bool sample_position) {
+    std::string source = R"(OpCapability Shader
+OpCapability SampleRateShading
+%1 = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+)";
+    source += sample_position
+                  ? "OpEntryPoint Fragment %main \"main\" %9 %out %position\n"
+                  : "OpEntryPoint Fragment %main \"main\" %9 %out\n";
+    source += R"(OpExecutionMode %main OriginUpperLeft
+OpName %9 "gl_SampleID"
+OpDecorate %9 Flat
+OpDecorate %9 BuiltIn SampleId
+OpDecorate %out Location 0
+OpDecorate %block Block
+OpMemberDecorate %block 0 Offset 0
+)";
+    if (sample_position) {
+      source += "OpDecorate %position BuiltIn SamplePosition\n";
+    }
+    source += R"(%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%int = OpTypeInt 32 1
+%float = OpTypeFloat 32
+%v2float = OpTypeVector %float 2
+%v4float = OpTypeVector %float 4
+%ptr_in_int = OpTypePointer Input %int
+%9 = OpVariable %ptr_in_int Input
+%ptr_out = OpTypePointer Output %v4float
+%out = OpVariable %ptr_out Output
+%block = OpTypeStruct %float
+%ptr_pc = OpTypePointer PushConstant %block
+%pc = OpVariable %ptr_pc PushConstant
+%ptr_pc_float = OpTypePointer PushConstant %float
+%int_0 = OpConstant %int 0
+)";
+    if (sample_position) {
+      source += "%ptr_in_v2float = OpTypePointer Input %v2float\n"
+                "%position = OpVariable %ptr_in_v2float Input\n";
+    }
+    source += R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+%id = OpLoad %int %9
+%id_float = OpConvertSToF %float %id
+%member = OpAccessChain %ptr_pc_float %pc %int_0
+%value = OpLoad %float %member
+%ceil = OpExtInst %float %1 Ceil %value
+%sum = OpFAdd %float %id_float %ceil
+%vec = OpCompositeConstruct %v4float %sum %sum %sum %sum
+OpStore %out %vec
+OpReturn
+OpFunctionEnd
+)";
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_1);
+    std::vector<u32> spirv;
+    Require(name, what,
+            tools.Assemble(source, &spirv,
+                           SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS),
+            "the hand-written module did not assemble");
+    ValidateSpirv(name, spirv);
+    return spirv;
+  };
+  check("literal operands equal to the id",
+        colliding("colliding literals", false), false);
+  // A SamplePosition input shades per sample as well: no copy.
+  Require(
+      name, "SamplePosition",
+      Libs::Graphics::SpirvWithoutSampleId(colliding("SamplePosition", true))
+          .empty(),
+      "a shader reading SamplePosition got a per-pixel copy");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckFloatStoreClamp() {
   constexpr const char *name = "FloatStoreClamp";
   using O = ShaderOpcode;
@@ -41198,6 +41349,7 @@ int main(int argc, char **argv) {
   CheckShaderFunctionRuntimeRecords();
   CheckTenBitRenderTargetFormat();
   CheckDeadImageViewScrub();
+  CheckPixelRateSampleIdVariant();
   CheckFloatStoreClamp();
   CheckShaderProbe();
   CheckRayTracingHitCallsReturn();
