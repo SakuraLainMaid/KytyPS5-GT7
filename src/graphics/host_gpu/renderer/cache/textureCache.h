@@ -118,6 +118,11 @@ public:
 		uint64_t first_overlap = 0; // the guest address of one of them
 	};
 	[[nodiscard]] DiagnosticState DiagnosticImageState(ImageId id);
+	// Diagnostics (the frame graph): the pixels the GPU holds for a texture a shader reads, once
+	// the commands recorded so far have run, against its guest bytes now (as the CPU wrote them
+	// before submitting). A light grid (R32G32_UINT cells: a light-list offset and packed light
+	// counts) also gets its lit cells per layer on both sides. Logs "FG 0 grid ...".
+	void CompareWithGuest(ImageId id, uint32_t op);
 
 private:
 	enum class TransferDirection { Upload, Download };

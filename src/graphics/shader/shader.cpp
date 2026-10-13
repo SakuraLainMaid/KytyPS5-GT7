@@ -918,7 +918,14 @@ bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Con
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
 	if (!ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess)) {
 		std::scoped_lock lock(g_rejected_tessellation_mutex);
-		g_rejected_tessellation.insert(tess_key);
+		// Once per pair: the analysis names its reason on the line before ("LS/HS tessellation
+		// ...").
+		if (g_rejected_tessellation.insert(tess_key).second) {
+			LOGF("Tessellation: LS 0x%016" PRIx64 " / HS 0x%016" PRIx64 " / ES 0x%016" PRIx64
+			     " (input cp %u, output cp %u) not supported: its patch draws are skipped\n",
+			     local_hash, control_hash, evaluation_hash, tess.input_control_points,
+			     tess.output_control_points);
+		}
 		return false;
 	}
 	for (auto& stage: input_info) {

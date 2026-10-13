@@ -34,6 +34,7 @@ bool                         g_truncated    = false;
 std::map<uint64_t, uint64_t>                  g_buffers;   // guest address -> bytes kept
 std::map<uint64_t, std::pair<uint64_t, bool>> g_readbacks; // small linear images: bytes, read back
 std::set<uint64_t>           g_shaders;
+std::set<uint64_t>           g_grid_checks;
 
 constexpr uint64_t MaxLines       = 600000;
 constexpr size_t   MaxBuffers     = 8192;
@@ -149,6 +150,7 @@ void OnFrameBoundary(BufferCache& cache) {
 	g_buffers.clear();
 	g_readbacks.clear();
 	g_shaders.clear();
+	g_grid_checks.clear();
 	LOGF("FG 0 begin capture %u after frame end %" PRIu64 "\n", g_capture, g_frame_ends);
 	g_active.store(true, std::memory_order_relaxed);
 	g_logging.store(true, std::memory_order_relaxed);
@@ -208,6 +210,13 @@ void NoteReadback(uint64_t address, uint64_t size, bool read_back) {
 		kept.first  = std::max(kept.first, bytes);
 		kept.second = kept.second || read_back;
 	}
+}
+
+bool ClaimGridCheck(uint64_t address) {
+	if (!Logging() || address == 0 || g_grid_checks.size() >= MaxGridChecks) {
+		return false;
+	}
+	return g_grid_checks.insert(address).second;
 }
 
 void SetShowBuffers(bool show) {

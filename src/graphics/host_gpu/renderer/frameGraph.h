@@ -53,6 +53,12 @@ void               SetShowBuffers(bool show);
 inline constexpr uint64_t ReadbackBytes = 8192;
 void                      NoteReadback(uint64_t address, uint64_t size, bool read_back);
 
+// A light grid (an R32G32_UINT array texture) a shader reads: whether to compare it with its guest
+// bytes (TextureCache::CompareWithGuest), the first time each address is bound in a capture, up to
+// MaxGridChecks per capture.
+inline constexpr size_t MaxGridChecks = 12;
+[[nodiscard]] bool      ClaimGridCheck(uint64_t address);
+
 // A shader the frame runs: its guest code is dumped once per capture.
 void NoteShader(const char* stage, uint64_t hash, uint64_t code_address, const uint32_t* user_data,
                 uint32_t user_data_count);

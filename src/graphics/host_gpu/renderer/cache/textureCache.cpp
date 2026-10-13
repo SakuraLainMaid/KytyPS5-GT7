@@ -23,13 +23,16 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <unordered_set>
 #include <span>
+#include <string>
 #include <string_view>
 #include <tuple>
+#include <vector>
 #include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
 
@@ -2551,6 +2554,105 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 		}
 	});
 	return true;
+}
+
+// A light grid's cells (two words each: a light-list offset and packed light counts) with any
+// light, and the most lights a cell holds, per layer: " <cells>/<most>" each.
+static std::string LitCellsPerLayer(const uint32_t* cells, size_t words, uint32_t width,
+                                    uint32_t height, uint32_t layers, uint32_t pitch) {
+	const uint64_t layer_words = words / std::max(layers, 1u);
+	std::string    text;
+	for (uint32_t layer = 0; layer < layers; layer++) {
+		uint32_t count = 0, most = 0;
+		for (uint32_t y = 0; y < height; y++) {
+			for (uint32_t x = 0; x < width; x++) {
+				const uint64_t at =
+				    layer * layer_words + (static_cast<uint64_t>(y) * pitch + x) * 2u + 1u;
+				if (at >= words) {
+					continue;
+				}
+				count += cells[at] != 0 ? 1u : 0u;
+				most = std::max(most, cells[at] & 0xffffu);
+			}
+		}
+		text += fmt::format(" {}/{}", count, most);
+	}
+	return text;
+}
+
+void TextureCache::CompareWithGuest(ImageId id, uint32_t op) {
+	std::scoped_lock lock {m_lock};
+	auto*            image = m_slot_images.try_get(id);
+	if (image == nullptr || image->depth_id || image->info.data.Empty()) {
+		return;
+	}
+	const auto range = image->info.data;
+	const auto flags =
+	    std::string {image->IsGpuModified() ? 'G' : '-', image->IsBufferModified() ? 'B' : '-',
+	                 image->IsCpuDirty() ? 'C' : '-'};
+	auto transfer = BuildDownload(*image);
+	if (!transfer.valid || transfer.depth_target) {
+		LOGF("FG %u grid 0x%012" PRIx64 "+0x%" PRIx64 " [%s]: no download for it\n", op,
+		     range.address, range.size, flags.c_str());
+		return;
+	}
+	auto guest = std::make_shared<std::vector<uint32_t>>(range.size / sizeof(uint32_t));
+	if (guest->empty() || !LibKernel::Memory::TryReadBacking(range.address, guest->data(),
+	                                                         guest->size() * sizeof(uint32_t))) {
+		return;
+	}
+	auto download = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                                         AllFlags, range.size);
+	if (download->Mapped().data() == nullptr) {
+		return;
+	}
+	DownloadImage(*image, *download, 0, range.size, std::move(transfer));
+	vk::BufferMemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = download->Handle();
+	barrier.offset              = 0;
+	barrier.size                = range.size;
+	m_scheduler.EndRendering();
+	m_scheduler.Current().Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                                                 vk::PipelineStageFlagBits::eHost, {}, 0,
+	                                                 nullptr, 1, &barrier, 0, nullptr);
+	const bool grid  = image->info.pixel_format == vk::Format::eR32G32Uint;
+	const auto width = image->info.extent.width, height = image->info.extent.height;
+	const auto layers = image->info.resources.layers;
+	const auto pitch  = std::max(image->info.pitch, width);
+	m_scheduler.DeferPriorityOperation([download, guest, range, op, flags, grid, width, height,
+	                                    layers, pitch] {
+		download->Invalidate(0, range.size);
+		const auto* gpu    = reinterpret_cast<const uint32_t*>(download->Mapped().data());
+		const auto  words  = guest->size();
+		size_t      differ = 0, first = words;
+		for (size_t i = 0; i < words; i++) {
+			if (gpu[i] != (*guest)[i]) {
+				first = differ++ == 0 ? i : first;
+			}
+		}
+		LOGF("FG %u grid 0x%012" PRIx64 "+0x%" PRIx64 " %ux%u layers %u pitch %u [%s]: the GPU's "
+		     "copy %s the guest bytes (%zu of %zu words differ%s)\n",
+		     op, range.address, range.size, width, height, layers, pitch, flags.c_str(),
+		     differ == 0 ? "matches" : "differs from", differ, words,
+		     differ == 0 ? ""
+		                 : fmt::format(", the first at +0x{:x}: guest {:08x}, GPU {:08x}",
+		                               first * 4, (*guest)[first], gpu[first])
+		                       .c_str());
+		if (!grid) {
+			return;
+		}
+		LOGF("FG %u grid 0x%012" PRIx64 " lit cells/most lights per layer, guest:%s\n", op,
+		     range.address,
+		     LitCellsPerLayer(guest->data(), words, width, height, layers, pitch).c_str());
+		if (differ != 0) {
+			LOGF("FG %u grid 0x%012" PRIx64 " lit cells/most lights per layer, GPU:%s\n", op,
+			     range.address, LitCellsPerLayer(gpu, words, width, height, layers, pitch).c_str());
+		}
+	});
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {

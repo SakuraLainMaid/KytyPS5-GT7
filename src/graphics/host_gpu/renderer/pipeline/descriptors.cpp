@@ -2105,6 +2105,13 @@ static void LogFrameGraphStage(RenderContext& context, const ShaderStageRuntime&
 		    static_cast<int>(info.pixel_format), static_cast<uint32_t>(info.guest_format),
 		    static_cast<uint32_t>(info.tile_mode), static_cast<uint32_t>(info.type),
 		    state.valid ? flags : "none", state.overlaps, state.gpu_overlaps, state.first_overlap);
+		// A light grid the CPU wrote: does the GPU's copy hold what the guest wrote? (Shown as
+		// the submission lands.)
+		if (!resource.written && binding.image_id && info.pixel_format == vk::Format::eR32G32Uint &&
+		    info.resources.layers > 1 && info.data.size <= 0x40000u &&
+		    FrameGraph::ClaimGridCheck(info.data.address)) {
+			textures.CompareWithGuest(binding.image_id, FrameGraph::CurrentOp());
+		}
 		// A small linear image a shader stores to, the kind the CPU reads back: shown after the
 		// frame as guest memory holds it.
 		if (resource.written && binding.desc.type == TextureCache::BindingType::Storage &&
