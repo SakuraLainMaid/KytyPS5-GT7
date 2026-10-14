@@ -2680,9 +2680,14 @@ void TextureCache::CompareWithGuest(ImageId id, uint32_t op) {
 		return;
 	}
 	const auto range = image->info.data;
+	// As the draw's binding will see it: a stage is logged before its textures are bound
+	// (RebindImages), so the guest bytes the tracking already marked are uploaded first. The
+	// round 40 captures compared the image before that upload.
+	const bool tracked_dirty = image->IsCpuDirty();
+	RefreshImage(id);
 	const auto flags =
 	    std::string {image->IsGpuModified() ? 'G' : '-', image->IsBufferModified() ? 'B' : '-',
-	                 image->IsCpuDirty() ? 'C' : '-'};
+	                 tracked_dirty ? 'C' : '-'};
 	auto transfer = BuildDownload(*image);
 	if (!transfer.valid || transfer.depth_target) {
 		LOGF("FG %u grid 0x%012" PRIx64 "+0x%" PRIx64 " [%s]: no download for it\n", op,

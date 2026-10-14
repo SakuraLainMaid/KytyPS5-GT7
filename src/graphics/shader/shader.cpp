@@ -23,6 +23,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -658,8 +659,9 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.tess.input_control_points);
 	if (info.tess.input_control_points != 0) {
 		const auto& tess = info.tess;
-		key.insert(key.end(), {tess.output_control_points, tess.ls_stride, tess.hs_stride,
-		                       tess.domain, tess.partitioning, tess.output_topology});
+		key.insert(key.end(),
+		           {tess.output_control_points, tess.ls_stride, tess.hs_stride, tess.domain,
+		            tess.partitioning, tess.output_topology, tess.patch_base, tess.patch_size});
 	}
 
 	for (int i = 0; i < info.resources_num; i++) {
@@ -852,6 +854,47 @@ uint32_t ShaderCodeSizeBytes(uint64_t shader_addr) {
 // without this a rejected pair is re-analysed on every draw that uses it.
 static std::mutex                   g_rejected_tessellation_mutex;
 static std::unordered_set<uint64_t> g_rejected_tessellation;
+// The pairs the analysis accepted, with what it found: analysed once, not per draw.
+static std::unordered_map<uint64_t, ShaderTessellationInputInfo> g_accepted_tessellation;
+
+// Diagnostics: the guest code of each tessellation program set, once per set, into
+// shader-dumps/ next to the log (as frame-graph captures write theirs), with the registers that
+// configure it, for offline work on the stages.
+static void DumpTessellationPrograms(const std::array<ShaderParams, 3>& params,
+                                     const std::array<uint64_t, 3>&     hashes,
+                                     const HW::ShaderRegisters&         sh) {
+	std::error_code created;
+	std::filesystem::create_directories("shader-dumps", created);
+	static constexpr std::array<const char*, 3> Stages {"LS", "HS", "ES"};
+	for (size_t stage = 0; stage < params.size(); stage++) {
+		char path[96];
+		std::snprintf(path, sizeof(path), "shader-dumps/%s_%016" PRIx64 ".bin", Stages[stage],
+		              hashes[stage]);
+		std::error_code checked;
+		if (std::filesystem::exists(path, checked)) continue;
+		if (FILE* file = std::fopen(path, "wb"); file != nullptr) {
+			std::fwrite(params[stage].code.data(), sizeof(uint32_t), params[stage].code.size(),
+			            file);
+			std::fclose(file);
+		}
+		std::snprintf(path, sizeof(path), "shader-dumps/%s_%016" PRIx64 ".txt", Stages[stage],
+		              hashes[stage]);
+		if (FILE* file = std::fopen(path, "w"); file != nullptr) {
+			std::fprintf(file,
+			             "stage=%s hash=%016" PRIx64 " bytes=%zu vgt_ls_hs_config=0x%08x "
+			             "vgt_tf_param=0x%08x\nuser_data=",
+			             Stages[stage], hashes[stage], params[stage].code.size() * 4u,
+			             sh.m_vgtLsHsConfig, sh.m_vgtTfParam);
+			for (uint32_t index = 0;
+			     index < params[stage].user_data_count && index < params[stage].user_data.size();
+			     index++) {
+				std::fprintf(file, "%08x ", params[stage].user_data[index]);
+			}
+			std::fprintf(file, "\n");
+			std::fclose(file);
+		}
+	}
+}
 
 static uint64_t TessellationProgramKey(const HW::VertexShaderInfo& regs,
                                        const HW::ShaderRegisters&  sh) {
@@ -916,17 +959,38 @@ bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Con
 	};
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
-	if (!ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess)) {
+	bool analysed = false;
+	{
 		std::scoped_lock lock(g_rejected_tessellation_mutex);
-		// Once per pair: the analysis names its reason on the line before ("LS/HS tessellation
-		// ...").
-		if (g_rejected_tessellation.insert(tess_key).second) {
-			LOGF("Tessellation: LS 0x%016" PRIx64 " / HS 0x%016" PRIx64 " / ES 0x%016" PRIx64
-			     " (input cp %u, output cp %u) not supported: its patch draws are skipped\n",
-			     local_hash, control_hash, evaluation_hash, tess.input_control_points,
-			     tess.output_control_points);
+		if (const auto found = g_accepted_tessellation.find(tess_key);
+		    found != g_accepted_tessellation.end()) {
+			tess     = found->second;
+			analysed = true;
 		}
-		return false;
+	}
+	if (!analysed) {
+		DumpTessellationPrograms(params, {local_hash, control_hash, evaluation_hash}, sh);
+		const bool accepted =
+		    ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess);
+		std::scoped_lock lock(g_rejected_tessellation_mutex);
+		if (!accepted) {
+			// Once per pair: the analysis names its reason on the line before ("LS/HS
+			// tessellation ...").
+			if (g_rejected_tessellation.insert(tess_key).second) {
+				LOGF("Tessellation: LS 0x%016" PRIx64 " / HS 0x%016" PRIx64 " / ES 0x%016" PRIx64
+				     " (input cp %u, output cp %u, VGT_TF_PARAM 0x%08x) not supported: its patch "
+				     "draws are skipped\n",
+				     local_hash, control_hash, evaluation_hash, tess.input_control_points,
+				     tess.output_control_points, sh.m_vgtTfParam);
+			}
+			return false;
+		}
+		if (g_accepted_tessellation.emplace(tess_key, tess).second) {
+			LOGF("Tessellation: LS 0x%016" PRIx64 " / HS 0x%016" PRIx64 " / ES 0x%016" PRIx64
+			     " (input cp %u, output cp %u, VGT_TF_PARAM 0x%08x) accepted\n",
+			     local_hash, control_hash, evaluation_hash, tess.input_control_points,
+			     tess.output_control_points, sh.m_vgtTfParam);
+		}
 	}
 	for (auto& stage: input_info) {
 		stage.tess = tess;
