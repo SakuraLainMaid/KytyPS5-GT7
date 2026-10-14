@@ -30,11 +30,13 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <unordered_set>
 #include <span>
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <utility>
 #include <vector>
 #include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
@@ -266,6 +268,99 @@ void ForgetLandedReadbacks(uint64_t address, uint64_t size) {
 
 } // namespace
 
+// The last snapshot of an image KYTY_TRACE_IMAGES follows (a glyph a layer), by guest address;
+// written as snapshots land (the scheduler's completion work).
+struct TextureCache::TraceHistory {
+	std::mutex  mutex;
+	std::string glyphs;
+};
+
+// KYTY_TRACE_IMAGES=<width>x<height>[x<layers>][,...]: the images of these shapes are followed
+// through the cache from their creation on: uploads (with what their guest bytes hold), CPU
+// writes, GPU buffer writes over them, write-backs and frees ("Trace image #<n> ..."); and at the
+// end of each guest frame in which one changed, a snapshot of its mip 0 as the GPU holds it: the
+// layers that changed and the shaders that wrote it (TraceFrameEnd). Up to
+// KYTY_TRACE_IMAGES_SNAPSHOTS (default 600) snapshots in all.
+struct TextureCache::TraceState {
+	struct Shape {
+		uint32_t width  = 0;
+		uint32_t height = 0;
+		uint32_t layers = 0; // 0: any
+	};
+	struct Followed {
+		uint32_t                        serial           = 0;
+		bool                            changed          = false;
+		bool                            unscanned_logged = false;
+		uint32_t                        cpu_writes       = 0;
+		uint32_t                        guest_logs       = 0;
+		std::map<std::string, uint32_t> writers; // since the last snapshot
+	};
+	std::vector<Shape>                                              shapes;
+	std::unordered_map<ImageId, Followed>                           images;
+	std::map<uint64_t, std::shared_ptr<TextureCache::TraceHistory>> history;
+	std::map<uint64_t, std::string> guest_glyphs; // the guest bytes last logged, by address
+	uint32_t                        serials       = 0;
+	uint32_t                        snapshots     = 0;
+	uint32_t                        max_snapshots = 600;
+
+	[[nodiscard]] bool Matches(const ImageInfo& info) const {
+		return std::any_of(shapes.begin(), shapes.end(), [&](const Shape& shape) {
+			return info.extent.width == shape.width && info.extent.height == shape.height &&
+			       (shape.layers == 0 || info.resources.layers == shape.layers);
+		});
+	}
+
+	[[nodiscard]] static std::unique_ptr<TraceState> FromEnvironment() {
+		const char* value = std::getenv("KYTY_TRACE_IMAGES");
+		if (value == nullptr || *value == '\0') {
+			return nullptr;
+		}
+		auto        state = std::make_unique<TraceState>();
+		std::string text  = value;
+		for (size_t begin = 0; begin < text.size();) {
+			const auto end   = std::min(text.find(',', begin), text.size());
+			const auto token = text.substr(begin, end - begin);
+			begin            = end + 1u;
+			Shape       shape;
+			const char* cursor = token.c_str();
+			char*       next   = nullptr;
+			shape.width        = static_cast<uint32_t>(std::strtoul(cursor, &next, 10));
+			if (next == cursor || *next != 'x') {
+				continue;
+			}
+			cursor       = next + 1;
+			shape.height = static_cast<uint32_t>(std::strtoul(cursor, &next, 10));
+			if (next == cursor) {
+				continue;
+			}
+			if (*next == 'x') {
+				shape.layers = static_cast<uint32_t>(std::strtoul(next + 1, nullptr, 10));
+			}
+			if (shape.width != 0 && shape.height != 0) {
+				state->shapes.push_back(shape);
+			}
+		}
+		if (const char* snapshots = std::getenv("KYTY_TRACE_IMAGES_SNAPSHOTS")) {
+			state->max_snapshots = static_cast<uint32_t>(std::strtoul(snapshots, nullptr, 10));
+		}
+		std::string shapes;
+		for (const auto& shape: state->shapes) {
+			shapes += shape.layers != 0
+			              ? fmt::format(" {}x{}x{}", shape.width, shape.height, shape.layers)
+			              : fmt::format(" {}x{}", shape.width, shape.height);
+		}
+		LOGF("Trace image: following the images of these shapes:%s (KYTY_TRACE_IMAGES), up to %u "
+		     "snapshots (KYTY_TRACE_IMAGES_SNAPSHOTS)\n",
+		     shapes.empty() ? " none (the format is <width>x<height>x<layers>,...)"
+		                    : shapes.c_str(),
+		     state->max_snapshots);
+		if (state->shapes.empty()) {
+			return nullptr;
+		}
+		return state;
+	}
+};
+
 // KYTY_TEXTURE_CACHE_MB / KYTY_BUFFER_CACHE_MB: an upper bound for a cache's collection thresholds,
 // whatever the card's size (default 6 GiB each; 0 = no bound). The thresholds otherwise follow the
 // device budget, and on a 32 GB card the caches kept everything up to ~25 GB: textures and buffers
@@ -302,6 +397,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		     " MB)\n",
 		     m_pressure_gc_memory >> 20u, m_trigger_gc_memory >> 20u, m_critical_gc_memory >> 20u);
 	}
+	m_trace = TraceState::FromEnvironment();
 }
 
 TextureCache::~TextureCache() {
@@ -372,6 +468,9 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	Profiler::Add(Profiler::Counter::ImagesCreated);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
+		if (m_trace != nullptr) {
+			TraceImageCreated(id);
+		}
 	}
 	return id;
 }
@@ -485,8 +584,32 @@ void TextureCache::ReleaseImage(ImageId id) {
 	Profiler::Add(Profiler::Counter::ImagesDestroyed);
 }
 
-void TextureCache::FreeImage(ImageId id) {
+void TextureCache::FreeImage(ImageId id, const char* why, bool copied) {
 	auto& image = m_slot_images[id];
+	// Pixels only this image held: the next image over the memory starts from the guest bytes.
+	if (image.gpu_pixels && image.IsGpuModified() && !copied && why != nullptr &&
+	    image.registered && !image.depth_id) {
+		static std::atomic<uint64_t> dropped {0};
+		const auto                   count = ++dropped;
+		if (count <= 32 || std::has_single_bit(count)) {
+			LOGF("TextureCache: GPU-written image 0x%012" PRIx64 "+0x%" PRIx64
+			     " %ux%u layers %u mips %u fmt %d tile %u dropped without a write-back (%s): the "
+			     "next image over its memory starts from the guest bytes (%" PRIu64 " so far)\n",
+			     image.info.data.address, image.info.data.size, image.info.extent.width,
+			     image.info.extent.height, image.info.resources.layers, image.info.resources.levels,
+			     static_cast<int>(image.info.pixel_format),
+			     static_cast<uint32_t>(image.info.tile_mode), why, count);
+		}
+	}
+	if (TracesImage(id)) {
+		TraceImageEvent(id,
+		                fmt::format("freed: {}{}", why != nullptr ? why : "(no reason given)",
+		                            !(image.gpu_pixels && image.IsGpuModified()) ? ""
+		                            : copied ? "; its GPU pixels were kept"
+		                                     : "; its GPU pixels are lost"),
+		                false);
+		m_trace->images.erase(id);
+	}
 	if (image.IsGpuModified()) {
 		image.ClearGpuModified();
 	}
@@ -892,8 +1015,12 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	}
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
+		destination.gpu_pixels = destination.gpu_pixels || source.gpu_pixels;
 	}
 	destination.ClearBufferModified();
+	if (m_trace != nullptr) {
+		TraceImageChanged(destination, "copy from an image over its memory");
+	}
 }
 
 void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
@@ -908,6 +1035,10 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	destination.CopyMip(source, mip, layer);
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
+		destination.gpu_pixels = destination.gpu_pixels || source.gpu_pixels;
+	}
+	if (m_trace != nullptr) {
+		TraceImageChanged(destination, "copy from an image over its memory");
 	}
 }
 
@@ -985,6 +1116,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
 	}
+	bool copied = false;
 	if (cached.backing.samples == replacement.backing.samples) {
 		const bool copy_supported =
 		    cached.backing.samples == 1 || cached.backing.format == replacement.backing.format ||
@@ -992,6 +1124,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		     ImageViewOps::FormatsCompatible(cached.backing.format, replacement.backing.format));
 		if (copy_supported) {
 			CopyImage(replacement_id, cached_id);
+			copied = true;
 		} else {
 			LOGF_COLOR(Log::Color::BrightYellow,
 			           "TextureCache: unsupported cross-format multisample depth copy\n");
@@ -1005,12 +1138,13 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		PrepareImageCopy(replacement);
 		m_blit_helper.ReinterpretColorAsMsDepth(cached, replacement);
 		CommitGpuWrite(replacement);
+		copied = true;
 	} else {
 		LOGF_COLOR(Log::Color::BrightYellow,
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
 	}
-	FreeImage(cached_id);
+	FreeImage(cached_id, "replaced by an image of another kind over the same memory", copied);
 	return replacement_id;
 }
 
@@ -1042,7 +1176,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		    (requested.resources == cached.info.resources &&
 		     requested.mip_layout != cached.info.mip_layout)) {
 			if (safe_to_delete) {
-				FreeImage(cached_id);
+				FreeImage(cached_id,
+				          "an image of another tile mode or mip layout took its address");
 			}
 			return {merged_id};
 		}
@@ -1126,11 +1261,11 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
 		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
 		             static_cast<uint32_t>(layer));
-		FreeImage(cached_id);
+		FreeImage(cached_id, "merged into a larger image", true);
 		return {merged_id};
 	}
 	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
-		FreeImage(cached_id);
+		FreeImage(cached_id, "an image over its memory took its place");
 	}
 	return {merged_id};
 }
@@ -1151,7 +1286,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	} else {
 		CopyImage(expanded_id, source_id);
 	}
-	FreeImage(source_id);
+	FreeImage(source_id, "expanded into a larger image", true);
 	return expanded_id;
 }
 
@@ -1364,6 +1499,44 @@ void TextureCache::InitializeImage(ImageId id) {
 		const auto range         = image.info.data;
 		Buffer*    source        = nullptr;
 		uint64_t   source_offset = 0;
+		// The GPU's pixels give way to the guest bytes (or to a cached buffer's, which hold a GPU
+		// buffer write): right when the CPU (or that write) replaced all of them, not when it
+		// wrote only some.
+		const bool over_gpu_pixels = image.gpu_pixels && image.IsGpuModified();
+		static std::atomic<uint64_t> replaced {0};
+		const auto                   count = over_gpu_pixels ? ++replaced : 0;
+		const bool log_replaced = over_gpu_pixels && (count <= 32 || std::has_single_bit(count));
+		if (log_replaced || TracesImage(id)) {
+			const bool gpu_bytes = m_buffer_cache.IsRegionGpuModified(range.address, range.size);
+			const char* cpu       = image.IsDefinitelyCpuDirty() ? "a CPU write"
+			                        : image.IsMaybeCpuDirty()    ? "a CPU write next to it"
+			                                                     : "";
+			const auto  reason    = !image.initialized
+			                            ? std::string("its creation")
+			                            : fmt::format("{}{}", cpu,
+                                                  image.IsBufferModified()
+			                                              ? (*cpu != '\0' ? " and a GPU buffer write"
+			                                                              : "a GPU buffer write")
+			                                              : "");
+			const auto from =
+			    gpu_bytes ? "a cached buffer that holds GPU-written bytes" : "the guest bytes";
+			if (log_replaced) {
+				LOGF("TextureCache: GPU-written image 0x%012" PRIx64 "+0x%" PRIx64
+				     " %ux%u layers %u mips %u fmt %d tile %u reloaded from %s after %s: what the "
+				     "GPU wrote into it is replaced (%" PRIu64 " so far)\n",
+				     range.address, range.size, image.info.extent.width, image.info.extent.height,
+				     image.info.resources.layers, image.info.resources.levels,
+				     static_cast<int>(image.info.pixel_format),
+				     static_cast<uint32_t>(image.info.tile_mode), from, reason.c_str(), count);
+			}
+			if (TracesImage(id)) {
+				TraceImageEvent(id,
+				                fmt::format("uploaded from {} after {}{}", from, reason,
+				                            over_gpu_pixels ? ", over its GPU pixels" : ""),
+				                true);
+				TraceImageChanged(image, "upload");
+			}
+		}
 		// Hashed before it is staged: a CPU write between the two leaves the hash older than
 		// the upload, so the next comparison uploads once more rather than missing it.
 		uint64_t hash = 0;
@@ -1383,10 +1556,12 @@ void TextureCache::InitializeImage(ImageId id) {
 		}
 		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();
+		image.gpu_pixels = false;
 	}
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
 	}
+	image.initialized = true;
 }
 
 bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc, uint32_t first,
@@ -2008,7 +2183,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
 			} else if (resolved.info.resources < desc.info.resources) {
-				FreeImage(result);
+				FreeImage(result, "a binding needs more mips or layers than it has");
 				result = {};
 			}
 		}
@@ -2240,6 +2415,10 @@ void TextureCache::CommitGpuWrite(Image& image) {
 		image.alias_owner = true;
 	}
 	image.MarkGpuModified();
+	image.gpu_pixels = true;
+	if (m_trace != nullptr) {
+		TraceImageChanged(image, "draw, clear or copy", true);
+	}
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
@@ -2606,6 +2785,15 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
+	if (TracesImage(id)) {
+		TraceImageEvent(id,
+		                evicting ? "written back to guest memory (evicted)"
+		                         : "written back to guest memory",
+		                false);
+	}
+	// Guest memory holds its pixels once this lands (unless the guest writes them first): freeing
+	// or reloading it loses nothing the GPU wrote.
+	image.gpu_pixels = false;
 	const bool guard = evicting && EvictWriteBackGuard();
 	// A small read-back for the CPU lands after the guest may already have seen the GPU finish
 	// (labels are written as they are recorded): a CPU that read the bytes and then changed them
@@ -2791,14 +2979,15 @@ void TextureCache::CompareWithGuest(ImageId id, uint32_t op) {
 	});
 }
 
-// Verification helpers (the frame graph): what a layer of an image holds, a glyph a layer.
+// Diagnostics helpers (the frame graph's verification, the KYTY_TRACE_* traces): what the layers
+// of an image hold, a glyph a layer.
 namespace {
 
 [[nodiscard]] float UnsignedSmallFloat(uint32_t bits, uint32_t mantissa_bits) {
 	const uint32_t exponent = bits >> mantissa_bits;
 	const uint32_t mantissa = bits & ((1u << mantissa_bits) - 1u);
 	if (exponent == 31u) {
-		return -1.0f; // infinity or NaN: left out
+		return -1.0f; // infinity or NaN
 	}
 	const auto scale = static_cast<float>(1u << mantissa_bits);
 	if (exponent == 0u) {
@@ -2812,7 +3001,7 @@ namespace {
 	const uint32_t mantissa = half & 0x3ffu;
 	const float    sign     = (half & 0x8000u) != 0 ? -1.0f : 1.0f;
 	if (exponent == 31u) {
-		return std::numeric_limits<float>::quiet_NaN();
+		return std::numeric_limits<float>::quiet_NaN(); // infinity counts as not finite too
 	}
 	if (exponent == 0u) {
 		return sign * std::ldexp(static_cast<float>(mantissa) / 1024.0f, -14);
@@ -2821,89 +3010,366 @@ namespace {
 	                         static_cast<int>(exponent) - 15);
 }
 
-// The luminance of a texel in the formats light data comes in, or a negative value when the
-// format is another (or the texel is not finite).
-[[nodiscard]] float TexelLuminance(vk::Format format, const uint32_t* word) {
+// The words a texel of the float formats light data comes in takes; 0 for other formats.
+[[nodiscard]] uint32_t FloatTexelWords(vk::Format format) {
+	switch (format) {
+		case vk::Format::eB10G11R11UfloatPack32:
+		case vk::Format::eR16G16Sfloat:
+		case vk::Format::eR32Sfloat: return 1;
+		case vk::Format::eR16G16B16A16Sfloat:
+		case vk::Format::eR32G32Sfloat: return 2;
+		case vk::Format::eR32G32B32A32Sfloat: return 4;
+		default: return 0;
+	}
+}
+
+[[nodiscard]] float Luminance(float r, float g, float b) {
+	return 0.2126f * std::fabs(r) + 0.7152f * std::fabs(g) + 0.0722f * std::fabs(b);
+}
+
+// The light of a texel of such a format: its luminance (the first channel's magnitude for one
+// and two channels), or a negative value when a channel, alpha too, is not finite.
+[[nodiscard]] float TexelLight(vk::Format format, const uint32_t* word) {
 	switch (format) {
 		case vk::Format::eB10G11R11UfloatPack32: {
 			const float r = UnsignedSmallFloat(word[0] & 0x7ffu, 6);
 			const float g = UnsignedSmallFloat((word[0] >> 11u) & 0x7ffu, 6);
 			const float b = UnsignedSmallFloat(word[0] >> 22u, 5);
-			return r < 0.0f || g < 0.0f || b < 0.0f ? -1.0f
-			                                        : 0.2126f * r + 0.7152f * g + 0.0722f * b;
+			return r < 0.0f || g < 0.0f || b < 0.0f ? -1.0f : Luminance(r, g, b);
 		}
+		case vk::Format::eR16G16Sfloat:
 		case vk::Format::eR16G16B16A16Sfloat: {
-			const float r = HalfToFloat(word[0] & 0xffffu);
-			const float g = HalfToFloat(word[0] >> 16u);
-			const float b = HalfToFloat(word[1] & 0xffffu);
-			const float l = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-			return std::isfinite(l) && l >= 0.0f ? l : -1.0f;
+			const uint32_t       channels = format == vk::Format::eR16G16Sfloat ? 2u : 4u;
+			std::array<float, 4> value {};
+			for (uint32_t c = 0; c < channels; c++) {
+				value[c] = HalfToFloat((word[c / 2u] >> (16u * (c % 2u))) & 0xffffu);
+				if (!std::isfinite(value[c])) {
+					return -1.0f;
+				}
+			}
+			return channels == 2u ? std::fabs(value[0]) : Luminance(value[0], value[1], value[2]);
+		}
+		case vk::Format::eR32Sfloat:
+		case vk::Format::eR32G32Sfloat:
+		case vk::Format::eR32G32B32A32Sfloat: {
+			const uint32_t channels = FloatTexelWords(format);
+			for (uint32_t c = 0; c < channels; c++) {
+				if (!std::isfinite(std::bit_cast<float>(word[c]))) {
+					return -1.0f;
+				}
+			}
+			const float r = std::bit_cast<float>(word[0]);
+			return channels == 4u
+			           ? Luminance(r, std::bit_cast<float>(word[1]), std::bit_cast<float>(word[2]))
+			           : std::fabs(r);
 		}
 		default: return -1.0f;
 	}
 }
 
-// One glyph a layer: '_' every word zero; for light formats a digit, the decade of the mean
-// luminance of its non-zero texels (5: 1 to 10, 4: 0.1 to 1, ... 0: below 1e-4, 9: 1e4 and up),
-// the letter a-j instead when under a quarter of its words are non-zero; '#' for other formats.
-[[nodiscard]] std::string LayerContentGlyphs(const uint32_t* words, size_t count, uint32_t layers,
-                                             vk::Format format) {
-	std::string glyphs;
-	if (layers == 0 || count < layers) {
-		return glyphs;
+// The words a texel of a scanned image takes (TextureCache::ScanImageLocked): the float formats
+// light data comes in, and other uncompressed formats of whole words, whose texels are only told
+// zero or not; 0 for the rest (block-compressed, under a word).
+[[nodiscard]] uint32_t ScanTexelWords(vk::Format format) {
+	if (const auto words = FloatTexelWords(format); words != 0) {
+		return words;
 	}
-	const size_t layer_words = count / layers;
-	const bool   light =
-	    format == vk::Format::eB10G11R11UfloatPack32 || format == vk::Format::eR16G16B16A16Sfloat;
-	const size_t step = format == vk::Format::eR16G16B16A16Sfloat ? 2u : 1u;
-	glyphs.reserve(layers);
-	for (uint32_t layer = 0; layer < layers; layer++) {
-		const uint32_t* first   = words + static_cast<size_t>(layer) * layer_words;
-		size_t          nonzero = 0;
-		double          sum     = 0.0;
-		size_t          texels  = 0;
-		for (size_t k = 0; k + step <= layer_words; k += step) {
-			const bool zero = step == 2u ? (first[k] | first[k + 1]) == 0 : first[k] == 0;
-			if (zero) {
-				continue;
-			}
-			nonzero += step;
-			if (light) {
-				const float l = TexelLuminance(format, first + k);
-				if (l >= 0.0f) {
-					sum += l;
-					texels++;
-				}
-			}
-		}
-		if (nonzero == 0) {
-			glyphs += '_';
-			continue;
-		}
-		if (!light || texels == 0) {
-			glyphs += '#';
-			continue;
-		}
-		const double mean   = sum / static_cast<double>(texels);
-		const int    decade = mean <= 0.0 ? 0 : static_cast<int>(std::floor(std::log10(mean))) + 5;
-		const int    bucket = std::clamp(decade, 0, 9);
-		glyphs += static_cast<char>((nonzero * 4u < layer_words ? 'a' : '0') + bucket);
+	const auto extent = vk::blockExtent(format);
+	const auto bytes  = vk::blockSize(format);
+	if (extent[0] != 1 || extent[1] != 1 || bytes < 4u || bytes % 4u != 0) {
+		return 0;
 	}
-	return glyphs;
+	return bytes / 4u;
 }
 
-void LogGlyphs(uint32_t op, const char* kind, uint64_t address, const std::string& glyphs) {
+// Words in a guest layout, put into the host's (the inverse of ImageInfo::GetColorTransform's
+// transfer transform): the guest's 10_11_11 keeps its 11-bit red in the high bits, the host's
+// B10G11R11 in the low ones, so the guest's bytes decoded as the host format read wrong.
+void GuestToHostLayout(uint32_t* words, size_t count, ColorTransform transform) {
+	switch (transform) {
+		case ColorTransform::Reverse10_11_11:
+			for (size_t i = 0; i < count; i++) {
+				const uint32_t packed = words[i];
+				words[i]              = (packed >> 21u) | (((packed >> 10u) & 0x7ffu) << 11u) |
+				           ((packed & 0x3ffu) << 22u);
+			}
+			break;
+		case ColorTransform::SwapBgra16:
+			for (size_t i = 0; i + 1u < count; i += 2u) {
+				const uint32_t x = words[i];
+				const uint32_t y = words[i + 1u];
+				words[i]         = (y & 0xffffu) | (x & 0xffff0000u);
+				words[i + 1u]    = (x & 0xffffu) | (y & 0xffff0000u);
+			}
+			break;
+		case ColorTransform::None: break;
+	}
+}
+
+// The bytes of mip 0 of every layer (or depth slice) of an image, tightly packed, as
+// TextureCache::ScanImageLocked copies them; 0 when it does not scan the image.
+[[nodiscard]] uint64_t ScanTexelBytes(const Image& image) {
+	if (image.depth_id || image.backing.image == nullptr || image.backing.samples != 1 ||
+	    image.info.IsDepth() || image.info.data.Empty()) {
+		return 0;
+	}
+	const uint32_t texel_words = ScanTexelWords(image.backing.format);
+	if (texel_words == 0) {
+		return 0;
+	}
+	const uint64_t width       = std::max(image.backing.extent.width, 1u);
+	const uint64_t height      = std::max(image.backing.extent.height, 1u);
+	const uint64_t layers      = image.backing.image_type == vk::ImageType::e3D
+	                                 ? std::max(image.backing.extent.depth, 1u)
+	                                 : std::max(image.backing.layers, 1u);
+	const uint64_t layer_bytes = width * height * texel_words * sizeof(uint32_t);
+	if (layer_bytes == 0 || layer_bytes > UINT64_MAX / layers) {
+		return 0;
+	}
+	return layer_bytes * layers;
+}
+
+[[nodiscard]] bool ZeroTexel(const uint32_t* word, uint32_t words) {
+	for (uint32_t k = 0; k < words; k++) {
+		if (word[k] != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// What a layer's texels hold.
+struct LayerScan {
+	size_t texels    = 0;
+	size_t zero      = 0;
+	size_t nonfinite = 0;
+	double light     = 0.0; // of the finite non-zero texels, summed
+};
+
+[[nodiscard]] LayerScan ScanTexels(const uint32_t* words, size_t count, vk::Format format) {
+	const uint32_t texel_words = FloatTexelWords(format);
+	const uint32_t step        = std::max(texel_words, 1u);
+	LayerScan      scan;
+	for (size_t k = 0; k + step <= count; k += step) {
+		scan.texels++;
+		if (ZeroTexel(words + k, step)) {
+			scan.zero++;
+			continue;
+		}
+		if (texel_words == 0) {
+			continue;
+		}
+		const float light = TexelLight(format, words + k);
+		if (light < 0.0f) {
+			scan.nonfinite++;
+		} else {
+			scan.light += light;
+		}
+	}
+	return scan;
+}
+
+// One glyph a layer: '_' when every texel is zero. For the float formats light comes in: a digit,
+// the decade of the mean light of its non-zero texels (5: 1 to 10, 4: 0.1 to 1, ... 0: below
+// 1e-4, 9: 1e4 and up), the letter a-j instead when under a quarter of its texels are non-zero;
+// '!' when some of its texels are not finite (infinity or NaN), '#' when every non-zero one is.
+// '+' for a layer of another format that is not all zero.
+[[nodiscard]] char LayerGlyph(const LayerScan& scan, bool float_format) {
+	const size_t nonzero = scan.texels - scan.zero;
+	if (nonzero == 0) {
+		return '_';
+	}
+	if (!float_format) {
+		return '+';
+	}
+	if (scan.nonfinite == nonzero) {
+		return '#';
+	}
+	if (scan.nonfinite != 0) {
+		return '!';
+	}
+	const double mean   = scan.light / static_cast<double>(nonzero);
+	const int    decade = !std::isfinite(mean) ? 9
+	                      : mean <= 0.0        ? 0
+	                                           : static_cast<int>(std::floor(std::log10(mean))) + 5;
+	return static_cast<char>((nonzero * 4u < scan.texels ? 'a' : '0') + std::clamp(decade, 0, 9));
+}
+
+constexpr const char* LayerGlyphLegend =
+    "'_' all zero; else a digit for the decade of the mean light, 5 for 1 to 10, 4 for 0.1 to 1 "
+    "...; a-j when mostly zero; '!' some texels not finite (infinity or NaN), '#' all of them; "
+    "'+' not a float format";
+
+// The words most of the texels that are not finite hold (their first word), up to `most`.
+[[nodiscard]] std::string CommonNonFiniteWords(const uint32_t* words, size_t count,
+                                               vk::Format format, size_t most) {
+	const uint32_t                         step = std::max(FloatTexelWords(format), 1u);
+	std::unordered_map<uint32_t, uint32_t> counts;
+	for (size_t k = 0; k + step <= count; k += step) {
+		if (!ZeroTexel(words + k, step) && TexelLight(format, words + k) < 0.0f) {
+			counts[words[k]]++;
+		}
+	}
+	std::vector<std::pair<uint32_t, uint32_t>> sorted(counts.begin(), counts.end());
+	std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+		return a.second != b.second ? a.second > b.second : a.first < b.first;
+	});
+	std::string text;
+	for (size_t i = 0; i < std::min(most, sorted.size()); i++) {
+		text += fmt::format(" {:08x} x{}", sorted[i].first, sorted[i].second);
+	}
+	if (sorted.size() > most) {
+		text += fmt::format(" (and {} other words)", sorted.size() - most);
+	}
+	return text;
+}
+
+// A glyph a layer (LayerGlyph), and for each run of layers that hold texels that are not finite,
+// up to max_details, a line on the run's first layer: how many of its texels, and their words.
+struct LayerSummary {
+	std::string              glyphs;
+	std::vector<std::string> details;
+	uint32_t                 nonfinite_layers = 0;
+	uint32_t                 runs             = 0;
+};
+
+[[nodiscard]] LayerSummary SummarizeLayers(const uint32_t* words, size_t count, uint32_t layers,
+                                           vk::Format format, size_t max_details) {
+	LayerSummary summary;
+	if (layers == 0 || count < layers) {
+		return summary;
+	}
+	const size_t layer_words  = count / layers;
+	const bool   float_format = FloatTexelWords(format) != 0;
+	summary.glyphs.reserve(layers);
+	for (uint32_t layer = 0; layer < layers; layer++) {
+		summary.glyphs += LayerGlyph(
+		    ScanTexels(words + static_cast<size_t>(layer) * layer_words, layer_words, format),
+		    float_format);
+	}
+	for (uint32_t first = 0; first < layers;) {
+		const char glyph = summary.glyphs[first];
+		if (glyph != '#' && glyph != '!') {
+			first++;
+			continue;
+		}
+		uint32_t last = first;
+		while (last + 1u < layers && summary.glyphs[last + 1u] == glyph) {
+			last++;
+		}
+		summary.runs++;
+		summary.nonfinite_layers += last - first + 1u;
+		if (summary.details.size() < max_details) {
+			const auto* layer_first = words + static_cast<size_t>(first) * layer_words;
+			const auto  scan        = ScanTexels(layer_first, layer_words, format);
+			summary.details.push_back(fmt::format(
+			    "layers {}-{} '{}': layer {} has {} of {} texels not finite, {} zero; the most "
+			    "common words:{}",
+			    first, last, glyph, first, scan.nonfinite, scan.texels, scan.zero,
+			    CommonNonFiniteWords(layer_first, layer_words, format, 4)));
+		}
+		first = last + 1u;
+	}
+	return summary;
+}
+
+void LogGlyphLines(const std::string& prefix, const std::string& glyphs) {
 	constexpr size_t Chunk = 192;
 	for (size_t first = 0; first < glyphs.size(); first += Chunk) {
 		const auto part = glyphs.substr(first, Chunk);
-		LOGF("FG %u %s 0x%012" PRIx64 " [%zu-%zu]: %s\n", op, kind, address, first,
-		     first + part.size() - 1u, part.c_str());
+		LOGF("%s [%zu-%zu]: %s\n", prefix.c_str(), first, first + part.size() - 1u, part.c_str());
 	}
+}
+
+void LogLayerDetails(const std::string& prefix, const LayerSummary& summary) {
+	if (summary.nonfinite_layers == 0) {
+		return;
+	}
+	LOGF("%s: %u of %zu layers hold texels that are not finite (%u runs)\n", prefix.c_str(),
+	     summary.nonfinite_layers, summary.glyphs.size(), summary.runs);
+	for (const auto& detail: summary.details) {
+		LOGF("%s %s\n", prefix.c_str(), detail.c_str());
+	}
+}
+
+void LogLayerSummary(const std::string& prefix, const LayerSummary& summary) {
+	LogGlyphLines(prefix, summary.glyphs);
+	LogLayerDetails(prefix, summary);
+}
+
+// The runs of layers whose glyph changed: " <first>-<last>:<before>><after>" each (up to 12
+// glyphs a side), up to `most` runs; `changed` counts the layers.
+[[nodiscard]] std::string ChangedLayers(const std::string& before, const std::string& after,
+                                        size_t most, size_t& changed) {
+	std::string text;
+	size_t      runs = 0;
+	changed          = 0;
+	for (size_t i = 0; i < after.size();) {
+		if (i < before.size() && before[i] == after[i]) {
+			i++;
+			continue;
+		}
+		size_t j = i;
+		while (j < after.size() && (j >= before.size() || before[j] != after[j])) {
+			j++;
+		}
+		changed += j - i;
+		if (runs++ < most) {
+			const auto shown = std::min<size_t>(j - i, 12);
+			text += fmt::format(" {}-{}:{}>{}", i, j - 1,
+			                    i < before.size() ? before.substr(i, shown) : std::string(),
+			                    after.substr(i, shown));
+		}
+		i = j;
+	}
+	if (runs > most) {
+		text += fmt::format(" (and {} more runs)", runs - most);
+	}
+	return text;
+}
+
+// KYTY_TRACE_VERIFY_MB (default 2048): how much the traces' guest-memory comparisons
+// (TextureCache::TraceVerify) download in all, each range once. `peek` only says whether a claim
+// would be granted.
+bool TraceVerifyClaim(uint64_t address, uint64_t size, bool peek) {
+	static std::mutex                              mutex;
+	static std::set<std::pair<uint64_t, uint64_t>> claimed;
+	static uint64_t                                used   = 0;
+	static const uint64_t                          budget = [] {
+        const char* value = std::getenv("KYTY_TRACE_VERIFY_MB");
+        return (value != nullptr ? std::strtoull(value, nullptr, 10) : 2048ull) << 20u;
+	}();
+	std::scoped_lock lock {mutex};
+	if (size == 0 || size > FrameGraph::MaxVerifyBytes || used + size > budget ||
+	    claimed.contains({address, size})) {
+		return false;
+	}
+	if (!peek) {
+		claimed.emplace(address, size);
+		used += size;
+	}
+	return true;
+}
+
+bool ClaimTraceVerify(uint64_t address, uint64_t size) {
+	return TraceVerifyClaim(address, size, false);
 }
 
 } // namespace
 
 void TextureCache::VerifyWithGuest(ImageId id, uint32_t op, const std::string& what) {
+	CompareImageWithGuest(id, fmt::format("FG {}", op), what, true, &FrameGraph::ClaimVerifyTexture,
+	                      &FrameGraph::ClaimVerifyLayers);
+}
+
+void TextureCache::TraceVerify(ImageId id, const std::string& label, const std::string& what) {
+	CompareImageWithGuest(id, label, what, false, &ClaimTraceVerify, &ClaimTraceVerify);
+}
+
+void TextureCache::CompareImageWithGuest(ImageId id, const std::string& label,
+                                         const std::string& what, bool frame_graph,
+                                         bool (*claim)(uint64_t, uint64_t),
+                                         bool (*claim_layers)(uint64_t, uint64_t)) {
 	if (!id) {
 		return;
 	}
@@ -2913,8 +3379,7 @@ void TextureCache::VerifyWithGuest(ImageId id, uint32_t op, const std::string& w
 	auto*            image = m_slot_images.try_get(id);
 	if (image == nullptr || image->depth_id || image->info.data.Empty() || image->info.IsDepth() ||
 	    image->info.samples != 1 ||
-	    image->info.metadata.compression != VideoOutCompression::Uncompressed ||
-	    !image->SafeToDownload()) {
+	    image->info.metadata.compression != VideoOutCompression::Uncompressed) {
 		return;
 	}
 	const auto range = image->info.data;
@@ -2922,44 +3387,71 @@ void TextureCache::VerifyWithGuest(ImageId id, uint32_t op, const std::string& w
 	                 m_buffer_cache.IsRegionGpuModified(range.address, range.size);
 	const auto layers  = image->info.resources.layers;
 	const bool layered = layers >= 6u && !image->info.IsVolume() && range.size % layers == 0;
-	if ((gpu && !layered) || range.size % sizeof(uint32_t) != 0 ||
-	    !FrameGraph::ClaimVerify(range.address, range.size)) {
+	// A linear image with a colour transform downloads through a scratch copy that does not keep
+	// the padding between its rows: its comparison would always differ.
+	const bool transformed_linear =
+	    !image->info.IsTiled() && image->info.GetColorTransform() != ColorTransform::None;
+	if ((gpu && !layered) || (!gpu && transformed_linear) || range.size % sizeof(uint32_t) != 0) {
+		return;
+	}
+	// The download, and the copy of mip 0 an array's layers are told from.
+	const uint64_t scan_bytes  = layered ? ScanTexelBytes(*image) : 0;
+	const uint64_t claim_bytes = range.size + scan_bytes;
+	const auto     claim_now   = gpu ? claim_layers : claim;
+	// A frame capture claims each range once: no more work for the next bindings of it. A trace's
+	// claims hold for the whole run: claimed only once the comparison is recorded.
+	if (frame_graph ? !claim_now(range.address, claim_bytes)
+	                : !TraceVerifyClaim(range.address, claim_bytes, true)) {
 		return;
 	}
 	const bool tracked_dirty = image->IsCpuDirty();
 	const bool cached_buffer = m_buffer_cache.IsRegionRegistered(range.address, range.size);
 	if (!gpu) {
-		// As the draw's binding will see it (RebindImages refreshes it after this).
+		// As the binding will see it (RebindImages refreshes it after this).
 		RefreshImage(id);
 		image = m_slot_images.try_get(id);
-		if (image == nullptr) {
+		if (image == nullptr || image->IsDefinitelyCpuDirty()) {
 			return;
 		}
 	}
 	auto transfer = BuildDownload(*image);
-	if (!transfer.valid || transfer.depth_target) {
+	if (!transfer.valid || transfer.depth_target ||
+	    (!frame_graph && !claim_now(range.address, claim_bytes))) {
 		return;
 	}
-	const size_t                           words = range.size / sizeof(uint32_t);
-	std::shared_ptr<std::vector<uint32_t>> guest;
-	if (!gpu) {
-		guest = std::make_shared<std::vector<uint32_t>>(words);
-		if (!LibKernel::Memory::TryReadBacking(range.address, guest->data(), range.size)) {
-			return;
-		}
+	const auto& info        = image->info;
+	const auto  description = fmt::format(
+        "{} 0x{:012x}+0x{:x} {}x{}x{} layers {} mips {} fmt {} guest {} tile {} [{}{}{}] overlaps "
+	     "{} ({} GPU-written){}{}",
+        what, range.address, range.size, info.extent.width, info.extent.height, info.extent.depth,
+        layers, info.resources.levels, static_cast<int>(info.pixel_format),
+        static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode),
+        gpu ? 'G' : '-', image->IsBufferModified() ? 'B' : '-', tracked_dirty ? 'C' : '-',
+        state.overlaps, state.gpu_overlaps, cached_buffer ? ", a cached buffer covers it" : "",
+        !gpu && image->IsMaybeCpuDirty() ? ", maybe CPU-written since (a write next to it)" : "");
+	// An array's mip 0 as the GPU holds it, a glyph a layer (the float formats light data comes
+	// in): its texels alone, without the guest layout's padding.
+	if (layered) {
+		(void)ScanImageLocked(*image, fmt::format("{} layers 0x{:012x}", label, range.address),
+		                      FrameGraph::MaxVerifyBytes, nullptr,
+		                      fmt::format("{} layers {}, mip 0 as the GPU holds it ({}):", label,
+		                                  description, LayerGlyphLegend));
+	}
+	const size_t words = range.size / sizeof(uint32_t);
+	// The guest bytes: what the GPU's copy of an image it did not write is compared with; for an
+	// array it wrote, what guest memory holds beside what the GPU does.
+	auto guest = std::make_shared<std::vector<uint32_t>>(words);
+	if (!LibKernel::Memory::TryReadBacking(range.address, guest->data(), range.size)) {
+		return;
 	}
 	auto download = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
 	                                         AllFlags, range.size);
 	if (download->Mapped().data() == nullptr) {
 		return;
 	}
-	// The guest bytes first (zeros for a GPU-written image): the copy writes only the texels, so
-	// the padding between them compares equal.
-	if (guest != nullptr) {
-		std::memcpy(download->Mapped().data(), guest->data(), range.size);
-	} else {
-		std::memset(download->Mapped().data(), 0, range.size);
-	}
+	// The guest bytes first: the copy writes only the texels, so the padding between them compares
+	// equal.
+	std::memcpy(download->Mapped().data(), guest->data(), range.size);
 	download->Flush(0, range.size);
 	DownloadImage(*image, *download, 0, range.size, std::move(transfer));
 	vk::BufferMemoryBarrier barrier {};
@@ -2974,60 +3466,279 @@ void TextureCache::VerifyWithGuest(ImageId id, uint32_t op, const std::string& w
 	m_scheduler.Current().Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                                 vk::PipelineStageFlagBits::eHost, {}, 0,
 	                                                 nullptr, 1, &barrier, 0, nullptr);
-	const auto& info        = image->info;
-	const auto  description = fmt::format(
-        "{} 0x{:012x}+0x{:x} {}x{}x{} layers {} mips {} fmt {} guest {} tile {} [{}{}{}] overlaps "
-	     "{} "
-	     "({} GPU-written){}",
-        what, range.address, range.size, info.extent.width, info.extent.height, info.extent.depth,
-        layers, info.resources.levels, static_cast<int>(info.pixel_format),
-        static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode),
-        gpu ? 'G' : '-', image->IsBufferModified() ? 'B' : '-', tracked_dirty ? 'C' : '-',
-        state.overlaps, state.gpu_overlaps, cached_buffer ? ", a cached buffer covers it" : "");
-	const auto format = info.pixel_format;
-	m_scheduler.DeferPriorityOperation([download, guest, range, words, op, description, layered,
-	                                    layers, format] {
+	const auto format    = info.pixel_format;
+	const auto transform = info.GetColorTransform();
+	m_scheduler.DeferPriorityOperation([download, guest, range, words, label, description, layered,
+	                                    layers, format, transform, gpu, frame_graph] {
 		download->Invalidate(0, range.size);
-		const auto* held    = reinterpret_cast<const uint32_t*>(download->Mapped().data());
-		bool        differs = false;
-		if (guest != nullptr) {
-			size_t differ = 0, first = words, guest_zero = 0, gpu_zero = 0;
-			for (size_t i = 0; i < words; i++) {
-				guest_zero += (*guest)[i] == 0 ? 1u : 0u;
-				gpu_zero += held[i] == 0 ? 1u : 0u;
-				if (held[i] != (*guest)[i]) {
-					first = differ++ == 0 ? i : first;
-				}
-			}
-			differs = differ != 0;
-			if (differs) {
-				LOGF("FG %u stale %s: %zu of %zu words differ, the first at +0x%zx (guest "
-				     "%08x, GPU %08x); zero words: guest %zu, GPU %zu\n",
-				     op, description.c_str(), differ, words, first * 4u, (*guest)[first],
-				     held[first], guest_zero, gpu_zero);
-				if (layered) {
-					const size_t layer_words = words / layers;
-					std::string  glyphs;
-					glyphs.reserve(layers);
-					for (uint32_t layer = 0; layer < layers; layer++) {
-						const auto at = static_cast<size_t>(layer) * layer_words;
-						glyphs += std::memcmp(held + at, guest->data() + at,
-						                      layer_words * sizeof(uint32_t)) == 0
-						              ? '='
-						              : 'x';
-					}
-					LogGlyphs(op, "stale layers", range.address, glyphs);
-				}
+		const auto* held   = reinterpret_cast<const uint32_t*>(download->Mapped().data());
+		size_t      differ = 0, first = words, guest_zero = 0, gpu_zero = 0;
+		for (size_t i = 0; i < words; i++) {
+			guest_zero += (*guest)[i] == 0 ? 1u : 0u;
+			gpu_zero += held[i] == 0 ? 1u : 0u;
+			if (held[i] != (*guest)[i]) {
+				first = differ++ == 0 ? i : first;
 			}
 		}
-		if (layered) {
-			LOGF("FG %u layers %s, as the GPU holds them ('_' empty; else the decade of the "
-			     "mean light, 5 for 1 to 10, 4 for 0.1 to 1 ..., a-j when mostly empty):\n",
-			     op, description.c_str());
-			LogGlyphs(op, "layers", range.address, LayerContentGlyphs(held, words, layers, format));
+		const bool stale = !gpu && differ != 0;
+		if (stale) {
+			LOGF("%s stale %s: %zu of %zu words differ, the first at +0x%zx (guest %08x, GPU "
+			     "%08x); zero words: guest %zu, GPU %zu\n",
+			     label.c_str(), description.c_str(), differ, words, first * 4u, (*guest)[first],
+			     held[first], guest_zero, gpu_zero);
 		}
-		FrameGraph::CountVerify(true, range.size, differs);
+		if (layered && (gpu || stale)) {
+			// Which layers the GPU holds as guest memory does: for one the GPU wrote, the layers it
+			// never wrote since their upload (or wrote the same bytes into).
+			const size_t layer_words = words / layers;
+			std::string  glyphs;
+			glyphs.reserve(layers);
+			for (uint32_t layer = 0; layer < layers; layer++) {
+				const auto at = static_cast<size_t>(layer) * layer_words;
+				glyphs +=
+				    std::memcmp(held + at, guest->data() + at, layer_words * sizeof(uint32_t)) == 0
+				        ? '='
+				        : 'x';
+			}
+			LOGF("%s %s %s: '=' the GPU holds the layer as guest memory does, 'x' it does not:\n",
+			     label.c_str(), gpu ? "guest-equal layers" : "stale layers", description.c_str());
+			LogGlyphLines(fmt::format("{} {} 0x{:012x}", label,
+			                          gpu ? "guest-equal layers" : "stale layers", range.address),
+			              glyphs);
+		}
+		if (layered && gpu) {
+			// What guest memory holds, padding included (its texels in the host's bit layout).
+			GuestToHostLayout(guest->data(), words, transform);
+			const auto summary = SummarizeLayers(guest->data(), words, layers, format, 6);
+			LOGF("%s guest layers 0x%012" PRIx64
+			     ", as guest memory holds them (padding included):\n",
+			     label.c_str(), range.address);
+			LogLayerSummary(fmt::format("{} guest layers 0x{:012x}", label, range.address),
+			                summary);
+		}
+		if (frame_graph) {
+			FrameGraph::CountVerify(true, range.size, stale);
+		}
 	});
+}
+
+bool TextureCache::ScanImageLocked(Image& image, const std::string& prefix, uint64_t max_bytes,
+                                   std::shared_ptr<TraceHistory> history,
+                                   const std::string&            header) {
+	if (image.depth_id || image.backing.image == nullptr || image.backing.samples != 1 ||
+	    image.info.IsDepth() || image.info.data.Empty()) {
+		return false;
+	}
+	const auto     format = image.backing.format;
+	const uint64_t bytes  = ScanTexelBytes(image);
+	if (bytes == 0 || bytes > max_bytes) {
+		return false;
+	}
+	// The host image's own extent: a copy region must lie within it.
+	const uint32_t width  = std::max(image.backing.extent.width, 1u);
+	const uint32_t height = std::max(image.backing.extent.height, 1u);
+	const bool     volume = image.backing.image_type == vk::ImageType::e3D;
+	const uint32_t layers =
+	    volume ? std::max(image.backing.extent.depth, 1u) : std::max(image.backing.layers, 1u);
+	auto download = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                                         AllFlags, bytes);
+	if (download->Mapped().data() == nullptr) {
+		return false;
+	}
+	vk::BufferImageCopy region {};
+	region.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, volume ? 1u : layers};
+	region.imageExtent      = vk::Extent3D {width, height, volume ? layers : 1u};
+	image.Download(std::span {&region, 1u}, download->Handle(), 0, bytes);
+	vk::BufferMemoryBarrier barrier {};
+	barrier.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = download->Handle();
+	barrier.offset              = 0;
+	barrier.size                = bytes;
+	m_scheduler.Current().Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                                                 vk::PipelineStageFlagBits::eHost, {}, 0,
+	                                                 nullptr, 1, &barrier, 0, nullptr);
+	m_scheduler.DeferPriorityOperation([download, bytes, layers, format, prefix, history, header] {
+		download->Invalidate(0, bytes);
+		const auto* words   = reinterpret_cast<const uint32_t*>(download->Mapped().data());
+		const auto  summary = SummarizeLayers(words, bytes / sizeof(uint32_t), layers, format, 6);
+		if (!header.empty()) {
+			LOGF("%s\n", header.c_str());
+		}
+		if (history == nullptr) {
+			LogLayerSummary(prefix, summary);
+			return;
+		}
+		std::string before;
+		{
+			std::scoped_lock lock {history->mutex};
+			before = std::exchange(history->glyphs, summary.glyphs);
+		}
+		if (before.empty()) {
+			LogLayerSummary(prefix, summary);
+			return;
+		}
+		size_t     changed = 0;
+		const auto runs    = ChangedLayers(before, summary.glyphs, 40, changed);
+		LOGF("%s: %zu of %zu layers changed%s%s; %u hold texels that are not finite\n",
+		     prefix.c_str(), changed, summary.glyphs.size(), changed != 0 ? ":" : "", runs.c_str(),
+		     summary.nonfinite_layers);
+		if (changed > 96) {
+			LogGlyphLines(prefix, summary.glyphs);
+		}
+		if (changed != 0) {
+			LogLayerDetails(prefix, summary);
+		}
+	});
+	return true;
+}
+
+bool TextureCache::TraceScanImage(ImageId id, const std::string& prefix, uint64_t max_bytes) {
+	if (!id) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	auto*            image = m_slot_images.try_get(id);
+	return image != nullptr && ScanImageLocked(*image, prefix, max_bytes, nullptr, std::string());
+}
+
+bool TextureCache::TracesImage(ImageId id) const {
+	return m_trace != nullptr && m_trace->images.contains(id);
+}
+
+void TextureCache::TraceImageCreated(ImageId id) {
+	if (!m_trace->Matches(m_slot_images[id].info)) {
+		return;
+	}
+	auto& followed  = m_trace->images[id];
+	followed        = {};
+	followed.serial = ++m_trace->serials;
+	TraceImageEvent(id, "created", true);
+}
+
+void TextureCache::TraceImageEvent(ImageId id, const std::string& event, bool guest_glyphs) {
+	if (m_trace == nullptr) {
+		return;
+	}
+	const auto found = m_trace->images.find(id);
+	if (found == m_trace->images.end()) {
+		return;
+	}
+	auto&       followed = found->second;
+	const auto& image    = m_slot_images[id];
+	const auto& info     = image.info;
+	LOGF("Trace image #%u 0x%012" PRIx64 "+0x%" PRIx64 " %ux%u layers %u mips %u fmt %d tile %u "
+	     "frame %" PRIu64 " [%c%c%c]: %s\n",
+	     followed.serial, info.data.address, info.data.size, info.extent.width, info.extent.height,
+	     info.resources.layers, info.resources.levels, static_cast<int>(info.pixel_format),
+	     static_cast<uint32_t>(info.tile_mode),
+	     m_graphics.presented_frames.load(std::memory_order_relaxed),
+	     image.IsGpuModified() ? 'G' : '-', image.IsBufferModified() ? 'B' : '-',
+	     image.IsCpuDirty() ? 'C' : '-', event.c_str());
+	const auto layers = std::max(info.resources.layers, 1u);
+	if (!guest_glyphs || info.IsVolume() || info.data.size % (uint64_t {layers} * 4u) != 0 ||
+	    info.data.size > FrameGraph::MaxVerifyBytes || followed.guest_logs >= 64) {
+		return;
+	}
+	std::vector<uint32_t> words(info.data.size / sizeof(uint32_t));
+	if (!LibKernel::Memory::TryReadBacking(info.data.address, words.data(), info.data.size)) {
+		LOGF("Trace image #%u: its guest bytes cannot be read\n", followed.serial);
+		return;
+	}
+	GuestToHostLayout(words.data(), words.size(), info.GetColorTransform());
+	const auto summary = SummarizeLayers(words.data(), words.size(), layers, info.pixel_format, 6);
+	auto&      last    = m_trace->guest_glyphs[info.data.address];
+	if (last == summary.glyphs) {
+		LOGF("Trace image #%u: its guest bytes, a glyph a layer, are as last logged\n",
+		     followed.serial);
+		return;
+	}
+	followed.guest_logs++;
+	last = summary.glyphs;
+	LOGF("Trace image #%u guest bytes, a glyph a layer, padding included (%s):\n", followed.serial,
+	     LayerGlyphLegend);
+	LogLayerSummary(fmt::format("Trace image #{} guest", followed.serial), summary);
+}
+
+void TextureCache::TraceImageChanged(Image& image, const char* how, bool gpu_write) {
+	if (m_trace == nullptr) {
+		return;
+	}
+	const auto found = m_trace->images.find(image.self_id);
+	if (found == m_trace->images.end()) {
+		return;
+	}
+	found->second.changed = true;
+	found->second
+	    .writers[gpu_write && s_trace_shader != 0 ? fmt::format("cs {:016x}", s_trace_shader)
+	                                              : std::string(how)]++;
+}
+
+void TextureCache::TraceCpuWrite(ImageId id, const Image& image, uint64_t address, uint64_t size) {
+	const auto found = m_trace->images.find(id);
+	if (found == m_trace->images.end()) {
+		return;
+	}
+	const auto count = ++found->second.cpu_writes;
+	if (count > 8 && !std::has_single_bit(count)) {
+		return;
+	}
+	const auto offset = address > image.info.data.address ? address - image.info.data.address : 0;
+	const auto layers = std::max(image.info.resources.layers, 1u);
+	const auto slice  = image.info.data.size / layers;
+	TraceImageEvent(id,
+	                fmt::format("CPU write 0x{:012x}+0x{:x} (offset 0x{:x}, layer {}; {} so far){}",
+	                            address, size, offset, slice != 0 ? offset / slice : 0, count,
+	                            image.IsGpuModified() ? ": its GPU pixels give way to the guest "
+	                                                    "bytes at its next use"
+	                                                  : ""),
+	                false);
+}
+
+void TextureCache::TraceFrameEnd() {
+	if (m_trace == nullptr) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	const auto       frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	for (auto it = m_trace->images.begin(); it != m_trace->images.end();) {
+		auto& [id, followed] = *it;
+		auto* image          = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered) {
+			it = m_trace->images.erase(it);
+			continue;
+		}
+		if (followed.changed && m_trace->snapshots < m_trace->max_snapshots) {
+			std::string writers;
+			for (const auto& [who, count]: followed.writers) {
+				writers += fmt::format(" {} x{}", who, count);
+			}
+			auto& history = m_trace->history[image->info.data.address];
+			if (history == nullptr) {
+				history = std::make_shared<TraceHistory>();
+			}
+			const auto prefix = fmt::format("Trace image #{} frame {}", followed.serial, frame);
+			if (ScanImageLocked(
+			        *image, prefix, FrameGraph::MaxVerifyBytes, history,
+			        fmt::format("{} 0x{:012x}: mip 0 as the GPU holds it, changed by:{}", prefix,
+			                    image->info.data.address, writers))) {
+				if (++m_trace->snapshots == m_trace->max_snapshots) {
+					LOGF("Trace image: the snapshots stop here (KYTY_TRACE_IMAGES_SNAPSHOTS=%u)\n",
+					     m_trace->max_snapshots);
+				}
+			} else if (!followed.unscanned_logged) {
+				followed.unscanned_logged = true;
+				LOGF("%s: no snapshot (its format is block-compressed or under a word a texel, or "
+				     "mip 0 is over %" PRIu64 " MB); changed by:%s\n",
+				     prefix.c_str(), FrameGraph::MaxVerifyBytes >> 20u, writers.c_str());
+			}
+			followed.changed = false;
+			followed.writers.clear();
+		}
+		++it;
+	}
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
@@ -3068,7 +3779,26 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 				     static_cast<uint32_t>(image.info.pixel_format));
 			}
 		}
+		if (TracesImage(id)) {
+			TraceImageEvent(
+			    id,
+			    fmt::format("GPU buffer write 0x{:012x}+0x{:x} at its base (writers {}): "
+			                "its next use takes the buffer's bytes",
+			                address, size, BufferCache::GpuWritersOf(address, size)),
+			    false);
+		}
 		if (image.IsGpuModified()) {
+			static std::atomic<uint64_t> replaced {0};
+			const auto                   count = ++replaced;
+			if (count <= 32 || std::has_single_bit(count)) {
+				LOGF("TextureCache: GPU buffer write 0x%012" PRIx64 "+0x%" PRIx64
+				     " at the base of GPU-written image 0x%012" PRIx64 "+0x%" PRIx64
+				     " %ux%u layers %u mips %u fmt %d: its next use takes the buffer's bytes over "
+				     "its pixels (%" PRIu64 " so far)\n",
+				     address, size, image.info.data.address, image.info.data.size,
+				     image.info.extent.width, image.info.extent.height, image.info.resources.layers,
+				     image.info.resources.levels, static_cast<int>(image.info.pixel_format), count);
+			}
 			image.ClearGpuModified();
 		}
 		image.MarkBufferModified();
@@ -3084,6 +3814,9 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 			continue;
 		}
 		if (owner->Overlaps(address, size)) {
+			if (m_trace != nullptr) {
+				TraceCpuWrite(id, *owner, address, size);
+			}
 			owner->InvalidateCpuWrite(address, size);
 			UntrackImage(id);
 			continue;
@@ -3159,7 +3892,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		if (owner == nullptr) {
 			continue;
 		}
-		FreeImage(id);
+		FreeImage(id, "its memory was unmapped", true);
 	}
 }
 
@@ -3219,7 +3952,7 @@ void TextureCache::RunGarbageCollector() {
 		const auto freed = image->AccountedSize();
 		g_gc_skip.freed++;
 		g_gc_skip.freed_mb += freed >> 20u;
-		FreeImage(pending.id);
+		FreeImage(pending.id, "evicted, written back", true);
 		return true;
 	});
 	// Memory pressure (GraphicContext::MemoryShortfall: device use past 90 % of the video memory
@@ -3268,7 +4001,7 @@ void TextureCache::RunGarbageCollector() {
 			}
 			m_guest_dropped_freed++;
 			m_guest_dropped_freed_bytes += image->AccountedSize();
-			FreeImage(id);
+			FreeImage(id, "dropped by the guest", true);
 			return true;
 		});
 		if (m_gc_tick % 500 == 0) {
@@ -3457,7 +4190,7 @@ void TextureCache::RunGarbageCollector() {
 			const auto freed = owner->AccountedSize();
 			g_gc_skip.freed++;
 			g_gc_skip.freed_mb += freed >> 20u;
-			FreeImage(id);
+			FreeImage(id, "evicted", true);
 			if (pressured || aggressive) {
 				--deletions;
 				m_gc_freed_images_frame++;

@@ -127,11 +127,52 @@ public:
 	// Diagnostics (the frame graph's verification, FrameGraph::ClaimVerify): an image a shader
 	// reads, refreshed as its binding will refresh it, against its guest bytes when the GPU did
 	// not write it ("FG <op> stale ..." when they differ), and for an array of six or more layers
-	// the contents of each layer as the GPU holds them ("FG <op> layers ..."). `what` names the
-	// binding in the lines.
+	// the contents of each layer as the GPU holds them ("FG <op> layers ...") and, for one the GPU
+	// wrote, as guest memory holds them. `what` names the binding in the lines.
 	void VerifyWithGuest(ImageId id, uint32_t op, const std::string& what);
 
+	// Diagnostics: the KYTY_TRACE_* traces (KYTY_TRACE_DISPATCHES in renderCompute.cpp,
+	// KYTY_TRACE_IMAGES here). Lines start "Trace ".
+	//
+	// Mip 0 of an image as the GPU holds it once the commands recorded so far have run, up to
+	// max_bytes: a glyph a layer, logged as "<prefix> ..." when the copy lands. For the float
+	// formats light data comes in (B10G11R11, RGBA16F, RG16F, R32F, RG32F, RGBA32F) the glyph
+	// tells the light and the layers whose texels are not all finite; for other formats of whole
+	// words a texel, only zero or not. False when it does not apply (block-compressed formats,
+	// depth, multisampled images).
+	bool TraceScanImage(ImageId id, const std::string& prefix, uint64_t max_bytes);
+	// VerifyWithGuest outside a frame capture, for an image the GPU did not write: "<label> stale
+	// ..." when the GPU's copy differs from its guest bytes. The caller decides how often.
+	void TraceVerify(ImageId id, const std::string& label, const std::string& what);
+	// GPU thread, at each guest frame end: a snapshot of each image KYTY_TRACE_IMAGES follows
+	// that changed in the frame (what changed in it, and who wrote it).
+	void TraceFrameEnd();
+	// The compute shader the GPU thread is recording a dispatch of (names the writers of the images
+	// KYTY_TRACE_IMAGES follows; 0 for draws and copies).
+	inline static thread_local uint64_t s_trace_shader = 0;
+
 private:
+	struct TraceState;
+	struct TraceHistory;
+	// The guest-memory verification behind VerifyWithGuest and TraceVerify: `label` starts the
+	// lines ("FG <op>", "Trace dispatch <n>"); `claim` says whether to compare this range now,
+	// `claim_layers` the same for an array the GPU wrote.
+	void CompareImageWithGuest(ImageId id, const std::string& label, const std::string& what,
+	                           bool frame_graph, bool (*claim)(uint64_t, uint64_t),
+	                           bool (*claim_layers)(uint64_t, uint64_t));
+	// Caller holds m_lock. TraceScanImage's copy and log; with a history, only what changed since
+	// the history's snapshot is logged (and the history becomes this one). `header` is logged
+	// first.
+	bool ScanImageLocked(Image& image, const std::string& prefix, uint64_t max_bytes,
+	                     std::shared_ptr<TraceHistory> history, const std::string& header);
+	// KYTY_TRACE_IMAGES (caller holds m_lock): whether the image is followed, and its events.
+	[[nodiscard]] bool TracesImage(ImageId id) const;
+	void               TraceImageCreated(ImageId id);
+	void               TraceImageEvent(ImageId id, const std::string& event, bool guest_glyphs);
+	// `gpu_write`: a GPU write (CommitGpuWrite), which names the shader whose dispatch it is.
+	void TraceImageChanged(Image& image, const char* how, bool gpu_write = false);
+	void TraceCpuWrite(ImageId id, const Image& image, uint64_t address, uint64_t size);
+
 	enum class TransferDirection { Upload, Download };
 	struct TextureTransfer;
 	struct ImageDownload;
@@ -175,7 +216,10 @@ private:
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
 	void                      ReleaseImage(ImageId id);
-	void                      FreeImage(ImageId id);
+	// `why` is logged when the image held pixels the GPU wrote that guest memory does not and
+	// that were not copied elsewhere (`copied`): they are lost. And for an image KYTY_TRACE_IMAGES
+	// follows.
+	void                      FreeImage(ImageId id, const char* why = nullptr, bool copied = false);
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);
 	void                      TrackImageHead(ImageId id);
@@ -298,6 +342,8 @@ private:
 	[[nodiscard]] uint64_t LruClock() const noexcept;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
+	// KYTY_TRACE_IMAGES (null when it is not set).
+	std::unique_ptr<TraceState> m_trace;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

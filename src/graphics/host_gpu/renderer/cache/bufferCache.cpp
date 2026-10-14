@@ -1795,6 +1795,56 @@ void BufferCache::VerifyWithGuest(uint64_t vaddr, uint64_t size, uint32_t op,
 	}
 }
 
+void BufferCache::TraceContents(uint64_t vaddr, uint64_t size, const std::string& prefix) {
+	size = std::min<uint64_t>(size, 4096);
+	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	const auto end = vaddr + size;
+	auto       it  = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		auto&      buffer = m_slot_buffers[it->second];
+		const auto start  = std::max(buffer.CpuAddress(), vaddr) & ~uint64_t {3};
+		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end) & ~uint64_t {3};
+		if (start < buffer.CpuAddress() || start >= finish) {
+			continue;
+		}
+		const auto bytes = finish - start;
+		auto download = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                         AllFlags, bytes);
+		if (download->Mapped().data() == nullptr) {
+			return;
+		}
+		download->CopyFrom(m_scheduler.Current(), buffer, buffer.Offset(start), 0, bytes,
+		                   vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eHostRead,
+		                   vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		                   vk::AccessFlagBits::eHostRead);
+		m_scheduler.DeferPriorityOperation([download, bytes, start, prefix] {
+			download->Invalidate(0, bytes);
+			const auto*  words     = reinterpret_cast<const uint32_t*>(download->Mapped().data());
+			const size_t count     = bytes / sizeof(uint32_t);
+			size_t       nonfinite = 0;
+			for (size_t i = 0; i < count; i++) {
+				nonfinite += (words[i] & 0x7f800000u) == 0x7f800000u ? 1u : 0u;
+			}
+			LOGF("%s 0x%012" PRIx64 "+0x%" PRIx64
+			     " as the GPU holds it: %zu of %zu words are not finite as floats\n",
+			     prefix.c_str(), start, bytes, nonfinite, count);
+			for (size_t row = 0; row < std::min<size_t>(count, 64); row += 16) {
+				std::string line;
+				for (size_t k = row; k < std::min(count, row + 16); k++) {
+					line += fmt::format(" {:08x}", words[k]);
+				}
+				LOGF("%s +0x%03zx:%s\n", prefix.c_str(), row * 4u, line.c_str());
+			}
+		});
+		return; // the first cached buffer over the range
+	}
+}
+
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 	const auto end = vaddr + size;
 	auto       it  = m_buffers.upper_bound(vaddr);

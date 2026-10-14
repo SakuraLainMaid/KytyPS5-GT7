@@ -64,11 +64,19 @@ inline constexpr size_t MaxGridChecks = 12;
 // far leave it) is compared with its guest bytes, which the CPU wrote and which are the truth for
 // it; a difference is a stale copy ("FG <op> stale ..."). An array texture of six or more layers,
 // written on the GPU or not, also gets a line of its layers' contents ("FG <op> layers ...").
-// Up to KYTY_FG_VERIFY_MB (default 3072) of downloads per capture, each up to MaxVerifyBytes.
+// Up to KYTY_FG_VERIFY_MB (default 3072) of buffer downloads per capture,
+// KYTY_FG_VERIFY_TEXTURES_MB (1536) of textures and KYTY_FG_VERIFY_LAYERS_MB (2048) of GPU-written
+// arrays, each up to MaxVerifyBytes.
 inline constexpr uint64_t MaxVerifyBytes = 256ull << 20u;
 [[nodiscard]] bool        VerifyEnabled();
-// Whether to verify this range now: the first time in the capture, within the budget.
+// Whether to verify this buffer range now: the first time in the capture, within the budget.
 [[nodiscard]] bool ClaimVerify(uint64_t address, uint64_t size);
+// The same for a texture the CPU wrote, within a budget of its own, KYTY_FG_VERIFY_TEXTURES_MB
+// (default 1536): every one is downloaded whole, and its copy is held until the GPU is done.
+[[nodiscard]] bool ClaimVerifyTexture(uint64_t address, uint64_t size);
+// The same for an array the GPU wrote (its layers' contents are shown), within a budget of its
+// own, KYTY_FG_VERIFY_LAYERS_MB (default 2048): the textures the CPU wrote do not use it up.
+[[nodiscard]] bool ClaimVerifyLayers(uint64_t address, uint64_t size);
 // Any thread, as a comparison lands: counted for the capture's "FG 0 verify" summary.
 void CountVerify(bool image, uint64_t bytes, bool differs);
 

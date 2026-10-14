@@ -874,6 +874,7 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		case SubmissionType::SuspendPoint:
 			FrameGraph::OnFrameBoundary(m_renderer.GetBufferCache());
+			m_renderer.GetTextureCache().TraceFrameEnd();
 			cp.EmitGlobalBarrier();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
 			    [ready = m_suspend_point_ready] { ready->release(); });

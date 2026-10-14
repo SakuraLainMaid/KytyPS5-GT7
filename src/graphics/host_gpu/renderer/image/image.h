@@ -193,6 +193,10 @@ public:
 	uint64_t content_hash             = 0;
 	uint64_t content_check_submission = 0;
 	bool     content_hash_valid       = false;
+	// TextureCache::InitializeImage has run: it holds contents (an upload, or the GPU's) since.
+	bool initialized = false;
+	// It holds pixels the GPU wrote (a draw, store, clear or copy) since its last upload.
+	bool gpu_pixels = false;
 
 private:
 	friend struct ImageTestAccess;

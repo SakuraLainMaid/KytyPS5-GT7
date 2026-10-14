@@ -28,6 +28,7 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -39,12 +40,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
 #include <string>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -114,6 +117,258 @@ struct DispatchRecoveryPolicy {
 		}
 	}
 };
+
+// KYTY_TRACE_DISPATCHES=<hash>[,<hash>...]: every dispatch of these compute shaders (a hash of 16
+// hex digits, or its first 8) is logged as it is recorded, "Trace dispatch <n> ...": its frame,
+// groups, user data and the words its user-data pointers point at (its constants and
+// descriptors), its textures with their cache states, and its buffers (the words of the small ones
+// it reads). Once the GPU has run it: mip 0 of each float image it writes, up to
+// KYTY_TRACE_SCAN_KB (default 1024), a glyph a layer with the texels that are not finite, and the
+// same for the images the GPU wrote that it reads (once a frame each); the first words of each
+// buffer it writes. A texture it reads that the GPU did not write is compared with its guest bytes
+// (TextureCache::TraceVerify: once each, up to KYTY_TRACE_VERIFY_MB, default 2048). Up to
+// KYTY_TRACE_MAX (default 20000) dispatches. KYTY_TRACE_FROM=<hash>: the trace starts at that
+// shader's first dispatch (a shader that runs only where the trace is wanted).
+struct ShaderHashes {
+	std::vector<uint64_t> hashes;
+	std::vector<uint32_t> prefixes; // the first 8 hex digits: the high 32 bits
+
+	[[nodiscard]] bool Empty() const { return hashes.empty() && prefixes.empty(); }
+	[[nodiscard]] bool Contains(uint64_t hash) const {
+		return std::find(hashes.begin(), hashes.end(), hash) != hashes.end() ||
+		       std::find(prefixes.begin(), prefixes.end(), static_cast<uint32_t>(hash >> 32u)) !=
+		           prefixes.end();
+	}
+	// "<hash>[,<hash>...]", each of 16 hex digits or the first 8.
+	[[nodiscard]] static ShaderHashes Parse(const char* value) {
+		ShaderHashes      result;
+		const std::string text = value != nullptr ? value : "";
+		for (size_t begin = 0; begin < text.size();) {
+			const auto end   = std::min(text.find(',', begin), text.size());
+			auto       token = text.substr(begin, end - begin);
+			begin            = end + 1u;
+			std::erase_if(token, [](char c) { return c == ' ' || c == '\t'; });
+			if (token.starts_with("0x") || token.starts_with("0X")) {
+				token = token.substr(2);
+			}
+			if (token.empty() || token.size() > 16) {
+				continue;
+			}
+			char*      stop = nullptr;
+			const auto hash = std::strtoull(token.c_str(), &stop, 16);
+			if (stop == nullptr || *stop != '\0') {
+				continue;
+			}
+			if (token.size() <= 8) {
+				result.prefixes.push_back(static_cast<uint32_t>(hash));
+			} else {
+				result.hashes.push_back(hash);
+			}
+		}
+		return result;
+	}
+};
+
+struct DispatchTraceConfig {
+	ShaderHashes traced;
+	ShaderHashes from;
+	uint64_t     max_dispatches = 20000;
+	uint64_t     scan_bytes     = 1024ull << 10u;
+};
+
+const DispatchTraceConfig& DispatchTrace() {
+	static const DispatchTraceConfig config = [] {
+		DispatchTraceConfig result;
+		result.traced = ShaderHashes::Parse(std::getenv("KYTY_TRACE_DISPATCHES"));
+		if (result.traced.Empty()) {
+			return result;
+		}
+		result.from = ShaderHashes::Parse(std::getenv("KYTY_TRACE_FROM"));
+		if (const char* max = std::getenv("KYTY_TRACE_MAX")) {
+			result.max_dispatches = std::strtoull(max, nullptr, 10);
+		}
+		if (const char* scan = std::getenv("KYTY_TRACE_SCAN_KB")) {
+			result.scan_bytes = std::strtoull(scan, nullptr, 10) << 10u;
+		}
+		LOGF("Trace dispatch: tracing the dispatches of %zu shaders (KYTY_TRACE_DISPATCHES)%s, up "
+		     "to %" PRIu64 " dispatches (KYTY_TRACE_MAX); images up to %" PRIu64
+		     " KB are scanned (KYTY_TRACE_SCAN_KB)\n",
+		     result.traced.hashes.size() + result.traced.prefixes.size(),
+		     result.from.Empty() ? "" : " from the first dispatch of KYTY_TRACE_FROM's shader",
+		     result.max_dispatches, result.scan_bytes >> 10u);
+		return result;
+	}();
+	return config;
+}
+
+// GPU thread: whether this dispatch is traced (KYTY_TRACE_FROM's shader starts the trace).
+[[nodiscard]] bool TracedShader(uint64_t hash) {
+	const auto& config = DispatchTrace();
+	if (config.traced.Empty()) {
+		return false;
+	}
+	static bool started = config.from.Empty();
+	if (!started) {
+		if (!config.from.Contains(hash)) {
+			return false;
+		}
+		started = true;
+		LOGF("Trace dispatch: the trace starts at this dispatch of cs %016" PRIx64
+		     " (KYTY_TRACE_FROM)\n",
+		     hash);
+	}
+	return config.traced.Contains(hash);
+}
+
+void LogTraceWords(const std::string& prefix, const uint32_t* words, size_t count) {
+	for (size_t row = 0; row < count; row += 16) {
+		std::string line;
+		for (size_t k = row; k < std::min(count, row + 16); k++) {
+			line += fmt::format(" {:08x}", words[k]);
+		}
+		LOGF("%s +0x%03zx:%s\n", prefix.c_str(), row * 4u, line.c_str());
+	}
+}
+
+// A texture the GPU wrote that a traced dispatch reads: scanned once a frame (many dispatches
+// read the same ones). GPU thread.
+[[nodiscard]] bool ClaimInputScan(uint64_t address, uint64_t frame) {
+	static std::unordered_map<uint64_t, uint64_t> scanned;
+	const auto [found, inserted] = scanned.emplace(address, frame);
+	if (!inserted && found->second == frame) {
+		return false;
+	}
+	found->second = frame;
+	return true;
+}
+
+// The compute shader whose dispatch the GPU thread records (TextureCache::s_trace_shader).
+struct TraceShaderScope {
+	explicit TraceShaderScope(uint64_t hash) { TextureCache::s_trace_shader = hash; }
+	~TraceShaderScope() { TextureCache::s_trace_shader = 0; }
+	KYTY_CLASS_NO_COPY(TraceShaderScope);
+};
+
+void TraceDispatch(RenderContext& context, const ShaderStageRuntime& stage,
+                   const PreparedBindings& bindings, const std::string& groups) {
+	static std::atomic<uint64_t> traced {0};
+	const auto&                  config = DispatchTrace();
+	const auto                   n      = ++traced;
+	if (n > config.max_dispatches) {
+		if (n == config.max_dispatches + 1u) {
+			LOGF("Trace dispatch: the trace stops here (KYTY_TRACE_MAX=%" PRIu64 ")\n",
+			     config.max_dispatches);
+		}
+		return;
+	}
+	const auto& program  = *stage.program;
+	const auto& snapshot = *stage.resources;
+	auto&       textures = context.GetTextureCache();
+	auto&       buffers  = context.GetBufferCache();
+	const auto  frame    = context.GetGraphics().presented_frames.load(std::memory_order_relaxed);
+	LOGF("Trace dispatch %" PRIu64 " frame %" PRIu64 " cs %016" PRIx64
+	     " groups %s: %zu textures, %zu buffers, %zu user data\n",
+	     n, frame, program.shader_hash, groups.c_str(), program.info.images.size(),
+	     program.info.buffers.size(), snapshot.user_data.size());
+	const auto& user = snapshot.user_data;
+	for (size_t row = 0; row < user.size(); row += 16) {
+		std::string line;
+		for (size_t k = row; k < std::min(user.size(), row + 16); k++) {
+			line += fmt::format(" {:08x}", user[k]);
+		}
+		LOGF("Trace dispatch %" PRIu64 " user s%zu:%s\n", n, program.user_data_base + row,
+		     line.c_str());
+	}
+	// What the user-data pointers point at: the shader's constants and descriptors, as guest
+	// memory holds them.
+	for (size_t reg = 0; reg + 1 < user.size(); reg += 2) {
+		const uint64_t address = user[reg] | (static_cast<uint64_t>(user[reg + 1]) << 32u);
+		if ((user[reg] & 3u) != 0 || user[reg + 1] == 0 || user[reg + 1] > 0xffu) {
+			continue;
+		}
+		const auto bytes = Libs::LibKernel::Memory::TryClampRangeSize(address, 256) & ~uint64_t {3};
+		if (bytes == 0) {
+			continue;
+		}
+		const auto prefix =
+		    fmt::format("Trace dispatch {} ptr s[{}:{}] 0x{:012x}", n, program.user_data_base + reg,
+		                program.user_data_base + reg + 1u, address);
+		if (buffers.HasGpuDirtyBytes(address, bytes)) {
+			LOGF("%s: the GPU wrote these bytes (not shown)\n", prefix.c_str());
+			continue;
+		}
+		std::vector<uint32_t> words(bytes / sizeof(uint32_t));
+		if (Libs::LibKernel::Memory::TryReadBacking(address, words.data(), bytes)) {
+			LogTraceWords(prefix, words.data(), words.size());
+		}
+	}
+	for (size_t i = 0; i < bindings.images.size() && i < program.info.images.size(); i++) {
+		const auto& binding  = bindings.images[i];
+		const auto& resource = program.info.images[i];
+		const auto& info     = binding.desc.info;
+		const auto& view     = binding.desc.view_info;
+		const auto  state    = binding.image_id ? textures.DiagnosticImageState(binding.image_id)
+		                                        : TextureCache::DiagnosticState {};
+		LOGF("Trace dispatch %" PRIu64 " tex[%zu] %s%s 0x%012" PRIx64 "+0x%" PRIx64
+		     " %ux%ux%u layers %u mips %u view %u+%u/%u+%u fmt %d tile %u [%c%c%c]\n",
+		     n, i, resource.written ? "write" : "read",
+		     binding.desc.type == TextureCache::BindingType::Storage ? " storage" : "",
+		     info.data.address, info.data.size, info.extent.width, info.extent.height,
+		     info.extent.depth, info.resources.layers, info.resources.levels, view.base_level,
+		     view.level_count, view.base_layer, view.layer_count,
+		     static_cast<int>(info.pixel_format), static_cast<uint32_t>(info.tile_mode),
+		     state.gpu_written ? 'G' : '-', state.buffer_write ? 'B' : '-',
+		     state.cpu_dirty ? 'C' : '-');
+		if (!binding.image_id || info.data.Empty()) {
+			continue;
+		}
+		const auto label = fmt::format("Trace dispatch {} tex[{}]", n, i);
+		if (resource.written) {
+			// One that is not scanned says so once (its address).
+			static std::unordered_set<uint64_t> unscanned;
+			if (!textures.TraceScanImage(binding.image_id, label + " out", config.scan_bytes) &&
+			    unscanned.insert(info.data.address).second) {
+				LOGF("%s out 0x%012" PRIx64 ": not scanned (over KYTY_TRACE_SCAN_KB=%" PRIu64
+				     ", or a format the scan does not read); said once\n",
+				     label.c_str(), info.data.address, config.scan_bytes >> 10u);
+			}
+		} else if (state.gpu_written || state.buffer_write) {
+			if (ClaimInputScan(info.data.address, frame)) {
+				(void)textures.TraceScanImage(binding.image_id, label + " in", config.scan_bytes);
+			}
+		} else {
+			textures.TraceVerify(binding.image_id, fmt::format("Trace dispatch {}", n),
+			                     fmt::format("tex[{}]", i));
+		}
+	}
+	for (size_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); i++) {
+		const auto     r = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
+		const uint64_t bytes =
+		    std::max<uint64_t>(r.Stride(), 1u) * static_cast<uint64_t>(r.NumRecords());
+		const uint64_t mapped  = r.Base48() >= BufferCache::CACHING_PAGESIZE && bytes != 0
+		                             ? Libs::LibKernel::Memory::TryClampRangeSize(r.Base48(), bytes)
+		                             : 0;
+		const bool     gpu     = mapped != 0 && buffers.HasGpuDirtyBytes(r.Base48(), mapped);
+		const bool     written = program.info.buffers[i].written;
+		LOGF("Trace dispatch %" PRIu64 " buf[%zu] %s 0x%012" PRIx64 "+0x%" PRIx64
+		     " (mapped 0x%" PRIx64 ") stride %u records %u fmt %u [%c]\n",
+		     n, i, written ? "write" : "read", r.Base48(), bytes, mapped, r.Stride(),
+		     r.NumRecords(), r.RawFormat(), gpu ? 'G' : '-');
+		if (mapped == 0) {
+			continue;
+		}
+		const auto prefix = fmt::format("Trace dispatch {} buf[{}]", n, i);
+		if (written) {
+			buffers.TraceContents(r.Base48(), mapped, prefix + " out");
+		} else if (!gpu && mapped <= 1024) {
+			std::vector<uint32_t> words(mapped / sizeof(uint32_t));
+			if (!words.empty() && Libs::LibKernel::Memory::TryReadBacking(
+			                          r.Base48(), words.data(), words.size() * sizeof(uint32_t))) {
+				LogTraceWords(prefix, words.data(), words.size());
+			}
+		}
+	}
+}
 
 // Dispatches are recorded on the GPU thread only.
 DispatchRecoveryPolicy& RecoveryPolicy() {
@@ -626,6 +881,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                       cs_regs.cs_regs.data_addr, nullptr, 0);
 		FrameGraph::SetShowBuffers(true);
 	}
+	const TraceShaderScope trace_shader(program.shader_hash);
 	PrepareBindings(input_info.stage, bindings);
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
 		std::copy(std::begin(input_info.dispatch_threads_num), std::end(input_info.dispatch_threads_num),
@@ -745,6 +1001,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// The removed host fence also ordered read-only dispatches before later writers.
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	} while (recovery.Retry());
+	if (TracedShader(program.shader_hash)) {
+		TraceDispatch(m_context, input_info.stage, bindings,
+		              fmt::format("{}x{}x{}", thread_group_x, thread_group_y, thread_group_z));
+	}
 	ResetBindings();
 }
 
@@ -809,6 +1069,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		FrameGraph::NoteShader("CS", ShaderDeclaredHash(cs_regs.cs_regs.data_addr),
 		                       cs_regs.cs_regs.data_addr, nullptr, 0);
 	}
+	const TraceShaderScope trace_shader(input_info.stage.program->shader_hash);
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
@@ -887,6 +1148,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		Timeline::Mark("dispatch-indirect", program.shader_hash, 0);
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	} while (recovery.Retry());
+	if (TracedShader(program.shader_hash)) {
+		TraceDispatch(m_context, input_info.stage, bindings,
+		              fmt::format("indirect (arguments at 0x{:012x})", args_addr));
+	}
 	ResetBindings();
 }
 

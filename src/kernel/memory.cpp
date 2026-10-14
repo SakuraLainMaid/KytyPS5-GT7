@@ -15,6 +15,7 @@
 #include <atomic>
 #include <bit>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
@@ -2816,6 +2817,74 @@ size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {
 	return PhysicalMemory::Size();
 }
 
+// A request for 0 bytes of direct memory gets EINVAL, as from the kernel, and the guest may ask
+// again at once. GT7 did, forever, when time trial was selected on its track map (2026-10-14), and
+// the log of each try and of the AvailableDirectMemorySize query before it grew to 34 GB. Such a
+// request is described the first times, with the guest code it came from (to see how it came to
+// ask for 0 bytes); once the same one has failed four times in a row, it and those queries are
+// logged at powers of two only. Guarded by g_memory_operation_mutex.
+struct ZeroLengthRequest {
+	int64_t  search_start = 0;
+	int64_t  search_end   = 0;
+	size_t   alignment    = 0;
+	int      memory_type  = 0;
+	uint64_t caller       = 0;
+	uint64_t count        = 0; // in a row
+};
+static ZeroLengthRequest g_zero_length_request;
+static uint32_t          g_zero_length_described = 0;
+static uint64_t          g_quiet_queries         = 0;
+
+// Whether this AvailableDirectMemorySize query's lines are left out (see ZeroLengthRequest).
+static bool QuietDirectMemoryQuery() {
+	if (g_zero_length_request.count < 4) {
+		return false;
+	}
+	return !std::has_single_bit(++g_quiet_queries);
+}
+
+static void NoteZeroLengthRequest(int64_t search_start, int64_t search_end, size_t alignment,
+                                  int memory_type, uint64_t caller) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	auto&                                 request = g_zero_length_request;
+	const bool same = request.count != 0 && request.search_start == search_start &&
+	                  request.search_end == search_end && request.alignment == alignment &&
+	                  request.memory_type == memory_type && request.caller == caller;
+	if (!same) {
+		request         = {search_start, search_end, alignment, memory_type, caller, 0};
+		g_quiet_queries = 0;
+	}
+	request.count++;
+	if (request.count >= 4 && std::has_single_bit(request.count)) {
+		LOGF("AllocateDirectMemory: the same request for 0 bytes (EINVAL) %" PRIu64
+		     " times in a row, from 0x%016" PRIx64
+		     "; it and the AvailableDirectMemorySize queries are logged at powers of two only\n",
+		     request.count, caller);
+	}
+	if (request.count != 1 || g_zero_length_described >= 3) {
+		return;
+	}
+	g_zero_length_described++;
+	LOGF("AllocateDirectMemory: a request for 0 bytes (EINVAL), type %d, alignment 0x%" PRIx64
+	     ", search 0x%" PRIx64 "-0x%" PRIx64 ", from guest code at 0x%016" PRIx64
+	     "; its code before that:\n",
+	     memory_type, static_cast<uint64_t>(alignment), search_start, search_end, caller);
+	constexpr uint64_t                  Before = 0x200;
+	constexpr uint64_t                  After  = 0x40;
+	std::array<uint8_t, Before + After> code {};
+	if (caller < Before || !TryReadBacking(caller - Before, code.data(), code.size())) {
+		LOGF("AllocateDirectMemory: (the code is not readable)\n");
+		return;
+	}
+	for (uint64_t row = 0; row < code.size(); row += 32) {
+		char line[32 * 2 + 1] {};
+		for (uint64_t k = 0; k < 32; k++) {
+			std::snprintf(line + k * 2, 3, "%02x", code[row + k]);
+		}
+		LOGF("AllocateDirectMemory: code 0x%016" PRIx64 ": %s\n", caller - Before + row, line);
+	}
+}
+
 int KYTY_SYSV_ABI KernelAvailableDirectMemorySize(int64_t search_start, int64_t search_end,
                                                   size_t alignment, int64_t* phys_addr_out,
                                                   size_t* size_out) {
@@ -2823,10 +2892,13 @@ int KYTY_SYSV_ABI KernelAvailableDirectMemorySize(int64_t search_start, int64_t 
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
-	LOGF("\t search_start = 0x%016" PRIx64 "\n"
-	     "\t search_end   = 0x%016" PRIx64 "\n"
-	     "\t alignment    = 0x%016" PRIx64 "\n",
-	     search_start, search_end, static_cast<uint64_t>(alignment));
+	const bool quiet = QuietDirectMemoryQuery();
+	if (!quiet) {
+		LOGF("\t search_start = 0x%016" PRIx64 "\n"
+		     "\t search_end   = 0x%016" PRIx64 "\n"
+		     "\t alignment    = 0x%016" PRIx64 "\n",
+		     search_start, search_end, static_cast<uint64_t>(alignment));
+	}
 
 	if (phys_addr_out == nullptr || size_out == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -2856,11 +2928,13 @@ int KYTY_SYSV_ABI KernelAvailableDirectMemorySize(int64_t search_start, int64_t 
 	*phys_addr_out = static_cast<int64_t>(phys_addr);
 	*size_out      = static_cast<size_t>(size);
 
-	LOGF_COLOR(Log::Color::Green,
-	           "\t phys_addr = 0x%016" PRIx64 "\n"
-	           "\t size      = 0x%016" PRIx64 "\n"
-	           "\t[Ok]\n",
-	           phys_addr, size);
+	if (!quiet) {
+		LOGF_COLOR(Log::Color::Green,
+		           "\t phys_addr = 0x%016" PRIx64 "\n"
+		           "\t size      = 0x%016" PRIx64 "\n"
+		           "\t[Ok]\n",
+		           phys_addr, size);
+	}
 
 	return OK;
 }
@@ -2980,12 +3054,18 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, s
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
-	LOGF("\t search_start = 0x%016" PRIx64 "\n"
-	     "\t search_end   = 0x%016" PRIx64 "\n"
-	     "\t len          = 0x%016" PRIx64 "\n"
-	     "\t alignment    = 0x%016" PRIx64 "\n"
-	     "\t memory_type  = %d\n",
-	     search_start, search_end, len, alignment, memory_type);
+	if (len != 0) {
+		g_zero_length_request.count = 0;
+	}
+	if (len != 0 || g_zero_length_request.count < 4 ||
+	    std::has_single_bit(g_zero_length_request.count)) {
+		LOGF("\t search_start = 0x%016" PRIx64 "\n"
+		     "\t search_end   = 0x%016" PRIx64 "\n"
+		     "\t len          = 0x%016" PRIx64 "\n"
+		     "\t alignment    = 0x%016" PRIx64 "\n"
+		     "\t memory_type  = %d\n",
+		     search_start, search_end, len, alignment, memory_type);
+	}
 
 	constexpr uint64_t PAGE_SIZE = 0x4000;
 	if (search_start < 0 || search_end <= search_start || len == 0 ||
@@ -3014,6 +3094,10 @@ int KYTY_SYSV_ABI KernelAllocateDirectMemory(int64_t search_start, int64_t searc
                                              size_t alignment, int memory_type,
                                              int64_t* phys_addr_out) {
 	PRINT_NAME();
+	if (len == 0) {
+		NoteZeroLengthRequest(search_start, search_end, alignment, memory_type,
+		                      reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+	}
 	return AllocateDirectMemory(search_start, search_end, len, alignment, memory_type,
 	                            phys_addr_out);
 }

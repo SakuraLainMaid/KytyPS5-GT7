@@ -140,6 +140,10 @@ public:
 	// reads that the GPU did not write, synchronized as a binding would synchronize it, against
 	// its guest bytes in every cached buffer over it ("FG <op> stale ..." when they differ).
 	void VerifyWithGuest(uint64_t vaddr, uint64_t size, uint32_t op, const std::string& what);
+	// Diagnostics (KYTY_TRACE_DISPATCHES): up to 4 KB of a range as the cached buffer over it
+	// holds it once the commands recorded so far have run, logged as "<prefix> ..." when the copy
+	// lands: its words (the first 64), and how many of them are not finite as floats.
+	void TraceContents(uint64_t vaddr, uint64_t size, const std::string& prefix);
 	// Same, but visits only the tracker regions that may hold CPU-dirty pages.
 	void                            SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
 	void                            RunGarbageCollector();

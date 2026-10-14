@@ -39,6 +39,8 @@ std::set<uint64_t>           g_grid_checks;
 // the comparisons that landed (written as they land, from the scheduler's completion work).
 std::set<std::pair<uint64_t, uint64_t>> g_verify_claimed;
 uint64_t                                g_verify_claimed_bytes = 0;
+uint64_t                                g_verify_texture_bytes = 0;
+uint64_t                                g_verify_layer_bytes   = 0;
 uint64_t                                g_verify_over_budget   = 0;
 std::atomic<uint64_t>                   g_verify_images {0};
 std::atomic<uint64_t>                   g_verify_image_bytes {0};
@@ -55,9 +57,27 @@ uint64_t VerifyBudgetBytes() {
 	return bytes;
 }
 
+uint64_t VerifyTexturesBudgetBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_FG_VERIFY_TEXTURES_MB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 1536ull) << 20u;
+	}();
+	return bytes;
+}
+
+uint64_t VerifyLayersBudgetBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_FG_VERIFY_LAYERS_MB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 2048ull) << 20u;
+	}();
+	return bytes;
+}
+
 void ResetVerify() {
 	g_verify_claimed.clear();
 	g_verify_claimed_bytes = 0;
+	g_verify_texture_bytes = 0;
+	g_verify_layer_bytes   = 0;
 	g_verify_over_budget   = 0;
 	g_verify_images.store(0, std::memory_order_relaxed);
 	g_verify_image_bytes.store(0, std::memory_order_relaxed);
@@ -75,8 +95,9 @@ void LogVerify(BufferCache& cache) {
 	cache.WaitForDiagnostics();
 	LOGF("FG 0 verify: %" PRIu64 " textures (%" PRIu64
 	     " MB) compared with their guest bytes, %" PRIu64 " stale; %" PRIu64 " buffers (%" PRIu64
-	     " MB), %" PRIu64 " stale; %" PRIu64 " ranges past the %" PRIu64
-	     " MB budget (KYTY_FG_VERIFY_MB) not compared\n",
+	     " MB), %" PRIu64 " stale; %" PRIu64 " ranges past the budgets (%" PRIu64
+	     " MB of buffers, KYTY_FG_VERIFY_MB; KYTY_FG_VERIFY_TEXTURES_MB, KYTY_FG_VERIFY_LAYERS_MB) "
+	     "not compared\n",
 	     g_verify_images.load(std::memory_order_relaxed),
 	     g_verify_image_bytes.load(std::memory_order_relaxed) >> 20u,
 	     g_verify_images_differ.load(std::memory_order_relaxed),
@@ -291,6 +312,31 @@ bool ClaimVerify(uint64_t address, uint64_t size) {
 	g_verify_claimed.emplace(address, size);
 	g_verify_claimed_bytes += size;
 	return true;
+}
+
+// A claim against one of the budgets.
+static bool ClaimVerifyWithin(uint64_t address, uint64_t size, uint64_t& used, uint64_t budget) {
+	if (!Logging() || !VerifyEnabled() || address == 0 || size == 0 || size > MaxVerifyBytes) {
+		return false;
+	}
+	if (g_verify_claimed.contains({address, size})) {
+		return false;
+	}
+	if (used + size > budget) {
+		g_verify_over_budget++;
+		return false;
+	}
+	g_verify_claimed.emplace(address, size);
+	used += size;
+	return true;
+}
+
+bool ClaimVerifyTexture(uint64_t address, uint64_t size) {
+	return ClaimVerifyWithin(address, size, g_verify_texture_bytes, VerifyTexturesBudgetBytes());
+}
+
+bool ClaimVerifyLayers(uint64_t address, uint64_t size) {
+	return ClaimVerifyWithin(address, size, g_verify_layer_bytes, VerifyLayersBudgetBytes());
 }
 
 void CountVerify(bool image, uint64_t bytes, bool differs) {
