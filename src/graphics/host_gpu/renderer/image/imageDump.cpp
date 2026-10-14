@@ -513,6 +513,22 @@ bool Claim(uint32_t capture, uint64_t address, uint64_t content) {
 	return true;
 }
 
+bool ClaimTrace(uint64_t address, uint64_t content) {
+	static const uint32_t most = [] {
+		const char* value = std::getenv("KYTY_DUMP_IMAGES_TRACE_MAX");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 24u;
+	}();
+	static uint32_t                                count = 0;
+	static std::set<std::pair<uint64_t, uint64_t>> claimed;
+	if (count >= most || !claimed.emplace(address, content).second) {
+		return false;
+	}
+	if (++count == most) {
+		LOGF("Trace image: %u pictures, the most KYTY_DUMP_IMAGES_TRACE_MAX allows\n", count);
+	}
+	return true;
+}
+
 uint32_t MaxSide() {
 	static const uint32_t side = [] {
 		const char* value = std::getenv("KYTY_DUMP_IMAGES_SIZE");

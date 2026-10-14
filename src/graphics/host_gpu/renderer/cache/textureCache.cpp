@@ -534,11 +534,15 @@ struct TextureCache::TraceHistory {
 	std::string glyphs;
 };
 
-// KYTY_TRACE_IMAGES=<width>x<height>[x<layers>][,...]: the images of these shapes are followed
+// KYTY_TRACE_IMAGES=<item>[,...], an item <width>x<height>[x<layers>] (the images of that shape)
+// or 0x<address>[+<size>] (the images over any byte of that range): these images are followed
 // through the cache from their creation on: uploads (with what their guest bytes hold), CPU
-// writes, GPU buffer writes over them, write-backs and frees ("Trace image #<n> ..."); and at the
-// end of each guest frame in which one changed, a snapshot of its mip 0 as the GPU holds it: the
-// layers that changed and the shaders that wrote it (TraceFrameEnd). Up to
+// writes, GPU buffer writes over them (at their base or inside them), their bindings as render or
+// depth targets and the viewports and scissors of the draws into them, copies, write-backs and
+// frees ("Trace image #<n> ..."); and at the end of each guest frame in which one changed, a
+// snapshot of its mip 0 as the GPU holds it: the layers that changed and the shaders that wrote it
+// (TraceFrameEnd), and a picture of it when KYTY_DUMP_IMAGES matches it too (up to
+// KYTY_DUMP_IMAGES_TRACE_MAX, default 24, image-dumps/trace_*.png). Up to
 // KYTY_TRACE_IMAGES_SNAPSHOTS (default 600) snapshots in all.
 struct TextureCache::TraceState {
 	struct Shape {
@@ -546,15 +550,25 @@ struct TextureCache::TraceState {
 		uint32_t height = 0;
 		uint32_t layers = 0; // 0: any
 	};
+	struct Range {
+		uint64_t address = 0;
+		uint64_t size    = 1;
+	};
 	struct Followed {
 		uint32_t                        serial           = 0;
 		bool                            changed          = false;
 		bool                            unscanned_logged = false;
 		uint32_t                        cpu_writes       = 0;
 		uint32_t                        guest_logs       = 0;
+		uint32_t                        inner_writes     = 0;
+		uint64_t                        bind_frame       = UINT64_MAX; // last target binding logged
+		uint64_t                        draw_frame       = UINT64_MAX; // draw_states' frame
+		std::set<std::string>           draw_states;
+		uint32_t                        target_logs = 0; // bindings and draws logged
 		std::map<std::string, uint32_t> writers; // since the last snapshot
 	};
 	std::vector<Shape>                                              shapes;
+	std::vector<Range>                                              ranges;
 	std::unordered_map<ImageId, Followed>                           images;
 	std::map<uint64_t, std::shared_ptr<TextureCache::TraceHistory>> history;
 	std::map<uint64_t, std::string> guest_glyphs; // the guest bytes last logged, by address
@@ -563,10 +577,16 @@ struct TextureCache::TraceState {
 	uint32_t                        max_snapshots = 600;
 
 	[[nodiscard]] bool Matches(const ImageInfo& info) const {
-		return std::any_of(shapes.begin(), shapes.end(), [&](const Shape& shape) {
-			return info.extent.width == shape.width && info.extent.height == shape.height &&
-			       (shape.layers == 0 || info.resources.layers == shape.layers);
-		});
+		return std::any_of(shapes.begin(), shapes.end(),
+		                   [&](const Shape& shape) {
+			                   return info.extent.width == shape.width &&
+			                          info.extent.height == shape.height &&
+			                          (shape.layers == 0 || info.resources.layers == shape.layers);
+		                   }) ||
+		       std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) {
+			       return info.data.size != 0 && info.data.address < range.address + range.size &&
+			              range.address < info.data.address + info.data.size;
+		       });
 	}
 
 	[[nodiscard]] static std::unique_ptr<TraceState> FromEnvironment() {
@@ -580,6 +600,16 @@ struct TextureCache::TraceState {
 			const auto end   = std::min(text.find(',', begin), text.size());
 			const auto token = text.substr(begin, end - begin);
 			begin            = end + 1u;
+			if (token.size() > 2 && token[0] == '0' && (token[1] == 'x' || token[1] == 'X')) {
+				Range range;
+				char* rest    = nullptr;
+				range.address = std::strtoull(token.c_str() + 2, &rest, 16);
+				if (rest != nullptr && *rest == '+') {
+					range.size = std::max<uint64_t>(std::strtoull(rest + 1, nullptr, 16), 1u);
+				}
+				state->ranges.push_back(range);
+				continue;
+			}
 			Shape       shape;
 			const char* cursor = token.c_str();
 			char*       next   = nullptr;
@@ -608,12 +638,16 @@ struct TextureCache::TraceState {
 			              ? fmt::format(" {}x{}x{}", shape.width, shape.height, shape.layers)
 			              : fmt::format(" {}x{}", shape.width, shape.height);
 		}
-		LOGF("Trace image: following the images of these shapes:%s (KYTY_TRACE_IMAGES), up to %u "
-		     "snapshots (KYTY_TRACE_IMAGES_SNAPSHOTS)\n",
-		     shapes.empty() ? " none (the format is <width>x<height>x<layers>,...)"
-		                    : shapes.c_str(),
+		for (const auto& range: state->ranges) {
+			shapes += fmt::format(" 0x{:012x}+0x{:x}", range.address, range.size);
+		}
+		LOGF("Trace image: following the images of these shapes and ranges:%s "
+		     "(KYTY_TRACE_IMAGES), up to %u snapshots (KYTY_TRACE_IMAGES_SNAPSHOTS)\n",
+		     shapes.empty()
+		         ? " none (the format is <width>x<height>x<layers> or 0x<address>+<size>,...)"
+		         : shapes.c_str(),
 		     state->max_snapshots);
-		if (state->shapes.empty()) {
+		if (state->shapes.empty() && state->ranges.empty()) {
 			return nullptr;
 		}
 		return state;
@@ -2591,6 +2625,9 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
 	}
 	TouchImage(image);
+	if (TracesImage(id)) {
+		TraceTargetBound(id, desc, "render");
+	}
 	image.MarkGpuModified();
 	image.usage.render_target = true;
 	RefreshImage(id);
@@ -2609,6 +2646,9 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
 	}
 	TouchImage(image);
+	if (TracesImage(id)) {
+		TraceTargetBound(id, desc, "depth");
+	}
 	image.MarkGpuModified();
 	image.usage.depth_target = true;
 	if (desc.info.HasStencil()) {
@@ -3875,10 +3915,15 @@ bool TextureCache::DumpImage(ImageId id, uint32_t capture, const std::string& na
 	}
 	std::scoped_lock lock {m_lock};
 	auto*            image = m_slot_images.try_get(id);
+	return image != nullptr && DumpImageLocked(*image, false, capture, name, description);
+}
+
+bool TextureCache::DumpImageLocked(Image& target, bool trace, uint32_t capture,
+                                   const std::string& name, const std::string& description) {
+	auto* image = &target;
 	// An image with a depth twin keeps its contents there (UploadImage), as ScanImageLocked
 	// leaves out.
-	if (image == nullptr || image->backing.image == nullptr || image->backing.samples != 1 ||
-	    image->depth_id) {
+	if (image->backing.image == nullptr || image->backing.samples != 1 || image->depth_id) {
 		return false;
 	}
 	const auto format      = image->backing.format;
@@ -3923,7 +3968,8 @@ bool TextureCache::DumpImage(ImageId id, uint32_t capture, const std::string& na
 	const uint64_t shown = uint64_t {(mip_width + step - 1u) / step} * rows;
 	tiles                = static_cast<uint32_t>(std::min<uint64_t>(
         {uint64_t {tiles}, budget / tile_pitch, std::max<uint64_t>((16ull << 20u) / shown, 1u)}));
-	if (!ImageDump::Claim(capture, image->info.data.address, image->content_serial)) {
+	if (trace ? !ImageDump::ClaimTrace(image->info.data.address, image->content_serial)
+	          : !ImageDump::Claim(capture, image->info.data.address, image->content_serial)) {
 		return false;
 	}
 	const uint64_t bytes = tile_pitch * tiles;
@@ -4270,6 +4316,54 @@ void TextureCache::TraceImageEvent(ImageId id, const std::string& event, bool gu
 	LogLayerSummary(fmt::format("Trace image #{} guest", followed.serial), summary);
 }
 
+// The lines of a followed image's bindings as a target and of the draws into it.
+static constexpr uint32_t MaxTargetLogs = 400;
+
+void TextureCache::TraceTargetDraw(ImageId id, const char* kind, const std::string& state) {
+	std::scoped_lock lock {m_lock};
+	if (m_trace == nullptr) {
+		return;
+	}
+	const auto found = m_trace->images.find(id);
+	if (found == m_trace->images.end()) {
+		return;
+	}
+	auto&      followed = found->second;
+	const auto frame    = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	if (followed.draw_frame != frame) {
+		followed.draw_frame = frame;
+		followed.draw_states.clear();
+	}
+	if (followed.draw_states.size() >= 8 || followed.target_logs >= MaxTargetLogs ||
+	    !followed.draw_states.insert(state).second) {
+		return;
+	}
+	if (++followed.target_logs == MaxTargetLogs) {
+		LOGF("Trace image #%u: its target bindings and draws are not logged after these\n",
+		     followed.serial);
+	}
+	TraceImageEvent(id, fmt::format("a draw into it as the {} target: {}", kind, state), false);
+}
+
+void TextureCache::TraceTargetBound(ImageId id, const ImageDesc& desc, const char* kind) {
+	auto&      followed = m_trace->images[id];
+	const auto frame    = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	if (followed.bind_frame == frame || followed.target_logs >= MaxTargetLogs) {
+		return;
+	}
+	followed.bind_frame = frame;
+	if (++followed.target_logs == MaxTargetLogs) {
+		LOGF("Trace image #%u: its target bindings and draws are not logged after these\n",
+		     followed.serial);
+	}
+	TraceImageEvent(id,
+	                fmt::format("bound as the {} target: 0x{:012x}+0x{:x} {}x{} mip {} layer {}",
+	                            kind, desc.info.data.address, desc.info.data.size,
+	                            desc.info.extent.width, desc.info.extent.height,
+	                            desc.view_info.base_level, desc.view_info.base_layer),
+	                false);
+}
+
 void TextureCache::TraceImageChanged(Image& image, const char* how, bool gpu_write) {
 	if (m_trace == nullptr) {
 		return;
@@ -4330,6 +4424,14 @@ void TextureCache::TraceFrameEnd() {
 			it = m_trace->images.erase(it);
 			continue;
 		}
+		if (followed.changed && ImageDump::Enabled() &&
+		    ImageDump::Wanted(image->info.data.address, image->info.extent.width,
+		                      image->info.extent.height, image->info.resources.layers,
+		                      image->info.IsDepth())) {
+			(void)DumpImageLocked(*image, true, 0,
+			                      fmt::format("trace_f{}_n{}", frame, followed.serial),
+			                      fmt::format("Trace image #{} frame {}", followed.serial, frame));
+		}
 		if (followed.changed && m_trace->snapshots < m_trace->max_snapshots) {
 			std::string writers;
 			for (const auto& [who, count]: followed.writers) {
@@ -4386,6 +4488,22 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		    image.info.metadata.compression == VideoOutCompression::Uncompressed &&
 		    image.Overlaps(address, size);
 		if (image.info.data.address != address && !guest_texels) {
+			if (TracesImage(id)) {
+				auto&      followed = m_trace->images[id];
+				const auto count    = ++followed.inner_writes;
+				if (count <= 16 || std::has_single_bit(count)) {
+					TraceImageEvent(
+					    id,
+					    fmt::format("GPU buffer write 0x{:012x}+0x{:x} over it, not at its base "
+					                "(offset 0x{:x}; writers {}; {} so far): it keeps its pixels",
+					                address, size,
+					                address > image.info.data.address
+					                    ? address - image.info.data.address
+					                    : 0,
+					                BufferCache::GpuWritersOf(address, size), count),
+					    false);
+				}
+			}
 			continue;
 		}
 		if (image.info.data.address != address) {

@@ -189,6 +189,10 @@ public:
 	// The compute shader the GPU thread is recording a dispatch of (names the writers of the images
 	// KYTY_TRACE_IMAGES follows; 0 for draws and copies).
 	inline static thread_local uint64_t s_trace_shader = 0;
+	// KYTY_TRACE_IMAGES: whether it follows any image; and a draw into a render or depth target it
+	// follows: the draw's viewport and scissor (`state`), each distinct one once a frame.
+	[[nodiscard]] bool TraceEnabled() const noexcept { return m_trace != nullptr; }
+	void               TraceTargetDraw(ImageId id, const char* kind, const std::string& state);
 
 private:
 	struct TraceState;
@@ -206,8 +210,14 @@ private:
 	                     std::shared_ptr<TraceHistory> history, const std::string& header);
 	// KYTY_TRACE_IMAGES (caller holds m_lock): whether the image is followed, and its events.
 	[[nodiscard]] bool TracesImage(ImageId id) const;
+	// Caller holds m_lock. DumpImage's work; `trace` dumps count against the trace's own limit
+	// (ImageDump::ClaimTrace) instead of a capture's.
+	bool DumpImageLocked(Image& image, bool trace, uint32_t capture, const std::string& name,
+	                     const std::string& description);
 	void               TraceImageCreated(ImageId id);
 	void               TraceImageEvent(ImageId id, const std::string& event, bool guest_glyphs);
+	// Caller holds m_lock: a followed image's binding as a target, once a frame.
+	void TraceTargetBound(ImageId id, const ImageDesc& desc, const char* kind);
 	// `gpu_write`: a GPU write (CommitGpuWrite), which names the shader whose dispatch it is.
 	void TraceImageChanged(Image& image, const char* how, bool gpu_write = false);
 	void TraceCpuWrite(ImageId id, const Image& image, uint64_t address, uint64_t size);

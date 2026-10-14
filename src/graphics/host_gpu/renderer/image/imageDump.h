@@ -30,6 +30,9 @@ namespace Libs::Graphics::ImageDump {
 // GPU thread, in a capture: whether to dump this image's content now (the first time this
 // capture, within the count).
 [[nodiscard]] bool Claim(uint32_t capture, uint64_t address, uint64_t content);
+// GPU thread: the same for KYTY_TRACE_IMAGES' frame-end pictures, up to KYTY_DUMP_IMAGES_TRACE_MAX
+// (default 24) in the whole run.
+[[nodiscard]] bool ClaimTrace(uint64_t address, uint64_t content);
 // A single image's longer side; an array's tiles get half of it (at least 64).
 [[nodiscard]] uint32_t MaxSide();
 // One image's readback, KYTY_DUMP_IMAGES_MB (default 256).

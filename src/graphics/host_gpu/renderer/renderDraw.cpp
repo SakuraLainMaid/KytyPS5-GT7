@@ -458,6 +458,32 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandR
 #endif
 }
 
+// KYTY_TRACE_IMAGES: a draw into a followed render or depth target, with its first viewport and
+// final scissor as the guest set them (TextureCache::TraceTargetDraw).
+static void TraceTargetDraws(TextureCache& textures, const CommandBuffer& buffer,
+                             const RenderDepthInfo& depth, const RenderColorInfo* colors,
+                             uint32_t color_count, const RenderState& rendering) {
+	const auto& ctx     = buffer.GetRegisters();
+	const auto& vp      = ctx.GetScreenViewport();
+	const auto& guest   = vp.viewports[0];
+	const auto  scissor = calc_final_scissor(vp, ctx.GetScanModeControl(),
+	                                         vk::Extent2D {rendering.width, rendering.height}, 0);
+	const auto  state =
+	    fmt::format("viewport ({:.1f},{:.1f} {:.1f}x{:.1f}) scissor ({},{})-({},{}) area {}x{}{}",
+	                guest.xoffset - guest.xscale, guest.yoffset - guest.yscale, guest.xscale * 2.0f,
+	                guest.yscale * 2.0f, scissor.left, scissor.top, scissor.right, scissor.bottom,
+	                rendering.width, rendering.height,
+	                ctx.GetClipControl().clip_disable ? " (no clipping)" : "");
+	if (depth.image_id) {
+		textures.TraceTargetDraw(depth.image_id, "depth", state);
+	}
+	for (uint32_t i = 0; i < color_count; i++) {
+		if (colors[i].image_id) {
+			textures.TraceTargetDraw(colors[i].image_id, "render", state);
+		}
+	}
+}
+
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 
 	const auto& vs = sh_ctx.GetVs();
@@ -1612,6 +1638,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
+	if (m_context.GetTextureCache().TraceEnabled()) {
+		TraceTargetDraws(m_context.GetTextureCache(), buffer, state.depth_info, state.color_info,
+		                 state.color_count, rendering);
+	}
 	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
 	}
