@@ -873,6 +873,30 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const bool depth_tile = tile == Prospero::TileMode::kDepth;
 	const bool msaa_tile  = depth_tile || tile == Prospero::TileMode::kRenderTarget;
 	const bool msaa_array = type == Prospero::ImageType::kColor2DMsaaArray;
+	// A first mip past the last: no view of any image. GT7 binds such a T# (its address and the
+	// words after it are not a texture's) while it leaves a race, the car materials it still
+	// draws reading descriptors already reused (2026-10-14, with tessellation drawing the cars).
+	// Sampled as a null texture, as the console returns something rather than stopping.
+	if (!multisampled && base_level > last_level) {
+		if (RejectBindlessTexture("first mip past the last", address)) {
+			return {};
+		}
+		static std::atomic<uint32_t> reports {0};
+		const auto                   report = reports.fetch_add(1, std::memory_order_relaxed);
+		if (report < 8u || (report & (report + 1u)) == 0u) {
+			LOGF("Texture with its first mip past the last (base %u, last %u) at 0x%016" PRIx64
+			     " bound as a null texture (%" PRIu32 " so far): "
+			     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			     base_level, last_level, address, report + 1u, descriptor.fields[0],
+			     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
+			     descriptor.fields[4], descriptor.fields[5], descriptor.fields[6],
+			     descriptor.fields[7]);
+		}
+		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                    : TextureCache::BindingType::Texture);
+		const auto id   = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
 	if ((!multisampled && base_level > last_level) ||
 	    (multisampled &&
 	     (base_level != 0 || last_level == 0 || last_level > 3 || max_mip != last_level ||
