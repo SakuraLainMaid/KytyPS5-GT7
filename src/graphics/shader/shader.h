@@ -145,6 +145,10 @@ struct ShaderTessellationInputInfo {
 	// too: AnalyzeTessellationPrograms; 0 when the HS writes none.
 	uint32_t patch_base = 0;
 	uint32_t patch_size = 0;
+	// VGT_HOS_MIN/MAX_TESS_LEVEL (float bits): the range the tessellator clamps the HS's factors
+	// to; 0 for the maximum when the game never set it (no clamp).
+	uint32_t min_level_bits = 0;
+	uint32_t max_level_bits = 0;
 };
 
 struct ShaderVertexInputInfo {

@@ -661,7 +661,8 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		const auto& tess = info.tess;
 		key.insert(key.end(),
 		           {tess.output_control_points, tess.ls_stride, tess.hs_stride, tess.domain,
-		            tess.partitioning, tess.output_topology, tess.patch_base, tess.patch_size});
+		            tess.partitioning, tess.output_topology, tess.patch_base, tess.patch_size,
+		            tess.min_level_bits, tess.max_level_bits});
 	}
 
 	for (int i = 0; i < info.resources_num; i++) {
@@ -990,6 +991,21 @@ bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Con
 			     " (input cp %u, output cp %u, VGT_TF_PARAM 0x%08x) accepted\n",
 			     local_hash, control_hash, evaluation_hash, tess.input_control_points,
 			     tess.output_control_points, sh.m_vgtTfParam);
+		}
+	}
+	// The tessellator's factor clamp (not part of the analysis or its cache key).
+	tess.min_level_bits = sh.m_vgtHosMinTessLevel;
+	tess.max_level_bits = sh.m_vgtHosMaxTessLevel;
+	{
+		static std::mutex                   logged_mutex;
+		static std::unordered_set<uint64_t> logged;
+		std::scoped_lock                    lock(logged_mutex);
+		if (logged.size() < 8u &&
+		    logged.insert((uint64_t {tess.min_level_bits} << 32u) | tess.max_level_bits).second) {
+			LOGF(
+			    "Tessellation factor range: VGT_HOS_MIN_TESS_LEVEL %g, VGT_HOS_MAX_TESS_LEVEL %g\n",
+			    static_cast<double>(std::bit_cast<float>(tess.min_level_bits)),
+			    static_cast<double>(std::bit_cast<float>(tess.max_level_bits)));
 		}
 	}
 	for (auto& stage: input_info) {

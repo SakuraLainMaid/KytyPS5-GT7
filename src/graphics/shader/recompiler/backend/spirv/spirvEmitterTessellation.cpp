@@ -1,6 +1,8 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <algorithm>
+#include <bit>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -187,13 +189,49 @@ uint32_t EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& ins
 	});
 }
 
+// Diagnostics: KYTY_TESS_FACTOR=<f> (above 0) replaces every tessellation factor an HS writes
+// above zero (culled patches stay culled), so that cracks from factors that differ between
+// neighbouring patches can be told from cracks in the evaluation.
+static float TessellationFactorOverride() {
+	static const float value = [] {
+		const char* text = std::getenv("KYTY_TESS_FACTOR");
+		return text != nullptr ? std::strtof(text, nullptr) : 0.0f;
+	}();
+	return value;
+}
+
 void EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	EmitIfCondition(ctx.state, ctx.Arg(inst, 3), [&] {
 		auto value = ctx.Arg(inst, 2);
 		if (inst.Arg(0).U32() == static_cast<uint32_t>(IR::TessellationAttribute::Factor)) {
-			const auto floating = ctx.state.builder.AllocateId();
-			ctx.state.builder.AddFunction(spv::OpBitcast, TypeF32(ctx.state), floating, value);
+			auto&       state    = ctx.state;
+			const auto& tess     = state.input_info.vertex->tess;
+			const auto  floating = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBitcast, TypeF32(state), floating, value);
 			value = floating;
+			// A factor above zero draws the patch; zero, a negative or NaN culls it, whatever
+			// the clamp below.
+			const auto drawn = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpFOrdGreaterThan, TypeBool(state), drawn, floating,
+			                          ConstantF32Value(state, 0.0f));
+			// The guest tessellator clamps the factors it draws to VGT_HOS_MIN/MAX_TESS_LEVEL;
+			// the host's only to its own limit.
+			const auto low  = std::max(std::bit_cast<float>(tess.min_level_bits), 0.0f);
+			const auto high = std::bit_cast<float>(tess.max_level_bits);
+			if (tess.max_level_bits != 0u && high > 0.0f && high >= low) {
+				const auto clamped = EmitGlsl<GLSLstd450FClamp, IR::Type::F32>(
+				    state, floating, ConstantF32Value(state, low), ConstantF32Value(state, high));
+				const auto selected = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpSelect, TypeF32(state), selected, drawn, clamped,
+				                          floating);
+				value = selected;
+			}
+			if (const auto factor = TessellationFactorOverride(); factor > 0.0f) {
+				const auto replaced = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpSelect, TypeF32(state), replaced, drawn,
+				                          ConstantF32Value(state, factor), value);
+				value = replaced;
+			}
 		}
 		ctx.state.builder.AddFunction(spv::OpStore, TessellationPointer(ctx, inst), value);
 	});
