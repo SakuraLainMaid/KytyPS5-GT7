@@ -2136,6 +2136,11 @@ static void LogFrameGraphStage(RenderContext& context, const ShaderStageRuntime&
 		    FrameGraph::ClaimGridCheck(info.data.address)) {
 			textures.CompareWithGuest(binding.image_id, FrameGraph::CurrentOp());
 		}
+		// The verification: its GPU copy against its guest bytes, or its layers' contents.
+		if (!resource.written && binding.image_id && FrameGraph::VerifyEnabled()) {
+			textures.VerifyWithGuest(binding.image_id, FrameGraph::CurrentOp(),
+			                         fmt::format("{} tex[{}]", stage, i));
+		}
 		// A small linear image a shader stores to, the kind the CPU reads back: shown after the
 		// frame as guest memory holds it.
 		if (resource.written && binding.desc.type == TextureCache::BindingType::Storage &&
@@ -2165,6 +2170,11 @@ static void LogFrameGraphStage(RenderContext& context, const ShaderStageRuntime&
 		                cpu ? 'C' : '-', writers.empty() ? "-" : writers.c_str());
 		if (mapped != 0) {
 			FrameGraph::NoteBuffer(r.Base48(), mapped);
+		}
+		if (mapped != 0 && !gpu && !program.info.buffers[i].written &&
+		    FrameGraph::VerifyEnabled()) {
+			buffers.VerifyWithGuest(r.Base48(), mapped, FrameGraph::CurrentOp(),
+			                        fmt::format("{} buf[{}]", stage, i));
 		}
 	}
 	const auto& user = snapshot.user_data;

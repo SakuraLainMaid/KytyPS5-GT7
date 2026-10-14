@@ -19,6 +19,7 @@
 #include <map>
 #include <memory>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -123,6 +124,12 @@ public:
 	// before submitting). A light grid (R32G32_UINT cells: a light-list offset and packed light
 	// counts) also gets its lit cells per layer on both sides. Logs "FG 0 grid ...".
 	void CompareWithGuest(ImageId id, uint32_t op);
+	// Diagnostics (the frame graph's verification, FrameGraph::ClaimVerify): an image a shader
+	// reads, refreshed as its binding will refresh it, against its guest bytes when the GPU did
+	// not write it ("FG <op> stale ..." when they differ), and for an array of six or more layers
+	// the contents of each layer as the GPU holds them ("FG <op> layers ..."). `what` names the
+	// binding in the lines.
+	void VerifyWithGuest(ImageId id, uint32_t op, const std::string& what);
 
 private:
 	enum class TransferDirection { Upload, Download };

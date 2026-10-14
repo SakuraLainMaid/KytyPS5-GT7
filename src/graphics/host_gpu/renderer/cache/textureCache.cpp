@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -22,6 +23,7 @@
 #include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
@@ -1821,11 +1823,28 @@ static uint64_t GuestHashImageBytes() {
 	return bytes;
 }
 
+// KYTY_GUEST_HASH_TILED_KB (default 0: off): the same check for tiled images up to this size,
+// an experiment for textures the CPU streams in (it hashes every one bound, once a submission).
+static uint64_t GuestHashTiledBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_GUEST_HASH_TILED_KB");
+		const auto  kb    = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+		if (kb != 0) {
+			LOGF("TextureCache: tiled images up to %llu KB are checked against their guest bytes "
+			     "once a submission (KYTY_GUEST_HASH_TILED_KB)\n",
+			     static_cast<unsigned long long>(kb));
+		}
+		return kb << 10u;
+	}();
+	return bytes;
+}
+
 bool TextureCache::ChecksGuestContent(const Image& image) const {
-	const auto& info = image.info;
-	return GuestHashImageBytes() != 0 && !info.IsTiled() && !info.data.Empty() &&
-	       info.data.size <= GuestHashImageBytes() && info.samples == 1 && !image.depth_id &&
-	       !info.IsDepth() && info.metadata.compression == VideoOutCompression::Uncompressed &&
+	const auto& info  = image.info;
+	const auto  limit = info.IsTiled() ? GuestHashTiledBytes() : GuestHashImageBytes();
+	return limit != 0 && !info.data.Empty() && info.data.size <= limit && info.samples == 1 &&
+	       !image.depth_id && !info.IsDepth() &&
+	       info.metadata.compression == VideoOutCompression::Uncompressed &&
 	       !image.IsGpuModified() && !image.IsBufferModified() &&
 	       !m_buffer_cache.IsRegionGpuModified(info.data.address, info.data.size);
 }
@@ -1881,6 +1900,14 @@ void TextureCache::RefreshImage(ImageId id) {
 	}
 	if (image.content_hash_valid && ChecksGuestContent(image)) {
 		RefreshByContent(id);
+		return;
+	}
+	if (image.info.IsTiled() && ChecksGuestContent(image)) {
+		// The KYTY_GUEST_HASH_TILED_KB experiment: an image uploaded before it was checked is
+		// uploaded once more from its guest bytes, which records their hash for the next checks.
+		TrackImage(id);
+		image.MarkCpuDirty();
+		InitializeImage(id);
 		return;
 	}
 	TrackImage(id);
@@ -2761,6 +2788,245 @@ void TextureCache::CompareWithGuest(ImageId id, uint32_t op) {
 			LOGF("FG %u grid 0x%012" PRIx64 " lit cells/most lights per layer, GPU:%s\n", op,
 			     range.address, LitCellsPerLayer(gpu, words, width, height, layers, pitch).c_str());
 		}
+	});
+}
+
+// Verification helpers (the frame graph): what a layer of an image holds, a glyph a layer.
+namespace {
+
+[[nodiscard]] float UnsignedSmallFloat(uint32_t bits, uint32_t mantissa_bits) {
+	const uint32_t exponent = bits >> mantissa_bits;
+	const uint32_t mantissa = bits & ((1u << mantissa_bits) - 1u);
+	if (exponent == 31u) {
+		return -1.0f; // infinity or NaN: left out
+	}
+	const auto scale = static_cast<float>(1u << mantissa_bits);
+	if (exponent == 0u) {
+		return std::ldexp(static_cast<float>(mantissa) / scale, -14);
+	}
+	return std::ldexp(1.0f + static_cast<float>(mantissa) / scale, static_cast<int>(exponent) - 15);
+}
+
+[[nodiscard]] float HalfToFloat(uint32_t half) {
+	const uint32_t exponent = (half >> 10u) & 0x1fu;
+	const uint32_t mantissa = half & 0x3ffu;
+	const float    sign     = (half & 0x8000u) != 0 ? -1.0f : 1.0f;
+	if (exponent == 31u) {
+		return std::numeric_limits<float>::quiet_NaN();
+	}
+	if (exponent == 0u) {
+		return sign * std::ldexp(static_cast<float>(mantissa) / 1024.0f, -14);
+	}
+	return sign * std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f,
+	                         static_cast<int>(exponent) - 15);
+}
+
+// The luminance of a texel in the formats light data comes in, or a negative value when the
+// format is another (or the texel is not finite).
+[[nodiscard]] float TexelLuminance(vk::Format format, const uint32_t* word) {
+	switch (format) {
+		case vk::Format::eB10G11R11UfloatPack32: {
+			const float r = UnsignedSmallFloat(word[0] & 0x7ffu, 6);
+			const float g = UnsignedSmallFloat((word[0] >> 11u) & 0x7ffu, 6);
+			const float b = UnsignedSmallFloat(word[0] >> 22u, 5);
+			return r < 0.0f || g < 0.0f || b < 0.0f ? -1.0f
+			                                        : 0.2126f * r + 0.7152f * g + 0.0722f * b;
+		}
+		case vk::Format::eR16G16B16A16Sfloat: {
+			const float r = HalfToFloat(word[0] & 0xffffu);
+			const float g = HalfToFloat(word[0] >> 16u);
+			const float b = HalfToFloat(word[1] & 0xffffu);
+			const float l = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+			return std::isfinite(l) && l >= 0.0f ? l : -1.0f;
+		}
+		default: return -1.0f;
+	}
+}
+
+// One glyph a layer: '_' every word zero; for light formats a digit, the decade of the mean
+// luminance of its non-zero texels (5: 1 to 10, 4: 0.1 to 1, ... 0: below 1e-4, 9: 1e4 and up),
+// the letter a-j instead when under a quarter of its words are non-zero; '#' for other formats.
+[[nodiscard]] std::string LayerContentGlyphs(const uint32_t* words, size_t count, uint32_t layers,
+                                             vk::Format format) {
+	std::string glyphs;
+	if (layers == 0 || count < layers) {
+		return glyphs;
+	}
+	const size_t layer_words = count / layers;
+	const bool   light =
+	    format == vk::Format::eB10G11R11UfloatPack32 || format == vk::Format::eR16G16B16A16Sfloat;
+	const size_t step = format == vk::Format::eR16G16B16A16Sfloat ? 2u : 1u;
+	glyphs.reserve(layers);
+	for (uint32_t layer = 0; layer < layers; layer++) {
+		const uint32_t* first   = words + static_cast<size_t>(layer) * layer_words;
+		size_t          nonzero = 0;
+		double          sum     = 0.0;
+		size_t          texels  = 0;
+		for (size_t k = 0; k + step <= layer_words; k += step) {
+			const bool zero = step == 2u ? (first[k] | first[k + 1]) == 0 : first[k] == 0;
+			if (zero) {
+				continue;
+			}
+			nonzero += step;
+			if (light) {
+				const float l = TexelLuminance(format, first + k);
+				if (l >= 0.0f) {
+					sum += l;
+					texels++;
+				}
+			}
+		}
+		if (nonzero == 0) {
+			glyphs += '_';
+			continue;
+		}
+		if (!light || texels == 0) {
+			glyphs += '#';
+			continue;
+		}
+		const double mean   = sum / static_cast<double>(texels);
+		const int    decade = mean <= 0.0 ? 0 : static_cast<int>(std::floor(std::log10(mean))) + 5;
+		const int    bucket = std::clamp(decade, 0, 9);
+		glyphs += static_cast<char>((nonzero * 4u < layer_words ? 'a' : '0') + bucket);
+	}
+	return glyphs;
+}
+
+void LogGlyphs(uint32_t op, const char* kind, uint64_t address, const std::string& glyphs) {
+	constexpr size_t Chunk = 192;
+	for (size_t first = 0; first < glyphs.size(); first += Chunk) {
+		const auto part = glyphs.substr(first, Chunk);
+		LOGF("FG %u %s 0x%012" PRIx64 " [%zu-%zu]: %s\n", op, kind, address, first,
+		     first + part.size() - 1u, part.c_str());
+	}
+}
+
+} // namespace
+
+void TextureCache::VerifyWithGuest(ImageId id, uint32_t op, const std::string& what) {
+	if (!id) {
+		return;
+	}
+	// Before the lock: DiagnosticImageState takes it.
+	const auto       state = DiagnosticImageState(id);
+	std::scoped_lock lock {m_lock};
+	auto*            image = m_slot_images.try_get(id);
+	if (image == nullptr || image->depth_id || image->info.data.Empty() || image->info.IsDepth() ||
+	    image->info.samples != 1 ||
+	    image->info.metadata.compression != VideoOutCompression::Uncompressed ||
+	    !image->SafeToDownload()) {
+		return;
+	}
+	const auto range = image->info.data;
+	const bool gpu   = image->IsGpuModified() || image->IsBufferModified() ||
+	                 m_buffer_cache.IsRegionGpuModified(range.address, range.size);
+	const auto layers  = image->info.resources.layers;
+	const bool layered = layers >= 6u && !image->info.IsVolume() && range.size % layers == 0;
+	if ((gpu && !layered) || range.size % sizeof(uint32_t) != 0 ||
+	    !FrameGraph::ClaimVerify(range.address, range.size)) {
+		return;
+	}
+	const bool tracked_dirty = image->IsCpuDirty();
+	const bool cached_buffer = m_buffer_cache.IsRegionRegistered(range.address, range.size);
+	if (!gpu) {
+		// As the draw's binding will see it (RebindImages refreshes it after this).
+		RefreshImage(id);
+		image = m_slot_images.try_get(id);
+		if (image == nullptr) {
+			return;
+		}
+	}
+	auto transfer = BuildDownload(*image);
+	if (!transfer.valid || transfer.depth_target) {
+		return;
+	}
+	const size_t                           words = range.size / sizeof(uint32_t);
+	std::shared_ptr<std::vector<uint32_t>> guest;
+	if (!gpu) {
+		guest = std::make_shared<std::vector<uint32_t>>(words);
+		if (!LibKernel::Memory::TryReadBacking(range.address, guest->data(), range.size)) {
+			return;
+		}
+	}
+	auto download = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                                         AllFlags, range.size);
+	if (download->Mapped().data() == nullptr) {
+		return;
+	}
+	// The guest bytes first (zeros for a GPU-written image): the copy writes only the texels, so
+	// the padding between them compares equal.
+	if (guest != nullptr) {
+		std::memcpy(download->Mapped().data(), guest->data(), range.size);
+	} else {
+		std::memset(download->Mapped().data(), 0, range.size);
+	}
+	download->Flush(0, range.size);
+	DownloadImage(*image, *download, 0, range.size, std::move(transfer));
+	vk::BufferMemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = download->Handle();
+	barrier.offset              = 0;
+	barrier.size                = range.size;
+	m_scheduler.EndRendering();
+	m_scheduler.Current().Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                                                 vk::PipelineStageFlagBits::eHost, {}, 0,
+	                                                 nullptr, 1, &barrier, 0, nullptr);
+	const auto& info        = image->info;
+	const auto  description = fmt::format(
+        "{} 0x{:012x}+0x{:x} {}x{}x{} layers {} mips {} fmt {} guest {} tile {} [{}{}{}] overlaps "
+	     "{} "
+	     "({} GPU-written){}",
+        what, range.address, range.size, info.extent.width, info.extent.height, info.extent.depth,
+        layers, info.resources.levels, static_cast<int>(info.pixel_format),
+        static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode),
+        gpu ? 'G' : '-', image->IsBufferModified() ? 'B' : '-', tracked_dirty ? 'C' : '-',
+        state.overlaps, state.gpu_overlaps, cached_buffer ? ", a cached buffer covers it" : "");
+	const auto format = info.pixel_format;
+	m_scheduler.DeferPriorityOperation([download, guest, range, words, op, description, layered,
+	                                    layers, format] {
+		download->Invalidate(0, range.size);
+		const auto* held    = reinterpret_cast<const uint32_t*>(download->Mapped().data());
+		bool        differs = false;
+		if (guest != nullptr) {
+			size_t differ = 0, first = words, guest_zero = 0, gpu_zero = 0;
+			for (size_t i = 0; i < words; i++) {
+				guest_zero += (*guest)[i] == 0 ? 1u : 0u;
+				gpu_zero += held[i] == 0 ? 1u : 0u;
+				if (held[i] != (*guest)[i]) {
+					first = differ++ == 0 ? i : first;
+				}
+			}
+			differs = differ != 0;
+			if (differs) {
+				LOGF("FG %u stale %s: %zu of %zu words differ, the first at +0x%zx (guest "
+				     "%08x, GPU %08x); zero words: guest %zu, GPU %zu\n",
+				     op, description.c_str(), differ, words, first * 4u, (*guest)[first],
+				     held[first], guest_zero, gpu_zero);
+				if (layered) {
+					const size_t layer_words = words / layers;
+					std::string  glyphs;
+					glyphs.reserve(layers);
+					for (uint32_t layer = 0; layer < layers; layer++) {
+						const auto at = static_cast<size_t>(layer) * layer_words;
+						glyphs += std::memcmp(held + at, guest->data() + at,
+						                      layer_words * sizeof(uint32_t)) == 0
+						              ? '='
+						              : 'x';
+					}
+					LogGlyphs(op, "stale layers", range.address, glyphs);
+				}
+			}
+		}
+		if (layered) {
+			LOGF("FG %u layers %s, as the GPU holds them ('_' empty; else the decade of the "
+			     "mean light, 5 for 1 to 10, 4 for 0.1 to 1 ..., a-j when mostly empty):\n",
+			     op, description.c_str());
+			LogGlyphs(op, "layers", range.address, LayerContentGlyphs(held, words, layers, format));
+		}
+		FrameGraph::CountVerify(true, range.size, differs);
 	});
 }
 

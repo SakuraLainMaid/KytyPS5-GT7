@@ -136,6 +136,10 @@ public:
 		return m_fault_manager.UnattributedFaults();
 	}
 	void                            SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Diagnostics (the frame graph's verification, FrameGraph::ClaimVerify): a range a shader
+	// reads that the GPU did not write, synchronized as a binding would synchronize it, against
+	// its guest bytes in every cached buffer over it ("FG <op> stale ..." when they differ).
+	void VerifyWithGuest(uint64_t vaddr, uint64_t size, uint32_t op, const std::string& what);
 	// Same, but visits only the tracker regions that may hold CPU-dirty pages.
 	void                            SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
 	void                            RunGarbageCollector();

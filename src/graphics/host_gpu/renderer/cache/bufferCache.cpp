@@ -1345,6 +1345,19 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 	}
 }
 
+// KYTY_IMAGE_UPLOAD_FROM_BUFFERS=1: an image upload over a cached buffer copies from that
+// buffer even when the GPU wrote none of its bytes, as before 2026-10-14. By default the upload
+// takes the guest bytes then: they are what the CPU wrote, while the buffer is only as fresh as
+// its own tracking, which misses writes next to other cached data (GT7's light grids were stale
+// that way, 2026-10-13).
+static bool UploadImagesFromCachedBuffers() {
+	static const bool from_buffers = [] {
+		const char* value = std::getenv("KYTY_IMAGE_UPLOAD_FROM_BUFFERS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return from_buffers;
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
@@ -1352,6 +1365,18 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
+		if (buffer.IsInBounds(vaddr, size) && !UploadImagesFromCachedBuffers() &&
+		    !IsRegionGpuModified(vaddr, size)) {
+			static std::atomic<uint64_t> staged {0};
+			const auto                   count = ++staged;
+			if (count <= 4 || (count & (count - 1u)) == 0) {
+				LOGF("BufferCache: image upload 0x%012" PRIx64 "+0x%" PRIx64
+				     " takes its guest bytes, not the cached buffer over it (%" PRIu64
+				     " so far; KYTY_IMAGE_UPLOAD_FROM_BUFFERS=1 copies from the buffer)\n",
+				     vaddr, size, count);
+			}
+			return StageGuestBytesForImage(vaddr, size);
+		}
 		if (buffer.IsInBounds(vaddr, size)) {
 			TouchBuffer(buffer);
 			(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
@@ -1697,6 +1722,77 @@ void BufferCache::SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t siz
 	    vaddr, size, [this](uint64_t address, uint64_t bytes) {
 		    SynchronizeBuffersInRange(address, bytes);
 	    });
+}
+
+void BufferCache::VerifyWithGuest(uint64_t vaddr, uint64_t size, uint32_t op,
+                                  const std::string& what) {
+	if (size == 0 || !GuestRange {vaddr, size}.Valid() || HasGpuDirtyBytes(vaddr, size)) {
+		return;
+	}
+	// What the binding uploads first; what is left to differ, the tracking did not see.
+	SynchronizeBuffersInRange(vaddr, size);
+	const auto end = vaddr + size;
+	auto       it  = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		auto&      buffer = m_slot_buffers[it->second];
+		const auto start  = std::max(buffer.CpuAddress(), vaddr) & ~uint64_t {3};
+		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end) & ~uint64_t {3};
+		if (start < buffer.CpuAddress() || start >= finish ||
+		    !FrameGraph::ClaimVerify(start, finish - start)) {
+			continue;
+		}
+		const auto bytes = finish - start;
+		auto       guest = std::make_shared<std::vector<uint32_t>>(bytes / sizeof(uint32_t));
+		if (!Libs::LibKernel::Memory::TryReadBacking(start, guest->data(), bytes)) {
+			continue;
+		}
+		auto download = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                         AllFlags, bytes);
+		if (download->Mapped().data() == nullptr) {
+			continue;
+		}
+		download->CopyFrom(m_scheduler.Current(), buffer, buffer.Offset(start), 0, bytes,
+		                   vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eHostRead,
+		                   vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		                   vk::AccessFlagBits::eHostRead);
+		vk::BufferMemoryBarrier barrier {};
+		barrier.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.buffer              = download->Handle();
+		barrier.offset              = 0;
+		barrier.size                = bytes;
+		m_scheduler.Current().Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                                                 vk::PipelineStageFlagBits::eHost, {}, 0,
+		                                                 nullptr, 1, &barrier, 0, nullptr);
+		const auto description =
+		    fmt::format("{} 0x{:012x}+0x{:x} (cached buffer 0x{:012x}+0x{:x})", what, start, bytes,
+		                buffer.CpuAddress(), buffer.Size());
+		m_scheduler.DeferPriorityOperation([download, guest, start, bytes, op, description] {
+			download->Invalidate(0, bytes);
+			const auto*  held   = reinterpret_cast<const uint32_t*>(download->Mapped().data());
+			const size_t words  = guest->size();
+			size_t       differ = 0, first = words, last = 0;
+			for (size_t i = 0; i < words; i++) {
+				if (held[i] != (*guest)[i]) {
+					first = differ++ == 0 ? i : first;
+					last  = i;
+				}
+			}
+			if (differ != 0) {
+				LOGF("FG %u stale %s: %zu of %zu words differ, from +0x%zx to +0x%zx (the first: "
+				     "guest %08x, GPU %08x)\n",
+				     op, description.c_str(), differ, words, first * 4u, last * 4u, (*guest)[first],
+				     held[first]);
+			}
+			FrameGraph::CountVerify(false, bytes, differ != 0);
+			(void)start;
+		});
+	}
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

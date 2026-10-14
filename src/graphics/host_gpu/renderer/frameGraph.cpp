@@ -35,6 +35,56 @@ std::map<uint64_t, uint64_t>                  g_buffers;   // guest address -> b
 std::map<uint64_t, std::pair<uint64_t, bool>> g_readbacks; // small linear images: bytes, read back
 std::set<uint64_t>           g_shaders;
 std::set<uint64_t>           g_grid_checks;
+// Verification: the ranges claimed in this capture and the bytes they download; the counts of
+// the comparisons that landed (written as they land, from the scheduler's completion work).
+std::set<std::pair<uint64_t, uint64_t>> g_verify_claimed;
+uint64_t                                g_verify_claimed_bytes = 0;
+uint64_t                                g_verify_over_budget   = 0;
+std::atomic<uint64_t>                   g_verify_images {0};
+std::atomic<uint64_t>                   g_verify_image_bytes {0};
+std::atomic<uint64_t>                   g_verify_images_differ {0};
+std::atomic<uint64_t>                   g_verify_buffers {0};
+std::atomic<uint64_t>                   g_verify_buffer_bytes {0};
+std::atomic<uint64_t>                   g_verify_buffers_differ {0};
+
+uint64_t VerifyBudgetBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_FG_VERIFY_MB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 3072ull) << 20u;
+	}();
+	return bytes;
+}
+
+void ResetVerify() {
+	g_verify_claimed.clear();
+	g_verify_claimed_bytes = 0;
+	g_verify_over_budget   = 0;
+	g_verify_images.store(0, std::memory_order_relaxed);
+	g_verify_image_bytes.store(0, std::memory_order_relaxed);
+	g_verify_images_differ.store(0, std::memory_order_relaxed);
+	g_verify_buffers.store(0, std::memory_order_relaxed);
+	g_verify_buffer_bytes.store(0, std::memory_order_relaxed);
+	g_verify_buffers_differ.store(0, std::memory_order_relaxed);
+}
+
+// After the frame's comparisons landed.
+void LogVerify(BufferCache& cache) {
+	if (!VerifyEnabled() || g_verify_claimed.empty()) {
+		return;
+	}
+	cache.WaitForDiagnostics();
+	LOGF("FG 0 verify: %" PRIu64 " textures (%" PRIu64
+	     " MB) compared with their guest bytes, %" PRIu64 " stale; %" PRIu64 " buffers (%" PRIu64
+	     " MB), %" PRIu64 " stale; %" PRIu64 " ranges past the %" PRIu64
+	     " MB budget (KYTY_FG_VERIFY_MB) not compared\n",
+	     g_verify_images.load(std::memory_order_relaxed),
+	     g_verify_image_bytes.load(std::memory_order_relaxed) >> 20u,
+	     g_verify_images_differ.load(std::memory_order_relaxed),
+	     g_verify_buffers.load(std::memory_order_relaxed),
+	     g_verify_buffer_bytes.load(std::memory_order_relaxed) >> 20u,
+	     g_verify_buffers_differ.load(std::memory_order_relaxed), g_verify_over_budget,
+	     VerifyBudgetBytes() >> 20u);
+}
 
 constexpr uint64_t MaxLines       = 600000;
 constexpr size_t   MaxBuffers     = 8192;
@@ -132,6 +182,7 @@ void OnFrameBoundary(BufferCache& cache) {
 		     g_truncated ? " (lines truncated)" : "");
 		LogBuffers(cache);
 		LogReadbacks(cache);
+		LogVerify(cache);
 		LOGF("FG 0 end capture %u (%zu shaders dumped)\n", g_capture, g_shaders.size());
 		g_buffers.clear();
 		g_readbacks.clear();
@@ -151,7 +202,13 @@ void OnFrameBoundary(BufferCache& cache) {
 	g_readbacks.clear();
 	g_shaders.clear();
 	g_grid_checks.clear();
+	ResetVerify();
 	LOGF("FG 0 begin capture %u after frame end %" PRIu64 "\n", g_capture, g_frame_ends);
+	if (VerifyEnabled()) {
+		LOGF("FG 0 verify on: textures and buffers the GPU did not write are compared with their "
+		     "guest bytes, up to %" PRIu64 " MB (KYTY_FG_VERIFY=0 turns it off)\n",
+		     VerifyBudgetBytes() >> 20u);
+	}
 	g_active.store(true, std::memory_order_relaxed);
 	g_logging.store(true, std::memory_order_relaxed);
 }
@@ -209,6 +266,41 @@ void NoteReadback(uint64_t address, uint64_t size, bool read_back) {
 		auto& kept  = g_readbacks[address];
 		kept.first  = std::max(kept.first, bytes);
 		kept.second = kept.second || read_back;
+	}
+}
+
+bool VerifyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FG_VERIFY");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+bool ClaimVerify(uint64_t address, uint64_t size) {
+	if (!Logging() || !VerifyEnabled() || address == 0 || size == 0 || size > MaxVerifyBytes) {
+		return false;
+	}
+	if (g_verify_claimed.contains({address, size})) {
+		return false;
+	}
+	if (g_verify_claimed_bytes + size > VerifyBudgetBytes()) {
+		g_verify_over_budget++;
+		return false;
+	}
+	g_verify_claimed.emplace(address, size);
+	g_verify_claimed_bytes += size;
+	return true;
+}
+
+void CountVerify(bool image, uint64_t bytes, bool differs) {
+	auto& count = image ? g_verify_images : g_verify_buffers;
+	auto& total = image ? g_verify_image_bytes : g_verify_buffer_bytes;
+	auto& stale = image ? g_verify_images_differ : g_verify_buffers_differ;
+	count.fetch_add(1, std::memory_order_relaxed);
+	total.fetch_add(bytes, std::memory_order_relaxed);
+	if (differs) {
+		stale.fetch_add(1, std::memory_order_relaxed);
 	}
 }
 

@@ -59,6 +59,19 @@ void                      NoteReadback(uint64_t address, uint64_t size, bool rea
 inline constexpr size_t MaxGridChecks = 12;
 [[nodiscard]] bool      ClaimGridCheck(uint64_t address);
 
+// Verification (KYTY_FG_VERIFY, default 1; 0 turns it off): the first time a capture binds a
+// texture or a buffer that the GPU did not write, the GPU's copy of it (as the commands recorded so
+// far leave it) is compared with its guest bytes, which the CPU wrote and which are the truth for
+// it; a difference is a stale copy ("FG <op> stale ..."). An array texture of six or more layers,
+// written on the GPU or not, also gets a line of its layers' contents ("FG <op> layers ...").
+// Up to KYTY_FG_VERIFY_MB (default 3072) of downloads per capture, each up to MaxVerifyBytes.
+inline constexpr uint64_t MaxVerifyBytes = 256ull << 20u;
+[[nodiscard]] bool        VerifyEnabled();
+// Whether to verify this range now: the first time in the capture, within the budget.
+[[nodiscard]] bool ClaimVerify(uint64_t address, uint64_t size);
+// Any thread, as a comparison lands: counted for the capture's "FG 0 verify" summary.
+void CountVerify(bool image, uint64_t bytes, bool differs);
+
 // A shader the frame runs: its guest code is dumped once per capture.
 void NoteShader(const char* stage, uint64_t hash, uint64_t code_address, const uint32_t* user_data,
                 uint32_t user_data_count);
