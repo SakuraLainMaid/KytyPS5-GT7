@@ -55,6 +55,13 @@ struct PreparedBindings {
 	std::vector<BindlessTable::Heap*>     bindless_heaps;
 };
 
+// A shader that reads guest memory through its page table (DMA): the memory its user-data
+// pointers point at is made resident before it runs (BufferCache::MakeResident), the first
+// KYTY_DMA_PREFAULT_KB (default 4; 0 turns this off) from each. The light-probe bake reads its
+// per-probe constants that way, a new page each probe; those it read as zeros drew whole cubes of
+// NaN, the black lighting (2026-10-14).
+void PrefaultDmaPointers(BufferCache& buffers, const ShaderStageRuntime& stage);
+
 [[nodiscard]] vk::DescriptorType
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);
 [[nodiscard]] uint32_t

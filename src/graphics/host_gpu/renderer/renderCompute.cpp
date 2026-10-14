@@ -1164,6 +1164,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		std::copy(std::begin(input_info.dispatch_threads_num), std::end(input_info.dispatch_threads_num),
 		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
 	}
+	if (program.info.uses_dma) {
+		PrefaultDmaPointers(m_context.GetBufferCache(), input_info.stage);
+	}
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
 		KYTY_PROFILER_BLOCK("Dispatch::PrepareBda");
@@ -1348,8 +1351,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	const TraceShaderScope trace_shader(input_info.stage.program->shader_hash);
 	PrepareBindings(input_info.stage, bindings);
-	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
+	if (program.info.uses_dma) {
+		PrefaultDmaPointers(m_context.GetBufferCache(), input_info.stage);
+	}
+	FindBuffers(bindings);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}

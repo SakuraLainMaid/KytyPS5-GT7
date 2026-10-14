@@ -136,6 +136,12 @@ public:
 		return m_fault_manager.UnattributedFaults();
 	}
 	void                            SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// GPU thread. A shader that reads guest memory through its page table (DMA) reads a page no
+	// cached buffer covers as zeros, and only records the fault; a dispatch that writes images is
+	// not run again after one (DispatchBufferRecovery). The guest-mapped pages of
+	// [vaddr, vaddr + size) without a cached buffer get one, filled from guest memory. Returns how
+	// many pages had none.
+	uint32_t MakeResident(uint64_t vaddr, uint64_t size);
 	// Diagnostics (the frame graph's verification, FrameGraph::ClaimVerify): a range a shader
 	// reads that the GPU did not write, synchronized as a binding would synchronize it, against
 	// its guest bytes in every cached buffer over it ("FG <op> stale ..." when they differ).

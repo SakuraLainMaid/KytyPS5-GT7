@@ -23,6 +23,7 @@
 #include <unordered_map>
 #include <fmt/format.h>
 #include <xxhash.h>
+#include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
 
@@ -411,8 +412,25 @@ void Image::CopyImage(Image& source) {
 	std::vector<vk::ImageCopy> copies;
 	copies.reserve(levels);
 	for (uint32_t level = 0; level < levels; level++) {
-		const auto width  = std::max(source.backing.extent.width >> level, 1u);
-		const auto height = std::max(source.backing.extent.height >> level, 1u);
+		// Within both images: an alias the guest describes smaller over the same memory (a
+		// light-list grid whose size changes) took the larger one's extent, and the copy wrote
+		// past its image; the device was lost ("WriteInvalid", Route X, 2026-10-14). Counted in
+		// blocks: a direct copy may pair formats of the same block size and other block
+		// extents (BC7 with RGBA32 UINT), and the extent is in the source's texels.
+		const auto source_block      = vk::blockExtent(source.backing.format);
+		const auto destination_block = vk::blockExtent(backing.format);
+		const auto within = [&](uint32_t source_size, uint32_t destination_size, size_t axis) {
+			const uint32_t source_texels      = std::max(source_size >> level, 1u);
+			const uint32_t destination_texels = std::max(destination_size >> level, 1u);
+			const uint32_t source_per         = std::max<uint32_t>(source_block[axis], 1u);
+			const uint32_t destination_per    = std::max<uint32_t>(destination_block[axis], 1u);
+			const uint32_t blocks =
+			    std::min((source_texels + source_per - 1u) / source_per,
+			             (destination_texels + destination_per - 1u) / destination_per);
+			return std::min(source_texels, blocks * source_per);
+		};
+		const auto width  = within(source.backing.extent.width, backing.extent.width, 0);
+		const auto height = within(source.backing.extent.height, backing.extent.height, 1);
 		const auto depth  = std::max(base_depth >> level, 1u);
 		const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
 		vk::ImageCopy copy {};
@@ -427,11 +445,14 @@ void Image::CopyImage(Image& source) {
 				copy.extent                    = {width, height, 1};
 			}
 		} else if (source.backing.image_type == vk::ImageType::e2D) {
-			copy.srcSubresource.layerCount = source_layers;
-			copy.extent                    = {width, height, source_layers};
+			// Layers into depth slices: no more than either has.
+			const auto slices              = std::min(source_layers, source.backing.layers);
+			copy.srcSubresource.layerCount = slices;
+			copy.extent                    = {width, height, slices};
 		} else {
-			copy.dstSubresource.layerCount = destination_layers;
-			copy.extent                    = {width, height, destination_layers};
+			const auto slices              = std::min(destination_layers, backing.layers);
+			copy.dstSubresource.layerCount = slices;
+			copy.extent                    = {width, height, slices};
 		}
 		copies.push_back(copy);
 	}
@@ -637,8 +658,13 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	const auto height = std::max(backing.extent.height >> mip, 1u);
 	const auto depth  = std::max(backing.extent.depth >> mip, 1u);
 	EXIT_IF(width != source.backing.extent.width || height != source.backing.extent.height);
-	const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
-	const auto aspects                             = FullAspectMask(source.backing.format);
+	auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
+	// From `layer` on, the destination has only so many layers left.
+	if (backing.image_type != vk::ImageType::e3D &&
+	    source.backing.image_type != vk::ImageType::e3D) {
+		source_layers = destination_layers = std::min(source_layers, backing.layers - layer);
+	}
+	const auto aspects = FullAspectMask(source.backing.format);
 	EXIT_IF(aspects != FullAspectMask(backing.format));
 	std::array<vk::ImageCopy, 2> copies {};
 	uint32_t                     copy_count = 0;
