@@ -191,6 +191,10 @@ private:
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
+	// Small linear images the CPU writes, compared with their guest bytes instead of trusting
+	// the page tracking alone (KYTY_GUEST_HASH_IMAGES_KB).
+	[[nodiscard]] bool ChecksGuestContent(const Image& image) const;
+	void               RefreshByContent(ImageId id);
 	// The GPU-side MaterializeColorClear of GPU-written render-target metadata; false when it
 	// does not apply (the caller then reads the metadata back).
 	void                        DescribeUintArrayImage(ImageId id, const ImageDesc& desc);

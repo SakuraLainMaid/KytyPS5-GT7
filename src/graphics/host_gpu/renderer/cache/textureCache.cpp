@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
 #include <cstdlib>
@@ -1358,8 +1359,23 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
-		const auto [source, source_offset] =
-		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+		const auto range         = image.info.data;
+		Buffer*    source        = nullptr;
+		uint64_t   source_offset = 0;
+		// Hashed before it is staged: a CPU write between the two leaves the hash older than
+		// the upload, so the next comparison uploads once more rather than missing it.
+		uint64_t hash = 0;
+		if (ChecksGuestContent(image) && HashGuestBacking(range.address, range.size, hash)) {
+			std::tie(source, source_offset) =
+			    m_buffer_cache.StageGuestBytesForImage(range.address, range.size);
+			image.content_hash             = hash;
+			image.content_hash_valid       = true;
+			image.content_check_submission = g_guest_submission_seq.load(std::memory_order_relaxed);
+		} else {
+			std::tie(source, source_offset) =
+			    m_buffer_cache.ObtainBufferForImage(range.address, range.size);
+			image.content_hash_valid = false;
+		}
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
@@ -1786,11 +1802,85 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	report();
 }
 
+// KYTY_GUEST_HASH_IMAGES_KB (default 256, 0: off): linear images up to this size that the GPU
+// neither wrote nor covers with its writes are compared with their guest bytes (a hash) the
+// first time each guest submission binds them, and uploaded again, straight from guest memory,
+// when the bytes changed. What the game wrote before submitting is visible to all of that
+// submission's commands, as on the console; a CPU write the page tracking does see in between
+// is compared again. The page tracking alone misses CPU writes to an image's first and last pages
+// once a CPU write next to the image untracked them (InvalidateCpuAliases), and an upload from a
+// buffer the buffer cache keeps over the range is only as fresh as that buffer. GT7's light
+// grids, which the CPU rewrites every frame in memory it shares with other data, were found
+// stale on the GPU against their guest bytes (frame captures, 2026-10-13), as its tunnels and
+// night scenes went dark in screen tiles.
+static uint64_t GuestHashImageBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_GUEST_HASH_IMAGES_KB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 256ull) << 10u;
+	}();
+	return bytes;
+}
+
+bool TextureCache::ChecksGuestContent(const Image& image) const {
+	const auto& info = image.info;
+	return GuestHashImageBytes() != 0 && !info.IsTiled() && !info.data.Empty() &&
+	       info.data.size <= GuestHashImageBytes() && info.samples == 1 && !image.depth_id &&
+	       !info.IsDepth() && info.metadata.compression == VideoOutCompression::Uncompressed &&
+	       !image.IsGpuModified() && !image.IsBufferModified() &&
+	       !m_buffer_cache.IsRegionGpuModified(info.data.address, info.data.size);
+}
+
+void TextureCache::RefreshByContent(ImageId id) {
+	auto&      image = m_slot_images[id];
+	const auto range = image.info.data;
+	TrackImage(id);
+	const auto submission = g_guest_submission_seq.load(std::memory_order_relaxed);
+	if (image.content_check_submission == submission && !image.IsCpuDirty()) {
+		return;
+	}
+	uint64_t hash = 0;
+	if (!HashGuestBacking(range.address, range.size, hash)) {
+		image.content_hash_valid = false;
+		RefreshImage(id);
+		return;
+	}
+	image.content_check_submission = submission;
+	if (hash == image.content_hash) {
+		// The GPU holds these bytes already, whatever the tracking marked.
+		if (image.IsDefinitelyCpuDirty()) {
+			image.RefreshComplete();
+		} else {
+			image.ClearMaybeCpuDirty();
+		}
+		return;
+	}
+	if (!image.IsDefinitelyCpuDirty()) {
+		// What this check is for: the first few, then every 1000th.
+		static std::atomic<uint64_t> unseen {0};
+		const auto                   count = ++unseen;
+		if (count <= 16 || count % 1000 == 0) {
+			LOGF("TextureCache: guest bytes of 0x%012" PRIx64 "+0x%" PRIx64
+			     " (%ux%u, %u layers, format %u) changed unseen by the page tracking%s: uploaded "
+			     "again (%" PRIu64 " so far)\n",
+			     range.address, range.size, image.info.extent.width, image.info.extent.height,
+			     image.info.resources.layers, static_cast<uint32_t>(image.info.pixel_format),
+			     image.IsMaybeCpuDirty() ? " (a neighbour's write marked it maybe-dirty)" : "",
+			     count);
+		}
+	}
+	image.MarkCpuDirty();
+	InitializeImage(id);
+}
+
 void TextureCache::RefreshImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
 	     m_slot_images[image.depth_id].info.samples != 1)) {
+		return;
+	}
+	if (image.content_hash_valid && ChecksGuestContent(image)) {
+		RefreshByContent(id);
 		return;
 	}
 	TrackImage(id);
@@ -2100,6 +2190,8 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
 	}
+	// The GPU's pixels from now on, not the guest bytes an upload took.
+	image.content_hash_valid = false;
 	// Aliases aged by frames stay alive side by side. A single owner among them: this write
 	// supersedes the bytes of every other live image overlapping it, so none of those may later
 	// be written back (collector, linear readback, buffer sync) over it. Their native contents
@@ -2112,7 +2204,8 @@ void TextureCache::CommitGpuWrite(Image& image) {
 			if (other == nullptr || other == &image || other->depth_id || !other->registered) {
 				continue;
 			}
-			other->alias_owner = false;
+			other->alias_owner        = false;
+			other->content_hash_valid = false;
 			if (other->IsGpuModified()) {
 				other->ClearGpuModified();
 			}
@@ -2606,6 +2699,9 @@ void TextureCache::CompareWithGuest(ImageId id, uint32_t op) {
 	if (download->Mapped().data() == nullptr) {
 		return;
 	}
+	// The guest bytes first: the copy writes only the pixels, so the row padding compares equal.
+	std::memcpy(download->Mapped().data(), guest->data(), guest->size() * sizeof(uint32_t));
+	download->Flush(0, range.size);
 	DownloadImage(*image, *download, 0, range.size, std::move(transfer));
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eShaderWrite;
@@ -2634,13 +2730,21 @@ void TextureCache::CompareWithGuest(ImageId id, uint32_t op) {
 				first = differ++ == 0 ? i : first;
 			}
 		}
+		// For a grid (two words a cell), where the first difference is.
+		const uint64_t layer_words = words / std::max(layers, 1u);
+		const auto     place =
+            grid && differ != 0 && layer_words != 0
+		            ? fmt::format(" (layer {}, row {}, cell {})", first / layer_words,
+		                          (first % layer_words) / (static_cast<uint64_t>(pitch) * 2u),
+		                          ((first % layer_words) % (static_cast<uint64_t>(pitch) * 2u)) / 2u)
+		            : std::string();
 		LOGF("FG %u grid 0x%012" PRIx64 "+0x%" PRIx64 " %ux%u layers %u pitch %u [%s]: the GPU's "
-		     "copy %s the guest bytes (%zu of %zu words differ%s)\n",
+		     "pixels %s the guest bytes (%zu of %zu words differ%s)\n",
 		     op, range.address, range.size, width, height, layers, pitch, flags.c_str(),
-		     differ == 0 ? "matches" : "differs from", differ, words,
+		     differ == 0 ? "match" : "differ from", differ, words,
 		     differ == 0 ? ""
-		                 : fmt::format(", the first at +0x{:x}: guest {:08x}, GPU {:08x}",
-		                               first * 4, (*guest)[first], gpu[first])
+		                 : fmt::format(", the first at +0x{:x}{}: guest {:08x}, GPU {:08x}",
+		                               first * 4, place, (*guest)[first], gpu[first])
 		                       .c_str());
 		if (!grid) {
 			return;

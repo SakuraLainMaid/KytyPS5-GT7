@@ -1373,6 +1373,21 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	return {&m_staging_buffer, stage_offset};
 }
 
+std::pair<Buffer*, uint64_t> BufferCache::StageGuestBytesForImage(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: invalid image source\n");
+	}
+	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
+	if (staging == nullptr) {
+		EXIT("BufferCache: staging reservation failed for guest image\n");
+	}
+	if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
+		std::memset(staging, 0, static_cast<size_t>(size));
+	}
+	m_staging_buffer.Commit();
+	return {&m_staging_buffer, stage_offset};
+}
+
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
 	if ((vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 || size > UINT64_MAX - vaddr) {
 		EXIT("BufferCache: fill range must be dword aligned\n");

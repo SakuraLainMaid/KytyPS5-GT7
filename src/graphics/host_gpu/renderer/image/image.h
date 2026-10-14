@@ -113,6 +113,18 @@ public:
 		return m_cpu_dirty;
 	}
 
+	// TextureCache::RefreshByContent: the guest bytes changed (definitely dirty), or they did not
+	// (a maybe-dirty mark is dropped).
+	void MarkCpuDirty() {
+		m_cpu_dirty        = true;
+		m_maybe_cpu_dirty  = false;
+		m_maybe_hash_valid = false;
+	}
+	void ClearMaybeCpuDirty() {
+		m_maybe_cpu_dirty  = false;
+		m_maybe_hash_valid = false;
+	}
+
 	void RefreshComplete() {
 		if (!IsCpuDirty()) {
 			EXIT("clean image cannot complete a refresh\n");
@@ -176,6 +188,11 @@ public:
 	uint64_t         dcc_clear_checked_tick  = UINT64_MAX;
 	uint32_t         dcc_clear_checked_first = 0;
 	uint32_t         dcc_clear_checked_count = 0;
+	// A small linear image the CPU writes (TextureCache::ChecksGuestContent): the hash of the
+	// guest bytes its last upload took, and the guest submission they were last compared in.
+	uint64_t content_hash             = 0;
+	uint64_t content_check_submission = 0;
+	bool     content_hash_valid       = false;
 
 private:
 	friend struct ImageTestAccess;

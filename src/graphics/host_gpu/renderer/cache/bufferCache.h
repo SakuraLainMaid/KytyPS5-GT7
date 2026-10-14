@@ -91,6 +91,10 @@ public:
 	[[nodiscard]] Buffer*       GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	// The guest bytes of a range the GPU did not write, staged for an image upload whatever
+	// buffer covers them (ObtainBufferForImage copies from such a buffer instead).
+	[[nodiscard]] std::pair<Buffer*, uint64_t> StageGuestBytesForImage(uint64_t vaddr,
+	                                                                   uint64_t size);
 	// GPU write bitmap (KYTY_WRITE_BITMAP=1, rework.md Phase 2 first step): one bit per 4 KiB
 	// guest page below 1 TiB, set by shaders through bindings whose writes the host cannot bound.
 	// Its device address, or 0 when it is off or unavailable.
