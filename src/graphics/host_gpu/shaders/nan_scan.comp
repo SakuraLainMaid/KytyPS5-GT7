@@ -1,0 +1,62 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+// Diagnostics (NanScanner): the words of one mip of an image, copied tightly packed layer after
+// layer, are counted per layer when they hold a value that is not finite (infinity or NaN), into
+// one counter per layer. The packing tells where the float bit fields sit in a word.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words {
+    uint w[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Counts {
+    uint c[];
+};
+
+layout(push_constant) uniform Push {
+    uvec2 words_address;
+    uvec2 counts_address;
+    uint  words_per_layer;
+    uint  layers;
+    // 0: B10G11R11 (an 11-bit red and green, a 10-bit blue); 1: two halves; 2: one 32-bit float.
+    uint  packing;
+} pc;
+
+bool NotFinite(uint word) {
+    if (pc.packing == 0u) {
+        // The exponents: red bits 6-10, green bits 17-21, blue bits 27-31 (all ones: not finite).
+        return (word & 0x000007c0u) == 0x000007c0u || (word & 0x003e0000u) == 0x003e0000u ||
+               (word & 0xf8000000u) == 0xf8000000u;
+    }
+    if (pc.packing == 1u) {
+        return (word & 0x00007c00u) == 0x00007c00u || (word & 0x7c000000u) == 0x7c000000u;
+    }
+    return (word & 0x7f800000u) == 0x7f800000u;
+}
+
+void main() {
+    Words      words  = Words(pc.words_address);
+    Counts     counts = Counts(pc.counts_address);
+    const uint total  = pc.words_per_layer * pc.layers;
+    const uint stride = gl_NumWorkGroups.x * 256u;
+    // One layer's words are contiguous: count them per thread until the layer changes.
+    uint layer = 0xffffffffu;
+    uint found = 0u;
+    for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
+        const uint at = i / pc.words_per_layer;
+        if (at != layer) {
+            if (found != 0u) {
+                atomicAdd(counts.c[layer], found);
+            }
+            layer = at;
+            found = 0u;
+        }
+        found += NotFinite(words.w[i]) ? 1u : 0u;
+    }
+    if (found != 0u) {
+        atomicAdd(counts.c[layer], found);
+    }
+}

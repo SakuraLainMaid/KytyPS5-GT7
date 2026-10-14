@@ -43,9 +43,11 @@
 #include <fmt/format.h>
 #include <string>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -121,14 +123,25 @@ struct DispatchRecoveryPolicy {
 // KYTY_TRACE_DISPATCHES=<hash>[,<hash>...]: every dispatch of these compute shaders (a hash of 16
 // hex digits, or its first 8) is logged as it is recorded, "Trace dispatch <n> ...": its frame,
 // groups, user data and the words its user-data pointers point at (its constants and
-// descriptors), its textures with their cache states, and its buffers (the words of the small ones
-// it reads). Once the GPU has run it: mip 0 of each float image it writes, up to
-// KYTY_TRACE_SCAN_KB (default 1024), a glyph a layer with the texels that are not finite, and the
-// same for the images the GPU wrote that it reads (once a frame each); the first words of each
-// buffer it writes. A texture it reads that the GPU did not write is compared with its guest bytes
-// (TextureCache::TraceVerify: once each, up to KYTY_TRACE_VERIFY_MB, default 2048). Up to
-// KYTY_TRACE_MAX (default 20000) dispatches. KYTY_TRACE_FROM=<hash>: the trace starts at that
-// shader's first dispatch (a shader that runs only where the trace is wanted).
+// descriptors; KYTY_TRACE_PTR_BYTES, default 256), its textures with their cache states, and its
+// buffers (the words of the small ones it reads). Once the GPU has run it: mip 0 of each float
+// image it writes, up to KYTY_TRACE_SCAN_KB (default 1024), a glyph a layer with the texels that
+// are not finite, and the same for the images the GPU wrote that it reads (once a frame each); the
+// first words of each buffer it writes. A texture it reads that the GPU did not write is compared
+// with its guest bytes (TextureCache::TraceVerify: once each, up to KYTY_TRACE_VERIFY_MB, default
+// 2048). Up to KYTY_TRACE_MAX (default 20000) dispatches. KYTY_TRACE_FROM=<hash>: the trace starts
+// at that shader's first dispatch (a shader that runs only where the trace is wanted).
+//
+// KYTY_TRACE_NAN=1 instead follows the texels that are not finite (infinity or NaN) through the
+// traced dispatches, for passes of tens of thousands of them (a light-probe bake): after each one,
+// every mip of the float images it writes, and of the ones it reads once their contents changed,
+// is scanned on the GPU (TextureCache::ScanNonFiniteGpu). A layer of a mip that is not finite now
+// and was not at the image's last scan, or the other way round, is logged "Trace nan: dispatch
+// <n> ...". Only the first KYTY_TRACE_FIRST (default 3) dispatches of each shader are logged as
+// they are recorded; the others' lines are kept until their scans land and logged for the first
+// KYTY_TRACE_NAN_DESCRIBE (default 64) dispatches whose scans found a change. Up to
+// KYTY_TRACE_NAN_MAX (default 4000) change lines; KYTY_TRACE_MAX defaults to 1000000, and the
+// pointers' words to 1024 bytes.
 struct ShaderHashes {
 	std::vector<uint64_t> hashes;
 	std::vector<uint32_t> prefixes; // the first 8 hex digits: the high 32 bits
@@ -174,31 +187,53 @@ struct DispatchTraceConfig {
 	ShaderHashes from;
 	uint64_t     max_dispatches = 20000;
 	uint64_t     scan_bytes     = 1024ull << 10u;
+	uint64_t     pointer_bytes  = 256;
+	bool         nan            = false;
+	uint32_t     first          = 3;
+	uint32_t     describe       = 64;
+	uint64_t     max_changes    = 4000;
 };
 
+[[nodiscard]] uint64_t EnvironmentNumber(const char* name, uint64_t fallback) {
+	const char* value = std::getenv(name);
+	return value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : fallback;
+}
+
+// Leaked, as NanTrace(): the scans' callbacks may still run while the process exits.
 const DispatchTraceConfig& DispatchTrace() {
-	static const DispatchTraceConfig config = [] {
+	static const auto* config = new DispatchTraceConfig([] {
 		DispatchTraceConfig result;
 		result.traced = ShaderHashes::Parse(std::getenv("KYTY_TRACE_DISPATCHES"));
 		if (result.traced.Empty()) {
 			return result;
 		}
 		result.from = ShaderHashes::Parse(std::getenv("KYTY_TRACE_FROM"));
-		if (const char* max = std::getenv("KYTY_TRACE_MAX")) {
-			result.max_dispatches = std::strtoull(max, nullptr, 10);
-		}
-		if (const char* scan = std::getenv("KYTY_TRACE_SCAN_KB")) {
-			result.scan_bytes = std::strtoull(scan, nullptr, 10) << 10u;
-		}
+		const char* nan = std::getenv("KYTY_TRACE_NAN");
+		result.nan      = nan != nullptr && nan[0] == '1';
+		result.max_dispatches =
+		    EnvironmentNumber("KYTY_TRACE_MAX", result.nan ? 1000000u : result.max_dispatches);
+		result.scan_bytes    = EnvironmentNumber("KYTY_TRACE_SCAN_KB", 1024u) << 10u;
+		result.pointer_bytes = std::clamp<uint64_t>(
+		    EnvironmentNumber("KYTY_TRACE_PTR_BYTES", result.nan ? 1024u : 256u), 4u, 65536u);
+		result.first    = static_cast<uint32_t>(EnvironmentNumber("KYTY_TRACE_FIRST", 3u));
+		result.describe = static_cast<uint32_t>(EnvironmentNumber("KYTY_TRACE_NAN_DESCRIBE", 64u));
+		result.max_changes = EnvironmentNumber("KYTY_TRACE_NAN_MAX", 4000u);
 		LOGF("Trace dispatch: tracing the dispatches of %zu shaders (KYTY_TRACE_DISPATCHES)%s, up "
-		     "to %" PRIu64 " dispatches (KYTY_TRACE_MAX); images up to %" PRIu64
-		     " KB are scanned (KYTY_TRACE_SCAN_KB)\n",
+		     "to %" PRIu64 " dispatches (KYTY_TRACE_MAX); %s\n",
 		     result.traced.hashes.size() + result.traced.prefixes.size(),
 		     result.from.Empty() ? "" : " from the first dispatch of KYTY_TRACE_FROM's shader",
-		     result.max_dispatches, result.scan_bytes >> 10u);
+		     result.max_dispatches,
+		     result.nan ? fmt::format("following texels that are not finite on the GPU "
+		                              "(KYTY_TRACE_NAN), the first {} dispatches of each shader "
+		                              "logged as they are recorded (KYTY_TRACE_FIRST)",
+		                              result.first)
+		                      .c_str()
+		                : fmt::format("images up to {} KB are scanned (KYTY_TRACE_SCAN_KB)",
+		                              result.scan_bytes >> 10u)
+		                      .c_str());
 		return result;
-	}();
-	return config;
+	}());
+	return *config;
 }
 
 // GPU thread: whether this dispatch is traced (KYTY_TRACE_FROM's shader starts the trace).
@@ -220,13 +255,29 @@ const DispatchTraceConfig& DispatchTrace() {
 	return config.traced.Contains(hash);
 }
 
-void LogTraceWords(const std::string& prefix, const uint32_t* words, size_t count) {
+// Where a traced dispatch's lines go: the log, or (KYTY_TRACE_NAN) the dispatch's description,
+// kept until its scans land.
+struct TraceLines {
+	std::vector<std::string>* kept = nullptr;
+
+	template <typename... Args>
+	void operator()(const char* format, const Args&... args) const {
+		if (kept != nullptr) {
+			kept->push_back(fmt::sprintf(format, args...));
+		} else if (!Log::IsSilent()) {
+			Log::Write(fmt::sprintf(format, args...));
+		}
+	}
+};
+
+void LogTraceWords(const TraceLines& out, const std::string& prefix, const uint32_t* words,
+                   size_t count) {
 	for (size_t row = 0; row < count; row += 16) {
 		std::string line;
 		for (size_t k = row; k < std::min(count, row + 16); k++) {
 			line += fmt::format(" {:08x}", words[k]);
 		}
-		LOGF("%s +0x%03zx:%s\n", prefix.c_str(), row * 4u, line.c_str());
+		out("%s +0x%03zx:%s\n", prefix.c_str(), row * 4u, line.c_str());
 	}
 }
 
@@ -249,6 +300,206 @@ struct TraceShaderScope {
 	KYTY_CLASS_NO_COPY(TraceShaderScope);
 };
 
+// KYTY_TRACE_NAN: a traced dispatch, its lines kept until its scans have landed (none when they
+// were logged as it was recorded).
+struct NanTraceDispatch {
+	uint64_t                 serial = 0;
+	uint64_t                 shader = 0;
+	uint64_t                 frame  = 0;
+	std::vector<std::string> lines;
+	bool                     logged = false; // the priority thread's
+};
+
+// The last scan of each image, by guest address, shape and format, and what was logged (priority
+// thread).
+struct NanTraceState {
+	using Key = std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, int>;
+	struct Scanned {
+		uint64_t              serial = 0; // the dispatch the scan followed
+		std::vector<uint32_t> counts;
+	};
+	std::mutex             mutex;
+	std::map<Key, Scanned> images;
+	uint64_t               changes   = 0;
+	uint32_t               described = 0;
+};
+
+NanTraceState& NanTrace() {
+	static auto* state = new NanTraceState;
+	return *state;
+}
+
+// " mip <m> layers <runs> (<words>/<of> words at the first)" for each mip with a layer `pick`
+// selects, up to `most` runs a mip.
+template <typename Pick>
+[[nodiscard]] std::string NanMipLayers(const TextureCache::NonFiniteCounts& counts, size_t most,
+                                       Pick&& pick, uint32_t& total) {
+	std::string text;
+	total = 0;
+	for (uint32_t mip = 0; mip < counts.mips; mip++) {
+		std::string runs;
+		size_t      run_count = 0;
+		uint32_t    first     = UINT32_MAX;
+		for (uint32_t layer = 0; layer < counts.layers;) {
+			if (!pick(mip, layer)) {
+				layer++;
+				continue;
+			}
+			uint32_t last = layer;
+			while (last + 1u < counts.layers && pick(mip, last + 1u)) {
+				last++;
+			}
+			total += last - layer + 1u;
+			first = std::min(first, layer);
+			if (run_count++ < most) {
+				runs +=
+				    last == layer ? fmt::format(" {}", layer) : fmt::format(" {}-{}", layer, last);
+			}
+			layer = last + 1u;
+		}
+		if (run_count == 0) {
+			continue;
+		}
+		if (run_count > most) {
+			runs += fmt::format(" (and {} more runs)", run_count - most);
+		}
+		text += fmt::format("{} mip {} layers{} ({}/{} words at layer {})", text.empty() ? "" : ";",
+		                    mip, runs, counts.Count(mip, first), counts.words[mip], first);
+	}
+	return text;
+}
+
+// A scan of an image a traced dispatch wrote or read has landed (priority thread): what changed
+// since the image's last scan.
+void NanScanLanded(const std::shared_ptr<NanTraceDispatch>& dispatch, const std::string& what,
+                   TextureCache::NonFiniteCounts&& counts) {
+	const auto&      config = DispatchTrace();
+	auto&            state  = NanTrace();
+	std::scoped_lock lock {state.mutex};
+	auto&      last  = state.images[NanTraceState::Key {counts.address, counts.width, counts.height,
+                                                  counts.layers, counts.mips, counts.format}];
+	const bool known = last.serial != 0 && last.counts.size() == counts.counts.size();
+	bool       changed = !known;
+	for (size_t k = 0; !changed && k < counts.counts.size(); k++) {
+		changed = (counts.counts[k] != 0) != (last.counts[k] != 0);
+	}
+	const auto keep = [&] {
+		last.serial = dispatch->serial;
+		last.counts = std::move(counts.counts);
+	};
+	if (!changed) {
+		keep();
+		return;
+	}
+	const bool shown = state.changes++ < config.max_changes;
+	if (state.changes == config.max_changes + 1u) {
+		LOGF("Trace nan: the change lines stop here (KYTY_TRACE_NAN_MAX=%" PRIu64 ")\n",
+		     config.max_changes);
+	}
+	if (!shown) {
+		keep();
+		return;
+	}
+	const auto header = fmt::format(
+	    "Trace nan: dispatch {} (cs {:016x}, frame {}) {} 0x{:012x} {}x{}x{} mips {} fmt {} "
+	    "(guest {})",
+	    dispatch->serial, dispatch->shader, dispatch->frame, what, counts.address, counts.width,
+	    counts.height, counts.layers, counts.mips, counts.format, counts.guest_format);
+	const uint32_t mip_layers = counts.layers * counts.mips;
+	uint32_t       now        = 0;
+	for (const auto count: counts.counts) {
+		now += count != 0 ? 1u : 0u;
+	}
+	const auto not_finite = [&](uint32_t mip, uint32_t layer) {
+		return counts.Count(mip, layer) != 0;
+	};
+	if (!known) {
+		// The first scan of the image: what it held before the trace could see it change.
+		uint32_t   listed = 0;
+		const auto layers = NanMipLayers(counts, 16, not_finite, listed);
+		LOGF("%s: the first scan of it: %u of %u mip-layers hold words that are not finite%s%s\n",
+		     header.c_str(), now, mip_layers, now != 0 ? ":" : "", layers.c_str());
+	} else {
+		const auto was_not_finite = [&](uint32_t mip, uint32_t layer) {
+			return last.counts[static_cast<size_t>(mip) * counts.layers + layer] != 0;
+		};
+		const auto became_not_finite = [&](uint32_t mip, uint32_t layer) {
+			return not_finite(mip, layer) && !was_not_finite(mip, layer);
+		};
+		const auto became_finite = [&](uint32_t mip, uint32_t layer) {
+			return !not_finite(mip, layer) && was_not_finite(mip, layer);
+		};
+		uint32_t   became_count  = 0;
+		uint32_t   cleared_count = 0;
+		const auto became        = NanMipLayers(counts, 16, became_not_finite, became_count);
+		const auto cleared       = NanMipLayers(counts, 16, became_finite, cleared_count);
+		LOGF("%s: since the scan after dispatch %" PRIu64 "%s%s%s%s; %u of %u mip-layers hold "
+		     "words that are not finite now\n",
+		     header.c_str(), last.serial, became_count != 0 ? ", not finite now:" : "",
+		     became.c_str(), cleared_count != 0 ? ", finite again:" : "", cleared.c_str(), now,
+		     mip_layers);
+	}
+	if (!dispatch->logged && !dispatch->lines.empty() && state.described < config.describe) {
+		dispatch->logged = true;
+		state.described++;
+		LOGF("Trace nan: dispatch %" PRIu64 " as it was recorded (%u of %u described, "
+		     "KYTY_TRACE_NAN_DESCRIBE):\n",
+		     dispatch->serial, state.described, config.describe);
+		for (const auto& line: dispatch->lines) {
+			if (!Log::IsSilent()) {
+				Log::Write(line);
+			}
+		}
+	}
+	keep();
+}
+
+// KYTY_TRACE_NAN: records the GPU scans of a traced dispatch's float images (GPU thread).
+void ScanDispatchImages(RenderContext& context, const ShaderStageRuntime& stage,
+                        const PreparedBindings&                  bindings,
+                        const std::shared_ptr<NanTraceDispatch>& dispatch) {
+	// The content serial each image was last scanned at, and the addresses that cannot be
+	// scanned (said once).
+	static std::unordered_map<ImageId, uint64_t> scanned;
+	static std::unordered_set<uint64_t>          unscanned;
+
+	const auto&                 program  = *stage.program;
+	auto&                       textures = context.GetTextureCache();
+	std::unordered_set<ImageId> done;
+	// The images it writes first: one bound twice is scanned once, as written.
+	for (const bool outputs: {true, false}) {
+		for (size_t i = 0; i < bindings.images.size() && i < program.info.images.size(); i++) {
+			const auto& binding = bindings.images[i];
+			const auto& info    = binding.desc.info;
+			if (program.info.images[i].written != outputs || !binding.image_id ||
+			    info.data.Empty() || done.contains(binding.image_id)) {
+				continue;
+			}
+			const auto serial = textures.ContentSerial(binding.image_id);
+			const auto last   = scanned.find(binding.image_id);
+			if (!outputs && last != scanned.end() && last->second == serial) {
+				continue;
+			}
+			done.insert(binding.image_id);
+			const auto what = fmt::format("tex[{}] {}", i, outputs ? "write" : "read");
+			if (!textures.ScanNonFiniteGpu(
+			        binding.image_id, [dispatch, what](TextureCache::NonFiniteCounts&& counts) {
+				        NanScanLanded(dispatch, what, std::move(counts));
+			        })) {
+				if (unscanned.insert(info.data.address).second) {
+					LOGF("Trace nan: dispatch %" PRIu64 " tex[%zu] 0x%012" PRIx64
+					     " fmt %d is not scanned (not a float format of whole words, a volume, "
+					     "or over KYTY_GPU_SCAN_MB); said once\n",
+					     dispatch->serial, i, info.data.address,
+					     static_cast<int>(info.pixel_format));
+				}
+				continue;
+			}
+			scanned[binding.image_id] = serial;
+		}
+	}
+}
+
 void TraceDispatch(RenderContext& context, const ShaderStageRuntime& stage,
                    const PreparedBindings& bindings, const std::string& groups) {
 	static std::atomic<uint64_t> traced {0};
@@ -266,18 +517,30 @@ void TraceDispatch(RenderContext& context, const ShaderStageRuntime& stage,
 	auto&       textures = context.GetTextureCache();
 	auto&       buffers  = context.GetBufferCache();
 	const auto  frame    = context.GetGraphics().presented_frames.load(std::memory_order_relaxed);
-	LOGF("Trace dispatch %" PRIu64 " frame %" PRIu64 " cs %016" PRIx64
-	     " groups %s: %zu textures, %zu buffers, %zu user data\n",
-	     n, frame, program.shader_hash, groups.c_str(), program.info.images.size(),
-	     program.info.buffers.size(), snapshot.user_data.size());
+	// KYTY_TRACE_NAN logs the first dispatches of each shader as they are recorded, and keeps the
+	// others' lines (GPU thread).
+	static std::unordered_map<uint64_t, uint32_t> logged_per_shader;
+	const bool full = !config.nan || logged_per_shader[program.shader_hash]++ < config.first;
+	std::shared_ptr<NanTraceDispatch> dispatch;
+	if (config.nan) {
+		dispatch         = std::make_shared<NanTraceDispatch>();
+		dispatch->serial = n;
+		dispatch->shader = program.shader_hash;
+		dispatch->frame  = frame;
+	}
+	const TraceLines out {full ? nullptr : &dispatch->lines};
+	out("Trace dispatch %" PRIu64 " frame %" PRIu64 " cs %016" PRIx64
+	    " groups %s: %zu textures, %zu buffers, %zu user data\n",
+	    n, frame, program.shader_hash, groups.c_str(), program.info.images.size(),
+	    program.info.buffers.size(), snapshot.user_data.size());
 	const auto& user = snapshot.user_data;
 	for (size_t row = 0; row < user.size(); row += 16) {
 		std::string line;
 		for (size_t k = row; k < std::min(user.size(), row + 16); k++) {
 			line += fmt::format(" {:08x}", user[k]);
 		}
-		LOGF("Trace dispatch %" PRIu64 " user s%zu:%s\n", n, program.user_data_base + row,
-		     line.c_str());
+		out("Trace dispatch %" PRIu64 " user s%zu:%s\n", n, program.user_data_base + row,
+		    line.c_str());
 	}
 	// What the user-data pointers point at: the shader's constants and descriptors, as guest
 	// memory holds them.
@@ -286,7 +549,9 @@ void TraceDispatch(RenderContext& context, const ShaderStageRuntime& stage,
 		if ((user[reg] & 3u) != 0 || user[reg + 1] == 0 || user[reg + 1] > 0xffu) {
 			continue;
 		}
-		const auto bytes = Libs::LibKernel::Memory::TryClampRangeSize(address, 256) & ~uint64_t {3};
+		const auto bytes =
+		    Libs::LibKernel::Memory::TryClampRangeSize(address, config.pointer_bytes) &
+		    ~uint64_t {3};
 		if (bytes == 0) {
 			continue;
 		}
@@ -294,12 +559,12 @@ void TraceDispatch(RenderContext& context, const ShaderStageRuntime& stage,
 		    fmt::format("Trace dispatch {} ptr s[{}:{}] 0x{:012x}", n, program.user_data_base + reg,
 		                program.user_data_base + reg + 1u, address);
 		if (buffers.HasGpuDirtyBytes(address, bytes)) {
-			LOGF("%s: the GPU wrote these bytes (not shown)\n", prefix.c_str());
+			out("%s: the GPU wrote these bytes (not shown)\n", prefix.c_str());
 			continue;
 		}
 		std::vector<uint32_t> words(bytes / sizeof(uint32_t));
 		if (Libs::LibKernel::Memory::TryReadBacking(address, words.data(), bytes)) {
-			LogTraceWords(prefix, words.data(), words.size());
+			LogTraceWords(out, prefix, words.data(), words.size());
 		}
 	}
 	for (size_t i = 0; i < bindings.images.size() && i < program.info.images.size(); i++) {
@@ -309,21 +574,28 @@ void TraceDispatch(RenderContext& context, const ShaderStageRuntime& stage,
 		const auto& view     = binding.desc.view_info;
 		const auto  state    = binding.image_id ? textures.DiagnosticImageState(binding.image_id)
 		                                        : TextureCache::DiagnosticState {};
-		LOGF("Trace dispatch %" PRIu64 " tex[%zu] %s%s 0x%012" PRIx64 "+0x%" PRIx64
-		     " %ux%ux%u layers %u mips %u view %u+%u/%u+%u fmt %d tile %u [%c%c%c]\n",
-		     n, i, resource.written ? "write" : "read",
-		     binding.desc.type == TextureCache::BindingType::Storage ? " storage" : "",
-		     info.data.address, info.data.size, info.extent.width, info.extent.height,
-		     info.extent.depth, info.resources.layers, info.resources.levels, view.base_level,
-		     view.level_count, view.base_layer, view.layer_count,
-		     static_cast<int>(info.pixel_format), static_cast<uint32_t>(info.tile_mode),
-		     state.gpu_written ? 'G' : '-', state.buffer_write ? 'B' : '-',
-		     state.cpu_dirty ? 'C' : '-');
+		out("Trace dispatch %" PRIu64 " tex[%zu] %s%s 0x%012" PRIx64 "+0x%" PRIx64
+		    " %ux%ux%u layers %u mips %u view %u+%u/%u+%u fmt %d guest %u tile %u [%c%c%c]\n",
+		    n, i, resource.written ? "write" : "read",
+		    binding.desc.type == TextureCache::BindingType::Storage ? " storage" : "",
+		    info.data.address, info.data.size, info.extent.width, info.extent.height,
+		    info.extent.depth, info.resources.layers, info.resources.levels, view.base_level,
+		    view.level_count, view.base_layer, view.layer_count,
+		    static_cast<int>(info.pixel_format), static_cast<uint32_t>(info.guest_format),
+		    static_cast<uint32_t>(info.tile_mode), state.gpu_written ? 'G' : '-',
+		    state.buffer_write ? 'B' : '-', state.cpu_dirty ? 'C' : '-');
 		if (!binding.image_id || info.data.Empty()) {
 			continue;
 		}
 		const auto label = fmt::format("Trace dispatch {} tex[{}]", n, i);
-		if (resource.written) {
+		if (config.nan) {
+			// The GPU scans below; a texture the GPU did not write is still compared with its
+			// guest bytes (once each).
+			if (!resource.written && !state.gpu_written && !state.buffer_write) {
+				textures.TraceVerify(binding.image_id, fmt::format("Trace dispatch {}", n),
+				                     fmt::format("tex[{}]", i));
+			}
+		} else if (resource.written) {
 			// One that is not scanned says so once (its address).
 			static std::unordered_set<uint64_t> unscanned;
 			if (!textures.TraceScanImage(binding.image_id, label + " out", config.scan_bytes) &&
@@ -350,23 +622,28 @@ void TraceDispatch(RenderContext& context, const ShaderStageRuntime& stage,
 		                             : 0;
 		const bool     gpu     = mapped != 0 && buffers.HasGpuDirtyBytes(r.Base48(), mapped);
 		const bool     written = program.info.buffers[i].written;
-		LOGF("Trace dispatch %" PRIu64 " buf[%zu] %s 0x%012" PRIx64 "+0x%" PRIx64
-		     " (mapped 0x%" PRIx64 ") stride %u records %u fmt %u [%c]\n",
-		     n, i, written ? "write" : "read", r.Base48(), bytes, mapped, r.Stride(),
-		     r.NumRecords(), r.RawFormat(), gpu ? 'G' : '-');
+		out("Trace dispatch %" PRIu64 " buf[%zu] %s 0x%012" PRIx64 "+0x%" PRIx64
+		    " (mapped 0x%" PRIx64 ") stride %u records %u fmt %u [%c]\n",
+		    n, i, written ? "write" : "read", r.Base48(), bytes, mapped, r.Stride(), r.NumRecords(),
+		    r.RawFormat(), gpu ? 'G' : '-');
 		if (mapped == 0) {
 			continue;
 		}
 		const auto prefix = fmt::format("Trace dispatch {} buf[{}]", n, i);
 		if (written) {
-			buffers.TraceContents(r.Base48(), mapped, prefix + " out");
+			if (full) {
+				buffers.TraceContents(r.Base48(), mapped, prefix + " out");
+			}
 		} else if (!gpu && mapped <= 1024) {
 			std::vector<uint32_t> words(mapped / sizeof(uint32_t));
 			if (!words.empty() && Libs::LibKernel::Memory::TryReadBacking(
 			                          r.Base48(), words.data(), words.size() * sizeof(uint32_t))) {
-				LogTraceWords(prefix, words.data(), words.size());
+				LogTraceWords(out, prefix, words.data(), words.size());
 			}
 		}
+	}
+	if (config.nan) {
+		ScanDispatchImages(context, stage, bindings, dispatch);
 	}
 }
 

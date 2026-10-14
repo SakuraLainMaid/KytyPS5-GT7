@@ -197,6 +197,9 @@ public:
 	bool initialized = false;
 	// It holds pixels the GPU wrote (a draw, store, clear or copy) since its last upload.
 	bool gpu_pixels = false;
+	// Counts the uploads and GPU writes (TextureCache::ContentSerial): diagnostics scan an image
+	// again only once it changed.
+	uint64_t content_serial = 0;
 
 private:
 	friend struct ImageTestAccess;

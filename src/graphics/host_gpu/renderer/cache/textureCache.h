@@ -145,8 +145,41 @@ public:
 	// ..." when the GPU's copy differs from its guest bytes. The caller decides how often.
 	void TraceVerify(ImageId id, const std::string& label, const std::string& what);
 	// GPU thread, at each guest frame end: a snapshot of each image KYTY_TRACE_IMAGES follows
-	// that changed in the frame (what changed in it, and who wrote it).
+	// that changed in the frame (what changed in it, and who wrote it); and the NaN check
+	// (KYTY_NAN_CHECK, default on): the float arrays of six layers or more the GPU writes (light
+	// probe atlases, cube maps), up to KYTY_NAN_CHECK_MB (default 64) in all their mips, are
+	// scanned on the GPU for texels that are not finite, one image a frame end, each at most every
+	// 30 frames and only once it changed; "TextureCache: NaN check ..." is logged at an image's
+	// first check and whenever the layers that hold such texels change.
 	void TraceFrameEnd();
+
+	// Diagnostics: the words of each layer of each mip of an image whose float bits are infinity
+	// or NaN, counted on the GPU (NanScanner) once the commands recorded so far have run; only the
+	// counters come back to the host. `done` gets them on the scheduler's priority thread (it must
+	// not take the cache's lock). False, and `done` is never called, when the scan does not apply:
+	// a format other than the float ones light data comes in (B10G11R11, RG16F, RGBA16F, R32F to
+	// RGBA32F), a volume, multisampled or depth image, or one whose mips are over KYTY_GPU_SCAN_MB
+	// (default 512) in all.
+	struct NonFiniteCounts {
+		uint64_t              address      = 0;
+		uint32_t              width        = 0;
+		uint32_t              height       = 0;
+		uint32_t              layers       = 0;
+		uint32_t              mips         = 0;
+		int                   format       = 0; // the host format (vk::Format)
+		uint32_t              guest_format = 0;
+		std::vector<uint32_t> words;  // a layer's words, for each mip
+		std::vector<uint32_t> counts; // for each mip, a counter a layer
+
+		[[nodiscard]] uint32_t Count(uint32_t mip, uint32_t layer) const {
+			return counts[static_cast<size_t>(mip) * layers + layer];
+		}
+	};
+	using NonFiniteDone = std::function<void(NonFiniteCounts&&)>;
+	bool ScanNonFiniteGpu(ImageId id, NonFiniteDone done);
+	// Changes with each upload and GPU write of the image (Image::content_serial); 0 for an
+	// image that is gone.
+	[[nodiscard]] uint64_t ContentSerial(ImageId id);
 	// The compute shader the GPU thread is recording a dispatch of (names the writers of the images
 	// KYTY_TRACE_IMAGES follows; 0 for draws and copies).
 	inline static thread_local uint64_t s_trace_shader = 0;
@@ -172,6 +205,17 @@ private:
 	// `gpu_write`: a GPU write (CommitGpuWrite), which names the shader whose dispatch it is.
 	void TraceImageChanged(Image& image, const char* how, bool gpu_write = false);
 	void TraceCpuWrite(ImageId id, const Image& image, uint64_t address, uint64_t size);
+	// A followed image right after an upload: its texels that are not finite, on the GPU.
+	void TraceUploadScan(ImageId id);
+
+	// The GPU scan's pipeline, scratch and read-back ring (made at the first scan), and the NaN
+	// check's state (null with KYTY_NAN_CHECK=0). Caller holds m_lock.
+	struct GpuScan;
+	struct NanCheck;
+	// `max_bytes`: the most it copies of the image (every mip).
+	bool ScanNonFiniteGpuLocked(Image& image, NonFiniteDone done, uint64_t max_bytes);
+	void NoteNanCheckCandidate(const Image& image);
+	void RunNanCheck();
 
 	enum class TransferDirection { Upload, Download };
 	struct TextureTransfer;
@@ -344,6 +388,8 @@ private:
 	bool             m_readback_linear_images = false;
 	// KYTY_TRACE_IMAGES (null when it is not set).
 	std::unique_ptr<TraceState> m_trace;
+	std::unique_ptr<GpuScan>    m_gpu_scan;
+	std::unique_ptr<NanCheck>   m_nan_check;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

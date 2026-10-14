@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/image/nanScanner.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -22,6 +23,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cctype>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -29,7 +31,9 @@
 #include <fmt/format.h>
 #include <limits>
 #include <memory>
+#include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <unordered_set>
 #include <span>
@@ -266,7 +270,261 @@ void ForgetLandedReadbacks(uint64_t address, uint64_t size) {
 	return tiles;
 }
 
+// Where the float bit fields sit in a word of a host format NanScanner reads; none for the
+// others (block-compressed and integer formats, and the floats that cannot hold infinity or NaN).
+[[nodiscard]] std::optional<NanScanner::Packing> NonFinitePacking(vk::Format format) {
+	switch (format) {
+		case vk::Format::eB10G11R11UfloatPack32: return NanScanner::Packing::B10G11R11;
+		case vk::Format::eR16G16Sfloat:
+		case vk::Format::eR16G16B16A16Sfloat: return NanScanner::Packing::TwoHalves;
+		case vk::Format::eR32Sfloat:
+		case vk::Format::eR32G32Sfloat:
+		case vk::Format::eR32G32B32Sfloat:
+		case vk::Format::eR32G32B32A32Sfloat: return NanScanner::Packing::Float32;
+		default: return std::nullopt;
+	}
+}
+
+// KYTY_GPU_SCAN_MB (default 512): the most a GPU scan copies of one image (every mip).
+[[nodiscard]] uint64_t GpuScanLimit() {
+	static const uint64_t limit = [] {
+		const char* value = std::getenv("KYTY_GPU_SCAN_MB");
+		return (value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : 512ull)
+		       << 20u;
+	}();
+	return limit;
+}
+
+// How a GPU scan copies an image: each mip, every layer, tightly packed one after the other, a
+// mip starting at a multiple of the texel size (as a copy's buffer offset must). `bytes` is 0 when
+// the scan does not apply.
+struct NonFiniteLayout {
+	std::vector<vk::BufferImageCopy> regions;
+	std::vector<uint32_t>            words; // a layer's words, for each mip
+	uint64_t                         bytes   = 0;
+	NanScanner::Packing              packing = NanScanner::Packing::Float32;
+};
+
+[[nodiscard]] NonFiniteLayout NonFiniteScanLayout(const Image& image, uint64_t max_counters) {
+	NonFiniteLayout layout;
+	const auto&     backing = image.backing;
+	const auto      packing = NonFinitePacking(backing.format);
+	if (!packing || image.depth_id || backing.image == nullptr || backing.samples != 1 ||
+	    backing.image_type != vk::ImageType::e2D || image.info.IsDepth() ||
+	    !(backing.usage & vk::ImageUsageFlagBits::eTransferSrc)) {
+		return layout;
+	}
+	const uint32_t layers      = std::max(backing.layers, 1u);
+	const uint32_t mips        = std::max(backing.mip_levels, 1u);
+	const uint32_t texel_bytes = vk::blockSize(backing.format);
+	if (texel_bytes == 0 || texel_bytes % sizeof(uint32_t) != 0 ||
+	    uint64_t {layers} * mips > max_counters) {
+		return layout;
+	}
+	const uint64_t alignment = uint64_t {texel_bytes} * 64u;
+	uint64_t       total     = 0;
+	layout.regions.resize(mips);
+	layout.words.resize(mips);
+	for (uint32_t mip = 0; mip < mips; mip++) {
+		const uint32_t width  = std::max(backing.extent.width >> mip, 1u);
+		const uint32_t height = std::max(backing.extent.height >> mip, 1u);
+		const uint64_t words  = uint64_t {width} * height * (texel_bytes / sizeof(uint32_t));
+		if (words * layers > UINT32_MAX) {
+			return {};
+		}
+		total                   = (total + alignment - 1u) / alignment * alignment;
+		layout.words[mip]       = static_cast<uint32_t>(words);
+		auto& region            = layout.regions[mip];
+		region.bufferOffset     = total;
+		region.imageSubresource = {vk::ImageAspectFlagBits::eColor, mip, 0, layers};
+		region.imageExtent      = vk::Extent3D {width, height, 1u};
+		total += words * sizeof(uint32_t) * layers;
+	}
+	layout.bytes   = total;
+	layout.packing = *packing;
+	return layout;
+}
+
+// The runs of set entries: " <first>-<last>" each (" <first>" for one), up to `most` runs.
+[[nodiscard]] std::string SetRuns(const std::vector<uint8_t>& set, size_t most) {
+	std::string text;
+	size_t      runs = 0;
+	for (size_t first = 0; first < set.size();) {
+		if (set[first] == 0) {
+			first++;
+			continue;
+		}
+		size_t last = first;
+		while (last + 1u < set.size() && set[last + 1u] != 0) {
+			last++;
+		}
+		if (runs++ < most) {
+			text += last == first ? fmt::format(" {}", first) : fmt::format(" {}-{}", first, last);
+		}
+		first = last + 1u;
+	}
+	if (runs > most) {
+		text += fmt::format(" (and {} more runs)", runs - most);
+	}
+	return text;
+}
+
+// The layers of a scanned image that hold words that are not finite in any of its mips.
+struct NonFiniteLayers {
+	std::vector<uint8_t>  layers; // a flag a layer
+	std::vector<uint32_t> by_mip; // how many layers of each mip
+	uint32_t              count = 0;
+	uint32_t              cubes = 0; // of the arrays of whole cubes: the cubes with such a layer
+	uint64_t              words = 0;
+};
+
+[[nodiscard]] NonFiniteLayers FindNonFiniteLayers(const TextureCache::NonFiniteCounts& counts) {
+	NonFiniteLayers found;
+	found.layers.assign(counts.layers, 0);
+	found.by_mip.assign(counts.mips, 0);
+	for (uint32_t mip = 0; mip < counts.mips; mip++) {
+		for (uint32_t layer = 0; layer < counts.layers; layer++) {
+			const auto count = counts.Count(mip, layer);
+			if (count != 0) {
+				found.layers[layer] = 1;
+				found.by_mip[mip]++;
+				found.words += count;
+			}
+		}
+	}
+	for (uint32_t layer = 0; layer < counts.layers; layer++) {
+		found.count += found.layers[layer];
+	}
+	if (counts.layers % 6u == 0) {
+		for (uint32_t cube = 0; cube < counts.layers / 6u; cube++) {
+			bool any = false;
+			for (uint32_t face = 0; face < 6u; face++) {
+				any = any || found.layers[cube * 6u + face] != 0;
+			}
+			found.cubes += any ? 1u : 0u;
+		}
+	}
+	return found;
+}
+
+// "<n> of <layers> layers (<c> of <cubes> cubes) hold texels that are not finite (by mip: ...)"
+[[nodiscard]] std::string DescribeNonFinite(const TextureCache::NonFiniteCounts& counts,
+                                            const NonFiniteLayers&               found) {
+	auto text = fmt::format("{} of {} layers", found.count, counts.layers);
+	if (counts.layers % 6u == 0) {
+		text += fmt::format(" ({} of {} cubes)", found.cubes, counts.layers / 6u);
+	}
+	text += " hold texels that are not finite";
+	if (found.count != 0) {
+		text += fmt::format(", {} words in all; layers by mip:", found.words);
+		for (const auto layers: found.by_mip) {
+			text += fmt::format(" {}", layers);
+		}
+	}
+	return text;
+}
+
+[[nodiscard]] std::string DescribeScanned(const TextureCache::NonFiniteCounts& counts) {
+	return fmt::format("0x{:012x} {}x{}x{} mips {} fmt {} (guest {})", counts.address, counts.width,
+	                   counts.height, counts.layers, counts.mips, counts.format,
+	                   counts.guest_format);
+}
+
+// What the NaN check last found in each image, by guest address and shape (priority thread).
+struct NanCheckResults {
+	std::mutex                                                                         mutex;
+	std::map<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>, std::vector<uint8_t>> layers;
+};
+
+// Logged at an image's first check, and when the layers that hold texels that are not finite
+// change.
+void ReportNanCheck(NanCheckResults& results, uint64_t frame,
+                    const TextureCache::NonFiniteCounts& counts) {
+	const auto       found = FindNonFiniteLayers(counts);
+	const auto       key = std::tuple {counts.address, counts.width, counts.height, counts.layers};
+	std::scoped_lock lock {results.mutex};
+	const auto [entry, first] = results.layers.try_emplace(key);
+	auto& before              = entry->second;
+	if (!first && before == found.layers) {
+		return;
+	}
+	std::string change;
+	if (!first) {
+		std::vector<uint8_t> became(counts.layers, 0);
+		std::vector<uint8_t> cleared(counts.layers, 0);
+		for (uint32_t layer = 0; layer < counts.layers; layer++) {
+			became[layer]  = found.layers[layer] != 0 && before[layer] == 0 ? 1u : 0u;
+			cleared[layer] = found.layers[layer] == 0 && before[layer] != 0 ? 1u : 0u;
+		}
+		const auto became_runs  = SetRuns(became, 24);
+		const auto cleared_runs = SetRuns(cleared, 24);
+		change                  = fmt::format("; since the last check{}{}{}{}",
+                             became_runs.empty() ? "" : ", not finite now:", became_runs,
+                             cleared_runs.empty() ? "" : ", finite again:", cleared_runs);
+	} else if (found.count != 0) {
+		change = fmt::format(": layers{}", SetRuns(found.layers, 24));
+	}
+	LOGF("TextureCache: NaN check frame %" PRIu64 " %s: %s%s\n", frame,
+	     DescribeScanned(counts).c_str(), DescribeNonFinite(counts, found).c_str(), change.c_str());
+	before = found.layers;
+}
+
 } // namespace
+
+// The GPU scan (TextureCache::ScanNonFiniteGpu): the NaN-scan pipeline, a scratch buffer each mip
+// of an image is copied into tightly packed, the counters, and the ring the counters come back
+// through. The scratch grows to the largest image scanned so far, up to KYTY_GPU_SCAN_MB (default
+// 512), and is freed after IdleFrames frames without a scan. The callbacks keep what they read
+// from alive.
+struct TextureCache::GpuScan {
+	static constexpr uint64_t RingBytes   = 16ull << 20u;
+	static constexpr uint32_t MaxCounters = 1u << 18u;
+	static constexpr uint64_t IdleFrames  = 600;
+
+	GpuScan(GraphicContext& graphics, CommandScheduler& scheduler)
+	    : scanner(graphics), ring(std::make_shared<StreamBuffer>(
+	                             graphics, scheduler, MemoryUsage::Download, RingBytes)) {}
+
+	NanScanner                    scanner;
+	std::shared_ptr<StreamBuffer> ring;
+	std::shared_ptr<Buffer>       scratch;
+	std::shared_ptr<Buffer>       counts;
+	uint64_t                      last_frame = 0; // presented frame of the last scan
+};
+
+// KYTY_NAN_CHECK (default on; 0 or off turns it off): see TextureCache::TraceFrameEnd. Candidates
+// are the images CommitGpuWrite saw (GPU thread, under the cache's lock). An image over
+// KYTY_NAN_CHECK_MB (default 64) in all its mips is not checked (said once).
+struct TextureCache::NanCheck {
+	static constexpr uint64_t Interval = 30; // presented frames between two checks of an image
+
+	struct Candidate {
+		uint64_t address  = 0;
+		uint64_t frame    = 0; // of the last check
+		uint64_t content  = 0; // the image's content serial then
+		bool     checked  = false;
+		bool     rejected = false; // it cannot be checked
+	};
+	std::unordered_map<ImageId, Candidate> candidates;
+	std::shared_ptr<NanCheckResults>       results   = std::make_shared<NanCheckResults>();
+	uint64_t                               max_bytes = 64ull << 20u;
+
+	[[nodiscard]] static std::unique_ptr<NanCheck> FromEnvironment() {
+		std::string value =
+		    std::getenv("KYTY_NAN_CHECK") != nullptr ? std::getenv("KYTY_NAN_CHECK") : "";
+		std::transform(value.begin(), value.end(), value.begin(),
+		               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		if (value == "0" || value == "off" || value == "false" || value == "no") {
+			LOGF("TextureCache: the NaN check is off (KYTY_NAN_CHECK=%s)\n", value.c_str());
+			return nullptr;
+		}
+		auto check = std::make_unique<NanCheck>();
+		if (const char* mb = std::getenv("KYTY_NAN_CHECK_MB"); mb != nullptr && *mb != '\0') {
+			check->max_bytes = std::strtoull(mb, nullptr, 10) << 20u;
+		}
+		return check;
+	}
+};
 
 // The last snapshot of an image KYTY_TRACE_IMAGES follows (a glyph a layer), by guest address;
 // written as snapshots land (the scheduler's completion work).
@@ -397,7 +655,8 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		     " MB)\n",
 		     m_pressure_gc_memory >> 20u, m_trigger_gc_memory >> 20u, m_critical_gc_memory >> 20u);
 	}
-	m_trace = TraceState::FromEnvironment();
+	m_trace     = TraceState::FromEnvironment();
+	m_nan_check = NanCheck::FromEnvironment();
 }
 
 TextureCache::~TextureCache() {
@@ -1018,6 +1277,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		destination.gpu_pixels = destination.gpu_pixels || source.gpu_pixels;
 	}
 	destination.ClearBufferModified();
+	destination.content_serial++;
 	if (m_trace != nullptr) {
 		TraceImageChanged(destination, "copy from an image over its memory");
 	}
@@ -1037,6 +1297,7 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 		destination.MarkGpuModified();
 		destination.gpu_pixels = destination.gpu_pixels || source.gpu_pixels;
 	}
+	destination.content_serial++;
 	if (m_trace != nullptr) {
 		TraceImageChanged(destination, "copy from an image over its memory");
 	}
@@ -1557,6 +1818,10 @@ void TextureCache::InitializeImage(ImageId id) {
 		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();
 		image.gpu_pixels = false;
+		image.content_serial++;
+		if (TracesImage(id)) {
+			TraceUploadScan(id);
+		}
 	}
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
@@ -2416,6 +2681,10 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	}
 	image.MarkGpuModified();
 	image.gpu_pixels = true;
+	image.content_serial++;
+	if (m_nan_check != nullptr) {
+		NoteNanCheckCandidate(image);
+	}
 	if (m_trace != nullptr) {
 		TraceImageChanged(image, "draw, clear or copy", true);
 	}
@@ -3604,6 +3873,199 @@ bool TextureCache::TraceScanImage(ImageId id, const std::string& prefix, uint64_
 	return image != nullptr && ScanImageLocked(*image, prefix, max_bytes, nullptr, std::string());
 }
 
+bool TextureCache::ScanNonFiniteGpu(ImageId id, NonFiniteDone done) {
+	if (!id) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	auto*            image = m_slot_images.try_get(id);
+	return image != nullptr && ScanNonFiniteGpuLocked(*image, std::move(done), GpuScanLimit());
+}
+
+uint64_t TextureCache::ContentSerial(ImageId id) {
+	if (!id) {
+		return 0;
+	}
+	std::scoped_lock lock {m_lock};
+	const auto*      image = m_slot_images.try_get(id);
+	return image != nullptr ? image->content_serial : 0;
+}
+
+bool TextureCache::ScanNonFiniteGpuLocked(Image& image, NonFiniteDone done, uint64_t max_bytes) {
+	if (!m_scheduler.Active()) {
+		return false;
+	}
+	auto           layout = NonFiniteScanLayout(image, GpuScan::MaxCounters);
+	const uint64_t total  = layout.bytes;
+	if (total == 0 || total > max_bytes) {
+		return false;
+	}
+	const auto&     backing = image.backing;
+	const uint32_t  layers  = std::max(backing.layers, 1u);
+	const uint32_t  mips    = std::max(backing.mip_levels, 1u);
+	NonFiniteCounts result;
+	result.address      = image.info.data.address;
+	result.width        = backing.extent.width;
+	result.height       = backing.extent.height;
+	result.layers       = layers;
+	result.mips         = mips;
+	result.format       = static_cast<int>(backing.format);
+	result.guest_format = static_cast<uint32_t>(image.info.guest_format);
+	result.words        = layout.words;
+	const auto& regions = layout.regions;
+	if (m_gpu_scan == nullptr) {
+		m_gpu_scan = std::make_unique<GpuScan>(m_graphics, m_scheduler);
+	}
+	auto& scan = *m_gpu_scan;
+	if (!scan.scanner.Valid()) {
+		return false;
+	}
+	constexpr auto StorageFlags = vk::BufferUsageFlagBits::eStorageBuffer |
+	                              vk::BufferUsageFlagBits::eTransferDst |
+	                              vk::BufferUsageFlagBits::eShaderDeviceAddress;
+	if (scan.scratch == nullptr || scan.scratch->Size() < total) {
+		// A buffer still in use stays alive in the callbacks of the scans that use it.
+		scan.scratch =
+		    std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+		                             StorageFlags, Common::AlignUp(total, uint64_t {4} << 20u));
+	}
+	scan.last_frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	if (scan.counts == nullptr) {
+		scan.counts = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+		                                       StorageFlags | vk::BufferUsageFlagBits::eTransferSrc,
+		                                       uint64_t {GpuScan::MaxCounters} * sizeof(uint32_t));
+	}
+	const uint64_t count_bytes = uint64_t {layers} * mips * sizeof(uint32_t);
+	// A full ring waits for the GPU (and the callbacks) to be done with its oldest part.
+	const auto [mapped, offset] = scan.ring->Map(count_bytes, 64);
+	if (mapped == nullptr) {
+		return false;
+	}
+	scan.ring->Commit();
+	// The copy waits for the image's last writers, and for the last scan's reads of the scratch.
+	image.Download(regions, scan.scratch->Handle(), 0, total);
+	const auto        recorder = m_scheduler.Current().Recorder();
+	vk::MemoryBarrier all {};
+	all.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	all.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	recorder.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                         vk::PipelineStageFlagBits::eAllCommands, {}, 1, &all, 0, nullptr, 0,
+	                         nullptr);
+	recorder.fillBuffer(scan.counts->Handle(), 0, count_bytes, 0);
+	recorder.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                         vk::PipelineStageFlagBits::eComputeShader, {}, 1, &all, 0, nullptr, 0,
+	                         nullptr);
+	const auto scratch_address = scan.scratch->BufferDeviceAddress();
+	const auto counts_address  = scan.counts->BufferDeviceAddress();
+	for (uint32_t mip = 0; mip < mips; mip++) {
+		scan.scanner.Scan(recorder, scratch_address + regions[mip].bufferOffset,
+		                  counts_address + uint64_t {mip} * layers * sizeof(uint32_t),
+		                  result.words[mip], layers, layout.packing);
+	}
+	vk::MemoryBarrier counted {};
+	counted.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+	counted.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	recorder.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	                         vk::PipelineStageFlagBits::eTransfer, {}, 1, &counted, 0, nullptr, 0,
+	                         nullptr);
+	recorder.copyBuffer(scan.counts->Handle(), scan.ring->Handle(),
+	                    vk::BufferCopy {0, offset, count_bytes});
+	vk::BufferMemoryBarrier landed {};
+	landed.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	landed.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+	landed.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	landed.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	landed.buffer              = scan.ring->Handle();
+	landed.offset              = offset;
+	landed.size                = count_bytes;
+	recorder.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+	                         {}, 0, nullptr, 1, &landed, 0, nullptr);
+	m_scheduler.DeferPriorityOperation(
+	    [ring = scan.ring, scratch = scan.scratch, counts = scan.counts, mapped, offset,
+	     count_bytes, result = std::move(result), done = std::move(done)]() mutable {
+		    ring->Invalidate(offset, count_bytes);
+		    const auto* words = reinterpret_cast<const uint32_t*>(mapped);
+		    result.counts.assign(words, words + count_bytes / sizeof(uint32_t));
+		    done(std::move(result));
+	    });
+	return true;
+}
+
+void TextureCache::NoteNanCheckCandidate(const Image& image) {
+	if (image.backing.layers < 6u || image.backing.image_type != vk::ImageType::e2D ||
+	    image.backing.samples != 1 || image.depth_id || !NonFinitePacking(image.backing.format)) {
+		return;
+	}
+	auto& candidate = m_nan_check->candidates[image.self_id];
+	if (candidate.address != image.info.data.address) {
+		candidate         = {};
+		candidate.address = image.info.data.address;
+	}
+}
+
+void TextureCache::RunNanCheck() {
+	const auto frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	// One image a frame end: a copy of its mips and a scan, on the GPU.
+	bool scanned = false;
+	for (auto it = m_nan_check->candidates.begin(); it != m_nan_check->candidates.end();) {
+		auto* image = m_slot_images.try_get(it->first);
+		if (image == nullptr || !image->registered ||
+		    image->info.data.address != it->second.address) {
+			it = m_nan_check->candidates.erase(it);
+			continue;
+		}
+		auto&      candidate = it->second;
+		const bool due = !candidate.checked || (frame >= candidate.frame + NanCheck::Interval &&
+		                                        image->content_serial != candidate.content);
+		// An image its next use uploads anew is checked after that upload.
+		if (scanned || candidate.rejected || !due || image->IsCpuDirty() ||
+		    image->IsBufferModified()) {
+			++it;
+			continue;
+		}
+		const auto bytes = NonFiniteScanLayout(*image, GpuScan::MaxCounters).bytes;
+		if (bytes > m_nan_check->max_bytes) {
+			LOGF("TextureCache: NaN check skips 0x%012" PRIx64 " %ux%ux%u mips %u fmt %d: %" PRIu64
+			     " MB in all its mips, over KYTY_NAN_CHECK_MB=%" PRIu64 "\n",
+			     image->info.data.address, image->backing.extent.width,
+			     image->backing.extent.height, image->backing.layers, image->backing.mip_levels,
+			     static_cast<int>(image->backing.format), (bytes + (1u << 20u) - 1u) >> 20u,
+			     m_nan_check->max_bytes >> 20u);
+		}
+		if (bytes == 0 || bytes > m_nan_check->max_bytes ||
+		    !ScanNonFiniteGpuLocked(
+		        *image,
+		        [results = m_nan_check->results, frame](NonFiniteCounts&& counts) {
+			        ReportNanCheck(*results, frame, counts);
+		        },
+		        m_nan_check->max_bytes)) {
+			candidate.rejected = true;
+			++it;
+			continue;
+		}
+		candidate.frame   = frame;
+		candidate.content = image->content_serial;
+		candidate.checked = true;
+		scanned           = true;
+		++it;
+	}
+}
+
+void TextureCache::TraceUploadScan(ImageId id) {
+	const auto serial = m_trace->images[id].serial;
+	const auto frame  = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	(void)ScanNonFiniteGpuLocked(
+	    m_slot_images[id],
+	    [serial, frame](NonFiniteCounts&& counts) {
+		    const auto found = FindNonFiniteLayers(counts);
+		    LOGF("Trace image #%u frame %" PRIu64 " after its upload, on the GPU: %s%s%s\n", serial,
+		         frame, DescribeNonFinite(counts, found).c_str(),
+		         found.count != 0 ? ": layers" : "",
+		         found.count != 0 ? SetRuns(found.layers, 24).c_str() : "");
+	    },
+	    GpuScanLimit());
+}
+
 bool TextureCache::TracesImage(ImageId id) const {
 	return m_trace != nullptr && m_trace->images.contains(id);
 }
@@ -3698,10 +4160,22 @@ void TextureCache::TraceCpuWrite(ImageId id, const Image& image, uint64_t addres
 }
 
 void TextureCache::TraceFrameEnd() {
-	if (m_trace == nullptr) {
+	if (m_trace == nullptr && m_nan_check == nullptr) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
+	if (m_nan_check != nullptr) {
+		RunNanCheck();
+	}
+	if (m_gpu_scan != nullptr && m_gpu_scan->scratch != nullptr &&
+	    m_graphics.presented_frames.load(std::memory_order_relaxed) >
+	        m_gpu_scan->last_frame + GpuScan::IdleFrames) {
+		// The scans that used it keep it until they are done.
+		m_gpu_scan->scratch.reset();
+	}
+	if (m_trace == nullptr) {
+		return;
+	}
 	const auto       frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
 	for (auto it = m_trace->images.begin(); it != m_trace->images.end();) {
 		auto& [id, followed] = *it;
