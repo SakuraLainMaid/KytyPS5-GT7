@@ -61,6 +61,10 @@ struct PreparedBindings {
 // per-probe constants that way, a new page each probe; those it read as zeros drew whole cubes of
 // NaN, the black lighting (2026-10-14).
 void PrefaultDmaPointers(BufferCache& buffers, const ShaderStageRuntime& stage);
+// KYTY_DMA_FAULT_REPORT=1 (diagnostics): the page faults are collected after every DMA dispatch
+// that dispatch recovery does not run again, so the "GPU page faults" line names that dispatch
+// alone, with its user data; draws are named per collection, as without it.
+[[nodiscard]] bool DmaFaultReport();
 
 [[nodiscard]] vk::DescriptorType
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);

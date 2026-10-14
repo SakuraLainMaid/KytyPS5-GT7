@@ -739,6 +739,9 @@ public:
 		}
 	}
 
+	// Whether this dispatch runs as a transaction that collects its own faults.
+	[[nodiscard]] bool Enabled() const { return m_enabled; }
+
 	bool Retry() {
 		if (!m_enabled) return false;
 		auto&      cache  = m_context.GetBufferCache();
@@ -1285,6 +1288,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		TraceDispatch(m_context, input_info.stage, bindings,
 		              fmt::format("{}x{}x{}", thread_group_x, thread_group_y, thread_group_z));
 	}
+	if (program.info.uses_dma && DmaFaultReport() && !recovery.Enabled()) {
+		m_context.GetBufferCache().ProcessFaultBuffer();
+	}
 	ResetBindings();
 }
 
@@ -1434,6 +1440,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (TracedShader(program.shader_hash)) {
 		TraceDispatch(m_context, input_info.stage, bindings,
 		              fmt::format("indirect (arguments at 0x{:012x})", args_addr));
+	}
+	if (program.info.uses_dma && DmaFaultReport() && !recovery.Enabled()) {
+		m_context.GetBufferCache().ProcessFaultBuffer();
 	}
 	ResetBindings();
 }

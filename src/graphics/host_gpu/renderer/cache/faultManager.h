@@ -8,6 +8,9 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <string>
+#include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -34,6 +37,10 @@ public:
 	[[nodiscard]] uint64_t UnattributedFaults() const noexcept {
 		return m_unattributed_faults.load(std::memory_order_acquire);
 	}
+	// Diagnostics: a DMA shader recorded since the faults were last collected; a collection that
+	// finds faults no dispatch transaction claims names them ("GPU page faults: ...").
+	// `label`, when not empty, describes this use of it (KYTY_DMA_FAULT_REPORT).
+	void NoteDmaShader(uint64_t hash, std::string label);
 
 private:
 	void                                   ProcessFaultBufferImpl(ShaderFaultReport* report);
@@ -50,6 +57,9 @@ private:
 	vk::Pipeline                           m_fault_process_pipeline        = nullptr;
 	vk::PipelineLayout                     m_fault_process_pipeline_layout = nullptr;
 	std::atomic<uint64_t>                  m_unattributed_faults {0};
+	std::vector<std::string>               m_recent_dma;
+	std::unordered_set<uint64_t>           m_recent_dma_hashes;
+	size_t                                 m_recent_dma_more = 0;
 };
 
 } // namespace Libs::Graphics

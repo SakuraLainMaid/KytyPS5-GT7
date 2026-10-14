@@ -20,6 +20,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
+#include <fmt/format.h>
 #include <limits>
 #include <mutex>
 
@@ -180,6 +182,18 @@ void FaultManager::ProcessFaultBuffer() {
 	ProcessFaultBufferImpl(nullptr);
 }
 
+void FaultManager::NoteDmaShader(uint64_t hash, std::string label) {
+	constexpr size_t MaxNamed = 32;
+	if (label.empty() && !m_recent_dma_hashes.insert(hash).second) {
+		return;
+	}
+	if (m_recent_dma.size() >= MaxNamed) {
+		m_recent_dma_more++;
+		return;
+	}
+	m_recent_dma.push_back(label.empty() ? fmt::format("{:016x}", hash) : std::move(label));
+}
+
 ShaderFaultReport FaultManager::CollectFaults() {
 	ShaderFaultReport report;
 	ProcessFaultBufferImpl(&report);
@@ -268,8 +282,13 @@ void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 	// Preserve the record in readback, then release it for the next attempt. Fill
 	// supplies the transfer-read -> transfer-write -> shader-access dependencies.
 	m_fault_buffer.Fill(PageFaultBitsetSize, sizeof(ShaderTrapArea), 0);
-	const auto area = m_current_area;
-	m_scheduler.DeferOperation([this, mapped, offset, area, report] {
+	const auto area   = m_current_area;
+	auto       recent = std::move(m_recent_dma);
+	const auto more   = std::exchange(m_recent_dma_more, 0);
+	m_recent_dma.clear();
+	m_recent_dma_hashes.clear();
+	m_scheduler.DeferOperation([this, mapped, offset, area, report, recent = std::move(recent),
+	                            more] {
 		m_download_buffer.Invalidate(offset, m_download_area_size);
 		ShaderTrapRecord trap;
 		std::memcpy(&trap, mapped + PageFaultAreaSize, sizeof(trap));
@@ -308,6 +327,19 @@ void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 		if (faults[0] > count) {
 			LOGF("GPU page-fault report truncated: %" PRIu64 " entries, %" PRIu64 " recorded\n",
 			     faults[0], count);
+		}
+		if (report == nullptr && count != 0) {
+			std::string shaders;
+			for (const auto& shader: recent) {
+				shaders += " " + shader;
+			}
+			if (more != 0) {
+				shaders += fmt::format(" (and {} more)", more);
+			}
+			LOGF("GPU page faults: %" PRIu64
+			     " pages that no cached buffer covered were read as zeros; "
+			     "the DMA shaders recorded since the last check:%s\n",
+			     count, shaders.empty() ? " (none)" : shaders.c_str());
 		}
 		for (uint32_t index = 1; index <= count; ++index) {
 			const auto address = BufferCache::GuestAddress(faults[index]);

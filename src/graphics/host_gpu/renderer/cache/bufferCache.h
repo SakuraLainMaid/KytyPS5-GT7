@@ -117,6 +117,9 @@ public:
 	[[nodiscard]] bool              IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool              IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void                            ProcessFaultBuffer();
+	void                            NoteDmaShader(uint64_t hash, std::string label) {
+        m_fault_manager.NoteDmaShader(hash, std::move(label));
+	}
 	// GPU thread: writes bytes on a page protected because the GPU wrote to it, without
 	// downloading the page: the host copy through the backing store, the GPU copy in the command
 	// stream, after the GPU's earlier writes. Bytes the GPU had written are then current on both

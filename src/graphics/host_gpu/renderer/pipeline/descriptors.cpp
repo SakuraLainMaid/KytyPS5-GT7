@@ -2564,17 +2564,38 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	}
 }
 
+bool DmaFaultReport() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DMA_FAULT_REPORT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 void PrefaultDmaPointers(BufferCache& buffers, const ShaderStageRuntime& stage) {
 	static const uint64_t span = [] {
 		const char* value = std::getenv("KYTY_DMA_PREFAULT_KB");
 		return (value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : 4ull)
 		       << 10u;
 	}();
-	if (span == 0 || stage.program == nullptr || stage.resources == nullptr) {
+	if (stage.program == nullptr || stage.resources == nullptr) {
 		return;
 	}
 	const auto& program = *stage.program;
 	const auto& user    = stage.resources->user_data;
+	// Named in the fault lines; with KYTY_DMA_FAULT_REPORT=1, each use with its pointers.
+	if (!DmaFaultReport()) {
+		buffers.NoteDmaShader(program.shader_hash, {});
+	} else {
+		std::string label = fmt::format("{:016x}(", program.shader_hash);
+		for (size_t reg = 0; reg + 1u < user.size(); reg += 2u) {
+			label += fmt::format("{}{:08x}{:08x}", reg == 0 ? "" : ",", user[reg + 1u], user[reg]);
+		}
+		buffers.NoteDmaShader(program.shader_hash, label + ")");
+	}
+	if (span == 0) {
+		return;
+	}
 	// A 64-bit SGPR pair starts at an even register; one a scalar load reads through is 4-byte
 	// aligned and in one of the two windows the GPU sees of the guest's memory: below 1 TiB, and
 	// the extended memory at 8 TiB (automatic memory).
