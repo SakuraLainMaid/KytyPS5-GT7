@@ -586,8 +586,21 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	for (uint32_t level = 0; level < levels; level++) {
-		const auto width             = std::max(source.backing.extent.width >> level, 1u);
-		const auto height            = std::max(source.backing.extent.height >> level, 1u);
+		// Within both images, as CopyImage: the source's extent alone wrote past a smaller
+		// destination. A block-compressed source is cut on a block boundary.
+		const auto fit = [&](uint32_t source_size, uint32_t destination_size) {
+			const uint32_t source_texels      = std::max(source_size >> level, 1u);
+			const uint32_t destination_texels = std::max(destination_size >> level, 1u);
+			const uint32_t texels             = std::min(source_texels, destination_texels);
+			// A partial block only where it ends both images.
+			return source_texels == destination_texels ? texels
+			                                           : texels / source_block * source_block;
+		};
+		const auto width  = fit(source.backing.extent.width, backing.extent.width);
+		const auto height = fit(source.backing.extent.height, backing.extent.height);
+		if (width == 0 || height == 0) {
+			continue;
+		}
 		const auto source_depth      = source.backing.image_type == vk::ImageType::e3D
 		                                   ? std::max(source.backing.extent.depth >> level, 1u)
 		                                   : source.backing.layers;

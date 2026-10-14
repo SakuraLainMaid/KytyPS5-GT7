@@ -45,15 +45,44 @@ const char* OpName(uint32_t op) {
 		case 17: return "ImageClear";
 		case 18: return "BufferCopy";
 		case 19: return "DepthCopy";
+		case 20: return "InternalWork";
 		default: return "Unknown";
 	}
 }
 
+// CommandBufferDebugOp::InternalWork's kinds (render.h, InternalWork).
+const char* InternalWorkName(uint32_t kind) {
+	switch (kind) {
+		case 1: return "ColorClearCheck";
+		case 2: return "NanScan";
+		case 3: return "Detile";
+		case 4: return "Tile";
+		case 5: return "ColorTransform";
+		case 6: return "DepthConvert";
+		case 7: return "FaultScan";
+		case 8: return "BufferDownload";
+		case 9: return "ImageDump";
+		default: return "?";
+	}
+}
+
 bool IsTransferOp(uint32_t op) {
-	return op >= 11 && op <= 19;
+	return op >= 11 && op <= 20;
 }
 
 void Print(const char* stage, const DiagnosticCheckpoint& checkpoint) {
+	if (checkpoint.op == 20) {
+		std::printf("  [%s] seq=%" PRIu64 " op=InternalWork(%s) submit=%" PRIu64
+		            " dst=0x%016" PRIx64 " src=0x%016" PRIx64 " args=%u,%u\n",
+		            stage, checkpoint.sequence, InternalWorkName(checkpoint.arg0),
+		            checkpoint.submit_id, checkpoint.arg4, checkpoint.arg5, checkpoint.arg1,
+		            checkpoint.arg2);
+		LOGF("  [%s] seq=%" PRIu64 " op=InternalWork(%s) submit=%" PRIu64 " dst=0x%016" PRIx64
+		     " src=0x%016" PRIx64 " args=%u,%u\n",
+		     stage, checkpoint.sequence, InternalWorkName(checkpoint.arg0), checkpoint.submit_id,
+		     checkpoint.arg4, checkpoint.arg5, checkpoint.arg1, checkpoint.arg2);
+		return;
+	}
 	if (IsTransferOp(checkpoint.op)) {
 		std::printf("  [%s] seq=%" PRIu64 " op=%s submit=%" PRIu64 " dst=0x%016" PRIx64
 		            " src=0x%016" PRIx64 " args=%u,%u,%u\n",

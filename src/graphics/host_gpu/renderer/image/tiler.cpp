@@ -276,6 +276,11 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 	                     target_capacity % 4 != 0);
 
 	m_scheduler.EndRendering();
+	m_scheduler.Current().MarkTransfer(
+	    CommandBufferDebugOp::InternalWork, 0, 0,
+	    static_cast<uint32_t>(clear_target ? InternalWork::Detile : InternalWork::Tile),
+	    static_cast<uint32_t>(std::min<uint64_t>(target_capacity, UINT32_MAX)),
+	    static_cast<uint32_t>(dispatches.size()));
 	auto                    command = m_scheduler.Current().Recorder();
 	vk::BufferMemoryBarrier barriers[3] {};
 	barriers[0].srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostWrite;
@@ -493,6 +498,9 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	EXIT_IF(source.size < source_barrier_size || target.size < target_barrier_size);
 
 	m_scheduler.EndRendering();
+	m_scheduler.Current().MarkTransfer(CommandBufferDebugOp::InternalWork, 0, 0,
+	                                   static_cast<uint32_t>(InternalWork::DepthConvert),
+	                                   layout.width, layout.height);
 	auto                    command = m_scheduler.Current().Recorder();
 	vk::BufferMemoryBarrier barriers[2] {};
 	barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -638,6 +646,11 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eMemoryRead;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderWrite;
 	m_scheduler.EndRendering();
+	m_scheduler.Current().MarkTransfer(
+	    CommandBufferDebugOp::InternalWork, 0, 0,
+	    static_cast<uint32_t>(InternalWork::ColorTransform),
+	    static_cast<uint32_t>(std::min<uint64_t>(input.size / element_bytes, UINT32_MAX)),
+	    to_host ? 1u : 0u);
 	auto command = m_scheduler.Current().Recorder();
 	command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,

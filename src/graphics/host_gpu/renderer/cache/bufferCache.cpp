@@ -219,6 +219,10 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
+	command.MarkTransfer(CommandBufferDebugOp::InternalWork, buffer_address, 0,
+	                     static_cast<uint32_t>(InternalWork::BufferDownload),
+	                     static_cast<uint32_t>(std::min<uint64_t>(total_size, UINT32_MAX)),
+	                     static_cast<uint32_t>(copies.size()));
 	// Recorded through the recording thread: a raw Handle() made every readback wait for it to
 	// drain first (4.5 % of the GPU thread at the Leap Attack prompt, 2026-10-05).
 	const auto              native = command.Recorder();
@@ -250,8 +254,36 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 	                copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
+			const auto  address = buffer_address + copy.srcOffset;
+			const auto* bytes   = mapped + (copy.dstOffset - offset);
+			if (Libs::LibKernel::Memory::TryWriteBacking(address, bytes, copy.size)) {
+				continue;
+			}
+			// The guest unmapped some of these bytes after the GPU wrote them (a download window
+			// reaches past the mapping the read faulted in, and a buffer can span mappings):
+			// nothing is left to write those to. The pages still mapped get theirs. Route X's
+			// loading ended the emulator here (2026-10-14).
+			uint64_t dropped = 0;
+			for (uint64_t done = 0; done < copy.size;) {
+				const auto at    = address + done;
+				const auto piece = std::min<uint64_t>(
+				    copy.size - done, Common::AlignDown(at, 0x1000u) + 0x1000u - at);
+				if (!Libs::LibKernel::Memory::TryWriteBacking(at, bytes + done, piece)) {
+					if (Libs::LibKernel::Memory::TryClampRangeSize(at, piece) == piece) {
+						EXIT("Memory: required direct-backing write failed, addr=0x%016" PRIx64
+						     " size=0x%016" PRIx64 "\n",
+						     at, piece);
+					}
+					dropped += piece;
+				}
+				done += piece;
+			}
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("BufferCache: 0x%" PRIx64 " GPU-written bytes of 0x%016" PRIx64 "+0x%" PRIx64
+				     " dropped: the guest unmapped them before their download landed\n",
+				     dropped, address, static_cast<uint64_t>(copy.size));
+			}
 		}
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		for (const auto& copy: copies) {
@@ -392,6 +424,28 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	}
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+}
+
+void BufferCache::ForgetUnmapped(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	uint64_t dropped = 0;
+	{
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		if (!m_gpu_modified_ranges.Intersects(vaddr, size)) {
+			return;
+		}
+		m_gpu_modified_ranges.ForEachInRange(
+		    vaddr, size, [&](uint64_t begin, uint64_t end) { dropped += end - begin; });
+		m_gpu_modified_ranges.Subtract(vaddr, size);
+	}
+	static std::atomic<uint32_t> reported {0};
+	if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+		LOGF("BufferCache: 0x%" PRIx64 " GPU-written bytes of unmapped memory 0x%016" PRIx64
+		     "+0x%" PRIx64 " dropped\n",
+		     dropped, vaddr, size);
+	}
 }
 
 bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {

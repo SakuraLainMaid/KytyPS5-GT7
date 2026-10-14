@@ -243,6 +243,10 @@ uint32_t CurrentOp() {
 	return g_op;
 }
 
+uint32_t CaptureNumber() {
+	return g_capture;
+}
+
 void Log(const char* format, ...) {
 	if (!Logging()) {
 		return;

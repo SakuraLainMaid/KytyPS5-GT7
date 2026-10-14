@@ -130,6 +130,12 @@ public:
 	// the contents of each layer as the GPU holds them ("FG <op> layers ...") and, for one the GPU
 	// wrote, as guest memory holds them. `what` names the binding in the lines.
 	void VerifyWithGuest(ImageId id, uint32_t op, const std::string& what);
+	// Diagnostics (KYTY_DUMP_IMAGES, image/imageDump.h): the image as the GPU holds it once the
+	// commands recorded so far have run, written to image-dumps/<name>_<address>_<size>.png when
+	// the copy lands; once a capture for each content (Image::content_serial). False when it does
+	// not apply (multisampled or block-compressed images, formats the dump does not decode).
+	bool DumpImage(ImageId id, uint32_t capture, const std::string& name,
+	               const std::string& description);
 
 	// Diagnostics: the KYTY_TRACE_* traces (KYTY_TRACE_DISPATCHES in renderCompute.cpp,
 	// KYTY_TRACE_IMAGES here). Lines start "Trace ".

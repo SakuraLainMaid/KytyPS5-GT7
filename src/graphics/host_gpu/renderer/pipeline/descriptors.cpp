@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
+#include "graphics/host_gpu/renderer/image/imageDump.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -2140,6 +2141,17 @@ static void LogFrameGraphStage(RenderContext& context, const ShaderStageRuntime&
 		if (!resource.written && binding.image_id && FrameGraph::VerifyEnabled()) {
 			textures.VerifyWithGuest(binding.image_id, FrameGraph::CurrentOp(),
 			                         fmt::format("{} tex[{}]", stage, i));
+		}
+		// KYTY_DUMP_IMAGES: the image as this binding finds it, to a PNG.
+		if (binding.image_id && ImageDump::Enabled() &&
+		    ImageDump::Wanted(info.data.address, info.extent.width, info.extent.height,
+		                      info.resources.layers, info.IsDepth())) {
+			const auto capture = FrameGraph::CaptureNumber();
+			(void)textures.DumpImage(
+			    binding.image_id, capture,
+			    fmt::format("cap{}_op{}_{}_t{}", capture, FrameGraph::CurrentOp(), stage, i),
+			    fmt::format("FG {} {} tex[{}] {} of {:016x}", FrameGraph::CurrentOp(), stage, i,
+			                resource.written ? "write" : "read", program.shader_hash));
 		}
 		// A small linear image a shader stores to, the kind the CPU reads back: shown after the
 		// frame as guest memory holds it.

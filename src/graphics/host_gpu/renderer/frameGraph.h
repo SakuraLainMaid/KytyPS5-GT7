@@ -39,6 +39,8 @@ extern std::atomic<bool> g_logging;
 // line to the current one.
 uint32_t               BeginOp();
 [[nodiscard]] uint32_t CurrentOp();
+// The capture running (or the last one): counted from 1.
+[[nodiscard]] uint32_t CaptureNumber();
 void                   Log(const char* format, ...) KYTY_FORMAT_PRINTF(1, 2);
 
 // Buffer contents shown after the frame: the first KeepBytes of each.

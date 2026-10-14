@@ -63,6 +63,23 @@ enum class CommandBufferDebugOp : uint32_t {
 	ImageClear,
 	BufferCopy,
 	DepthCopy,
+	// The emulator's own GPU work (shaders and copies a guest command does not name), arg0 its
+	// InternalWork kind: a device lost between two guest commands names it.
+	InternalWork,
+};
+
+// CommandBufferDebugOp::InternalWork's arg0.
+enum class InternalWork : uint32_t {
+	ColorClearCheck = 1, // dst: the metadata's guest address, src: the image's; args: words, slice
+	NanScan,             // dst: the image's guest address; args: bytes, layers
+	Detile,              // the tiler (guest layout to linear); args: target bytes, dispatches
+	Tile,                // the tiler (linear to guest layout); args: target bytes, dispatches
+	ColorTransform,      // the tiler's color transform; args: texels, to the host (1) or not
+	DepthConvert,        // the tiler's D16 conversion; args: width, height
+	FaultScan,           // the page-fault buffer's scan
+	BufferDownload,      // GPU-written bytes to guest memory; dst: the buffer's guest address;
+	                     // args: bytes, copies
+	ImageDump,           // KYTY_DUMP_IMAGES; dst: the image's guest address; args: bytes, tiles
 };
 
 enum class DrawOffsetSource : uint8_t {

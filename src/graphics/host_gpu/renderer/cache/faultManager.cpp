@@ -249,6 +249,8 @@ void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 	}
 
 	m_scheduler.EndRendering();
+	m_scheduler.Current().MarkTransfer(CommandBufferDebugOp::InternalWork, 0, 0,
+	                                   static_cast<uint32_t>(InternalWork::FaultScan), 0, 0);
 	auto               command = m_scheduler.Current().Recorder();
 	vk::DependencyInfo dependency {};
 	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
