@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <fmt/format.h>
+#include <string>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -80,6 +82,90 @@ void PreferPerformanceCores(const char* name) {
 	     fast.size(), sets.size(), static_cast<unsigned>(highest), ok ? "" : " - failed");
 }
 
+bool SetProcessCpuSet(const char* which, std::string* description) {
+	const auto describe = [&](std::string text) {
+		if (description != nullptr) {
+			*description = std::move(text);
+		}
+	};
+	DWORD_PTR process_mask = 0, system_mask = 0;
+	if (which == nullptr ||
+	    GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) == FALSE) {
+		describe("the process's processors are unknown");
+		return false;
+	}
+	// The L3 caches of processor group 0 (the process's, with up to 64 logical processors) and
+	// the processors sharing each.
+	struct Cache {
+		DWORD_PTR mask = 0;
+		DWORD     size = 0;
+	};
+	std::vector<Cache> caches;
+	DWORD              length = 0;
+	GetLogicalProcessorInformationEx(RelationCache, nullptr, &length);
+	std::vector<uint8_t> buffer(length);
+	if (length != 0 &&
+	    GetLogicalProcessorInformationEx(
+	        RelationCache,
+	        reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()),
+	        &length) != FALSE) {
+		for (DWORD offset = 0; offset < length;) {
+			const auto* info =
+			    reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data() + offset);
+			if (info->Size == 0) {
+				break;
+			}
+			if (info->Relationship == RelationCache && info->Cache.Level == 3 &&
+			    info->Cache.GroupMask.Group == 0 &&
+			    (info->Cache.GroupMask.Mask & system_mask) != 0) {
+				caches.push_back({info->Cache.GroupMask.Mask & system_mask, info->Cache.CacheSize});
+			}
+			offset += info->Size;
+		}
+	}
+	const auto count = [](DWORD_PTR mask) {
+		uint32_t n = 0;
+		for (; mask != 0; mask &= mask - 1) {
+			n++;
+		}
+		return n;
+	};
+	const std::string name(which);
+	DWORD_PTR         mask = 0;
+	std::string       what;
+	if (name == "all") {
+		mask = system_mask;
+		what = "every processor";
+	} else if (name == "vcache" || name == "frequency") {
+		if (caches.size() < 2) {
+			describe(
+			    fmt::format("not changed: the processors share {} L3 cache(s)", caches.size()));
+			return false;
+		}
+		const auto largest = std::ranges::max_element(
+		    caches, [](const Cache& a, const Cache& b) { return a.size < b.size; });
+		for (const auto& cache: caches) {
+			const bool chosen = &cache == &*largest;
+			if (chosen == (name == "vcache")) {
+				mask |= cache.mask;
+			}
+		}
+		what = name == "vcache" ? fmt::format("the processors sharing the largest L3 cache ({} MB)",
+		                                      largest->size >> 20u)
+		                        : std::string("the processors outside the largest L3 cache");
+	} else {
+		describe("not changed: KYTY_CPU_SET takes vcache, frequency or all");
+		return false;
+	}
+	if (mask == 0 || SetProcessAffinityMask(GetCurrentProcess(), mask) == FALSE) {
+		describe(fmt::format("not changed: the mask 0x{:x} was refused", mask));
+		return false;
+	}
+	describe(fmt::format("the process runs on {}: {} of {} logical processors (mask 0x{:x})", what,
+	                     count(mask), count(system_mask), mask));
+	return true;
+}
+
 #elif !defined(__APPLE__)
 
 void PreferPerformanceCores(const char* name) {
@@ -122,9 +208,23 @@ void PreferPerformanceCores(const char* name) {
 	     count, highest / 1000ul, ok ? "" : " - failed");
 }
 
+bool SetProcessCpuSet(const char* /*which*/, std::string* description) {
+	if (description != nullptr) {
+		*description = "not changed: only on Windows";
+	}
+	return false;
+}
+
 #else
 
 void PreferPerformanceCores(const char* /*name*/) {}
+
+bool SetProcessCpuSet(const char* /*which*/, std::string* description) {
+	if (description != nullptr) {
+		*description = "not changed: only on Windows";
+	}
+	return false;
+}
 
 #endif
 

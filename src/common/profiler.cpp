@@ -1,6 +1,7 @@
 #include "common/profiler.h"
 
 #include "common/emulatorConfig.h"
+#include "common/perfStats.h"
 
 #include <common/TracyProtocol.hpp>
 #include <common/TracyVersion.hpp>
@@ -86,6 +87,7 @@ void PlotCounters() {
 } // namespace
 
 void SetThreadName(const char* name) {
+	Common::PerfStats::NameThread(name);
 	if (tracy::ProfilerAvailable() && name != nullptr) {
 		tracy::SetThreadName(name);
 	}

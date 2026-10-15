@@ -6,6 +6,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "common/timer.h"
@@ -100,6 +101,8 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	if (Profiler::t_gpu_thread) {
 		Profiler::Add(Profiler::Counter::GpuWaits);
 		Profiler::Add(Profiler::Counter::GpuWaitTime, static_cast<int64_t>(waited * 1e6));
+		Common::PerfStats::AddGpuThread(Common::PerfStats::GpuThread::HostGpuWait,
+		                                static_cast<uint64_t>(waited * 1e9));
 	}
 	if (result != vk::Result::eSuccess) {
 		if (result == vk::Result::eErrorDeviceLost) {

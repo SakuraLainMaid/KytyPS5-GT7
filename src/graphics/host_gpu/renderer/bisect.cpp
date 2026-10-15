@@ -1,6 +1,8 @@
 #include "graphics/host_gpu/renderer/bisect.h"
 
+#include "common/cpuAffinity.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 
 #include <algorithm>
 #include <atomic>
@@ -23,11 +25,14 @@ struct Skip {
 
 struct Step {
 	std::vector<Skip> skips;
-	bool              lit_big  = false;
-	bool              lit_all  = false;
-	bool              whole_cs = false;
-	std::string       name; // for the screen and the picture's file name
-	std::string       text; // name and actions, for the log
+	bool              lit_big     = false;
+	bool              lit_all     = false;
+	bool              whole_cs    = false;
+	bool              log_off     = false;
+	int64_t           readback_kb = -1; // -1: the usual window
+	std::string       cpu_set;          // empty: as at the start
+	std::string       name;             // for the screen and the picture's file name
+	std::string       text;             // name and actions, for the log
 };
 
 std::string_view Trim(std::string_view text) {
@@ -64,6 +69,23 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "mips:whole" || action == "mips:cs") {
 		step.whole_cs = true;
+		return true;
+	}
+	if (action == "log:off") {
+		step.log_off = true;
+		return true;
+	}
+	if (action == "cpu:vcache" || action == "cpu:frequency" || action == "cpu:all") {
+		step.cpu_set = std::string(action.substr(4));
+		return true;
+	}
+	if (action.starts_with("readback:")) {
+		const auto kb = action.substr(9);
+		if (kb.empty() || kb.find_first_not_of("0123456789") != std::string_view::npos) {
+			return false;
+		}
+		step.readback_kb =
+		    static_cast<int64_t>(std::strtoull(std::string(kb).c_str(), nullptr, 10));
 		return true;
 	}
 	if (action == "mips:graphics") {
@@ -164,6 +186,29 @@ bool FirstUse(uint32_t bit) {
 	return (g_logged.fetch_or(bit, std::memory_order_acq_rel) & bit) == 0;
 }
 
+std::string StartCpuSet() {
+	const char* value = std::getenv("KYTY_CPU_SET");
+	return value != nullptr && value[0] != '\0' ? std::string(value) : std::string("all");
+}
+
+// What the step that is on asks of the process (the CPU set, the log) and the name the Perf lines
+// give it. Once at the start, then at every change.
+void ApplyEffects() {
+	const auto& steps   = Steps();
+	const auto  current = g_current.load(std::memory_order_acquire);
+	const Step* step    = current == 0 || current > steps.size() ? nullptr : &steps[current - 1];
+	Common::PerfStats::SetConfiguration(step != nullptr ? step->name : std::string("normal"));
+	Log::SetMuted(step != nullptr && step->log_off);
+	static std::string applied = StartCpuSet();
+	const auto wanted = step != nullptr && !step->cpu_set.empty() ? step->cpu_set : StartCpuSet();
+	if (wanted != applied) {
+		std::string description;
+		Common::SetProcessCpuSet(wanted.c_str(), &description);
+		Log::WriteUnmuted(fmt::format("Bisect: cpu:{}: {}\n", wanted, description));
+		applied = wanted;
+	}
+}
+
 // g_pending_mutex held.
 void ApplyLocked() {
 	if (!g_pending.has_value()) {
@@ -172,6 +217,7 @@ void ApplyLocked() {
 	g_logged.store(0, std::memory_order_release);
 	g_current.store(*g_pending, std::memory_order_release);
 	g_pending.reset();
+	ApplyEffects();
 }
 
 std::string FileName(std::string_view name) {
@@ -214,11 +260,12 @@ std::string Advance() {
 	g_picture = fmt::format("bisect_{:02}_{}", g_presses,
 	                        now == 0 ? std::string("normal") : FileName(steps[now - 1].name));
 	g_pending = next;
-	LOGF("Bisect: F8 press %u: a picture of %s (%s.jpg), then %s\n", g_presses,
-	     now == 0 ? "normal" : fmt::format("step {}", now).c_str(), g_picture.c_str(),
-	     next == 0 ? "back to normal" : fmt::format("step {} of {}: {}", next, steps.size(),
-	                                               steps[next - 1].text)
-	                                      .c_str());
+	// Written even under log:off, which the press may be leaving.
+	Log::WriteUnmuted(fmt::format(
+	    "Bisect: F8 press {}: a picture of {} ({}.jpg), then {}\n", g_presses,
+	    now == 0 ? std::string("normal") : fmt::format("step {}", now), g_picture,
+	    next == 0 ? std::string("back to normal")
+	              : fmt::format("step {} of {}: {}", next, steps.size(), steps[next - 1].text)));
 	if (next == 0) {
 		return fmt::format("Bisect: normal (all {} steps off)", steps.size());
 	}
@@ -269,6 +316,19 @@ bool PassesDepthCompare(bool big_depth_image) {
 		     step->lit_all ? "lit:all" : "lit:big");
 	}
 	return true;
+}
+
+void Start() {
+	if (Steps().empty()) {
+		return;
+	}
+	std::scoped_lock lock(g_pending_mutex);
+	ApplyEffects();
+}
+
+int64_t ReadbackWindowKB() {
+	const auto* step = Current();
+	return step != nullptr ? step->readback_kb : -1;
 }
 
 bool WholeUnnormalizedViews() {

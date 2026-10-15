@@ -680,11 +680,15 @@ int KYTY_SYSV_ABI AgcUnknownGetFusedShaderSize(SizeAlign* dst, const Shader* fro
                                                const Shader* back) {
 	PRINT_NAME();
 
-	LOGF("\t dst   = 0x%016" PRIx64 "\n"
-	     "\t front = 0x%016" PRIx64 "\n"
-	     "\t back  = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(dst), reinterpret_cast<uint64_t>(front),
-	     reinterpret_cast<uint64_t>(back));
+	// The first 64 calls: some titles call this for every draw.
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1) < 64) {
+		LOGF("\t dst   = 0x%016" PRIx64 "\n"
+		     "\t front = 0x%016" PRIx64 "\n"
+		     "\t back  = 0x%016" PRIx64 "\n",
+		     reinterpret_cast<uint64_t>(dst), reinterpret_cast<uint64_t>(front),
+		     reinterpret_cast<uint64_t>(back));
+	}
 
 	EXIT_NOT_IMPLEMENTED(dst == nullptr);
 	EXIT_NOT_IMPLEMENTED(front == nullptr);
@@ -718,12 +722,16 @@ static void merge_shader_register_max_field(ShaderRegister* dst, const ShaderReg
 static int fuse_shader_halves(Shader* fused_result, const Shader* front,
                               const Shader* back, void* scratch_mem,
                               bool recompute_shared_vgprs) {
-	LOGF("\t fused_result = 0x%016" PRIx64 "\n"
-	     "\t front        = 0x%016" PRIx64 "\n"
-	     "\t back         = 0x%016" PRIx64 "\n"
-	     "\t scratch_mem  = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(fused_result), reinterpret_cast<uint64_t>(front),
-	     reinterpret_cast<uint64_t>(back), reinterpret_cast<uint64_t>(scratch_mem));
+	// The first 64 calls: some titles fuse shader halves for every draw.
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1) < 64) {
+		LOGF("\t fused_result = 0x%016" PRIx64 "\n"
+		     "\t front        = 0x%016" PRIx64 "\n"
+		     "\t back         = 0x%016" PRIx64 "\n"
+		     "\t scratch_mem  = 0x%016" PRIx64 "\n",
+		     reinterpret_cast<uint64_t>(fused_result), reinterpret_cast<uint64_t>(front),
+		     reinterpret_cast<uint64_t>(back), reinterpret_cast<uint64_t>(scratch_mem));
+	}
 
 	EXIT_NOT_IMPLEMENTED(fused_result == nullptr);
 	EXIT_NOT_IMPLEMENTED(front == nullptr);
@@ -3562,12 +3570,16 @@ uint32_t* KYTY_SYSV_ABI AgcUnknownKRzWekV120(CommandBuffer* buf, uint32_t arg1, 
                                              uint32_t arg3) {
 	PRINT_NAME();
 
-	LOGF("\t argc = 4\n"
-	     "\t arg0 = 0x%016" PRIx64 "\n"
-	     "\t arg1 = 0x%08" PRIx32 "\n"
-	     "\t arg2 = 0x%08" PRIx32 "\n"
-	     "\t arg3 = 0x%08" PRIx32 "\n",
-	     reinterpret_cast<uint64_t>(buf), arg1, arg2, arg3);
+	// The first 64 calls: some titles call this many times a frame.
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1) < 64) {
+		LOGF("\t argc = 4\n"
+		     "\t arg0 = 0x%016" PRIx64 "\n"
+		     "\t arg1 = 0x%08" PRIx32 "\n"
+		     "\t arg2 = 0x%08" PRIx32 "\n"
+		     "\t arg3 = 0x%08" PRIx32 "\n",
+		     reinterpret_cast<uint64_t>(buf), arg1, arg2, arg3);
+	}
 
 	if (buf == nullptr) {
 		return nullptr;

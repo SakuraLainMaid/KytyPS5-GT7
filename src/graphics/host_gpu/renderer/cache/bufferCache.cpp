@@ -3,10 +3,12 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
@@ -612,6 +614,10 @@ static uint64_t ReadbackWindow() {
 		const char* value = std::getenv("KYTY_READBACK_WINDOW_KB");
 		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {4096}) * 1024u;
 	}();
+	// KYTY_BISECT's readback:<n>, an A/B test within one run.
+	if (const auto kb = Bisect::ReadbackWindowKB(); kb >= 0) {
+		return static_cast<uint64_t>(kb) * 1024u;
+	}
 	return window;
 }
 
@@ -1383,6 +1389,7 @@ std::string BufferCache::GpuWritersOf(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::ReportGameThreadDownload(uint64_t vaddr, uint64_t bytes) {
+	Common::PerfStats::AddDownload(bytes);
 	std::lock_guard lock(g_writers_mutex);
 	uint64_t        shader = UINT64_MAX; // no record
 	if (auto it = g_writers.upper_bound(vaddr); it != g_writers.begin()) {

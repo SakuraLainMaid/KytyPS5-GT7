@@ -3,7 +3,9 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/perfStats.h"
 
+#include <atomic>
 #include <cstdio>
 #include <filesystem>
 #include <fmt/format.h>
@@ -179,9 +181,21 @@ Direction GetDirection() {
 	return g_direction;
 }
 
+// KYTY_BISECT's log:off (common/perfStats.h).
+static std::atomic<bool> g_muted {false};
+
+void SetMuted(bool muted) {
+	g_muted.store(muted, std::memory_order_relaxed);
+}
+
+void WriteUnmuted(std::string_view text) {
+	WriteImpl(text);
+}
+
 bool IsSilent() {
 	// Before init LOGF must keep writing to stdout, so report non-silent.
-	return g_initialized && g_direction == Direction::Silent;
+	return (g_initialized && g_direction == Direction::Silent) ||
+	       g_muted.load(std::memory_order_relaxed);
 }
 
 void Write(std::string_view text) {

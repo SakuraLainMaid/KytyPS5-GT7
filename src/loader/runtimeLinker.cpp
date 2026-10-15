@@ -6,6 +6,7 @@
 #include "common/file.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/platform/sysDbg.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
@@ -35,6 +36,7 @@
 #include <magic_enum.hpp>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -674,10 +676,12 @@ struct FaultStats {
 		uint64_t vaddr   = 0; // last faulting guest address
 		uint64_t emulated = 0; // reads of GPU-clean bytes completed by the handler itself
 	};
-	std::mutex             mutex;
-	std::vector<Site>      sites;
-	uint64_t               total    = 0;
-	uint64_t               reported = 0;
+	std::mutex mutex;
+	// By host pc. A search of a list of them was ~4,000 sites long in GT7, a scan of 200 KB for
+	// every one of ~30,000 faults a second, under this lock.
+	std::unordered_map<uint64_t, Site> sites;
+	uint64_t                           total    = 0;
+	uint64_t                           reported = 0;
 };
 FaultStats g_fault_stats;
 
@@ -696,46 +700,51 @@ void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bo
 	std::scoped_lock lock(g_fault_stats.mutex);
 	auto&            stats = g_fault_stats;
 	stats.total++;
-	auto it = std::find_if(stats.sites.begin(), stats.sites.end(),
-	                       [host_pc](const FaultStats::Site& site) { return site.address == host_pc; });
-	if (it == stats.sites.end()) {
-		stats.sites.push_back({host_pc, 0, 0, 0, 0, 0, 0});
-		it = std::prev(stats.sites.end());
-	}
-	it->count++;
-	it->reads += is_read ? 1 : 0;
-	it->gpu += gpu_thread ? 1 : 0;
-	it->micros += micros;
-	it->vaddr = guest_vaddr;
-	it->emulated += emulated ? 1 : 0;
-	if (stats.total - stats.reported < 5000) {
+	auto& site_entry   = stats.sites.try_emplace(host_pc).first->second;
+	site_entry.address = host_pc;
+	site_entry.count++;
+	site_entry.reads += is_read ? 1 : 0;
+	site_entry.gpu += gpu_thread ? 1 : 0;
+	site_entry.micros += micros;
+	site_entry.vaddr = guest_vaddr;
+	site_entry.emulated += emulated ? 1 : 0;
+	// Every 50,000 faults: every 5,000 was five reports a second in races, each three sorts of
+	// the sites under this lock and 33 lines of log.
+	if (stats.total - stats.reported < 50000) {
 		return;
 	}
 	stats.reported = stats.total;
-	std::sort(stats.sites.begin(), stats.sites.end(),
-	          [](const FaultStats::Site& a, const FaultStats::Site& b) { return a.count > b.count; });
+	std::vector<FaultStats::Site> sites;
+	sites.reserve(stats.sites.size());
+	for (const auto& [pc, site]: stats.sites) {
+		sites.push_back(site);
+	}
+	std::sort(sites.begin(), sites.end(), [](const FaultStats::Site& a, const FaultStats::Site& b) {
+		return a.count > b.count;
+	});
 	uint64_t gpu_total = 0;
-	for (const auto& site: stats.sites) {
+	for (const auto& site: sites) {
 		gpu_total += site.gpu;
 	}
 	LOGF("TrackedFaults: total=%" PRIu64 " gpu_thread=%" PRIu64 " distinct_sites=%zu\n", stats.total,
 	     gpu_total, stats.sites.size());
-	for (size_t i = 0; i < std::min<size_t>(stats.sites.size(), 12); i++) {
-		const auto& site = stats.sites[i];
+	for (size_t i = 0; i < std::min<size_t>(sites.size(), 12); i++) {
+		const auto& site = sites[i];
 		LOGF("\t pc=0x%016" PRIx64 " count=%" PRIu64 " reads=%" PRIu64 " gpu_thread=%" PRIu64 "\n",
 		     site.address, site.count, site.reads, site.gpu);
 	}
-	std::sort(stats.sites.begin(), stats.sites.end(),
+	std::sort(sites.begin(), sites.end(),
 	          [](const FaultStats::Site& a, const FaultStats::Site& b) { return a.gpu > b.gpu; });
-	for (size_t i = 0; i < std::min<size_t>(stats.sites.size(), 8) && stats.sites[i].gpu != 0; i++) {
-		const auto& site = stats.sites[i];
+	for (size_t i = 0; i < std::min<size_t>(sites.size(), 8) && sites[i].gpu != 0; i++) {
+		const auto& site = sites[i];
 		LOGF("\t gpu-thread pc=0x%016" PRIx64 " count=%" PRIu64 " reads=%" PRIu64 "\n", site.address,
 		     site.gpu, site.reads);
 	}
-	std::sort(stats.sites.begin(), stats.sites.end(),
-	          [](const FaultStats::Site& a, const FaultStats::Site& b) { return a.micros > b.micros; });
-	for (size_t i = 0; i < std::min<size_t>(stats.sites.size(), 12); i++) {
-		const auto& site = stats.sites[i];
+	std::sort(sites.begin(), sites.end(), [](const FaultStats::Site& a, const FaultStats::Site& b) {
+		return a.micros > b.micros;
+	});
+	for (size_t i = 0; i < std::min<size_t>(sites.size(), 12); i++) {
+		const auto& site = sites[i];
 		LOGF("\t slow pc=0x%016" PRIx64 " ms=%" PRIu64 " count=%" PRIu64 " reads=%" PRIu64
 		     " emulated=%" PRIu64 " gpu_thread=%" PRIu64 " last_vaddr=0x%016" PRIx64 "\n",
 		     site.address, site.micros / 1000, site.count, site.reads, site.emulated, site.gpu,
@@ -763,29 +772,33 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Unknown: return false;
 		}
 		const auto started = std::chrono::steady_clock::now();
-		const auto elapsed = [started] {
-			return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-			                                 std::chrono::steady_clock::now() - started)
-			                                 .count());
-		};
 		// A read of bytes the GPU has not written, on a page protected because it wrote others:
 		// complete the load from the backing store and leave the page protected. Otherwise the
 		// fault waits for the GPU thread, which downloads the page and drains the GPU.
 		// KYTY_NO_CLEAN_READ_EMULATION=1 restores that for every read.
 		static const bool emulate_clean_reads =
 		    std::getenv("KYTY_NO_CLEAN_READ_EMULATION") == nullptr;
+		const auto elapsed_ns = [started] {
+			return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                 std::chrono::steady_clock::now() - started)
+			                                 .count());
+		};
 		if (access == GpuAccess::Read && emulate_clean_reads &&
 		    Loader::X64InstructionEmulator::TryEmulateLoad(
 		        info->native_context, info->access_violation_vaddr,
 		        &Libs::LibKernel::Memory::TryReadCleanFaultingBytes)) {
+			const auto ns = elapsed_ns();
+			Common::PerfStats::AddFault(ns, true, true);
 			RecordTrackedFault(info->exception_address, info->access_violation_vaddr, true,
-			                   Libs::Graphics::GuestGpu::IsGpuThread(), elapsed(), true);
+			                   Libs::Graphics::GuestGpu::IsGpuThread(), ns / 1000u, true);
 			return true;
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+			const auto ns = elapsed_ns();
+			Common::PerfStats::AddFault(ns, access == GpuAccess::Read, false);
 			RecordTrackedFault(info->exception_address, info->access_violation_vaddr,
 			                   access == GpuAccess::Read, Libs::Graphics::GuestGpu::IsGpuThread(),
-			                   elapsed(), false);
+			                   ns / 1000u, false);
 			return true;
 		}
 	}

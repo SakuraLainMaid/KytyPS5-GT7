@@ -3,6 +3,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -1468,6 +1469,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		const auto gpu_zone = BeginGpuZone(m_context, buffer, program.shader_hash);
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 		Profiler::Add(Profiler::Counter::Dispatches);
+		Common::PerfStats::AddDispatch();
 		GpuProfiler::End(buffer, gpu_zone);
 		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
 		Timeline::Mark("dispatch", program.shader_hash,
@@ -1655,6 +1657,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		const auto gpu_zone = BeginGpuZone(m_context, buffer, program.shader_hash);
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
 		Profiler::Add(Profiler::Counter::Dispatches);
+		Common::PerfStats::AddDispatch();
 		GpuProfiler::End(buffer, gpu_zone);
 		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
 		Timeline::Mark("dispatch-indirect", program.shader_hash, 0);

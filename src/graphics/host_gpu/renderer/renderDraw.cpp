@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -1875,6 +1876,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
 	Profiler::Add(Profiler::Counter::Draws);
+	Common::PerfStats::AddDraw();
 	GpuProfiler::End(buffer, gpu_zone);
 	GpuTiming::After(m_context, buffer,
 	                 state.ps_active ? state.ps_input_info.stage.program->shader_hash

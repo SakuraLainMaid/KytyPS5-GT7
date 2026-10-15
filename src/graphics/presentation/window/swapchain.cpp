@@ -2,6 +2,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
@@ -1175,6 +1176,7 @@ void Presenter::Present(std::span<const Layer> layers) {
 	    m_impl->window.graphic_ctx.presented_frames.fetch_add(1, std::memory_order_relaxed) + 1;
 	Timeline::Present(presented);
 	GpuTiming::Present(presented);
+	Common::PerfStats::AddPresent();
 	m_impl->Present();
 }
 

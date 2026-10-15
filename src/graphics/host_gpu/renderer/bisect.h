@@ -20,7 +20,16 @@
 //                as before 2026-10-15 (round 56), instead of its first mip. Graphics stages keep
 //                the whole view anyway: mips:whole is the same as mips:cs, and mips:graphics
 //                changes nothing
+// and, for A/B tests of performance with the Perf lines (common/perfStats.h), which name the step:
+//   cpu:vcache   the process runs on the processors sharing the largest L3 cache (cpu:frequency
+//                the others, cpu:all every one); without it, as at the start (KYTY_CPU_SET)
+//   readback:<n> a game thread's fault on GPU-written memory downloads a window of n KB around
+//                it (KYTY_READBACK_WINDOW_KB, default 4096; 0 the faulting pages only)
+//   log:off      LOGF writes nothing
 namespace Libs::Graphics::Bisect {
+
+// The GPU thread, at its start: applies the start step's CPU set and log setting.
+void Start();
 
 // F8 (window thread): asks for a picture of the frame as it is and for the next step after it;
 // returns the line to show for that step.
@@ -37,6 +46,8 @@ void                      ApplyPending();
 [[nodiscard]] bool PassesDepthCompare(bool big_depth_image);
 // Whether a compute shader's sampler with unnormalized coordinates keeps the T#'s whole view.
 [[nodiscard]] bool WholeUnnormalizedViews();
+// The readback window the step that is on asks for, in KB, or -1.
+[[nodiscard]] int64_t ReadbackWindowKB();
 
 } // namespace Libs::Graphics::Bisect
 

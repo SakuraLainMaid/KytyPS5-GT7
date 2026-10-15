@@ -1933,10 +1933,19 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 
 	const uint32_t control = buffer[2];
 
+	// Each value once: GT7 calls with 0x0f800000 thousands of times a second, which was over a
+	// third of its log during races.
 	const uint32_t control_flags = control & 0x0fe00000u;
 	if (control_flags != 0x0f200000u) {
-		LOGF("\t temporary: accepting PS5 indirect buffer control flags = 0x%08" PRIx32 "\n",
-		     control_flags);
+		// Bits 21..27: 128 values, one bit each.
+		static std::array<std::atomic<uint64_t>, 2> logged {};
+		const auto                                  index = (control_flags >> 21u) & 0x7fu;
+		const auto                                  bit   = uint64_t {1} << (index & 63u);
+		if ((logged[index >> 6u].fetch_or(bit, std::memory_order_relaxed) & bit) == 0) {
+			LOGF("\t temporary: accepting PS5 indirect buffer control flags = 0x%08" PRIx32
+			     " (each value once)\n",
+			     control_flags);
+		}
 	}
 
 	auto* indirect_buffer =

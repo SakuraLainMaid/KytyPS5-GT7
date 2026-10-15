@@ -4,6 +4,7 @@
 #include "common/cpuAffinity.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -13,6 +14,7 @@
 #include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -681,6 +683,15 @@ void GuestGpu::ThreadRun(void* data) {
 	Profiler::t_gpu_thread = true;
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
+	Common::PerfStats::Start();
+	Bisect::Start();
+	// KYTY_PERF: how the GPU thread spends its time.
+	using PerfPhase      = Common::PerfStats::GpuThread;
+	const auto perf_time = [] {
+		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                 std::chrono::steady_clock::now().time_since_epoch())
+		                                 .count());
+	};
 
 	for (;;) {
 		Submission                   submission;
@@ -693,7 +704,9 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				Timeline::Mark("gpu-idle");
+				const auto idle_from = perf_time();
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				Common::PerfStats::AddGpuThread(PerfPhase::Idle, perf_time() - idle_from);
 				Timeline::Mark("gpu-wake");
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -717,7 +730,9 @@ void GuestGpu::ThreadRun(void* data) {
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
 					Timeline::Mark("gpu-blocked");
+					const auto blocked_from = perf_time();
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					Common::PerfStats::AddGpuThread(PerfPhase::Blocked, perf_time() - blocked_from);
 					Timeline::Mark("gpu-unblocked");
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
@@ -744,7 +759,9 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
+			const auto busy_from = perf_time();
 			command();
+			Common::PerfStats::AddGpuThread(PerfPhase::Busy, perf_time() - busy_from);
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -755,7 +772,9 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
-		const bool complete = gpu->Process(submission);
+		const auto busy_from = perf_time();
+		const bool complete  = gpu->Process(submission);
+		Common::PerfStats::AddGpuThread(PerfPhase::Busy, perf_time() - busy_from);
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
