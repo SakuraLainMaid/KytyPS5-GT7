@@ -29,9 +29,11 @@ public:
 
 	// Records the count of `words_per_layer * layers` words at `words` into the `layers` counters
 	// at `counts` (added to them). Binds a compute pipeline and push constants: call it between a
-	// guest dispatch's recording and the next one's bindings.
+	// guest dispatch's recording and the next one's bindings. `scrub` (B10G11R11 and halves):
+	// the words that are not finite are rewritten too, a NaN to zero and an infinity to the
+	// largest finite value.
 	void Scan(const CommandRecorder& command, vk::DeviceAddress words, vk::DeviceAddress counts,
-	          uint32_t words_per_layer, uint32_t layers, Packing packing) const;
+	          uint32_t words_per_layer, uint32_t layers, Packing packing, bool scrub = false) const;
 
 private:
 	GraphicContext&    m_graphics;

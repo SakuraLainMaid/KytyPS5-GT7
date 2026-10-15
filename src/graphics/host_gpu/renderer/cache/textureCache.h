@@ -237,7 +237,10 @@ private:
 	struct GpuScan;
 	struct NanCheck;
 	// `max_bytes`: the most it copies of the image (every mip).
-	bool ScanNonFiniteGpuLocked(Image& image, NonFiniteDone done, uint64_t max_bytes);
+	// `scrub` (B10G11R11 and half-float images): the texels that are not finite are also
+	// rewritten in the image, a NaN to zero and an infinity to the largest finite value.
+	bool ScanNonFiniteGpuLocked(Image& image, NonFiniteDone done, uint64_t max_bytes,
+	                            bool scrub = false);
 	void NoteNanCheckCandidate(const Image& image);
 	void RunNanCheck();
 

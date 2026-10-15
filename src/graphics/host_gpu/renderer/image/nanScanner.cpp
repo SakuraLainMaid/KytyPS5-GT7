@@ -21,6 +21,7 @@ struct PushConstants {
 	uint32_t words_per_layer;
 	uint32_t layers;
 	uint32_t packing;
+	uint32_t scrub;
 };
 
 constexpr uint32_t LocalSize = 256;
@@ -80,7 +81,7 @@ NanScanner::~NanScanner() {
 
 void NanScanner::Scan(const CommandRecorder& command, vk::DeviceAddress words,
                       vk::DeviceAddress counts, uint32_t words_per_layer, uint32_t layers,
-                      Packing packing) const {
+                      Packing packing, bool scrub) const {
 	const uint64_t total = uint64_t {words_per_layer} * layers;
 	if (!Valid() || total == 0 || total > UINT32_MAX) {
 		return;
@@ -91,7 +92,8 @@ void NanScanner::Scan(const CommandRecorder& command, vk::DeviceAddress words,
 	                          static_cast<uint32_t>(counts >> 32u),
 	                          words_per_layer,
 	                          layers,
-	                          static_cast<uint32_t>(packing)};
+	                          static_cast<uint32_t>(packing),
+	                          scrub && packing != Packing::Float32 ? 1u : 0u};
 	const auto          max_groups =
 	    m_graphics.physical_device_properties.limits.maxComputeWorkGroupCount[0];
 	const uint64_t groups = std::clamp<uint64_t>((total + LocalSize - 1u) / LocalSize, 1u,

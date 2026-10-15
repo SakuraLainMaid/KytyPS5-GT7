@@ -4153,7 +4153,8 @@ uint64_t TextureCache::ContentSerial(ImageId id) {
 	return image != nullptr ? image->content_serial : 0;
 }
 
-bool TextureCache::ScanNonFiniteGpuLocked(Image& image, NonFiniteDone done, uint64_t max_bytes) {
+bool TextureCache::ScanNonFiniteGpuLocked(Image& image, NonFiniteDone done, uint64_t max_bytes,
+                                          bool scrub) {
 	if (!m_scheduler.Active()) {
 		return false;
 	}
@@ -4162,6 +4163,8 @@ bool TextureCache::ScanNonFiniteGpuLocked(Image& image, NonFiniteDone done, uint
 	if (total == 0 || total > max_bytes) {
 		return false;
 	}
+	scrub = scrub && layout.packing != NanScanner::Packing::Float32 &&
+	        (image.backing.usage & vk::ImageUsageFlagBits::eTransferDst);
 	const auto&     backing = image.backing;
 	const uint32_t  layers  = std::max(backing.layers, 1u);
 	const uint32_t  mips    = std::max(backing.mip_levels, 1u);
@@ -4186,10 +4189,12 @@ bool TextureCache::ScanNonFiniteGpuLocked(Image& image, NonFiniteDone done, uint
 	                              vk::BufferUsageFlagBits::eTransferDst |
 	                              vk::BufferUsageFlagBits::eShaderDeviceAddress;
 	if (scan.scratch == nullptr || scan.scratch->Size() < total) {
+		// A scrub copies the scratch back into the image (StorageFlags | eTransferSrc below).
 		// A buffer still in use stays alive in the callbacks of the scans that use it.
 		scan.scratch =
 		    std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
-		                             StorageFlags, Common::AlignUp(total, uint64_t {4} << 20u));
+		                             StorageFlags | vk::BufferUsageFlagBits::eTransferSrc,
+		                             Common::AlignUp(total, uint64_t {4} << 20u));
 	}
 	scan.last_frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
 	if (scan.counts == nullptr) {
@@ -4226,7 +4231,12 @@ bool TextureCache::ScanNonFiniteGpuLocked(Image& image, NonFiniteDone done, uint
 	for (uint32_t mip = 0; mip < mips; mip++) {
 		scan.scanner.Scan(recorder, scratch_address + regions[mip].bufferOffset,
 		                  counts_address + uint64_t {mip} * layers * sizeof(uint32_t),
-		                  result.words[mip], layers, layout.packing);
+		                  result.words[mip], layers, layout.packing, scrub);
+	}
+	if (scrub) {
+		// The scrubbed words back into the image (Upload's barrier waits for the scan's writes).
+		image.Upload(regions, scan.scratch->Handle(), 0, total);
+		image.content_serial++;
 	}
 	vk::MemoryBarrier counted {};
 	counted.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
@@ -4255,6 +4265,25 @@ bool TextureCache::ScanNonFiniteGpuLocked(Image& image, NonFiniteDone done, uint
 		    done(std::move(result));
 	    });
 	return true;
+}
+
+// KYTY_NAN_SCRUB (default on; 0 turns it off): the NaN check also rewrites what it finds in the
+// B10G11R11 and half-float arrays it checks (light probes): a NaN to zero, an infinity to the
+// largest finite value. A probe that holds them shades the surfaces that reflect it black or with
+// NaN, which the frame's temporal and blur passes then spread, and a probe relit from its last
+// value keeps them for good. On the guest GPU a value out of these formats' range is stored as
+// their largest one instead.
+static bool NanScrub() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NAN_SCRUB");
+		const bool  on    = value == nullptr || value[0] != '0';
+		LOGF("TextureCache: NaN scrub %s (KYTY_NAN_SCRUB): the NaN check %s\n", on ? "on" : "off",
+		     on ? "replaces the texels that are not finite it finds (NaN with zero, infinity with "
+		          "the largest value)"
+		        : "only reports the texels that are not finite");
+		return on;
+	}();
+	return enabled;
 }
 
 void TextureCache::NoteNanCheckCandidate(const Image& image) {
@@ -4304,7 +4333,7 @@ void TextureCache::RunNanCheck() {
 		        [results = m_nan_check->results, frame](NonFiniteCounts&& counts) {
 			        ReportNanCheck(*results, frame, counts);
 		        },
-		        m_nan_check->max_bytes)) {
+		        m_nan_check->max_bytes, NanScrub())) {
 			candidate.rejected = true;
 			++it;
 			continue;

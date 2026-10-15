@@ -4,11 +4,14 @@
 
 // Diagnostics (NanScanner): the words of one mip of an image, copied tightly packed layer after
 // layer, are counted per layer when they hold a value that is not finite (infinity or NaN), into
-// one counter per layer. The packing tells where the float bit fields sit in a word.
+// one counter per layer. The packing tells where the float bit fields sit in a word. With `scrub`
+// (B10G11R11 and halves only) each such field is also rewritten: a NaN to zero, an infinity to the
+// largest finite value of its sign (what the guest GPU's conversion gives for a finite value out
+// of range); the caller copies the words back into the image.
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words {
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
     uint w[];
 };
 
@@ -23,7 +26,39 @@ layout(push_constant) uniform Push {
     uint  layers;
     // 0: B10G11R11 (an 11-bit red and green, a 10-bit blue); 1: two halves; 2: one 32-bit float.
     uint  packing;
+    uint  scrub;
 } pc;
+
+// One float field of `word` at bit `at`: `mantissa` mantissa bits under 5 exponent bits (and a sign
+// bit above them when `sign`). A NaN becomes zero, an infinity the largest finite value.
+uint ScrubField(uint word, uint at, uint mantissa, bool sign) {
+    const uint exponent_mask = 0x1fu << (at + mantissa);
+    if ((word & exponent_mask) != exponent_mask) {
+        return word;
+    }
+    const uint mantissa_mask = ((1u << mantissa) - 1u) << at;
+    const uint field_mask    = exponent_mask | mantissa_mask;
+    const uint largest       = ((0x1eu << mantissa) | ((1u << mantissa) - 1u)) << at;
+    if ((word & mantissa_mask) != 0u) {
+        // NaN: zero, the sign too.
+        const uint sign_mask = sign ? (1u << (at + mantissa + 5u)) : 0u;
+        return word & ~(field_mask | sign_mask);
+    }
+    return (word & ~field_mask) | largest;
+}
+
+uint Scrub(uint word) {
+    if (pc.packing == 0u) {
+        word = ScrubField(word, 0u, 6u, false);
+        word = ScrubField(word, 11u, 6u, false);
+        return ScrubField(word, 22u, 5u, false);
+    }
+    if (pc.packing == 1u) {
+        word = ScrubField(word, 0u, 10u, true);
+        return ScrubField(word, 16u, 10u, true);
+    }
+    return word;
+}
 
 bool NotFinite(uint word) {
     if (pc.packing == 0u) {
@@ -54,7 +89,13 @@ void main() {
             layer = at;
             found = 0u;
         }
-        found += NotFinite(words.w[i]) ? 1u : 0u;
+        const uint word = words.w[i];
+        if (NotFinite(word)) {
+            found++;
+            if (pc.scrub != 0u) {
+                words.w[i] = Scrub(word);
+            }
+        }
     }
     if (found != 0u) {
         atomicAdd(counts.c[layer], found);
