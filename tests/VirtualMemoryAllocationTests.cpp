@@ -1481,6 +1481,40 @@ void TestDirectReleaseContracts() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// An unchecked release of a range that is not one allocated span (here two allocations with a
+// free page between them) frees the allocated parts and passes over the gap; it used to free
+// nothing, which leaked the memory for good.
+void TestUncheckedReleaseFreesAllocatedParts() {
+	const char* test   = "UncheckedReleaseFreesAllocatedParts";
+	const auto  top    = static_cast<int64_t>(Libs::LibKernel::Memory::KernelGetDirectMemorySize());
+	const auto  page   = static_cast<int64_t>(SceKernelPageSize);
+	int64_t     first  = 0;
+	int64_t     second = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            top - page * 4, top - page * 3, SceKernelPageSize, SceKernelPageSize,
+	            SceKernelMtypeC, &first),
+	        "KernelAllocateDirectMemory(first)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            top - page * 2, top - page, SceKernelPageSize, SceKernelPageSize, SceKernelMtypeC,
+	            &second),
+	        "KernelAllocateDirectMemory(second)");
+	Check(test, first == top - page * 4 && second == top - page * 2,
+	      "the allocations did not land where the test placed them");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(first, SceKernelPageSize * 3),
+	        "KernelReleaseDirectMemory(over the gap)");
+	Check(test,
+	      Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(first, SceKernelPageSize) ==
+	          Libs::LibKernel::KERNEL_ERROR_ENOENT,
+	      "the first allocation was not released");
+	Check(test,
+	      Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(second, SceKernelPageSize) ==
+	          Libs::LibKernel::KERNEL_ERROR_ENOENT,
+	      "the second allocation was not released");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestReleasedReserveCanBeReused() {
 	const char* test = "ReleasedReserveCanBeReused";
 	void*       addr = nullptr;
@@ -4252,6 +4286,7 @@ int main(int argc, char** argv) {
 	RunTest(TestDirectMapValidationBeforeOwnerMutation);
 	RunTest(TestDirectReleaseRollbackRestoresOwnerMapping);
 	RunTest(TestDirectReleaseContracts);
+	RunTest(TestUncheckedReleaseFreesAllocatedParts);
 	RunTest(TestNonzeroDirectOffsetAliasesSharedBacking);
 	RunTest(TestDirectMapAcrossContiguousAllocations);
 	RunTest(TestDirectPhysicalFreeRangeReuseAndCoalescing);

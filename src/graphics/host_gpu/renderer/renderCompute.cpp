@@ -1129,6 +1129,25 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			return;
 		}
 	}
+	// A buffer fill that found no image to clear runs as a buffer write. Noted once recorded (its
+	// own write forgets older fills there): a target created inside it later starts as the fill,
+	// the bytes of it that are not mapped now among them (TextureCache::ClearsTargetsFromFills).
+	struct {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint32_t value   = 0;
+	} fill_note;
+	if (TextureCache::ClearsTargetsFromFills() && resources.specialization_reads.empty()) {
+		ShaderBufferResource fill_descriptor;
+		uint32_t             fill_value    = 0;
+		uint64_t             fill_size     = 0;
+		constexpr uint64_t   SmallestNoted = 64u * 1024u;
+		if (ResolveComputeBufferFill(input_info, thread_group_x, thread_group_y, thread_group_z,
+		                             mode, fill_descriptor, fill_value, fill_size) &&
+		    fill_size >= SmallestNoted) {
+			fill_note = {fill_descriptor.Base48(), fill_size, fill_value};
+		}
+	}
 
 	if (use_thread_dimensions) {
 		const uint32_t old_x = thread_group_x;
@@ -1290,6 +1309,25 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	if (program.info.uses_dma && DmaFaultReport() && !recovery.Enabled()) {
 		m_context.GetBufferCache().ProcessFaultBuffer();
+	}
+	if (fill_note.size != 0) {
+		const auto mapped =
+		    Libs::LibKernel::Memory::TryClampRangeSize(fill_note.address, fill_note.size);
+		m_context.GetBufferCache().NoteFill(fill_note.address, fill_note.size, fill_note.value,
+		                                    mapped, true);
+		static std::atomic<uint32_t> logged {0};
+		if (mapped != fill_note.size && logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("GraphicsRenderDispatchDirect: buffer fill 0x%012" PRIx64 "+0x%" PRIx64
+			     " with 0x%08x by cs %016" PRIx64 " found no image, and 0x%" PRIx64
+			     " bytes of it are mapped: a target created inside it starts as the fill\n",
+			     fill_note.address, fill_note.size, fill_note.value, program.shader_hash, mapped);
+		}
+		if (Libs::LibKernel::Memory::TracesMemory(fill_note.address, fill_note.size)) {
+			Libs::LibKernel::Memory::TraceMemory(
+			    "compute fill 0x%016" PRIx64 "+0x%" PRIx64 " with 0x%08x by cs %016" PRIx64
+			    " (no image there; 0x%" PRIx64 " bytes mapped): noted for targets made inside it",
+			    fill_note.address, fill_note.size, fill_note.value, program.shader_hash, mapped);
+		}
 	}
 	ResetBindings();
 }

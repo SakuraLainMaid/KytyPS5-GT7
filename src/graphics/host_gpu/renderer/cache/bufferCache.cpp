@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <fmt/format.h>
 #include <atomic>
+#include <bit>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -377,6 +378,15 @@ void BufferCache::ForgetFills(uint64_t vaddr, uint64_t size) {
 	std::erase_if(m_known_fills, [&](const KnownFillRecord& fill) {
 		return fill.address < vaddr + size && vaddr < fill.address + fill.size;
 	});
+	m_known_fill_count.store(m_known_fills.size(), std::memory_order_relaxed);
+}
+
+void BufferCache::ForgetFillsUnder(uint64_t vaddr, uint64_t size) {
+	if (m_known_fill_count.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
+	std::unique_lock lock(m_dirty_ranges_mutex);
+	ForgetFills(vaddr, size);
 }
 
 namespace {
@@ -412,6 +422,85 @@ bool BufferCache::KnownFill(uint64_t vaddr, uint64_t size, uint32_t& value) cons
 		}
 	}
 	return false;
+}
+
+bool BufferCache::FillOfNewImage(uint64_t vaddr, uint64_t size, uint32_t& value, bool take) {
+	if (size == 0 || size > UINT64_MAX - vaddr) {
+		return false;
+	}
+	std::unique_lock lock(m_dirty_ranges_mutex);
+	const auto       end   = vaddr + size;
+	const auto       found = std::ranges::find_if(m_known_fills, [&](const KnownFillRecord& fill) {
+        return fill.address <= vaddr && end <= fill.address + fill.size;
+    });
+	if (found == m_known_fills.end()) {
+		return false;
+	}
+	// The part of the image the fill wrote on the GPU: still GPU-written, or something wrote
+	// over it unseen (its buffer was collected: the pages are no longer tracked).
+	const auto gpu_end = std::min(end, found->address + found->gpu_bytes);
+	if (gpu_end > vaddr && !m_gpu_modified_ranges.Contains(vaddr, gpu_end - vaddr)) {
+		m_known_fills.erase(found);
+		m_known_fill_count.store(m_known_fills.size(), std::memory_order_relaxed);
+		return false;
+	}
+	value = found->value;
+	if (!take) {
+		return true;
+	}
+	// Keep what is left on either side, each with the part of it written on the GPU.
+	const auto fill        = *found;
+	const auto fill_end    = fill.address + fill.size;
+	const auto fill_gpu_to = fill.address + fill.gpu_bytes;
+	m_known_fills.erase(found);
+	if (vaddr > fill.address) {
+		m_known_fills.push_back({fill.address, vaddr - fill.address, fill.value,
+		                         std::min(fill.gpu_bytes, vaddr - fill.address)});
+	}
+	if (end < fill_end) {
+		m_known_fills.push_back(
+		    {end, fill_end - end, fill.value, fill_gpu_to > end ? fill_gpu_to - end : 0});
+	}
+	m_known_fill_count.store(m_known_fills.size(), std::memory_order_relaxed);
+	return true;
+}
+
+void BufferCache::NoteFill(uint64_t vaddr, uint64_t size, uint32_t value, uint64_t gpu_bytes,
+                           bool merge) {
+	if (size == 0 || size > UINT64_MAX - vaddr) {
+		return;
+	}
+	gpu_bytes = std::min(gpu_bytes, size);
+	std::unique_lock lock(m_dirty_ranges_mutex);
+	ForgetFills(vaddr, size);
+	if (merge && gpu_bytes == size) {
+		for (auto& fill: m_known_fills) {
+			if (fill.value != value || fill.gpu_bytes != fill.size) {
+				continue;
+			}
+			if (fill.address + fill.size == vaddr) {
+				fill.size += size;
+				fill.gpu_bytes = fill.size;
+				return;
+			}
+			if (vaddr + size == fill.address) {
+				fill.address = vaddr;
+				fill.size += size;
+				fill.gpu_bytes = fill.size;
+				return;
+			}
+		}
+	}
+	constexpr size_t   MaxKnownFills = 256;
+	constexpr uint64_t SmallFill     = 1u << 20u;
+	if (m_known_fills.size() >= MaxKnownFills) {
+		// The oldest small fill goes first: a large one is an image's bytes, not created yet.
+		const auto small = std::ranges::find_if(
+		    m_known_fills, [](const KnownFillRecord& fill) { return fill.size < SmallFill; });
+		m_known_fills.erase(small != m_known_fills.end() ? small : m_known_fills.begin());
+	}
+	m_known_fills.push_back({vaddr, size, value, gpu_bytes});
+	m_known_fill_count.store(m_known_fills.size(), std::memory_order_relaxed);
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
@@ -467,10 +556,13 @@ bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 		return false;
 	}
 	WriteDataBuffer(m_slot_buffers[*owner], vaddr, data, size);
-	if (HasGpuDirtyBytes(vaddr, size)) {
-		// Overwritten in full: guest memory holds the value the GPU copy will have.
+	{
 		std::unique_lock lock(m_dirty_ranges_mutex);
-		m_gpu_modified_ranges.Subtract(vaddr, size);
+		ForgetFills(vaddr, size);
+		if (m_gpu_modified_ranges.Intersects(vaddr, size)) {
+			// Overwritten in full: guest memory holds the value the GPU copy will have.
+			m_gpu_modified_ranges.Subtract(vaddr, size);
+		}
 	}
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	return true;
@@ -1372,6 +1464,18 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 		ForgetFills(vaddr, size);
 	}
 	RecordGpuWriter(vaddr, size, s_diag_shader_hash);
+	if (Libs::LibKernel::Memory::TracesMemory(vaddr, size)) {
+		// KYTY_TRACE_MEMORY: each writer's first eight writes, then at powers of two.
+		static std::map<uint64_t, uint64_t> writes;
+		const auto                          count = ++writes[s_diag_shader_hash];
+		if (count <= 8 || std::has_single_bit(count)) {
+			Libs::LibKernel::Memory::TraceMemory(
+			    "GPU write 0x%016" PRIx64 "+0x%" PRIx64 " by %s %016" PRIx64 " (%" PRIu64
+			    " by it so far)",
+			    vaddr, size, s_diag_shader_hash != 0 ? "shader" : "a copy or fill, shader",
+			    s_diag_shader_hash, count);
+		}
+	}
 	// Diagnostics: KYTY_WATCH_GPU_WRITE=<address>[+<size>][,<address>[+<size>]...] (hex) names
 	// the bindings that mark bytes of those ranges GPU-written: the first write of each
 	// (range, shader), with a host stack when no shader is being bound (copies, fills).
@@ -1509,8 +1613,15 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
-	(void)m_texture_cache.ClearMeta(vaddr);
+	const bool known_meta = m_texture_cache.ClearMeta(vaddr);
+	if (Libs::LibKernel::Memory::TracesMemory(vaddr, size)) {
+		Libs::LibKernel::Memory::TraceMemory(
+		    "fill 0x%016" PRIx64 "+0x%" PRIx64 " with 0x%08x on the %s%s", vaddr, size, value,
+		    IsRegionGpuModified(vaddr, size) ? "GPU" : "CPU",
+		    known_meta ? " (a known surface's metadata: a clear)" : "");
+	}
 	if (!IsRegionGpuModified(vaddr, size)) {
+		ForgetFillsUnder(vaddr, size);
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
@@ -1520,13 +1631,10 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
-	// After ObtainBuffer marked the range GPU-written (which forgets older fills of it).
-	std::unique_lock lock(m_dirty_ranges_mutex);
-	constexpr size_t MaxKnownFills = 256;
-	if (m_known_fills.size() >= MaxKnownFills) {
-		m_known_fills.erase(m_known_fills.begin());
-	}
-	m_known_fills.push_back({vaddr, size, value});
+	// After ObtainBuffer marked the range GPU-written (which forgets older fills of it). Not
+	// merged: neighbouring surfaces' metadata clears stay apart, so a write to one keeps the
+	// other's.
+	NoteFill(vaddr, size, value, size, false);
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -1545,6 +1653,11 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	const bool cpu_copy = src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	                      !IsRegionGpuModified(src_vaddr, size) &&
 	                      !m_texture_cache.FindImageFromRange(src_vaddr, size);
+	if (dst_memory && Libs::LibKernel::Memory::TracesMemory(dst_vaddr, size)) {
+		Libs::LibKernel::Memory::TraceMemory(
+		    "copy into 0x%016" PRIx64 "+0x%" PRIx64 " from 0x%016" PRIx64 "%s on the %s", dst_vaddr,
+		    size, src_vaddr, src_gds ? " (gds)" : "", cpu_copy ? "CPU" : "GPU");
+	}
 	if (FrameGraph::Logging()) {
 		FrameGraph::BeginOp();
 		FrameGraph::Log("dma 0x%012" PRIx64 "%s <- 0x%012" PRIx64 "%s, 0x%" PRIx64 " bytes, %s%s",
@@ -1555,6 +1668,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		                    : "");
 	}
 	if (cpu_copy) {
+		ForgetFillsUnder(dst_vaddr, size);
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
 		return;

@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <shared_mutex>
@@ -134,6 +135,21 @@ public:
 	// write and no CPU store touched those bytes since: a reader that only needs that value can
 	// skip downloading the range, which drains the GPU.
 	[[nodiscard]] bool              KnownFill(uint64_t vaddr, uint64_t size, uint32_t& value) const;
+	// GPU thread, for an image made over [vaddr, vaddr + size) (TextureCache::
+	// ClearsTargetsFromFills): the dword of the fill that holds all of it, when the bytes of it
+	// the fill wrote on the GPU are all still GPU-written (a collected buffer or a CPU-path write
+	// leaves them not); the bytes that were not mapped then are taken as the fill. `take` removes
+	// the range from the fill, which keeps the rest of it for other images.
+	[[nodiscard]] bool FillOfNewImage(uint64_t vaddr, uint64_t size, uint32_t& value, bool take);
+	// GPU thread: a GPU fill set [vaddr, vaddr + size) to `value` (FillBuffer, or a compute
+	// shader's fill once its dispatch is recorded); the first `gpu_bytes` of it were written on
+	// the GPU (the rest was not mapped then). KnownFill answers for it until another GPU write or
+	// a CPU store seen here touches it. `merge`: a fill that continues one of the same value
+	// joins it (a range filled in pieces), when both were written whole on the GPU.
+	void NoteFill(uint64_t vaddr, uint64_t size, uint32_t value, uint64_t gpu_bytes, bool merge);
+	// GPU thread: a write over [vaddr, vaddr + size) the other paths do not see (an image's GPU
+	// write, a CPU-path fill or copy, WriteClean), newer than the fills there.
+	void ForgetFillsUnder(uint64_t vaddr, uint64_t size);
 	// Diagnostics: names the GPU writes that mark bytes of [vaddr, vaddr + size) GPU-written from
 	// now on, as KYTY_WATCH_GPU_WRITE does (a few ranges, the first write per range and shader).
 	void                            WatchGpuWrites(uint64_t vaddr, uint64_t size, const char* label);
@@ -263,11 +279,14 @@ private:
 	mutable std::shared_mutex                          m_dirty_ranges_mutex;
 	// GPU fills whose bytes nothing has written since (KnownFill); under m_dirty_ranges_mutex.
 	struct KnownFillRecord {
-		uint64_t address = 0;
-		uint64_t size    = 0;
-		uint32_t value   = 0;
+		uint64_t address   = 0;
+		uint64_t size      = 0;
+		uint32_t value     = 0;
+		uint64_t gpu_bytes = 0; // [address, address + gpu_bytes) written on the GPU
 	};
 	std::vector<KnownFillRecord>                       m_known_fills;
+	// m_known_fills.size(), read without the mutex.
+	std::atomic<size_t> m_known_fill_count {0};
 	void ForgetFills(uint64_t vaddr, uint64_t size); // m_dirty_ranges_mutex held
 	MemoryTracker                                      m_memory_tracker;
 	StreamBuffer                                       m_staging_buffer;

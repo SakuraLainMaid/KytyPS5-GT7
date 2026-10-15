@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <string>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -141,6 +143,15 @@ bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data,
 // so is every range before the kernel's memory is set up (unit tests).
 [[nodiscard]] bool     IsCommittedRange(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
+// Diagnostics: KYTY_TRACE_MEMORY=0x<address>+<size>[,...]. What happens to these guest ranges is
+// logged as "Trace memory: ...": the kernel's mappings over them (maps, unmaps, protection
+// changes, including the memory manager's), file reads into them, and, from the GPU side, buffer
+// writes, fills and copies into them and cached buffers cut short at a hole in them.
+[[nodiscard]] bool TracesMemory(uint64_t vaddr, uint64_t size);
+void               TraceMemory(const char* format, ...) KYTY_FORMAT_PRINTF(1, 2);
+// The kernel's mappings over [vaddr, vaddr + size): each piece's offset from vaddr, size and type,
+// the holes between them included ("+0x0 0x8c00000 Direct rw, +0x8c00000 0x400000 hole, ...").
+[[nodiscard]] std::string DescribeMappings(uint64_t vaddr, uint64_t size);
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;

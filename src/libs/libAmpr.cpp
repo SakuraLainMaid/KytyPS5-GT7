@@ -1856,6 +1856,11 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 					LOGF("APRREAD path=%s offset=0x%" PRIx64 " size=0x%" PRIx64 "\n",
 					     host_path.c_str(), command.file_offset, command.size);
 				}
+				if (LibKernel::Memory::TracesMemory(command.destination, command.size)) {
+					LibKernel::Memory::TraceMemory(
+					    "file read into 0x%016" PRIx64 "+0x%" PRIx64 " from %s at 0x%" PRIx64,
+					    command.destination, command.size, host_path.c_str(), command.file_offset);
+				}
 				uint64_t bytes_read = 0;
 				auto result = ReadHostFileToGuest(host_path, command.file_offset,
 				                                  command.destination, command.size, &bytes_read);

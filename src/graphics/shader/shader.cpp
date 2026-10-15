@@ -395,7 +395,24 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		r.fields[2]       = sharp[2];
 		r.fields[3]       = sharp[3];
 		EXIT_NOT_IMPLEMENTED(r.AddTid());
-		EXIT_NOT_IMPLEMENTED(r.SwizzleEnabled());
+		if (r.SwizzleEnabled()) {
+			// A swizzled vertex buffer (groups of 8 << index stride vertices, each dword of a
+			// vertex 4 * that many bytes from the next) has no Vulkan vertex input. Until the
+			// vertex fetch does it in the shader, it is read as if linear: that attribute comes
+			// out wrong, the emulator keeps running (each descriptor once, the first 32).
+			static std::mutex                   logged_mutex;
+			static std::unordered_set<uint64_t> logged;
+			std::lock_guard                     lock(logged_mutex);
+			const auto key = r.Base48() ^ (static_cast<uint64_t>(r.fields[3]) << 32u);
+			if (logged.size() < 32 && logged.insert(key).second) {
+				LOGF("Vertex input: swizzled vertex buffer read as if linear: attribute %u "
+				     "(semantic %u) V# [0x%08x 0x%08x 0x%08x 0x%08x] base 0x%012" PRIx64
+				     " stride %u records %u index stride %u attribute format %u offset %u\n",
+				     i, static_cast<uint32_t>(in.semantic), r.fields[0], r.fields[1], r.fields[2],
+				     r.fields[3], r.Base48(), r.Stride(), r.NumRecords(), 8u << r.IndexStride(),
+				     static_cast<uint32_t>(format), offset);
+			}
+		}
 		if (format != Prospero::VertexAttribFormat::kInvalid) {
 			const auto                   format_raw    = static_cast<uint32_t>(format);
 			const auto                   buffer_format = format_raw >> 2u;

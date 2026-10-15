@@ -1791,6 +1791,10 @@ void TextureCache::InitializeImage(ImageId id) {
 		return;
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
+	if (upload && !image.initialized && ClearFromKnownFill(id)) {
+		image.initialized = true;
+		return;
+	}
 	if (upload) {
 		const auto range         = image.info.data;
 		Buffer*    source        = nullptr;
@@ -2726,6 +2730,11 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	image.MarkGpuModified();
 	image.gpu_pixels = true;
 	image.content_serial++;
+	if (ClearsTargetsFromFills() && !image.depth_id && !image.info.data.Empty()) {
+		// Its pixels are newer than a fill of its memory: an image made there later must not
+		// start as that fill (ClearFromKnownFill).
+		m_buffer_cache.ForgetFillsUnder(image.info.data.address, image.info.data.size);
+	}
 	if (m_nan_check != nullptr) {
 		NoteNanCheckCandidate(image);
 	}
@@ -2803,6 +2812,71 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	if (stencil_id) {
 		TrackImage(stencil_id);
 		CommitGpuWrite(m_slot_images[stencil_id]);
+	}
+	return true;
+}
+
+bool TextureCache::ClearsTargetsFromFills() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PENDING_FILLS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+bool TextureCache::ClearFromKnownFill(ImageId id) {
+	auto&       image = m_slot_images[id];
+	const auto& info  = image.info;
+	// A target the draw or dispatch binding it is about to write, made from scratch: a texture
+	// may hold what the CPU wrote into memory a fill's holes left unmapped (those stores are not
+	// seen), a target's bytes are the GPU's.
+	if (!ClearsTargetsFromFills() || image.depth_id || image.backing.image == nullptr ||
+	    info.samples != 1 || image.backing.samples != 1 || info.data.Empty() || info.IsVolume() ||
+	    info.HasStencil() || !(image.usage.render_target || image.usage.depth_target) ||
+	    image.usage.texture || image.usage.storage || image.usage.video_out ||
+	    info.metadata.compression != VideoOutCompression::Uncompressed) {
+		return false;
+	}
+	uint32_t value = 0;
+	if (!m_buffer_cache.FillOfNewImage(info.data.address, info.data.size, value, false)) {
+		return false;
+	}
+	vk::ClearValue       clear {};
+	vk::ImageAspectFlags aspect = vk::ImageAspectFlagBits::eColor;
+	if (info.IsDepth()) {
+		aspect = ImageViewOps::DepthAspectMask(image.backing.format);
+		if (info.pixel_format == vk::Format::eD16Unorm) {
+			// Two texels a dword: both the same.
+			if ((value >> 16u) != (value & 0xffffu)) {
+				return false;
+			}
+			clear.depthStencil.depth = static_cast<float>(value & 0xffffu) / 65535.0f;
+		} else if (!DecodePackedDepthClear(info.pixel_format, value, clear.depthStencil.depth)) {
+			return false;
+		}
+		clear.depthStencil.stencil = 0;
+	} else if (!DecodeColorDwordFill(info.pixel_format, value, clear.color)) {
+		return false;
+	}
+	if (!m_buffer_cache.FillOfNewImage(info.data.address, info.data.size, value, true)) {
+		return false;
+	}
+	ClearImage(m_scheduler.Current(), id, image.backing.format,
+	           {aspect, 0, info.resources.levels, 0, image.backing.layers}, clear);
+	static std::atomic<uint64_t> cleared {0};
+	const auto                   count = ++cleared;
+	if (count <= 32 || std::has_single_bit(count)) {
+		LOGF("TextureCache: %s 0x%012" PRIx64 "+0x%" PRIx64 " %ux%u layers %u mips %u fmt %d "
+		     "tile %u created inside a GPU fill with 0x%08x: starts as the fill, not as its memory "
+		     "(%" PRIu64 " so far)\n",
+		     info.IsDepth() ? "depth target" : "render target", info.data.address, info.data.size,
+		     info.extent.width, info.extent.height, info.resources.layers, info.resources.levels,
+		     static_cast<int>(info.pixel_format), static_cast<uint32_t>(info.tile_mode), value,
+		     count);
+	}
+	if (TracesImage(id)) {
+		TraceImageEvent(
+		    id, fmt::format("cleared to the GPU fill 0x{:08x} it was created in", value), true);
 	}
 	return true;
 }
@@ -4269,7 +4343,11 @@ void TextureCache::TraceImageCreated(ImageId id) {
 	auto& followed  = m_trace->images[id];
 	followed        = {};
 	followed.serial = ++m_trace->serials;
-	TraceImageEvent(id, "created", true);
+	const auto& info = m_slot_images[id].info;
+	TraceImageEvent(id,
+	                fmt::format("created; its memory: {}", LibKernel::Memory::DescribeMappings(
+	                                                           info.data.address, info.data.size)),
+	                true);
 }
 
 void TextureCache::TraceImageEvent(ImageId id, const std::string& event, bool guest_glyphs) {
@@ -4356,12 +4434,19 @@ void TextureCache::TraceTargetBound(ImageId id, const ImageDesc& desc, const cha
 		LOGF("Trace image #%u: its target bindings and draws are not logged after these\n",
 		     followed.serial);
 	}
-	TraceImageEvent(id,
-	                fmt::format("bound as the {} target: 0x{:012x}+0x{:x} {}x{} mip {} layer {}",
-	                            kind, desc.info.data.address, desc.info.data.size,
-	                            desc.info.extent.width, desc.info.extent.height,
-	                            desc.view_info.base_level, desc.view_info.base_layer),
-	                false);
+	const auto& meta = desc.info.metadata.range;
+	TraceImageEvent(
+	    id,
+	    fmt::format("bound as the {} target: 0x{:012x}+0x{:x} {}x{} mip {} layer {}{}", kind,
+	                desc.info.data.address, desc.info.data.size, desc.info.extent.width,
+	                desc.info.extent.height, desc.view_info.base_level, desc.view_info.base_layer,
+	                desc.info.HasMetadata()
+	                    ? fmt::format("; metadata 0x{:012x}+0x{:x} ({}), its memory: {}",
+	                                  meta.address, meta.size,
+	                                  m_surface_metas.contains(meta.address) ? "known" : "new",
+	                                  LibKernel::Memory::DescribeMappings(meta.address, meta.size))
+	                    : std::string("; no metadata")),
+	    false);
 }
 
 void TextureCache::TraceImageChanged(Image& image, const char* how, bool gpu_write) {

@@ -14,14 +14,18 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cinttypes>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <magic_enum.hpp>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -232,6 +236,74 @@ static bool IsPrivateCommittedRangeType(VirtualRangeType type) {
 static bool g_test_fail_next_range_replace = false;
 #endif
 
+// KYTY_TRACE_MEMORY (memory.h): the watched ranges.
+struct MemoryWatch {
+	uint64_t address = 0;
+	uint64_t size    = 0;
+};
+
+static const std::vector<MemoryWatch>& MemoryWatches() {
+	static const std::vector<MemoryWatch> watches = [] {
+		std::vector<MemoryWatch> result;
+		const char*              text = std::getenv("KYTY_TRACE_MEMORY");
+		while (text != nullptr && *text != '\0') {
+			char*      end     = nullptr;
+			const auto address = std::strtoull(text, &end, 16);
+			if (end == text) {
+				break;
+			}
+			uint64_t size = 1;
+			if (*end == '+') {
+				text = end + 1;
+				size = std::max<uint64_t>(std::strtoull(text, &end, 16), 1u);
+			}
+			result.push_back({address, size});
+			text = *end == ',' ? end + 1 : nullptr;
+		}
+		for (const auto& watch: result) {
+			LOGF("Trace memory: watching 0x%016" PRIx64 "+0x%" PRIx64 " (KYTY_TRACE_MEMORY)\n",
+			     watch.address, watch.size);
+		}
+		return result;
+	}();
+	return watches;
+}
+
+bool TracesMemory(uint64_t vaddr, uint64_t size) {
+	const auto& watches = MemoryWatches();
+	if (watches.empty() || size == 0) {
+		return false;
+	}
+	return std::any_of(watches.begin(), watches.end(), [&](const MemoryWatch& watch) {
+		return vaddr < watch.address + watch.size && watch.address < vaddr + size;
+	});
+}
+
+void TraceMemory(const char* format, ...) {
+	char    text[1024];
+	va_list args;
+	va_start(args, format);
+	std::vsnprintf(text, sizeof(text), format, args);
+	va_end(args);
+	LOGF("Trace memory: %s\n", text);
+}
+
+// The kernel's own mapping changes over a watched range: the first 400, then at powers of two.
+static void TraceRangeChange(const char* what, uint64_t start, uint64_t size, const char* type,
+                             int protection, uint64_t offset) {
+	if (!TracesMemory(start, size)) {
+		return;
+	}
+	static std::atomic<uint64_t> changes {0};
+	const auto                   count = ++changes;
+	if (count > 400 && !std::has_single_bit(count)) {
+		return;
+	}
+	TraceMemory("%s 0x%016" PRIx64 "+0x%" PRIx64 " %s prot 0x%x offset 0x%" PRIx64 " (%" PRIu64
+	            " changes so far)",
+	            what, start, size, type, protection, offset, count);
+}
+
 class VirtualRanges {
 public:
 	struct Range {
@@ -275,6 +347,8 @@ public:
 		const auto index = static_cast<size_t>(position - m_ranges.begin());
 		m_ranges.insert(position, r);
 		MergeAroundUnlocked(index);
+		TraceRangeChange("mapped", start, size, magic_enum::enum_name(type).data(), protection,
+		                 offset);
 		return true;
 	}
 
@@ -282,6 +356,7 @@ public:
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
+		TraceRangeChange("unmapped", start, size, "-", 0, 0);
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -315,6 +390,7 @@ public:
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
+		TraceRangeChange("reservation released", start, size, "-", 0, 0);
 
 		for (size_t index = 0; index < m_ranges.size(); index++) {
 			auto& r = m_ranges[index];
@@ -360,6 +436,8 @@ public:
 			return false;
 		}
 #endif
+		TraceRangeChange("replaced", start, size, magic_enum::enum_name(type).data(), protection,
+		                 offset);
 		Range replacement {};
 		replacement.start          = start;
 		replacement.size           = size;
@@ -393,6 +471,7 @@ public:
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
+		TraceRangeChange("protected", start, size, "-", protection, 0);
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
@@ -472,6 +551,54 @@ public:
 	// replace, release); protection, name and memory type changes leave it.
 	[[nodiscard]] uint64_t CoverageGeneration() const noexcept {
 		return m_coverage_generation.load(std::memory_order_acquire);
+	}
+
+	// DescribeMappings (memory.h).
+	std::string Describe(uint64_t start, uint64_t size) {
+		Common::LockGuard lock(m_mutex);
+		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
+			return "(none)";
+		}
+		const auto  end     = start + size;
+		auto        current = start;
+		std::string text;
+		size_t      pieces = 0;
+		const auto  add    = [&](uint64_t from, uint64_t to, const char* what, int protection) {
+            if (++pieces > 48) {
+                return;
+            }
+            char piece[160];
+            std::snprintf(piece, sizeof(piece), "%s+0x%" PRIx64 " 0x%" PRIx64 " %s%s",
+                          text.empty() ? "" : ", ", from - start, to - from, what,
+                          protection != 0 ? (protection & 2 ? " rw" : " r") : "");
+            text += piece;
+		};
+		for (const auto& r: m_ranges) {
+			const auto range_end = End(r.start, r.size);
+			if (range_end <= current) {
+				continue;
+			}
+			if (r.start >= end) {
+				break;
+			}
+			if (r.start > current) {
+				add(current, r.start, "hole", 0);
+				current = r.start;
+			}
+			const auto to = std::min(end, range_end);
+			add(current, to, magic_enum::enum_name(r.type).data(), r.protection);
+			current = to;
+			if (current == end) {
+				break;
+			}
+		}
+		if (current < end) {
+			add(current, end, "hole", 0);
+		}
+		if (pieces > 48) {
+			text += ", ... (" + std::to_string(pieces) + " pieces)";
+		}
+		return text;
 	}
 
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
@@ -1072,8 +1199,18 @@ uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
 		     " to 0x%016" PRIx64 "\n",
 		     vaddr, size, clamped_size);
+		if (TracesMemory(vaddr, size)) {
+			TraceMemory("range 0x%016" PRIx64 "+0x%" PRIx64 " cut to 0x%" PRIx64
+			            " at a hole in the mappings: %s",
+			            vaddr, size, clamped_size, DescribeMappings(vaddr, size).c_str());
+		}
 	}
 	return clamped_size;
+}
+
+std::string DescribeMappings(uint64_t vaddr, uint64_t size) {
+	return g_virtual_ranges != nullptr ? g_virtual_ranges->Describe(vaddr, size)
+	                                   : "(no memory map)";
 }
 
 bool IsCommittedRange(uint64_t vaddr, uint64_t size) {
@@ -2835,6 +2972,92 @@ static ZeroLengthRequest g_zero_length_request;
 static uint32_t          g_zero_length_described = 0;
 static uint64_t          g_quiet_queries         = 0;
 
+// Direct memory running out: the guest may try again at once, forever (GT7 on its time selection
+// screen, 2026-10-14: a loop of queries, small allocations, an 8 MB one that fails and releases,
+// 5 GB of log). Each failure is counted; at powers of two the log gets what the memory is used
+// for, and after 256 failures the lines of each AllocateDirectMemory, AvailableDirectMemorySize
+// and ReleaseDirectMemory call are left out until 4,096 calls in a row went without one.
+// Guarded by g_memory_operation_mutex.
+struct DirectMemoryPressure {
+	uint64_t failures         = 0;
+	uint64_t calls_since_fail = 0;
+	bool     quiet            = false;
+	// Unchecked releases of ranges that were not one allocated span (see
+	// KernelReleaseDirectMemory): how many, and what they freed.
+	uint64_t partial_releases = 0;
+	uint64_t partial_freed    = 0;
+};
+static DirectMemoryPressure g_direct_memory_pressure;
+
+static bool DirectMemoryQuiet() {
+	auto& pressure = g_direct_memory_pressure;
+	if (pressure.quiet && ++pressure.calls_since_fail >= 4096) {
+		pressure.quiet = false;
+		LOGF("Direct memory: 4096 calls without a failed allocation; their lines are logged "
+		     "again\n");
+	}
+	return pressure.quiet;
+}
+
+static void ReportDirectMemoryFailure(uint64_t len, uint64_t alignment, int memory_type) {
+	auto& pressure            = g_direct_memory_pressure;
+	pressure.calls_since_fail = 0;
+	const auto failures       = ++pressure.failures;
+	if (failures >= 256 && !pressure.quiet) {
+		pressure.quiet = true;
+		LOGF("Direct memory: %" PRIu64 " failed allocations; the lines of each allocation, query "
+		     "and release are left out until 4096 calls in a row go without a failure\n",
+		     failures);
+	}
+	if (!std::has_single_bit(failures)) {
+		return;
+	}
+	uint64_t                                   allocated[3] = {};
+	uint64_t                                   blocks       = 0;
+	uint64_t                                   mapped       = 0;
+	uint64_t                                   largest_free = 0;
+	uint64_t                                   free_at      = 0;
+	std::map<int, uint64_t>                    by_type;
+	std::vector<std::pair<uint64_t, uint64_t>> largest; // size, start
+	{
+		Common::LockGuard lock(g_physical_memory->GetMutex());
+		for (const auto& [start, block]: g_physical_memory->GetPhysicalBlocks()) {
+			allocated[static_cast<int>(block.kind)] += block.size;
+			by_type[block.memory_type] += block.size;
+			blocks++;
+			largest.emplace_back(block.size, start);
+		}
+		for (const auto& mapping: g_physical_memory->GetMappings()) {
+			mapped += mapping.map_size;
+		}
+	}
+	(void)g_physical_memory->Available(0, PhysicalMemory::Size(), 0, &free_at, &largest_free);
+	std::ranges::sort(largest, std::greater {});
+	char        part[64];
+	std::string types;
+	for (const auto& [type, bytes]: by_type) {
+		std::snprintf(part, sizeof(part), "%stype %d %" PRIu64 " MiB", types.empty() ? "" : ", ",
+		              type, bytes >> 20u);
+		types += part;
+	}
+	std::string biggest;
+	for (size_t i = 0; i < largest.size() && i < 8; i++) {
+		std::snprintf(part, sizeof(part), "%s0x%" PRIx64 "+0x%" PRIx64, i == 0 ? "" : ", ",
+		              largest[i].second, largest[i].first);
+		biggest += part;
+	}
+	const auto total = allocated[0] + allocated[1] + allocated[2];
+	LOGF("Direct memory: no 0x%" PRIx64 " bytes (alignment 0x%" PRIx64 ", type %d) to allocate, "
+	     "%" PRIu64 " failures so far. %" PRIu64 " of %" PRIu64 " MiB allocated in %" PRIu64
+	     " blocks (direct %" PRIu64 ", pooled %" PRIu64 ", automatic %" PRIu64 " MiB; %s), %" PRIu64
+	     " MiB mapped; the largest free range 0x%" PRIx64 "+0x%" PRIx64 "; the largest blocks %s; "
+	     "%" PRIu64 " releases of ranges that were not one allocation freed %" PRIu64 " MiB\n",
+	     len, alignment, memory_type, failures, total >> 20u, PhysicalMemory::Size() >> 20u, blocks,
+	     allocated[0] >> 20u, allocated[1] >> 20u, allocated[2] >> 20u, types.c_str(),
+	     mapped >> 20u, free_at, largest_free, biggest.c_str(), pressure.partial_releases,
+	     pressure.partial_freed >> 20u);
+}
+
 // Whether this AvailableDirectMemorySize query's lines are left out (see ZeroLengthRequest).
 static bool QuietDirectMemoryQuery() {
 	if (g_zero_length_request.count < 4) {
@@ -2892,7 +3115,9 @@ int KYTY_SYSV_ABI KernelAvailableDirectMemorySize(int64_t search_start, int64_t 
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
-	const bool quiet = QuietDirectMemoryQuery();
+	const bool zero_length_quiet = QuietDirectMemoryQuery();
+	const bool pressure_quiet    = DirectMemoryQuiet();
+	const bool quiet             = zero_length_quiet || pressure_quiet;
 	if (!quiet) {
 		LOGF("\t search_start = 0x%016" PRIx64 "\n"
 		     "\t search_end   = 0x%016" PRIx64 "\n"
@@ -2921,7 +3146,9 @@ int KYTY_SYSV_ABI KernelAvailableDirectMemorySize(int64_t search_start, int64_t 
 	if (!g_physical_memory->Available(static_cast<uint64_t>(search_start),
 	                                  static_cast<uint64_t>(search_end), alignment, &phys_addr,
 	                                  &size)) {
-		LOGF_COLOR(Log::Color::Red, "\t[Fail]\n");
+		if (!quiet) {
+			LOGF_COLOR(Log::Color::Red, "\t[Fail]\n");
+		}
 		return KERNEL_ERROR_ENOMEM;
 	}
 
@@ -3057,8 +3284,9 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, s
 	if (len != 0) {
 		g_zero_length_request.count = 0;
 	}
-	if (len != 0 || g_zero_length_request.count < 4 ||
-	    std::has_single_bit(g_zero_length_request.count)) {
+	const bool quiet = DirectMemoryQuiet();
+	if (!quiet && (len != 0 || g_zero_length_request.count < 4 ||
+	               std::has_single_bit(g_zero_length_request.count))) {
 		LOGF("\t search_start = 0x%016" PRIx64 "\n"
 		     "\t search_end   = 0x%016" PRIx64 "\n"
 		     "\t len          = 0x%016" PRIx64 "\n"
@@ -3079,13 +3307,18 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, s
 	                            : PhysicalMemory::AllocationKind::Direct;
 	if (!g_physical_memory->Alloc(search_start, search_end, len, alignment, &addr, memory_type,
 	                              kind)) {
-		LOGF_COLOR(Log::Color::Red, "\t[Fail]\n");
+		if (!quiet) {
+			LOGF_COLOR(Log::Color::Red, "\t[Fail]\n");
+		}
+		ReportDirectMemoryFailure(len, alignment, memory_type);
 		return KERNEL_ERROR_EAGAIN;
 	}
 
 	*phys_addr_out = static_cast<int64_t>(addr);
 
-	LOGF_COLOR(Log::Color::Green, "\tphys_addr    = %016" PRIx64 "\n\t[Ok]\n", addr);
+	if (!quiet) {
+		LOGF_COLOR(Log::Color::Green, "\tphys_addr    = %016" PRIx64 "\n\t[Ok]\n", addr);
+	}
 
 	return OK;
 }
@@ -3117,7 +3350,8 @@ int KYTY_SYSV_ABI KernelAllocateMainDirectMemory(size_t len, size_t alignment, i
 	                                  alignment, memory_type, phys_addr_out);
 }
 
-static int ReleaseDirectMemoryInternal(int64_t start, size_t len) {
+// `not_one_span`: set when the range is not one allocated span (nothing was released).
+static int ReleaseDirectMemoryInternal(int64_t start, size_t len, bool* not_one_span = nullptr) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
 	if (g_pooled_memory->ReleaseExpansion(static_cast<uint64_t>(start), len)) {
@@ -3129,6 +3363,9 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len) {
 
 	std::vector<PhysicalMemory::AllocatedBlock> allocated_span;
 	if (!g_physical_memory->GetAllocatedSpan(static_cast<uint64_t>(start), len, &allocated_span)) {
+		if (not_one_span != nullptr) {
+			*not_one_span = true;
+		}
 		return KERNEL_ERROR_EACCES;
 	}
 
@@ -3214,19 +3451,73 @@ static int ValidateDirectReleaseRange(int64_t start, size_t len) {
 	           : OK;
 }
 
+// The allocated parts of [start, start + len) (pooled ones left out), as runs of adjacent blocks.
+static std::vector<std::pair<uint64_t, uint64_t>> AllocatedRuns(uint64_t start, uint64_t len) {
+	std::vector<std::pair<uint64_t, uint64_t>> runs;
+	if (len == 0 || len > UINT64_MAX - start) {
+		return runs;
+	}
+	const auto        end = start + len;
+	Common::LockGuard lock(g_physical_memory->GetMutex());
+	const auto&       blocks = g_physical_memory->GetPhysicalBlocks();
+	auto              block  = blocks.upper_bound(start);
+	if (block != blocks.begin()) {
+		--block;
+	}
+	for (; block != blocks.end() && block->second.start_addr < end; ++block) {
+		const auto& b     = block->second;
+		const auto  b_end = b.start_addr + b.size;
+		if (b_end <= start || b.kind == PhysicalMemory::AllocationKind::Pooled) {
+			continue;
+		}
+		const auto part_start = std::max(start, b.start_addr);
+		const auto part_end   = std::min(end, b_end);
+		if (!runs.empty() && runs.back().first + runs.back().second == part_start) {
+			runs.back().second += part_end - part_start;
+		} else {
+			runs.emplace_back(part_start, part_end - part_start);
+		}
+	}
+	return runs;
+}
+
 int KYTY_SYSV_ABI KernelReleaseDirectMemory(int64_t start, size_t len) {
 	PRINT_NAME();
 
-	LOGF("\t start = 0x%016" PRIx64 "\n"
-	     "\t len   = 0x%016" PRIx64 "\n",
-	     start, len);
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	if (!DirectMemoryQuiet()) {
+		LOGF("\t start = 0x%016" PRIx64 "\n"
+		     "\t len   = 0x%016" PRIx64 "\n",
+		     start, len);
+	}
 
 	const int validation = ValidateDirectReleaseRange(start, len);
 	if (validation != OK) {
 		return validation;
 	}
-	if (len != 0) {
-		(void)ReleaseDirectMemoryInternal(start, len);
+	bool not_one_span = false;
+	if (len != 0 && ReleaseDirectMemoryInternal(start, len, &not_one_span) != OK && not_one_span) {
+		// Not one allocated span (a gap, or a part already released): the unchecked release
+		// frees the allocated parts of the range and passes over the rest, where this used to
+		// free nothing at all and keep the whole range allocated.
+		uint64_t freed = 0;
+		uint32_t parts = 0;
+		for (const auto& [part_start, part_size]: AllocatedRuns(start, len)) {
+			if (ReleaseDirectMemoryInternal(static_cast<int64_t>(part_start), part_size) == OK) {
+				freed += part_size;
+				parts++;
+			}
+		}
+		auto& pressure = g_direct_memory_pressure;
+		pressure.partial_releases++;
+		pressure.partial_freed += freed;
+		if (pressure.partial_releases <= 32 || std::has_single_bit(pressure.partial_releases)) {
+			LOGF("ReleaseDirectMemory: 0x%016" PRIx64 "+0x%" PRIx64 " is not one allocated span: "
+			     "its %u allocated parts were released (0x%" PRIx64 " bytes; %" PRIu64
+			     " such releases, %" PRIu64 " MiB, so far)\n",
+			     start, static_cast<uint64_t>(len), parts, freed, pressure.partial_releases,
+			     pressure.partial_freed >> 20u);
+		}
 	}
 	return OK;
 }

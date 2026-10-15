@@ -71,6 +71,11 @@ public:
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
+	// KYTY_PENDING_FILLS (default on, 0 turns it off): a GPU fill that found no image to clear
+	// (a compute shader's, which is then noted with BufferCache::NoteFill, or a DMA fill) still
+	// holds for its range, the bytes of it that were not mapped then among them: a render or depth
+	// target created later inside it starts as the fill instead of what its memory holds then.
+	[[nodiscard]] static bool ClearsTargetsFromFills();
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 
@@ -223,6 +228,9 @@ private:
 	void TraceCpuWrite(ImageId id, const Image& image, uint64_t address, uint64_t size);
 	// A followed image right after an upload: its texels that are not finite, on the GPU.
 	void TraceUploadScan(ImageId id);
+	// Caller holds m_lock: a target's creation inside a known fill (ClearsTargetsFromFills)
+	// clears it to the fill; false when nothing was done (the caller uploads as before).
+	bool ClearFromKnownFill(ImageId id);
 
 	// The GPU scan's pipeline, scratch and read-back ring (made at the first scan), and the NaN
 	// check's state (null with KYTY_NAN_CHECK=0). Caller holds m_lock.

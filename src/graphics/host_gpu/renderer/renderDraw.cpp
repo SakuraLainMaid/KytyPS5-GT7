@@ -475,7 +475,18 @@ static void TraceTargetDraws(TextureCache& textures, const CommandBuffer& buffer
 	                rendering.width, rendering.height,
 	                ctx.GetClipControl().clip_disable ? " (no clipping)" : "");
 	if (depth.image_id) {
-		textures.TraceTargetDraw(depth.image_id, "depth", state);
+		const auto& meta = depth.desc.info.metadata;
+		textures.TraceTargetDraw(
+		    depth.image_id, "depth",
+		    fmt::format(
+		        "{}; depth test {} write {} op {}, clear by register {} at the pass's start "
+		        "{} to {}, {}",
+		        state, depth.depth_test_enable ? 1 : 0, depth.depth_write_enable ? 1 : 0,
+		        static_cast<int>(depth.depth_compare_op), depth.depth_clear_enable ? 1 : 0,
+		        depth.depth_load_clear_enable ? 1 : 0, depth.depth_clear_value,
+		        meta.kind == ImageMetadataKind::Htile
+		            ? fmt::format("HTile 0x{:012x}+0x{:x}", meta.range.address, meta.range.size)
+		            : std::string("no HTile")));
 	}
 	for (uint32_t i = 0; i < color_count; i++) {
 		if (colors[i].image_id) {
