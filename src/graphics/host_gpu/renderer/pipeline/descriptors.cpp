@@ -2588,6 +2588,21 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
+	// Whether a sampler with unnormalized coordinates samples image i.
+	const auto SampledUnnormalized = [&](uint32_t image) {
+		for (const auto& pair: program.info.sampled_pairs) {
+			if (pair.image != image || pair.sampler >= program.info.samplers.size()) {
+				continue;
+			}
+			const auto index = program.info.samplers[pair.sampler].snapshot_index;
+			if (index < snapshot.samplers.size() &&
+			    DecodeNativeDescriptor<ShaderSamplerResource>(snapshot.samplers[index])
+			        .ForceUnormCoords()) {
+				return true;
+			}
+		}
+		return false;
+	};
 	// Acquire each view before a later overlapping descriptor can replace its image.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
@@ -2619,6 +2634,24 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 				binding.mip_views.push_back(texture_cache.FindTexture(binding.image_id, desc));
 			}
 			binding.image_view = binding.mip_views.front();
+		} else if (binding.desc.type != TextureCache::BindingType::Storage &&
+		           binding.desc.view_info.level_count > 1 && SampledUnnormalized(i)) {
+			// A sampler with unnormalized coordinates (FORCE_UNNORMALIZED) reads the view's first
+			// mip on the console. A Vulkan sampler with unnormalizedCoordinates needs a view of a
+			// single mip: with all of the T#'s, the driver read others. The SDK's mip chain
+			// shaders sample the level above this way, so every mip of GT7's reflection cubes
+			// came out one flat color per face (2026-10-15).
+			auto desc                  = binding.desc;
+			desc.view_info.level_count = 1;
+			desc.view_info.min_lod     = 0;
+			binding.image_view         = texture_cache.FindTexture(binding.image_id, desc);
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("Unnormalized sampling: shader %016" PRIx64 " tex[%u] 0x%012" PRIx64
+				     " viewed at mip %u only (the T# has %u)\n",
+				     program.shader_hash, i, binding.desc.info.data.address,
+				     binding.desc.view_info.base_level, binding.desc.view_info.level_count);
+			}
 		} else {
 			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
 		}
