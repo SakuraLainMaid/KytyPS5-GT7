@@ -2215,10 +2215,18 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 			}
 			continue;
 		}
-		if (cmd_offset >= Pm4::UC_NUM) {
-			EXIT("unsupported indirect UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
-			     "), value = 0x%08" PRIx32 "\n",
-			     cmd_offset, raw_cmd_offset, value);
+		if (raw_cmd_offset == 0xffffffffu || cmd_offset >= Pm4::UC_NUM) {
+			// As for CX and SH: the 0xffffffff sentinel, and an offset outside the UC range, are
+			// skipped. GT7 ended here leaving the World Circuit menu, on a pair of 0xffffffff
+			// words amid its stale register lists (2026-10-15).
+			static std::atomic<uint32_t> skip_reports {0};
+			if (skip_reports.fetch_add(1, std::memory_order_relaxed) < 16u) {
+				LOGF("\t temporary: skipping indirect UC register offset 0x%08" PRIx32
+				     " (raw 0x%08" PRIx32 "), value = 0x%08" PRIx32 ", entry %" PRIu32
+				     " of %" PRIu32 "\n",
+				     cmd_offset, raw_cmd_offset, value, i, indirect_num_dw);
+			}
+			continue;
 		}
 
 		auto pfunc = g_hw_uc_indirect_func[cmd_offset & (Pm4::UC_NUM - 1)];

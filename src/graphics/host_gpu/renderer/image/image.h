@@ -200,6 +200,8 @@ public:
 	// Counts the uploads and GPU writes (TextureCache::ContentSerial): diagnostics scan an image
 	// again only once it changed.
 	uint64_t content_serial = 0;
+	// TextureCache::ResetUnmappedDepth: the content it last checked (UINT64_MAX: none yet).
+	uint64_t sparse_checked_serial = UINT64_MAX;
 
 private:
 	friend struct ImageTestAccess;

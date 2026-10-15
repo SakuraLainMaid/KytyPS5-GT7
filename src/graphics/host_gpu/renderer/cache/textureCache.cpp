@@ -4004,6 +4004,133 @@ bool TextureCache::DumpImage(ImageId id, uint32_t capture, const std::string& na
 	return image != nullptr && DumpImageLocked(*image, false, capture, name, description);
 }
 
+static bool SparseHoles() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SPARSE_HOLES");
+		const bool  on    = value == nullptr || value[0] != '0';
+		LOGF("Sparse depth: the unmapped blocks of partly mapped depth images %s "
+		     "(KYTY_SPARSE_HOLES)\n",
+		     on ? "pass the depth comparison that samples them" : "keep what was drawn into them");
+		return on;
+	}();
+	return enabled;
+}
+
+void TextureCache::ResetUnmappedDepth(ImageId id, float empty) {
+	if (!id || !SparseHoles()) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	auto*            found = m_slot_images.try_get(id);
+	if (found == nullptr || found->sparse_checked_serial == found->content_serial) {
+		return;
+	}
+	auto&       image             = *found;
+	const auto& info              = image.info;
+	image.sparse_checked_serial   = image.content_serial;
+	const auto         format     = image.backing.format;
+	const uint32_t     bytes      = format == vk::Format::eD16Unorm    ? 2u
+	                                : format == vk::Format::eD32Sfloat ? 4u
+	                                                                   : 0u;
+	constexpr uint64_t BlockBytes = 0x10000u;
+	if (bytes == 0 || image.backing.image == nullptr || image.depth_id || info.data.Empty() ||
+	    info.tile_mode != Prospero::TileMode::kDepth || info.HasStencil() || info.IsVolume() ||
+	    info.resources.levels != 1 || info.resources.layers != 1 || image.backing.samples != 1 ||
+	    image.backing.mip_levels != 1 || (info.data.address % BlockBytes) != 0 ||
+	    !(image.backing.usage & vk::ImageUsageFlagBits::eTransferDst)) {
+		return;
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> spans;
+	if (!Libs::LibKernel::Memory::CommittedSpans(info.data.address, info.data.size, 1u << 20u,
+	                                             &spans)) {
+		return;
+	}
+	uint64_t committed = 0;
+	for (const auto& span: spans) {
+		committed += span.second;
+	}
+	if (committed >= info.data.size) {
+		return; // all mapped: the common case
+	}
+	TileBlockLayout block {};
+	if (!TileGetBlockLayout(TileBlockFamily::Depth64KB, bytes, block) ||
+	    block.block_size != BlockBytes || block.block_depth != 1) {
+		return;
+	}
+	const uint32_t width          = std::max(image.backing.extent.width, 1u);
+	const uint32_t height         = std::max(image.backing.extent.height, 1u);
+	const uint32_t blocks_per_row = (width + block.block_width - 1u) / block.block_width;
+	const uint32_t block_rows     = (height + block.block_height - 1u) / block.block_height;
+	const uint64_t blocks         = uint64_t {blocks_per_row} * block_rows;
+	if (blocks * BlockBytes > info.data.size) {
+		return; // not the layout assumed here (64 KB blocks, row by row)
+	}
+	// Whether each block is mapped: any byte of it is (a block partly mapped keeps its texels).
+	std::vector<bool> mapped(blocks, false);
+	for (const auto& [start, size]: spans) {
+		const uint64_t first = (start - info.data.address) / BlockBytes;
+		const uint64_t end   = std::min<uint64_t>(
+            (start + size - info.data.address + BlockBytes - 1u) / BlockBytes, blocks);
+		for (uint64_t b = first; b < end; b++) {
+			mapped[b] = true;
+		}
+	}
+	std::vector<vk::BufferImageCopy> regions;
+	uint64_t                         largest = 0;
+	uint64_t                         holes   = 0;
+	for (uint32_t row = 0; row < block_rows; row++) {
+		for (uint32_t column = 0; column < blocks_per_row;) {
+			if (mapped[uint64_t {row} * blocks_per_row + column]) {
+				column++;
+				continue;
+			}
+			uint32_t end = column;
+			while (end < blocks_per_row && !mapped[uint64_t {row} * blocks_per_row + end]) {
+				end++;
+			}
+			holes += end - column;
+			const uint32_t      x = column * block.block_width;
+			const uint32_t      y = row * block.block_height;
+			vk::BufferImageCopy region {};
+			region.imageSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1};
+			region.imageOffset = vk::Offset3D {static_cast<int32_t>(x), static_cast<int32_t>(y), 0};
+			region.imageExtent = vk::Extent3D {std::min(end * block.block_width, width) - x,
+			                                   std::min(block.block_height, height - y), 1};
+			largest            = std::max<uint64_t>(largest, uint64_t {region.imageExtent.width} *
+			                                                     region.imageExtent.height * bytes);
+			regions.push_back(region);
+			column = end;
+		}
+	}
+	if (regions.empty()) {
+		return;
+	}
+	// One far-depth source for every region (each reads it from its start).
+	const uint64_t source_size = Common::AlignUp(largest, uint64_t {4});
+	auto           source      = std::make_shared<Buffer>(
+        m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+        vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eTransferSrc, source_size);
+	m_scheduler.EndRendering();
+	const uint32_t empty_word =
+	    bytes == 2u ? (empty >= 1.0f ? 0xffffffffu : 0u) : std::bit_cast<uint32_t>(empty);
+	m_scheduler.Current().Recorder().fillBuffer(source->Handle(), 0, source_size, empty_word);
+	image.Upload(regions, source->Handle(), 0, source_size);
+	m_scheduler.DeferRelease([source] {});
+	image.content_serial++;
+	image.sparse_checked_serial = image.content_serial;
+	static std::mutex                   logged_mutex;
+	static std::unordered_set<uint64_t> logged;
+	std::lock_guard                     logged_lock(logged_mutex);
+	if (logged.size() < 32 &&
+	    logged.insert(info.data.address ^ (uint64_t {width} << 40u) ^ (uint64_t {holes} << 20u))
+	        .second) {
+		LOGF("Sparse depth: 0x%012" PRIx64 " %ux%u: %" PRIu64 " of %" PRIu64
+		     " 64 KB blocks unmapped, reset to depth %.1f (%zu regions)\n",
+		     info.data.address, width, height, holes, blocks, static_cast<double>(empty),
+		     regions.size());
+	}
+}
+
 bool TextureCache::DumpImageLocked(Image& target, bool trace, uint32_t capture,
                                    const std::string& name, const std::string& description) {
 	auto* image = &target;

@@ -2603,6 +2603,43 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		}
 		return false;
 	};
+	// The depth that passes the comparison of the samplers that sample image i with one: 1.0 for
+	// LESS/LEQUAL, 0.0 for GREATER/GEQUAL. None without such a sampler, or for other functions
+	// or samplers that disagree.
+	const auto PassingDepth = [&](uint32_t image) -> std::optional<float> {
+		std::optional<float> depth;
+		for (const auto& pair: program.info.sampled_pairs) {
+			if (pair.image != image || pair.sampler >= program.info.samplers.size()) {
+				continue;
+			}
+			const auto& sampler = program.info.samplers[pair.sampler];
+			if (!sampler.depth_compare) {
+				continue;
+			}
+			if (sampler.bindless || sampler.snapshot_index >= snapshot.samplers.size()) {
+				return std::nullopt;
+			}
+			float passing = 0.0f;
+			switch (DecodeNativeDescriptor<ShaderSamplerResource>(
+			            snapshot.samplers[sampler.snapshot_index])
+			            .DepthCompareFunc()) {
+				case 1: // LESS
+				case 3: // LEQUAL
+					passing = 1.0f;
+					break;
+				case 4: // GREATER
+				case 6: // GEQUAL
+					passing = 0.0f;
+					break;
+				default: return std::nullopt;
+			}
+			if (depth.has_value() && *depth != passing) {
+				return std::nullopt;
+			}
+			depth = passing;
+		}
+		return depth;
+	};
 	// Acquire each view before a later overlapping descriptor can replace its image.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
@@ -2636,24 +2673,38 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			binding.image_view = binding.mip_views.front();
 		} else if (binding.desc.type != TextureCache::BindingType::Storage &&
 		           binding.desc.view_info.level_count > 1 && SampledUnnormalized(i)) {
-			// A sampler with unnormalized coordinates (FORCE_UNNORMALIZED) reads the view's first
-			// mip on the console. A Vulkan sampler with unnormalizedCoordinates needs a view of a
-			// single mip: with all of the T#'s, the driver read others. The SDK's mip chain
-			// shaders sample the level above this way, so every mip of GT7's reflection cubes
-			// came out one flat color per face (2026-10-15).
-			auto desc                  = binding.desc;
-			desc.view_info.level_count = 1;
-			desc.view_info.min_lod     = 0;
-			binding.image_view         = texture_cache.FindTexture(binding.image_id, desc);
-			static std::atomic<uint32_t> reported {0};
-			if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
-				LOGF("Unnormalized sampling: shader %016" PRIx64 " tex[%u] 0x%012" PRIx64
-				     " viewed at mip %u only (the T# has %u)\n",
-				     program.shader_hash, i, binding.desc.info.data.address,
+			// Outside a pixel shader, a sampler with unnormalized coordinates (FORCE_UNNORMALIZED)
+			// reads the view's first mip on the console (no derivatives there: LOD 0). A Vulkan
+			// sampler with unnormalizedCoordinates needs a view of a single mip: with all of the
+			// T#'s, the driver read others. The SDK's mip chain shaders sample the level above
+			// this way, so every mip of GT7's reflection cubes came out one flat color per face
+			// (2026-10-15). Pixel shaders keep the whole view, as before: with one mip for them
+			// too, GT7's cars came out with broken textures in third person (probably this).
+			const bool one_mip = program.stage != ShaderType::Pixel;
+			auto       desc    = binding.desc;
+			if (one_mip) {
+				desc.view_info.level_count = 1;
+				desc.view_info.min_lod     = 0;
+			}
+			binding.image_view = texture_cache.FindTexture(binding.image_id, desc);
+			static std::mutex                   logged_mutex;
+			static std::unordered_set<uint64_t> logged;
+			std::lock_guard                     lock(logged_mutex);
+			if (logged.size() < 32 && logged.insert(program.shader_hash ^ i).second) {
+				LOGF("Unnormalized sampling: %s shader %016" PRIx64 " tex[%u] 0x%012" PRIx64
+				     " %s mip %u (the T# has %u)\n",
+				     FrameGraphStage(program.stage), program.shader_hash, i,
+				     binding.desc.info.data.address, one_mip ? "viewed at" : "keeps every mip from",
 				     binding.desc.view_info.base_level, binding.desc.view_info.level_count);
 			}
 		} else {
 			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
+		}
+		// After FindTexture, which may refresh it from guest memory.
+		if (binding.desc.type != TextureCache::BindingType::Storage) {
+			if (const auto passing = PassingDepth(i); passing.has_value()) {
+				texture_cache.ResetUnmappedDepth(binding.image_id, *passing);
+			}
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;

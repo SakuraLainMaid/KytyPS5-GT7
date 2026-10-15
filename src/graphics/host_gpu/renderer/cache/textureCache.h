@@ -141,6 +141,14 @@ public:
 	// not apply (multisampled or block-compressed images, formats the dump does not decode).
 	bool DumpImage(ImageId id, uint32_t capture, const std::string& name,
 	               const std::string& description);
+	// A depth image over memory only partly mapped (sparse, in 64 KB blocks), sampled with a
+	// depth comparison: the texels of its unmapped blocks are reset to `empty`, the depth that
+	// passes the comparison (1.0 for LESS/LEQUAL, 0.0 for GREATER/GEQUAL), once each time its
+	// contents change. The console drops the writes that land there and reports reads there as
+	// not resident, which the shaders sampling such shadow maps take as lit (TFE, which the
+	// translation does not return). Without this the host's texels there, drawn into, shadowed
+	// the ground in noisy patches with straight edges. KYTY_SPARSE_HOLES=0 turns it off.
+	void ResetUnmappedDepth(ImageId id, float empty);
 
 	// Diagnostics: the KYTY_TRACE_* traces (KYTY_TRACE_DISPATCHES in renderCompute.cpp,
 	// KYTY_TRACE_IMAGES here). Lines start "Trace ".
