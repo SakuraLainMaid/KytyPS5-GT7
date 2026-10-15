@@ -9,6 +9,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <map>
 #include <set>
@@ -381,7 +382,10 @@ void NoteShader(const char* stage, uint64_t hash, uint64_t code_address, const u
 	}
 	std::vector<uint32_t> code(bytes / 4u);
 	if (!LibKernel::Memory::TryReadBacking(code_address, code.data(), bytes)) {
-		return;
+		// Code outside the memory the guest maps (the SDK modules' own shaders): read where the
+		// translator reads it (ShaderMapUserData hashed it there), as guest addresses are the
+		// process's own.
+		std::memcpy(code.data(), reinterpret_cast<const void*>(code_address), bytes);
 	}
 	std::error_code created;
 	std::filesystem::create_directories("shader-dumps", created);

@@ -471,6 +471,19 @@ bool Enabled() {
 	return !Items().empty();
 }
 
+bool AllMips() {
+	static const bool all = [] {
+		const char* value = std::getenv("KYTY_DUMP_IMAGES_MIPS");
+		const bool  on    = value != nullptr && value[0] == '1' && !Items().empty();
+		if (on) {
+			LOGF("ImageDump: KYTY_DUMP_IMAGES_MIPS=1: every mip of a matched image, where a draw "
+			     "or dispatch reads it without writing it\n");
+		}
+		return on;
+	}();
+	return all;
+}
+
 bool Wanted(uint64_t address, uint32_t width, uint32_t height, uint32_t layers, bool depth) {
 	for (const auto& item: Items()) {
 		switch (item.kind) {

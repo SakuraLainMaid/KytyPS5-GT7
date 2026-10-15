@@ -2143,10 +2143,20 @@ static void LogFrameGraphStage(RenderContext& context, const ShaderStageRuntime&
 			textures.VerifyWithGuest(binding.image_id, FrameGraph::CurrentOp(),
 			                         fmt::format("{} tex[{}]", stage, i));
 		}
-		// KYTY_DUMP_IMAGES: the image as this binding finds it, to a PNG.
+		// KYTY_DUMP_IMAGES: the image as this binding finds it, to a PNG (with
+		// KYTY_DUMP_IMAGES_MIPS, only where no binding of this stage stores to it).
+		const auto stage_writes = [&](const auto& id) {
+			for (size_t j = 0; j < prepared.images.size() && j < program.info.images.size(); j++) {
+				if (prepared.images[j].image_id == id && program.info.images[j].written) {
+					return true;
+				}
+			}
+			return false;
+		};
 		if (binding.image_id && ImageDump::Enabled() &&
 		    ImageDump::Wanted(info.data.address, info.extent.width, info.extent.height,
-		                      info.resources.layers, info.IsDepth())) {
+		                      info.resources.layers, info.IsDepth()) &&
+		    !(ImageDump::AllMips() && stage_writes(binding.image_id))) {
 			const auto capture = FrameGraph::CaptureNumber();
 			(void)textures.DumpImage(
 			    binding.image_id, capture,

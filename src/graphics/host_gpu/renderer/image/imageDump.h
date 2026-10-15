@@ -25,6 +25,10 @@
 namespace Libs::Graphics::ImageDump {
 
 [[nodiscard]] bool Enabled();
+// KYTY_DUMP_IMAGES_MIPS=1: each mip of a matched image is written as a file of its own (_m<mip>
+// in the name), and only where the draw or dispatch stage reads the image without writing it, so
+// a mip chain the frame builds pass by pass is shown once, when it is read.
+[[nodiscard]] bool AllMips();
 [[nodiscard]] bool Wanted(uint64_t address, uint32_t width, uint32_t height, uint32_t layers,
                           bool depth);
 // GPU thread, in a capture: whether to dump this image's content now (the first time this

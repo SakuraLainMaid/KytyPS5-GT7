@@ -4017,113 +4017,139 @@ bool TextureCache::DumpImageLocked(Image& target, bool trace, uint32_t capture,
 	const auto  width   = std::max(backing.extent.width, 1u);
 	const auto  height  = std::max(backing.extent.height, 1u);
 	const auto  layers  = volume ? 1u : std::max(backing.layers, 1u);
-	// The mip closest above the size shown, every step-th row and column of it.
+	// The mip closest above the size shown, every step-th row and column of it (with
+	// KYTY_DUMP_IMAGES_MIPS, every mip, each the same way).
 	const bool     tiled_sheet = layers > 1 || (volume && backing.extent.depth > 1);
 	const uint32_t side =
 	    tiled_sheet ? std::max(ImageDump::MaxSide() / 2u, 64u) : ImageDump::MaxSide();
-	uint32_t mip = 0;
-	while (mip + 1 < levels && std::max(width >> (mip + 1), height >> (mip + 1)) >= side) {
-		mip++;
+	uint32_t first = 0;
+	while (first + 1 < levels && std::max(width >> (first + 1), height >> (first + 1)) >= side) {
+		first++;
 	}
-	const uint32_t mip_width  = std::max(width >> mip, 1u);
-	const uint32_t mip_height = std::max(height >> mip, 1u);
-	uint32_t       tiles      = volume ? std::max(backing.extent.depth >> mip, 1u) : layers;
-	const uint32_t step       = (std::max(mip_width, mip_height) + side - 1u) / side;
-	const uint32_t rows       = (mip_height + step - 1u) / step;
-	const uint64_t row_pitch  = step == 1 ? uint64_t {mip_width} * texel_bytes
-	                                      : Common::AlignUp(uint64_t {mip_width} * texel_bytes, 16);
-	const uint64_t tile_pitch = Common::AlignUp(row_pitch * rows, 16);
-	const auto     budget     = ImageDump::MaxBytes();
-	if (tile_pitch == 0 || tile_pitch > budget) {
+	const auto budget = ImageDump::MaxBytes();
+	struct MipPlan {
+		uint32_t width = 0, height = 0, tiles = 0, all_tiles = 0, step = 1, rows = 0;
+		uint64_t row_pitch = 0, tile_pitch = 0;
+	};
+	const auto plan_mip = [&](uint32_t mip) {
+		MipPlan plan;
+		plan.width      = std::max(width >> mip, 1u);
+		plan.height     = std::max(height >> mip, 1u);
+		plan.all_tiles  = volume ? std::max(backing.extent.depth >> mip, 1u) : layers;
+		plan.step       = (std::max(plan.width, plan.height) + side - 1u) / side;
+		plan.rows       = (plan.height + plan.step - 1u) / plan.step;
+		plan.row_pitch  = plan.step == 1 ? uint64_t {plan.width} * texel_bytes
+		                                 : Common::AlignUp(uint64_t {plan.width} * texel_bytes, 16);
+		plan.tile_pitch = Common::AlignUp(plan.row_pitch * plan.rows, 16);
+		if (plan.tile_pitch == 0 || plan.tile_pitch > budget) {
+			return plan; // no tiles: not dumped
+		}
+		// Within the readback budget, and at most 16M texels shown (the decode keeps 16 bytes
+		// each).
+		const uint64_t shown = uint64_t {(plan.width + plan.step - 1u) / plan.step} * plan.rows;
+		plan.tiles           = static_cast<uint32_t>(
+            std::min<uint64_t>({uint64_t {plan.all_tiles}, budget / plan.tile_pitch,
+		                                  std::max<uint64_t>((16ull << 20u) / shown, 1u)}));
+		return plan;
+	};
+	if (plan_mip(first).tiles == 0) {
 		return false;
 	}
-	const uint32_t all_tiles = tiles;
-	// Within the readback budget, and at most 16M texels shown (the decode keeps 16 bytes each).
-	const uint64_t shown = uint64_t {(mip_width + step - 1u) / step} * rows;
-	tiles                = static_cast<uint32_t>(std::min<uint64_t>(
-        {uint64_t {tiles}, budget / tile_pitch, std::max<uint64_t>((16ull << 20u) / shown, 1u)}));
 	if (trace ? !ImageDump::ClaimTrace(image->info.data.address, image->content_serial)
 	          : !ImageDump::Claim(capture, image->info.data.address, image->content_serial)) {
 		return false;
 	}
-	const uint64_t bytes = tile_pitch * tiles;
-	auto download = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
-	                                         AllFlags, bytes);
-	if (download->Mapped().data() == nullptr) {
-		return false;
-	}
-	const auto aspect = depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor;
-	std::vector<vk::BufferImageCopy> regions;
-	regions.reserve(static_cast<size_t>(tiles) * (step == 1 ? 1u : rows));
-	for (uint32_t tile = 0; tile < tiles; tile++) {
-		vk::BufferImageCopy region {};
-		region.imageSubresource = {aspect, mip, volume ? 0u : tile, 1};
-		if (step == 1) {
-			region.bufferOffset = tile * tile_pitch;
-			region.imageOffset  = vk::Offset3D {0, 0, volume ? static_cast<int32_t>(tile) : 0};
-			region.imageExtent  = vk::Extent3D {mip_width, mip_height, 1};
-			regions.push_back(region);
+	const bool     all_mips = !trace && ImageDump::AllMips();
+	const uint32_t from     = all_mips ? 0u : first;
+	const uint32_t to       = all_mips ? levels : first + 1u;
+	const auto  aspect = depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor;
+	const auto& info   = image->info;
+	m_scheduler.EndRendering();
+	bool dumped = false;
+	for (uint32_t mip = from; mip < to; mip++) {
+		const auto plan = plan_mip(mip);
+		if (plan.tiles == 0) {
 			continue;
 		}
-		for (uint32_t row = 0; row < rows; row++) {
-			region.bufferOffset = tile * tile_pitch + row * row_pitch;
-			region.imageOffset  = vk::Offset3D {0, static_cast<int32_t>(row * step),
-                                               volume ? static_cast<int32_t>(tile) : 0};
-			region.imageExtent  = vk::Extent3D {mip_width, 1, 1};
-			regions.push_back(region);
+		const uint64_t bytes = plan.tile_pitch * plan.tiles;
+		auto download = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                         AllFlags, bytes);
+		if (download->Mapped().data() == nullptr) {
+			break;
 		}
+		std::vector<vk::BufferImageCopy> regions;
+		regions.reserve(static_cast<size_t>(plan.tiles) * (plan.step == 1 ? 1u : plan.rows));
+		for (uint32_t tile = 0; tile < plan.tiles; tile++) {
+			vk::BufferImageCopy region {};
+			region.imageSubresource = {aspect, mip, volume ? 0u : tile, 1};
+			if (plan.step == 1) {
+				region.bufferOffset = tile * plan.tile_pitch;
+				region.imageOffset  = vk::Offset3D {0, 0, volume ? static_cast<int32_t>(tile) : 0};
+				region.imageExtent  = vk::Extent3D {plan.width, plan.height, 1};
+				regions.push_back(region);
+				continue;
+			}
+			for (uint32_t row = 0; row < plan.rows; row++) {
+				region.bufferOffset = tile * plan.tile_pitch + row * plan.row_pitch;
+				region.imageOffset  = vk::Offset3D {0, static_cast<int32_t>(row * plan.step),
+                                                   volume ? static_cast<int32_t>(tile) : 0};
+				region.imageExtent  = vk::Extent3D {plan.width, 1, 1};
+				regions.push_back(region);
+			}
+		}
+		m_scheduler.Current().MarkTransfer(
+		    CommandBufferDebugOp::InternalWork, image->info.data.address, 0,
+		    static_cast<uint32_t>(InternalWork::ImageDump),
+		    static_cast<uint32_t>(std::min<uint64_t>(bytes, UINT32_MAX)), plan.tiles);
+		image->Download(regions, download->Handle(), 0, bytes);
+		vk::BufferMemoryBarrier barrier {};
+		barrier.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.buffer              = download->Handle();
+		barrier.offset              = 0;
+		barrier.size                = bytes;
+		m_scheduler.Current().Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                                                 vk::PipelineStageFlagBits::eHost, {}, 0,
+		                                                 nullptr, 1, &barrier, 0, nullptr);
+		ImageDump::Layout layout;
+		layout.format      = format;
+		layout.row_texels  = plan.width;
+		layout.rows        = plan.rows;
+		layout.tiles       = plan.tiles;
+		layout.step        = plan.step;
+		layout.row_pitch   = plan.row_pitch;
+		layout.tile_pitch  = plan.tile_pitch;
+		layout.texel_bytes = texel_bytes;
+		layout.depth       = depth;
+		layout.cubes       = !volume && layers >= 6 && layers % 6 == 0;
+		auto file = fmt::format("{}_{:012x}_{}x{}", name, info.data.address, width, height);
+		if (layers > 1 || volume) {
+			file += fmt::format("x{}", volume ? backing.extent.depth : layers);
+		}
+		file += fmt::format("_m{}_f{}", mip, static_cast<int>(format));
+		auto text = fmt::format(
+		    "{} 0x{:012x}+0x{:x} {}x{}x{} layers {} mips {} fmt {} guest {} tile {} [{}{}{}], mip "
+		    "{}{}",
+		    description, info.data.address, info.data.size, info.extent.width, info.extent.height,
+		    info.extent.depth, info.resources.layers, info.resources.levels,
+		    static_cast<int>(info.pixel_format), static_cast<uint32_t>(info.guest_format),
+		    static_cast<uint32_t>(info.tile_mode), image->IsGpuModified() ? 'G' : '-',
+		    image->IsBufferModified() ? 'B' : '-', image->IsCpuDirty() ? 'C' : '-', mip,
+		    plan.tiles < plan.all_tiles
+		        ? fmt::format(", the first {} of {} (the size limits)", plan.tiles, plan.all_tiles)
+		        : std::string());
+		m_scheduler.DeferPriorityOperation(
+		    [download, bytes, layout, file = std::move(file), text = std::move(text)]() mutable {
+			    download->Invalidate(0, bytes);
+			    const auto*          mapped = download->Mapped().data();
+			    std::vector<uint8_t> copy(mapped, mapped + bytes);
+			    ImageDump::Write(std::move(file), std::move(text), layout, std::move(copy));
+		    });
+		dumped = true;
 	}
-	m_scheduler.EndRendering();
-	m_scheduler.Current().MarkTransfer(CommandBufferDebugOp::InternalWork, image->info.data.address,
-	                                   0, static_cast<uint32_t>(InternalWork::ImageDump),
-	                                   static_cast<uint32_t>(std::min<uint64_t>(bytes, UINT32_MAX)),
-	                                   tiles);
-	image->Download(regions, download->Handle(), 0, bytes);
-	vk::BufferMemoryBarrier barrier {};
-	barrier.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
-	barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
-	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.buffer              = download->Handle();
-	barrier.offset              = 0;
-	barrier.size                = bytes;
-	m_scheduler.Current().Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                                                 vk::PipelineStageFlagBits::eHost, {}, 0,
-	                                                 nullptr, 1, &barrier, 0, nullptr);
-	ImageDump::Layout layout;
-	layout.format      = format;
-	layout.row_texels  = mip_width;
-	layout.rows        = rows;
-	layout.tiles       = tiles;
-	layout.step        = step;
-	layout.row_pitch   = row_pitch;
-	layout.tile_pitch  = tile_pitch;
-	layout.texel_bytes = texel_bytes;
-	layout.depth       = depth;
-	layout.cubes       = !volume && layers >= 6 && layers % 6 == 0;
-	const auto& info   = image->info;
-	auto        file   = fmt::format("{}_{:012x}_{}x{}", name, info.data.address, width, height);
-	if (layers > 1 || volume) {
-		file += fmt::format("x{}", volume ? backing.extent.depth : layers);
-	}
-	file += fmt::format("_m{}_f{}", mip, static_cast<int>(format));
-	auto text = fmt::format(
-	    "{} 0x{:012x}+0x{:x} {}x{}x{} layers {} mips {} fmt {} guest {} tile {} [{}{}{}], mip {}{}",
-	    description, info.data.address, info.data.size, info.extent.width, info.extent.height,
-	    info.extent.depth, info.resources.layers, info.resources.levels,
-	    static_cast<int>(info.pixel_format), static_cast<uint32_t>(info.guest_format),
-	    static_cast<uint32_t>(info.tile_mode), image->IsGpuModified() ? 'G' : '-',
-	    image->IsBufferModified() ? 'B' : '-', image->IsCpuDirty() ? 'C' : '-', mip,
-	    tiles < all_tiles ? fmt::format(", the first {} of {} (the size limits)", tiles, all_tiles)
-	                      : std::string());
-	m_scheduler.DeferPriorityOperation(
-	    [download, bytes, layout, file = std::move(file), text = std::move(text)]() mutable {
-		    download->Invalidate(0, bytes);
-		    const auto*          mapped = download->Mapped().data();
-		    std::vector<uint8_t> copy(mapped, mapped + bytes);
-		    ImageDump::Write(std::move(file), std::move(text), layout, std::move(copy));
-	    });
-	return true;
+	return dumped;
 }
 
 bool TextureCache::TraceScanImage(ImageId id, const std::string& prefix, uint64_t max_bytes) {
