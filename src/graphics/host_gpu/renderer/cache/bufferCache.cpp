@@ -495,9 +495,9 @@ void BufferCache::NoteFill(uint64_t vaddr, uint64_t size, uint32_t value, uint64
 	constexpr uint64_t SmallFill     = 1u << 20u;
 	if (m_known_fills.size() >= MaxKnownFills) {
 		// The oldest small fill goes first: a large one is an image's bytes, not created yet.
-		const auto small = std::ranges::find_if(
+		const auto evict = std::ranges::find_if(
 		    m_known_fills, [](const KnownFillRecord& fill) { return fill.size < SmallFill; });
-		m_known_fills.erase(small != m_known_fills.end() ? small : m_known_fills.begin());
+		m_known_fills.erase(evict != m_known_fills.end() ? evict : m_known_fills.begin());
 	}
 	m_known_fills.push_back({vaddr, size, value, gpu_bytes});
 	m_known_fill_count.store(m_known_fills.size(), std::memory_order_relaxed);
