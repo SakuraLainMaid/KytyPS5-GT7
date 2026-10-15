@@ -6,6 +6,8 @@
 #include "common/virtualMemory.h"
 
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 class RenderContext;
@@ -142,6 +144,11 @@ bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data,
 // mappings (what sceKernelVirtualQuery reports), without asking the host. An empty range is, and
 // so is every range before the kernel's memory is set up (unit tests).
 [[nodiscard]] bool     IsCommittedRange(uint64_t vaddr, uint64_t size);
+// The committed parts of [vaddr, vaddr + size), in order, as (start, size): the pages a GPU write
+// over the range lands in when some of it is not mapped (sparse memory). At most `max_spans`;
+// false (and no spans) when there are more.
+[[nodiscard]] bool     CommittedSpans(uint64_t vaddr, uint64_t size, size_t max_spans,
+                                      std::vector<std::pair<uint64_t, uint64_t>>* spans);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 // Diagnostics: KYTY_TRACE_MEMORY=0x<address>+<size>[,...]. What happens to these guest ranges is
 // logged as "Trace memory: ...": the kernel's mappings over them (maps, unmaps, protection

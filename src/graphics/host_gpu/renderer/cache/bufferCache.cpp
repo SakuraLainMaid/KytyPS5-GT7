@@ -1637,6 +1637,55 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	NoteFill(vaddr, size, value, size, false);
 }
 
+void BufferCache::FillMappedSpans(std::span<const std::pair<uint64_t, uint64_t>> spans,
+                                  uint32_t                                       value) {
+	if (spans.empty()) {
+		return;
+	}
+	for (const auto& [vaddr, size]: spans) {
+		if ((vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 ||
+		    !GuestRange {vaddr, size}.Valid()) {
+			EXIT("BufferCache: invalid mapped fill span 0x%016" PRIx64 "+0x%" PRIx64 "\n", vaddr,
+			     size);
+		}
+	}
+	// One cached buffer over all of them (holes included, which read as zero), as an image over
+	// the range will want later, rather than one a span; then one barrier pair for all the fills.
+	const auto first = spans.front().first;
+	const auto last  = spans.back().first + spans.back().second;
+	const auto id    = FindBuffer(first, last - first);
+	struct Fill {
+		vk::Buffer buffer;
+		uint64_t   offset;
+		uint64_t   size;
+	};
+	std::vector<Fill> fills;
+	fills.reserve(spans.size());
+	for (const auto& [vaddr, size]: spans) {
+		m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+		auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true, id);
+		fills.push_back({dst->Handle(), dst_offset, size});
+	}
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto        native = command.Recorder();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+	                       nullptr);
+	for (const auto& fill: fills) {
+		native.fillBuffer(fill.buffer, fill.offset, fill.size, value);
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0, nullptr, 0,
+	                       nullptr);
+}
+
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
                              bool src_gds) {
 	const bool dst_memory = !dst_gds;

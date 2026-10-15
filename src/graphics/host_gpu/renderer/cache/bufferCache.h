@@ -108,6 +108,10 @@ public:
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferTracked(uint64_t vaddr, uint64_t size,
 	                                                               BufferId id);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// GPU thread: a GPU fill of a range with holes in its mappings (a compute shader's fill of
+	// sparse memory) sets the mapped `spans` of it on the GPU, as the hardware does, and leaves the
+	// holes, where the hardware drops the writes.
+	void FillMappedSpans(std::span<const std::pair<uint64_t, uint64_t>> spans, uint32_t value);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.

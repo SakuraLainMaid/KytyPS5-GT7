@@ -601,6 +601,40 @@ public:
 		return text;
 	}
 
+	bool CommittedSpans(uint64_t start, uint64_t size, size_t max_spans,
+	                    std::vector<std::pair<uint64_t, uint64_t>>* spans) {
+		Common::LockGuard lock(m_mutex);
+		spans->clear();
+		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
+			return true;
+		}
+		const auto generation = m_coverage_generation.load(std::memory_order_relaxed);
+		if (m_spans_generation != generation) {
+			RebuildSpansUnlocked();
+			m_spans_generation = generation;
+		}
+		const auto end  = start + size;
+		auto       span = std::upper_bound(
+            m_spans.begin(), m_spans.end(), start,
+            [](uint64_t value, const Span& candidate) { return value < candidate.start; });
+		if (span != m_spans.begin()) {
+			--span;
+		}
+		for (; span != m_spans.end() && span->start < end; ++span) {
+			const auto from = std::max(start, span->start);
+			const auto to   = std::min(end, span->end);
+			if (from >= to) {
+				continue;
+			}
+			if (spans->size() >= max_spans) {
+				spans->clear();
+				return false;
+			}
+			spans->emplace_back(from, to - from);
+		}
+		return true;
+	}
+
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
 
@@ -1220,6 +1254,16 @@ bool IsCommittedRange(uint64_t vaddr, uint64_t size) {
 	}
 
 	return size == 0 || g_virtual_ranges->ClampRangeSize(vaddr, size) == size;
+}
+
+bool CommittedSpans(uint64_t vaddr, uint64_t size, size_t max_spans,
+                    std::vector<std::pair<uint64_t, uint64_t>>* spans) {
+	EXIT_IF(spans == nullptr);
+	if (g_virtual_ranges == nullptr) {
+		spans->assign(1, {vaddr, size});
+		return true;
+	}
+	return g_virtual_ranges->CommittedSpans(vaddr, size, max_spans, spans);
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {

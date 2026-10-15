@@ -46,6 +46,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <span>
 #include <tuple>
 #include <unordered_map>
@@ -859,11 +860,17 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                               uint32_t group_y, uint32_t group_z, uint32_t mode,
                               ShaderBufferResource& resolved_descriptor, uint32_t& resolved_clear,
-                              uint64_t& resolved_size) {
+                              uint64_t& resolved_size, const char** why) {
+	const auto fail = [why](const char* reason) {
+		if (why != nullptr) {
+			*why = reason;
+		}
+		return false;
+	};
 	const auto& resources = *input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
 	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer) {
-		return false;
+		return fail("not a uniform buffer fill (or its value is not known for this dispatch)");
 	}
 	const auto element_size = fill.words * sizeof(uint32_t);
 	const auto descriptor =
@@ -874,29 +881,163 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	if (descriptor.Stride() != element_size || descriptor.Format() != formats[fill.words - 1] ||
 	    descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 || descriptor.AddTid() ||
 	    descriptor.Base48() == 0) {
-		return false;
+		return fail("its V# is not a plain array of the stored elements");
 	}
 	if (input.threads_num[0] == 0 || input.threads_num[0] != fill.group_stride[0] ||
-	    input.threads_num[1] != 1 || input.threads_num[2] != 1 || group_x == 0 || group_y != 1 ||
-	    group_z != 1 || mode != (input.dispatch_thread_dimensions ? 0x61u : 0x41u)) {
-		return false;
+	    input.threads_num[1] != 1 || input.threads_num[2] != 1) {
+		return fail("its workgroup shape does not match the fill's index");
+	}
+	if (group_x == 0 || group_y != 1 || group_z != 1) {
+		return fail("not a one-dimensional dispatch");
+	}
+	if (mode != (input.dispatch_thread_dimensions ? 0x61u : 0x41u)) {
+		return fail("dispatch initiator bits");
 	}
 	const uint64_t invocations = input.dispatch_thread_dimensions
 	                                 ? group_x
 	                                 : static_cast<uint64_t>(group_x) * input.threads_num[0];
 	const auto     size        = descriptor.GetSize();
-	if (invocations != descriptor.NumRecords() || size == 0 || size > UINT32_MAX ||
-	    (input.dispatch_thread_dimensions &&
-	     (group_x % input.threads_num[0] != 0 || input.dispatch_threads_num[0] != group_x ||
-	      input.dispatch_threads_num[1] != 1 || input.dispatch_threads_num[2] != 1))) {
-		return false;
+	if (invocations != descriptor.NumRecords()) {
+		return fail("its invocations are not one per record of its V#");
+	}
+	if (size == 0 || size > UINT32_MAX) {
+		return fail("its size");
+	}
+	if (input.dispatch_thread_dimensions &&
+	    (group_x % input.threads_num[0] != 0 || input.dispatch_threads_num[0] != group_x ||
+	     input.dispatch_threads_num[1] != 1 || input.dispatch_threads_num[2] != 1)) {
+		return fail("its thread counts are not whole workgroups");
 	}
 	if (!FillSourcesDisjoint(resources.buffers, {descriptor.Base48(), size}, fill.resource))
-		return false;
+		return fail("another of its buffers overlaps the destination");
 	resolved_descriptor = descriptor;
 	resolved_clear      = fill.value;
 	resolved_size       = size;
 	return true;
+}
+
+// KYTY_SPARSE_FILLS=0: a compute fill over memory with holes runs as a dispatch, which writes
+// only up to the first hole.
+static bool SparseFills() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SPARSE_FILLS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// A uniform fill of [base, base + size) whose mappings have holes: its mapped parts are filled on
+// the GPU, as the hardware's writes land there (the rest it drops). False when the range has no
+// hole (the dispatch runs) or too many pieces to fill one by one.
+static bool FillMappedParts(RenderContext& context, uint64_t shader, uint64_t base, uint64_t size,
+                            uint32_t value) {
+	const auto prefix = Libs::LibKernel::Memory::TryClampRangeSize(base, size);
+	if (prefix == size || (base & 3u) != 0 || (size & 3u) != 0) {
+		return false;
+	}
+	constexpr size_t                           MaxSpans = 16384;
+	std::vector<std::pair<uint64_t, uint64_t>> spans;
+	if (!Libs::LibKernel::Memory::CommittedSpans(base, size, MaxSpans, &spans)) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("GraphicsRenderDispatchDirect: buffer fill 0x%012" PRIx64 "+0x%" PRIx64
+			     " by cs %016" PRIx64 " over more than %zu mapped pieces: run as a dispatch, "
+			     "which stops at its first hole\n",
+			     base, size, shader, MaxSpans);
+		}
+		return false;
+	}
+	uint64_t mapped = 0;
+	for (const auto& span: spans) {
+		mapped += span.second;
+	}
+	context.GetBufferCache().FillMappedSpans(spans, value);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+		LOGF("GraphicsRenderDispatchDirect: buffer fill 0x%012" PRIx64 "+0x%" PRIx64
+		     " with 0x%08x by cs %016" PRIx64 " over memory with holes: its %zu mapped pieces "
+		     "(0x%" PRIx64 " bytes) filled, the holes left alone (a dispatch stops at the "
+		     "first, 0x%" PRIx64 " in)\n",
+		     base, size, value, shader, spans.size(), mapped, prefix);
+	}
+	if (Libs::LibKernel::Memory::TracesMemory(base, size)) {
+		Libs::LibKernel::Memory::TraceMemory(
+		    "compute fill 0x%016" PRIx64 "+0x%" PRIx64 " with 0x%08x by cs %016" PRIx64
+		    " over holes: %zu mapped pieces, 0x%" PRIx64 " bytes, filled on the GPU",
+		    base, size, value, shader, spans.size(), mapped);
+	}
+	return true;
+}
+
+// Diagnostics: a compute shader's buffer write over memory with holes in its mappings stops at
+// the first hole. Each such (shader, address) is logged once (the first 32) with the dispatch, its
+// V# and user data, and why it was not taken as a fill.
+// `groups`: the dispatch's group counts, or null for an indirect one (`args` holds its address).
+static void ReportWritesOverHoles(const ShaderComputeInputInfo& input, const char* fill_why,
+                                  const uint32_t* groups, uint64_t args, uint32_t mode) {
+	// `seen`: the (shader, address) pairs checked, logged or not; `reports`: those logged.
+	constexpr size_t                               MaxReports = 32;
+	constexpr size_t                               MaxSeen    = 4096;
+	static std::atomic<bool>                       full {false};
+	static std::mutex                              mutex;
+	static std::set<std::pair<uint64_t, uint64_t>> seen;
+	static size_t                                  reports = 0;
+	if (full.load(std::memory_order_relaxed)) {
+		return;
+	}
+	const auto& program   = *input.stage.program;
+	const auto& resources = *input.stage.resources;
+	for (uint32_t i = 0; i < program.info.buffers.size() && i < resources.buffers.size(); i++) {
+		if (!program.info.buffers[i].written) {
+			continue;
+		}
+		const auto     r     = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		const uint64_t bytes = r.GetSize();
+		if (r.Base48() < BufferCache::CACHING_PAGESIZE || bytes == 0 ||
+		    bytes > UINT64_MAX - r.Base48()) {
+			continue;
+		}
+		const auto mapped = Libs::LibKernel::Memory::TryClampRangeSize(r.Base48(), bytes);
+		if (mapped == bytes) {
+			continue;
+		}
+		std::lock_guard lock(mutex);
+		if (!seen.insert({program.shader_hash, r.Base48()}).second) {
+			continue;
+		}
+		if (seen.size() >= MaxSeen) {
+			full.store(true, std::memory_order_relaxed);
+		}
+		// Anything mapped past the first hole (the binding loses only that)?
+		std::vector<std::pair<uint64_t, uint64_t>> spans;
+		const bool few = Libs::LibKernel::Memory::CommittedSpans(r.Base48(), bytes, 2, &spans);
+		if (few && (spans.empty() || (spans.size() == 1 && spans[0].first == r.Base48()))) {
+			continue;
+		}
+		if (++reports >= MaxReports) {
+			full.store(true, std::memory_order_relaxed);
+		}
+		const auto shape =
+		    groups != nullptr
+		        ? fmt::format("groups {}x{}x{} mode 0x{:x}", groups[0], groups[1], groups[2], mode)
+		        : fmt::format("indirect args 0x{:x} mode 0x{:x}", args, mode);
+		std::string user;
+		for (size_t k = 0; k < resources.user_data.size() && k < 16; k++) {
+			user += fmt::format(" {:08x}", resources.user_data[k]);
+		}
+		const auto& fill = resources.uniform_fill;
+		LOGF("GraphicsRenderDispatch: cs %016" PRIx64 " %s threads %ux%ux%u%s writes buf[%u] "
+		     "0x%012" PRIx64 "+0x%" PRIx64 " over memory with holes: a binding stops at the first, "
+		     "0x%" PRIx64 " in, with mapped pieces past it; V# [%08x %08x %08x %08x] stride %u "
+		     "records %u fmt %u; user data%s; uniform fill: kind %u words %u value 0x%08x; not "
+		     "taken as a fill: %s\n",
+		     program.shader_hash, shape.c_str(), input.threads_num[0], input.threads_num[1],
+		     input.threads_num[2], input.dispatch_thread_dimensions ? " (thread counts)" : "", i,
+		     r.Base48(), bytes, mapped, r.fields[0], r.fields[1], r.fields[2], r.fields[3],
+		     r.Stride(), r.NumRecords(), r.RawFormat(), user.c_str(),
+		     static_cast<uint32_t>(fill.kind), fill.words, fill.value,
+		     fill_why != nullptr ? fill_why : "(not checked)");
+	}
 }
 
 bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
@@ -1129,24 +1270,47 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			return;
 		}
 	}
-	// A buffer fill that found no image to clear runs as a buffer write. Noted once recorded (its
-	// own write forgets older fills there): a target created inside it later starts as the fill,
-	// the bytes of it that are not mapped now among them (TextureCache::ClearsTargetsFromFills).
+	// A buffer fill that found no image to clear. Over memory with holes in its mappings (sparse
+	// memory, as the top-down depth maps of a track), the hardware writes the mapped pages and
+	// drops the rest; a binding stops at the first hole, so its mapped pages after it are filled
+	// one by one instead of running the dispatch (KYTY_SPARSE_FILLS=0 runs it as before).
+	// Otherwise it runs as a buffer write, noted once recorded (its own write forgets older fills
+	// there): a target created inside it later starts as the fill (ClearsTargetsFromFills).
 	struct {
 		uint64_t address = 0;
 		uint64_t size    = 0;
 		uint32_t value   = 0;
 	} fill_note;
-	if (TextureCache::ClearsTargetsFromFills() && resources.specialization_reads.empty()) {
+	const char* fill_why = "its program is specialized on guest memory it reads";
+	if (resources.specialization_reads.empty()) {
 		ShaderBufferResource fill_descriptor;
 		uint32_t             fill_value    = 0;
 		uint64_t             fill_size     = 0;
 		constexpr uint64_t   SmallestNoted = 64u * 1024u;
-		if (ResolveComputeBufferFill(input_info, thread_group_x, thread_group_y, thread_group_z,
-		                             mode, fill_descriptor, fill_value, fill_size) &&
-		    fill_size >= SmallestNoted) {
+		const bool           fill =
+		    ResolveComputeBufferFill(input_info, thread_group_x, thread_group_y, thread_group_z,
+		                             mode, fill_descriptor, fill_value, fill_size, &fill_why);
+		if (fill && SparseFills() &&
+		    FillMappedParts(m_context, program.shader_hash, fill_descriptor.Base48(), fill_size,
+		                    fill_value)) {
+			if (FrameGraph::Logging()) {
+				FrameGraph::Log("  consumed as a fill of the mapped parts of 0x%012" PRIx64
+				                "+0x%" PRIx64 ": cs %016" PRIx64,
+				                fill_descriptor.Base48(), fill_size, program.shader_hash);
+			}
+			ResetBindings();
+			return;
+		}
+		if (fill && TextureCache::ClearsTargetsFromFills() && fill_size >= SmallestNoted) {
 			fill_note = {fill_descriptor.Base48(), fill_size, fill_value};
 		}
+		if (fill) {
+			fill_why = nullptr;
+		}
+	}
+	if (fill_why != nullptr) {
+		const uint32_t groups[] = {thread_group_x, thread_group_y, thread_group_z};
+		ReportWritesOverHoles(input_info, fill_why, groups, 0, mode);
 	}
 
 	if (use_thread_dimensions) {
@@ -1396,6 +1560,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const TraceShaderScope trace_shader(input_info.stage.program->shader_hash);
 	PrepareBindings(input_info.stage, bindings);
 	const auto& program = *input_info.stage.program;
+	ReportWritesOverHoles(input_info, "an indirect dispatch is not checked for a fill", nullptr,
+	                      args_addr, mode);
 	if (program.info.uses_dma) {
 		PrefaultDmaPointers(m_context.GetBufferCache(), input_info.stage);
 	}

@@ -1122,6 +1122,52 @@ void TestReserveMapFixedAndNoOverwrite() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// The committed parts of a range with holes in its mappings: what a GPU write over sparse memory
+// lands in (TryClampRangeSize stops at the first hole).
+void TestCommittedSpansAcrossHoles() {
+	const char* test = "CommittedSpansAcrossHoles";
+	void*       addr = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&addr, SceKernelPageSize * 4, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(addr);
+	for (const uint64_t page: {uint64_t {0}, uint64_t {2}}) {
+		void* fixed = reinterpret_cast<void*>(base + SceKernelPageSize * page);
+		CheckOk(test,
+		        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+		            &fixed, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, "span"),
+		        "KernelMapNamedFlexibleMemory(fixed)");
+	}
+	Check(test,
+	      Libs::LibKernel::Memory::TryClampRangeSize(base, SceKernelPageSize * 4) ==
+	          SceKernelPageSize,
+	      "the clamp did not stop at the first hole");
+	std::vector<std::pair<uint64_t, uint64_t>> spans;
+	Check(test,
+	      Libs::LibKernel::Memory::CommittedSpans(base, SceKernelPageSize * 4, 8, &spans) &&
+	          spans.size() == 2 && spans[0].first == base && spans[0].second == SceKernelPageSize &&
+	          spans[1].first == base + SceKernelPageSize * 2 &&
+	          spans[1].second == SceKernelPageSize,
+	      "the committed spans are not the two mapped pages");
+	Check(test,
+	      Libs::LibKernel::Memory::CommittedSpans(base + SceKernelPageSize, SceKernelPageSize * 2,
+	                                              8, &spans) &&
+	          spans.size() == 1 && spans[0].first == base + SceKernelPageSize * 2,
+	      "a range starting in a hole lost its mapped page");
+	Check(test,
+	      !Libs::LibKernel::Memory::CommittedSpans(base, SceKernelPageSize * 4, 1, &spans) &&
+	          spans.empty(),
+	      "more spans than asked for were not refused");
+	for (uint64_t page = 0; page < 4; page++) {
+		CheckOk(test,
+		        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize * page,
+		                                              SceKernelPageSize),
+		        "KernelMunmap(cleanup)");
+	}
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestFixedNoOverwriteRejectsReservedRange() {
 	const char* test = "FixedNoOverwriteRejectsReservedRange";
 	void*       addr = nullptr;
@@ -4287,6 +4333,7 @@ int main(int argc, char** argv) {
 	RunTest(TestDirectReleaseRollbackRestoresOwnerMapping);
 	RunTest(TestDirectReleaseContracts);
 	RunTest(TestUncheckedReleaseFreesAllocatedParts);
+	RunTest(TestCommittedSpansAcrossHoles);
 	RunTest(TestNonzeroDirectOffsetAliasesSharedBacking);
 	RunTest(TestDirectMapAcrossContiguousAllocations);
 	RunTest(TestDirectPhysicalFreeRangeReuseAndCoalescing);
