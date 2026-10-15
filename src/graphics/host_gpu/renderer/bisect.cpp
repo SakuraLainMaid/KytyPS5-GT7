@@ -45,7 +45,7 @@ std::vector<std::string_view> Split(std::string_view text, char separator) {
 	std::vector<std::string_view> parts;
 	size_t                        start = 0;
 	while (start <= text.size()) {
-		const auto end = std::min(text.find(separator, start), text.size());
+		const auto end = (std::min)(text.find(separator, start), text.size());
 		if (const auto part = Trim(text.substr(start, end - start)); !part.empty()) {
 			parts.push_back(part);
 		}

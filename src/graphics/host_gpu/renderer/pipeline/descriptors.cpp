@@ -2382,7 +2382,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		}
 		auto& textures = m_context.GetTextureCache();
 		bool  big      = false;
-		bool  small    = false;
+		bool  smaller  = false; // not "small": a macro in the Windows headers
 		for (const auto& pair: program.info.sampled_pairs) {
 			if (pair.sampler != sampler || pair.image >= prepared.images.size()) {
 				continue;
@@ -2390,10 +2390,10 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			const auto* image =
 			    textures.m_slot_images.try_get(prepared.images[pair.image].image_id);
 			if (image != nullptr && image->info.IsDepth()) {
-				(image->info.extent.width >= 4096 ? big : small) = true;
+				(image->info.extent.width >= 4096 ? big : smaller) = true;
 			}
 		}
-		if (big && small) {
+		if (big && smaller) {
 			static std::mutex                   logged_mutex;
 			static std::unordered_set<uint64_t> logged;
 			std::lock_guard                     lock(logged_mutex);
