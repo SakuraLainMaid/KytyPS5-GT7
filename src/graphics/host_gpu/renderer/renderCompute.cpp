@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/gpuProfiler.h"
@@ -1257,6 +1258,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
+	// KYTY_BISECT (bisect.h): a step that leaves out this shader's dispatches.
+	if (Bisect::SkipsShader(program.shader_hash)) {
+		if (FrameGraph::Logging()) {
+			FrameGraph::Log("  not run: KYTY_BISECT leaves out cs %016" PRIx64,
+			                program.shader_hash);
+		}
+		ResetBindings();
+		return;
+	}
 	{
 		KYTY_PROFILER_BLOCK("Dispatch::TryConsumeClears");
 		if (resources.specialization_reads.empty() &&
@@ -1539,6 +1549,15 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			                ShaderDeclaredHash(cs_regs.cs_regs.data_addr));
 			FrameGraph::NoteShader("CS", ShaderDeclaredHash(cs_regs.cs_regs.data_addr),
 			                       cs_regs.cs_regs.data_addr, nullptr, 0);
+		}
+		ResetBindings();
+		return;
+	}
+	// KYTY_BISECT (bisect.h): a step that leaves out this shader's dispatches.
+	if (Bisect::SkipsShader(input_info.stage.program->shader_hash)) {
+		if (FrameGraph::Logging()) {
+			FrameGraph::Log("  not run: KYTY_BISECT leaves out cs %016" PRIx64,
+			                input_info.stage.program->shader_hash);
 		}
 		ResetBindings();
 		return;

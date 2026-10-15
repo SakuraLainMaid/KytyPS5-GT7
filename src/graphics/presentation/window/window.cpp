@@ -13,6 +13,7 @@
 #include "common/timer.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -204,6 +205,13 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 			case SDLK_F1:
 				if (!key.repeat) {
 					RenderDocRequestCapture();
+				}
+				break;
+			case SDLK_F8:
+				if (!key.repeat) {
+					if (const auto status = Bisect::Advance(); !status.empty()) {
+						SetSystemOverlayStatus(status);
+					}
 				}
 				break;
 			case SDLK_F9:

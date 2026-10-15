@@ -27,6 +27,9 @@ bool                     ProcessSystemOverlayInput(const SDL_Event& event);
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept;
 void                     NotifyTrophyUnlocked(std::string_view name, int32_t grade,
                                               std::span<const std::byte> icon_png);
+// Diagnostics: a line of text shown at the top of the screen until it is replaced, or cleared
+// with an empty one (KYTY_BISECT names its step there, so a screenshot shows which it was).
+void SetSystemOverlayStatus(std::string_view text);
 
 class SystemOverlay final {
 public:

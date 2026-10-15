@@ -15,6 +15,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -1068,14 +1069,17 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 	return {id, nullptr, std::move(desc)};
 }
 
-static vk::Sampler NativeSampler(RenderContext&                       context,
+static vk::Sampler NativeSampler(RenderContext&                                  context,
                                  const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                                 uint32_t index,
-                                 const ShaderRecompiler::IR::DescriptorValue& value) {
+                                 uint32_t index, const ShaderRecompiler::IR::DescriptorValue& value,
+                                 bool big_depth_image) {
 	auto        descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
 	const auto& sampler = program.info.samplers[index];
 	if (!sampler.depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
+	} else if (Bisect::PassesDepthCompare(big_depth_image)) {
+		// KYTY_BISECT lit:big / lit:all: the comparison always passes (ALWAYS, 7).
+		descriptor.fields[0] |= 0x7u << 12u;
 	}
 	if (sampler.force_point_filtering) {
 		descriptor.SetPointFiltering();
@@ -2369,9 +2373,42 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		prepared.images[i] = std::move(binding);
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
+	// KYTY_BISECT lit:big: whether a sampler samples a depth image 4096 or more texels wide. One
+	// sampler can serve smaller depth images too (samplers are shared by their S#), which then
+	// pass as well: logged, so a lit:big picture is read right.
+	const auto samples_big_depth = [&](uint32_t sampler) {
+		if (!Bisect::Active()) {
+			return false;
+		}
+		auto& textures = m_context.GetTextureCache();
+		bool  big      = false;
+		bool  small    = false;
+		for (const auto& pair: program.info.sampled_pairs) {
+			if (pair.sampler != sampler || pair.image >= prepared.images.size()) {
+				continue;
+			}
+			const auto* image =
+			    textures.m_slot_images.try_get(prepared.images[pair.image].image_id);
+			if (image != nullptr && image->info.IsDepth()) {
+				(image->info.extent.width >= 4096 ? big : small) = true;
+			}
+		}
+		if (big && small) {
+			static std::mutex                   logged_mutex;
+			static std::unordered_set<uint64_t> logged;
+			std::lock_guard                     lock(logged_mutex);
+			if (logged.size() < 16 && logged.insert(program.shader_hash ^ sampler).second) {
+				LOGF("Bisect: shader %016" PRIx64 " sampler %u samples a big and a smaller depth "
+				     "image: with lit:big both pass\n",
+				     program.shader_hash, sampler);
+			}
+		}
+		return big;
+	};
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 		prepared.samplers.push_back(NativeSampler(
-		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index],
+		    samples_big_depth(i)));
 	}
 	for (const auto& use: snapshot.bindless_heaps) {
 		if (m_bindless_surveyed.insert(use.base ^ (static_cast<uint64_t>(use.table_offset) << 48u))
@@ -2680,7 +2717,9 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			// this way, so every mip of GT7's reflection cubes came out one flat color per face
 			// (2026-10-15). Pixel shaders keep the whole view, as before: with one mip for them
 			// too, GT7's cars came out with broken textures in third person (probably this).
-			const bool one_mip = program.stage != ShaderType::Pixel;
+			const bool one_mip =
+			    program.stage != ShaderType::Pixel &&
+			    !Bisect::WholeUnnormalizedViews(program.stage == ShaderType::Compute);
 			auto       desc    = binding.desc;
 			if (one_mip) {
 				desc.view_info.level_count = 1;

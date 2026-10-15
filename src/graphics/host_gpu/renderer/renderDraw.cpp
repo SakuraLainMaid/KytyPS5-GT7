@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -52,6 +53,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <fmt/format.h>
@@ -322,6 +324,58 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	}
 }
 
+// Diagnostics: the raster state of the draws into depth targets 8192 or more texels wide (the
+// top-down shadow maps of a whole track), a line for each state the first time (at most 48). How
+// they are biased decides how much the ground shadows itself under a low sun.
+static void LogBigDepthDraw(const CommandBuffer& buffer, const ShaderVertexInputInfo& vs_input_info,
+                            const RenderDepthInfo& depth, bool bias_enable, float constant,
+                            float slope) {
+	const auto& info = depth.desc.info;
+	if (!depth.image_id || info.extent.width < 8192 || vs_input_info.stage.program == nullptr) {
+		return;
+	}
+	const auto& ctx  = buffer.GetRegisters();
+	const auto& mode = ctx.GetModeControl();
+	const auto& po   = ctx.GetPolyOffset();
+	const auto& vp   = ctx.GetScreenViewport().viewports[0];
+	const auto& clip = ctx.GetClipControl();
+	const auto  vs   = vs_input_info.stage.program->shader_hash;
+	uint64_t    key  = info.data.address ^ (vs * 0x9e3779b97f4a7c15ull);
+	for (const float value: {po.clamp, po.front_scale, po.front_offset, po.back_scale,
+	                         po.back_offset, vp.zscale, vp.zoffset}) {
+		key = (key ^ std::bit_cast<uint32_t>(value)) * 0x100000001b3ull;
+	}
+	key ^= (uint64_t {mode.cull_front} << 1u) | (uint64_t {mode.cull_back} << 2u) |
+	       (uint64_t {mode.face} << 3u) | (uint64_t {mode.poly_offset_front_enable} << 4u) |
+	       (uint64_t {mode.poly_offset_back_enable} << 5u) |
+	       (uint64_t {static_cast<uint32_t>(depth.depth_compare_op)} << 6u) |
+	       (uint64_t {depth.depth_write_enable} << 9u) | (uint64_t {clip.clip_disable} << 10u);
+	static std::mutex                   logged_mutex;
+	static std::unordered_set<uint64_t> logged;
+	std::lock_guard                     lock(logged_mutex);
+	if (logged.size() >= 48 || !logged.insert(key).second) {
+		return;
+	}
+	LOGF("Big depth draw: 0x%012" PRIx64 " %ux%u %s, vs %016" PRIx64
+	     ": cull front %d back %d, front face %s; offset front %d back %d, scale %g/%g, offset "
+	     "%g/%g, clamp %g, db bits %d%s -> bias %s, constant %g, slope %g; depth test %d write "
+	     "%d op %d; viewport scale %g,%g offset %g,%g z scale %g offset %g; clip disable %d, z "
+	     "clip %d\n",
+	     info.data.address, info.extent.width, info.extent.height,
+	     vk::to_string(depth.desc.view_info.format).c_str(), vs, mode.cull_front ? 1 : 0,
+	     mode.cull_back ? 1 : 0, mode.face ? "cw" : "ccw", mode.poly_offset_front_enable ? 1 : 0,
+	     mode.poly_offset_back_enable ? 1 : 0, static_cast<double>(po.front_scale),
+	     static_cast<double>(po.back_scale), static_cast<double>(po.front_offset),
+	     static_cast<double>(po.back_offset), static_cast<double>(po.clamp),
+	     static_cast<int>(po.neg_num_db_bits), po.db_is_float_fmt ? " float" : "",
+	     bias_enable ? "on" : "off", static_cast<double>(constant), static_cast<double>(slope),
+	     depth.depth_test_enable ? 1 : 0, depth.depth_write_enable ? 1 : 0,
+	     static_cast<int>(depth.depth_compare_op), static_cast<double>(vp.xscale),
+	     static_cast<double>(vp.yscale), static_cast<double>(vp.xoffset),
+	     static_cast<double>(vp.yoffset), static_cast<double>(vp.zscale),
+	     static_cast<double>(vp.zoffset), clip.clip_disable ? 1 : 0, clip.IsZClipEnabled() ? 1 : 0);
+}
+
 static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandRecorder& vk_buffer,
                                      const ShaderVertexInputInfo& vs_input_info,
                                      const RenderDepthInfo& depth, const RenderState& rendering) {
@@ -395,17 +449,19 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandR
 	const bool  use_front         = mode.poly_offset_front_enable && !mode.cull_front;
 	const bool  use_back          = mode.poly_offset_back_enable && !mode.cull_back;
 	const bool  depth_bias_enable = use_front || use_back;
+	float       constant_factor   = 0.0f;
+	float       slope_factor      = 0.0f;
 	vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
 	if (depth_bias_enable) {
 		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
 		const float guest_constant_factor =
 		    use_front ? poly_offset.front_offset : poly_offset.back_offset;
-		const float constant_factor = ConvertPolygonOffsetConstantFactor(
-		    guest_constant_factor, poly_offset, depth.desc.view_info.format);
-		const float slope_factor =
-		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
+		constant_factor = ConvertPolygonOffsetConstantFactor(guest_constant_factor, poly_offset,
+		                                                     depth.desc.view_info.format);
+		slope_factor    = (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
 		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
 	}
+	LogBigDepthDraw(buffer, vs_input_info, depth, depth_bias_enable, constant_factor, slope_factor);
 
 	vk_buffer.setStencilTestEnable(depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
 	if (depth.stencil_test_enable) {
@@ -1467,6 +1523,25 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	if (FrameGraph::Logging()) {
 		LogFrameGraphDraw(m_context, buffer, draw, state, vertex_stages, topology);
+	}
+	// KYTY_BISECT (bisect.h): a step that leaves out the draws of one of these shaders.
+	if (Bisect::Active()) {
+		uint64_t skipped = 0;
+		for (const auto& stage: vertex_stages) {
+			if (skipped == 0 && Bisect::SkipsShader(stage.stage.program->shader_hash)) {
+				skipped = stage.stage.program->shader_hash;
+			}
+		}
+		if (skipped == 0 && state.ps_active &&
+		    Bisect::SkipsShader(state.ps_input_info.stage.program->shader_hash)) {
+			skipped = state.ps_input_info.stage.program->shader_hash;
+		}
+		if (skipped != 0) {
+			if (FrameGraph::Logging()) {
+				FrameGraph::Log("  not drawn: KYTY_BISECT leaves out %016" PRIx64, skipped);
+			}
+			return;
+		}
 	}
 	// EQAA (fewer color than depth samples). KYTY_FRAME_GRAPH_EQAA=1: the first such draw (GT7's
 	// 1920x2160 rendering after a race in Frame Rate mode) asks for a frame capture (F9's).

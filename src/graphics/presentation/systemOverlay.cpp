@@ -194,6 +194,11 @@ struct TrophyNotification {
 std::mutex                     g_trophy_notification_mutex;
 std::deque<TrophyNotification> g_trophy_notifications;
 std::atomic<bool>              g_trophy_notification_active {false};
+// SetSystemOverlayStatus.
+std::mutex            g_status_mutex;
+std::string           g_status_text;
+std::atomic<bool>     g_status_active {false};
+std::atomic<uint64_t> g_status_revision {0};
 
 void ClearInputEvents() {
 	std::scoped_lock lock(g_input_mutex);
@@ -484,8 +489,17 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto dialog = DialogIme::GetVisualState();
 	const auto system = SystemDialog::GetVisualState();
 	const bool trophy_active = g_trophy_notification_active.load(std::memory_order_acquire);
-	return {core.active || dialog.active || system.active || trophy_active,
-	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u)};
+	const bool status_active = g_status_active.load(std::memory_order_acquire);
+	return {core.active || dialog.active || system.active || trophy_active || status_active,
+	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
+	            g_status_revision.load(std::memory_order_acquire)};
+}
+
+void SetSystemOverlayStatus(std::string_view text) {
+	std::scoped_lock lock(g_status_mutex);
+	g_status_text = std::string(text);
+	g_status_active.store(!g_status_text.empty(), std::memory_order_release);
+	g_status_revision.fetch_add(1, std::memory_order_acq_rel);
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -1153,11 +1167,40 @@ struct SystemOverlay::Impl {
 		draw->PopClipRect();
 	}
 
+	// SetSystemOverlayStatus: its line at the top middle of the screen, yellow on black.
+	void DrawStatus(vk::Extent2D frame_extent) {
+		std::string text;
+		{
+			std::scoped_lock lock(g_status_mutex);
+			text = g_status_text;
+		}
+		if (text.empty()) {
+			return;
+		}
+		const float  scale   = std::clamp(std::min(static_cast<float>(frame_extent.width) / 1920.0f,
+		                                           static_cast<float>(frame_extent.height) / 1080.0f),
+		                                  0.65f, 2.0f);
+		const float  size    = 22.0f * scale;
+		const float  pad     = 10.0f * scale;
+		const ImVec2 measure = ImGui::CalcTextSize(text.c_str());
+		const float  ratio   = ImGui::GetFontSize() > 0.0f ? size / ImGui::GetFontSize() : 1.0f;
+		const ImVec2 text_size {measure.x * ratio, measure.y * ratio};
+		const ImVec2 top_left {(static_cast<float>(frame_extent.width) - text_size.x) * 0.5f - pad,
+		                       6.0f * scale};
+		const ImVec2 bottom_right {top_left.x + text_size.x + 2.0f * pad,
+		                           top_left.y + text_size.y + pad};
+		auto*        draw = ImGui::GetForegroundDrawList();
+		draw->AddRectFilled(top_left, bottom_right, IM_COL32(0, 0, 0, 215), 6.0f * scale);
+		draw->AddText(nullptr, size, {top_left.x + pad, top_left.y + pad * 0.5f},
+		              IM_COL32(255, 225, 40, 255), text.c_str());
+	}
+
 	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count) {
 		OverlaySnapshot snapshot;
 		const bool      has_overlay = GetOverlaySnapshot(&snapshot);
 		const auto now = Clock::now();
-		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire)) {
+		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
+		    !g_status_active.load(std::memory_order_acquire)) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -1200,6 +1243,7 @@ struct SystemOverlay::Impl {
 			}
 		}
 		DrawTrophyNotification(frame_extent, now);
+		DrawStatus(frame_extent);
 		ImGui::Render();
 		extent = frame_extent;
 		return true;

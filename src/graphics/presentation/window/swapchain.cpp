@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
@@ -286,6 +287,14 @@ public:
 		return std::make_unique<FrameDump>(graphics, folder, interval);
 	}
 
+	// KYTY_BISECT (bisect.h): the pictures F8 asks for, as JPEG files in image-dumps (next to the
+	// log, where the frame captures' pictures go).
+	static std::unique_ptr<FrameDump> ForPictures(GraphicContext& graphics) {
+		std::error_code error;
+		std::filesystem::create_directories("image-dumps", error);
+		return std::make_unique<FrameDump>(graphics, "image-dumps", 0);
+	}
+
 	FrameDump(GraphicContext& graphics, std::string folder, int interval)
 	    : m_graphics(graphics), m_folder(std::move(folder)), m_interval(interval),
 	      m_start(std::chrono::steady_clock::now()) {}
@@ -366,13 +375,13 @@ public:
 		                        1, &to_host, 0, nullptr);
 	}
 
+	// The next Write's file name (no extension): a JPEG of that name instead of the periodic BMP.
+	void Name(std::string name) { m_name = std::move(name); }
+
 	void Write(uint64_t presented) {
 		RequireVulkanSuccess(static_cast<vk::Result>(vmaInvalidateAllocation(
 		                         m_graphics.allocator, m_buffer_allocation, 0, VK_WHOLE_SIZE)),
 		                     "invalidate frame dump buffer");
-		char name[32];
-		std::snprintf(name, sizeof(name), "frame_%04u.bmp", m_seconds);
-		const auto path = (std::filesystem::path(m_folder) / name).string();
 		// RGB only: the frame's alpha is whatever the game left there.
 		const auto*          rgba = static_cast<const uint8_t*>(m_mapped);
 		std::vector<uint8_t> rgb(static_cast<size_t>(m_extent.width) * m_extent.height * 3u);
@@ -381,6 +390,20 @@ public:
 			rgb[pixel * 3u + 1u] = rgba[pixel * 4u + 1u];
 			rgb[pixel * 3u + 2u] = rgba[pixel * 4u + 2u];
 		}
+		if (!m_name.empty()) {
+			const auto path = (std::filesystem::path(m_folder) / (m_name + ".jpg")).string();
+			const bool ok =
+			    stbi_write_jpg(path.c_str(), static_cast<int>(m_extent.width),
+			                   static_cast<int>(m_extent.height), 3, rgb.data(), 88) != 0;
+			LOGF("Bisect: %s the picture %s (%ux%u, presented frame %" PRIu64 ")\n",
+			     ok ? "wrote" : "failed to write", path.c_str(), m_extent.width, m_extent.height,
+			     presented);
+			m_name.clear();
+			return;
+		}
+		char name[32];
+		std::snprintf(name, sizeof(name), "frame_%04u.bmp", m_seconds);
+		const auto path = (std::filesystem::path(m_folder) / name).string();
 		const bool ok = stbi_write_bmp(path.c_str(), static_cast<int>(m_extent.width),
 		                               static_cast<int>(m_extent.height), 3, rgb.data()) != 0;
 		LOGF("Frame dump: %s %s (%ux%u, presented frame %" PRIu64 ")\n",
@@ -433,6 +456,7 @@ private:
 
 	GraphicContext&                       m_graphics;
 	std::string                           m_folder;
+	std::string                           m_name;
 	int                                   m_interval = 15;
 	std::chrono::steady_clock::time_point m_start;
 	uint32_t                              m_next    = 1;
@@ -537,8 +561,10 @@ struct Presenter::Impl {
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
-	// Declared last: destroyed first, while the device is still alive.
+	// Declared last: destroyed first, while the device is still alive. bisect_pictures holds
+	// KYTY_BISECT's pictures (bisect.h).
 	std::unique_ptr<FrameDump> frame_dump;
+	std::unique_ptr<FrameDump> bisect_pictures;
 };
 
 void Swapchain::Create() {
@@ -1179,6 +1205,7 @@ void Presenter::Impl::Present() {
 			continue;
 		}
 		bool     dumped    = false;
+		bool     pictured  = false;
 		uint64_t dump_tick = 0;
 		{
 			Common::LockGuard render_lock(renderer.GetMutex());
@@ -1191,6 +1218,19 @@ void Presenter::Impl::Present() {
 				frame_dump->Record(command.Handle(), *layers[0].frame);
 				dumped = true;
 			}
+			// KYTY_BISECT: the picture F8 asked for, of this frame as the step before drew it;
+			// the next step goes on after it.
+			if (auto picture = Bisect::TakePictureRequest(); !picture.empty()) {
+				if (layers[0].frame != nullptr) {
+					if (bisect_pictures == nullptr) {
+						bisect_pictures = FrameDump::ForPictures(window.graphic_ctx);
+					}
+					bisect_pictures->Name(std::move(picture));
+					bisect_pictures->Record(command.Handle(), *layers[0].frame);
+					pictured = true;
+				}
+				Bisect::ApplyPending();
+			}
 			const auto tick = swapchain.Submit(present_scheduler);
 			for (const auto& layer: layers) {
 				if (layer.frame != nullptr) {
@@ -1199,9 +1239,16 @@ void Presenter::Impl::Present() {
 			}
 			dump_tick = tick;
 		}
-		if (dumped) {
+		if (dumped || pictured) {
 			present_scheduler.Wait(dump_tick);
-			frame_dump->Write(window.graphic_ctx.presented_frames.load(std::memory_order_relaxed));
+			const auto presented =
+			    window.graphic_ctx.presented_frames.load(std::memory_order_relaxed);
+			if (dumped) {
+				frame_dump->Write(presented);
+			}
+			if (pictured) {
+				bisect_pictures->Write(presented);
+			}
 		}
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {
