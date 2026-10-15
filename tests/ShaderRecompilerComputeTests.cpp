@@ -1945,6 +1945,8 @@ struct GraphicsCase {
   u32 pixel_perspective_centroid_vgpr = UINT32_MAX;
   u32 pixel_custom_interpolation_mask = 0;
   u32 pixel_target_half_float_mask = 0;
+  // SPI_SHADER_COL_FORMAT's export format for MRT0 (0: none set).
+  u32 pixel_target_output_mode = 0;
 };
 
 struct CompiledShader {
@@ -2364,6 +2366,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   pixel_info.ps_perspective_centroid_vgpr = test.pixel_perspective_centroid_vgpr;
   pixel_info.custom_interpolation_mask = test.pixel_custom_interpolation_mask;
   pixel_info.target_half_float_mask = test.pixel_target_half_float_mask;
+  pixel_info.target_output_mode[0] = static_cast<uint8_t>(test.pixel_target_output_mode);
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
     pixel_info.interpolator_settings[i] = i;
   }
@@ -39042,6 +39045,46 @@ void CheckFloatStoreClamp() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// A packed (compr) color export is unpacked as its SPI_SHADER_COL_FORMAT export format says:
+// halves (FP16_ABGR, and when none is set), UNORM16_ABGR, SNORM16_ABGR.
+void CheckPackedExportFormats() {
+  constexpr const char *name = "PackedExportFormats";
+  struct Mode {
+    u32 mode;
+    const char *unpack;
+  };
+  constexpr std::array<Mode, 4> modes{{{0, "UnpackHalf2x16"},
+                                       {4, "UnpackHalf2x16"},
+                                       {5, "UnpackUnorm2x16"},
+                                       {6, "UnpackSnorm2x16"}}};
+  constexpr std::array<const char *, 3> unpacks{"UnpackHalf2x16", "UnpackUnorm2x16",
+                                                "UnpackSnorm2x16"};
+  for (const auto &mode : modes) {
+    GraphicsCase test;
+    test.name = name;
+    // 0.5, -0.25 and 1.0, -1.0 as SNORM16 pairs.
+    AppendVMovLiteral(&test.fragment_code, 0, 0xe0004000u);
+    AppendVMovLiteral(&test.fragment_code, 1, 0x80017fffu);
+    test.fragment_code.push_back(EncodeExp0(0x00, 0xf, true, true));
+    test.fragment_code.push_back(EncodeExp1(0, 1, 0, 0));
+    AppendEnd(&test.fragment_code);
+    test.pixel_target_output_mode = mode.mode;
+    const auto compiled = CompileFragmentCase(test);
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string text;
+    Require(name, "SPIR-V disassembly", tools.Disassemble(compiled.spirv, &text),
+            "failed to disassemble emitted SPIR-V");
+    for (const auto *unpack : unpacks) {
+      const bool expected = std::strcmp(unpack, mode.unpack) == 0;
+      Require(name, unpack,
+              (text.find(std::string(" ") + unpack + " ") != std::string::npos) == expected,
+              expected ? "a packed export is not unpacked as its export format says"
+                       : "a packed export is unpacked as another export format");
+    }
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckNativeImageDescriptorTypes() {
   using ShaderRecompiler::IR::DescriptorBindingKind;
   using ShaderRecompiler::IR::FirstImageBinding;
@@ -41352,6 +41395,7 @@ int main(int argc, char **argv) {
   CheckDeadImageViewScrub();
   CheckPixelRateSampleIdVariant();
   CheckFloatStoreClamp();
+  CheckPackedExportFormats();
   CheckShaderProbe();
   CheckRayTracingHitCallsReturn();
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {

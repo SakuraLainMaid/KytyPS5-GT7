@@ -1444,6 +1444,14 @@ void TestSpirvRequirementsAnalysis() {
             !add_tid_requirements.subgroup_ballot &&
             !add_tid_requirements.subgroup_shuffle,
         "buffer ADD_TID requested the wrong subgroup contract");
+  // Graphics stages add the lane too (a pixel shader of GT7's license tests binds such a V#).
+  for (const auto stage : {ShaderType::Vertex, ShaderType::Pixel}) {
+    add_tid.stage = stage;
+    Check(ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(add_tid)
+              .subgroup_local_invocation_id,
+          "graphics buffer ADD_TID did not request the lane");
+  }
+  add_tid.stage = ShaderType::Compute;
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   ExpectFatal(
@@ -1452,12 +1460,6 @@ void TestSpirvRequirementsAnalysis() {
         ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(add_tid);
       },
       "invalid buffer requirement metadata did not terminate analysis");
-  ExpectFatal(
-      [&] {
-        add_tid.stage = ShaderType::Vertex;
-        ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(add_tid);
-      },
-      "graphics buffer ADD_TID did not terminate requirements analysis");
 #endif
 
   Program empty;
@@ -11095,16 +11097,19 @@ void TestEmbeddedVertexFormatSwizzle() {
     ShaderMapUserData(regs.es_regs.data_addr, mapped);
     ShaderVertexInputInfo input{};
     PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, input);
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
     if (&test == cases) {
+      // A swizzled or ADD_TID vertex buffer is read as if linear (and logged), not stopped:
+      // GT7 binds an ADD_TID one.
       for (const auto [word, flag] : {std::pair{1u, 1u << 31u}, std::pair{3u, 1u << 23u}}) {
         buffer[word] |= flag;
-        ExpectFatal([&] { PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, input); },
-                    "unsupported vertex fetch flags bypassed acquisition validation");
+        ShaderVertexInputInfo flagged{};
+        PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, flagged);
+        Check(flagged.resources_num == input.resources_num &&
+                  flagged.buffers_num == input.buffers_num,
+              "a swizzled or ADD_TID vertex buffer was not read as if linear");
         buffer[word] &= ~flag;
       }
     }
-#endif
     Frontend::EmbeddedFetchPlan fetch;
     fetch.loads.push_back({.pc = 0, .attrib_id = 0, .components = test.components});
     Frontend::TranslateOptions options{};

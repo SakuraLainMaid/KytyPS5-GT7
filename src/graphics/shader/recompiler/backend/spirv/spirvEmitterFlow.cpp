@@ -279,8 +279,21 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
                       bool uint_output) {
 	auto& state = ctx.state;
 	if (exp.compr && !uint_output) {
-		const auto unpack =
-		    MrtOutputMode(state, exp) == 5u ? GLSLstd450UnpackUnorm2x16 : GLSLstd450UnpackHalf2x16;
+		// SPI_SHADER_COL_FORMAT: a packed export holds what its format says, two 16-bit values a
+		// register (5 UNORM16_ABGR, from V_CVT_PKNORM_U16_F32; 6 SNORM16_ABGR, from
+		// V_CVT_PKNORM_I16_F32; else halves). SNORM16 read as halves came out as 0, +-1 or NaN:
+		// GT7's G-buffer normals (16_16_16_16_SNORM, which its ambient occlusion reads) were noise.
+		const auto mode   = MrtOutputMode(state, exp);
+		const auto unpack = mode == 5u   ? GLSLstd450UnpackUnorm2x16
+		                    : mode == 6u ? GLSLstd450UnpackSnorm2x16
+		                                 : GLSLstd450UnpackHalf2x16;
+		if (mode == 6u) {
+			static std::atomic<uint32_t> logged = 0;
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("Shader: SNORM16 export to MRT%u unpacked as SNORM16 hash=0x%016" PRIx64 "\n",
+				     exp.index, state.program.shader_hash);
+			}
+		}
 		uint32_t f32[4] = {ConstantF32(state, 0), ConstantF32(state, 0), ConstantF32(state, 0),
 		                   ConstantF32(state, 0x3f800000u)};
 		for (uint32_t pair = 0; pair < 2u; pair++) {

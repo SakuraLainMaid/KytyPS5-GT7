@@ -23,10 +23,9 @@ struct Skip {
 
 struct Step {
 	std::vector<Skip> skips;
-	bool              lit_big   = false;
-	bool              lit_all   = false;
-	bool              whole_cs  = false;
-	bool              whole_gfx = false;
+	bool              lit_big  = false;
+	bool              lit_all  = false;
+	bool              whole_cs = false;
 	std::string       name; // for the screen and the picture's file name
 	std::string       text; // name and actions, for the log
 };
@@ -63,9 +62,13 @@ bool ParseAction(std::string_view action, Step& step) {
 		step.lit_all = true;
 		return true;
 	}
-	if (action == "mips:whole" || action == "mips:cs" || action == "mips:graphics") {
-		step.whole_cs  = step.whole_cs || action != "mips:graphics";
-		step.whole_gfx = step.whole_gfx || action != "mips:cs";
+	if (action == "mips:whole" || action == "mips:cs") {
+		step.whole_cs = true;
+		return true;
+	}
+	if (action == "mips:graphics") {
+		LOGF("Bisect: mips:graphics changes nothing: graphics stages keep the whole view "
+		     "anyway\n");
 		return true;
 	}
 	if (action.starts_with("skip:")) {
@@ -268,15 +271,14 @@ bool PassesDepthCompare(bool big_depth_image) {
 	return true;
 }
 
-bool WholeUnnormalizedViews(bool compute) {
+bool WholeUnnormalizedViews() {
 	const auto* step = Current();
-	if (step == nullptr || !(compute ? step->whole_cs : step->whole_gfx)) {
+	if (step == nullptr || !step->whole_cs) {
 		return false;
 	}
 	if (FirstUse(4u)) {
-		LOGF("Bisect: an unnormalized sampler of a %s shader keeps the whole view, the first "
-		     "this step\n",
-		     compute ? "compute" : "graphics");
+		LOGF("Bisect: an unnormalized sampler of a compute shader keeps the whole view, the first "
+		     "this step\n");
 	}
 	return true;
 }

@@ -2710,16 +2710,16 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			binding.image_view = binding.mip_views.front();
 		} else if (binding.desc.type != TextureCache::BindingType::Storage &&
 		           binding.desc.view_info.level_count > 1 && SampledUnnormalized(i)) {
-			// Outside a pixel shader, a sampler with unnormalized coordinates (FORCE_UNNORMALIZED)
-			// reads the view's first mip on the console (no derivatives there: LOD 0). A Vulkan
-			// sampler with unnormalizedCoordinates needs a view of a single mip: with all of the
-			// T#'s, the driver read others. The SDK's mip chain shaders sample the level above
-			// this way, so every mip of GT7's reflection cubes came out one flat color per face
-			// (2026-10-15). Pixel shaders keep the whole view, as before: with one mip for them
-			// too, GT7's cars came out with broken textures in third person (probably this).
+			// A compute shader's sampler with unnormalized coordinates (FORCE_UNNORMALIZED) gets a
+			// view of the T#'s first mip, as a Vulkan sampler with unnormalizedCoordinates needs:
+			// with all of them, the driver read others. The SDK's mip chain shaders sample the
+			// level above this way, so every mip of GT7's reflection cubes came out one flat color
+			// per face (2026-10-15). Graphics stages keep the whole view, as before: GT7's hull
+			// shaders sample a depth pyramid this way at the mip they name, and with one mip its
+			// cars came out with broken textures in third person (KYTY_BISECT mips:graphics put
+			// them right, 2026-10-15).
 			const bool one_mip =
-			    program.stage != ShaderType::Pixel &&
-			    !Bisect::WholeUnnormalizedViews(program.stage == ShaderType::Compute);
+			    program.stage == ShaderType::Compute && !Bisect::WholeUnnormalizedViews();
 			auto       desc    = binding.desc;
 			if (one_mip) {
 				desc.view_info.level_count = 1;

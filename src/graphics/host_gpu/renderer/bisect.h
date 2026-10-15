@@ -16,9 +16,10 @@
 //   lit:big      depth comparisons against depth images 4096 or more texels wide (the top-down
 //                shadow maps of a whole track) pass, as if nothing cast a shadow there
 //   lit:all      every depth comparison passes: no shadow map darkens anything
-//   mips:whole   a sampler with unnormalized coordinates gets the whole view in every stage, as
-//                before 2026-10-15 (round 56); otherwise only pixel shaders do. mips:cs does so
-//                for compute shaders only, mips:graphics for the other stages only
+//   mips:cs      a compute shader's sampler with unnormalized coordinates gets the T#'s whole view,
+//                as before 2026-10-15 (round 56), instead of its first mip. Graphics stages keep
+//                the whole view anyway: mips:whole is the same as mips:cs, and mips:graphics
+//                changes nothing
 namespace Libs::Graphics::Bisect {
 
 // F8 (window thread): asks for a picture of the frame as it is and for the next step after it;
@@ -34,7 +35,8 @@ void                      ApplyPending();
 [[nodiscard]] bool Active();
 [[nodiscard]] bool SkipsShader(uint64_t hash);
 [[nodiscard]] bool PassesDepthCompare(bool big_depth_image);
-[[nodiscard]] bool WholeUnnormalizedViews(bool compute);
+// Whether a compute shader's sampler with unnormalized coordinates keeps the T#'s whole view.
+[[nodiscard]] bool WholeUnnormalizedViews();
 
 } // namespace Libs::Graphics::Bisect
 

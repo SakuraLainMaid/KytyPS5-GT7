@@ -329,10 +329,10 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					const auto bits = StorageBufferElementBits(program, memory);
 					requirements.buffer_u8 |= bits == 8u;
 					requirements.buffer_u16 |= bits == 16u;
+					// ADD_TID adds the lane to the index in every stage, as an indirect buffer's
+					// does (BufferLane). GT7's license tests bind such a V# to a pixel shader
+					// (0x6c73d01a0306c895), which stopped the emulator here.
 					if ((program.info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
-						if (program.stage != ShaderType::Compute) {
-							Fail(program, "buffer ADD_TID is only valid for compute shaders");
-						}
 						requirements.subgroup_local_invocation_id = true;
 					}
 				}

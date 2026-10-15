@@ -178,10 +178,12 @@ static void vs_check(const HW::VertexShaderInfo& vs, const HW::ShaderRegisters& 
 static void ps_check(const HW::PsStageRegisters& ps, const HW::ShaderRegisters& sh) {
 	if (sh.target_output_mode[0] != 0 && sh.target_output_mode[0] != 2 &&
 	    sh.target_output_mode[0] != 4 && sh.target_output_mode[0] != 5 &&
-	    sh.target_output_mode[0] != 7 && sh.target_output_mode[0] != 9) {
+	    sh.target_output_mode[0] != 6 && sh.target_output_mode[0] != 7 &&
+	    sh.target_output_mode[0] != 9) {
 		EXIT("Not implemented (sh.target_output_mode[0] != 0 && sh.target_output_mode[0] != 2 && "
 		     "sh.target_output_mode[0] != 4 && sh.target_output_mode[0] != 5 && "
-		     "sh.target_output_mode[0] != 7 && sh.target_output_mode[0] != 9)\n");
+		     "sh.target_output_mode[0] != 6 && sh.target_output_mode[0] != 7 && "
+		     "sh.target_output_mode[0] != 9)\n");
 	}
 	EXIT_NOT_IMPLEMENTED(sh.db_shader_control.conservative_z_export_value != 0x00000000);
 	EXIT_NOT_IMPLEMENTED(sh.db_shader_control.shader_z_behavior != 0x00000001 &&
