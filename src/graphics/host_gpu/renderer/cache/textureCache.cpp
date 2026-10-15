@@ -159,11 +159,15 @@ void ForgetLandedReadbacks(uint64_t address, uint64_t size) {
 		if (desc.type != TextureCache::BindingType::RenderTarget || !metadata.clear_register_valid) {
 			return false;
 		}
-		if (DecodePackedColorClear(format, metadata.clear_word, clear)) {
+		// The clear word holds texel bits of the guest's layout (a 10_11_11 target's differ from
+		// the host format's).
+		const auto clear_word =
+		    GuestColorWordToHost(metadata.clear_word, desc.info.GetColorTransform());
+		if (DecodePackedColorClear(format, clear_word, clear)) {
 			return true;
 		}
 		// KYTY_CLEAR_REGISTER_WIDE: 64-bit, 16-bit-channel and B10G11R11 targets (both words).
-		if (!DecodePackedColorClear64(format, metadata.clear_word, metadata.clear_word1, clear)) {
+		if (!DecodePackedColorClear64(format, clear_word, metadata.clear_word1, clear)) {
 			return false;
 		}
 		static std::mutex                   logged_mutex;
@@ -2793,7 +2797,9 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	auto&          image = m_slot_images[selected];
 	vk::ClearValue clear {};
 	if (aspect == vk::ImageAspectFlagBits::eColor) {
-		if (!DecodeColorDwordFill(image.info.pixel_format, packed_clear, clear.color)) {
+		if (!DecodeColorDwordFill(
+		        image.info.pixel_format,
+		        GuestColorWordToHost(packed_clear, image.info.GetColorTransform()), clear.color)) {
 			return false;
 		}
 	} else {
@@ -2855,7 +2861,9 @@ bool TextureCache::ClearFromKnownFill(ImageId id) {
 			return false;
 		}
 		clear.depthStencil.stencil = 0;
-	} else if (!DecodeColorDwordFill(info.pixel_format, value, clear.color)) {
+	} else if (!DecodeColorDwordFill(info.pixel_format,
+	                                 GuestColorWordToHost(value, info.GetColorTransform()),
+	                                 clear.color)) {
 		return false;
 	}
 	if (!m_buffer_cache.FillOfNewImage(info.data.address, info.data.size, value, true)) {
@@ -3469,16 +3477,15 @@ namespace {
 	return bytes / 4u;
 }
 
-// Words in a guest layout, put into the host's (the inverse of ImageInfo::GetColorTransform's
-// transfer transform): the guest's 10_11_11 keeps its 11-bit red in the high bits, the host's
-// B10G11R11 in the low ones, so the guest's bytes decoded as the host format read wrong.
+// Words in a guest layout, put into the host's (as ImageInfo::GetColorTransform's transfer
+// transform uploads them): the guest's 10_11_11 keeps its 10-bit red in the low bits and its
+// 11-bit blue in the high ones, the host's B10G11R11 the other way round
+// (Guest10_11_11ToHost), so the guest's bytes decoded as the host format read wrong.
 void GuestToHostLayout(uint32_t* words, size_t count, ColorTransform transform) {
 	switch (transform) {
 		case ColorTransform::Reverse10_11_11:
 			for (size_t i = 0; i < count; i++) {
-				const uint32_t packed = words[i];
-				words[i]              = (packed >> 21u) | (((packed >> 10u) & 0x7ffu) << 11u) |
-				           ((packed & 0x3ffu) << 22u);
+				words[i] = Guest10_11_11ToHost(words[i]);
 			}
 			break;
 		case ColorTransform::SwapBgra16:
@@ -3860,10 +3867,14 @@ void TextureCache::CompareImageWithGuest(ImageId id, const std::string& label,
 		download->Invalidate(0, range.size);
 		const auto* held   = reinterpret_cast<const uint32_t*>(download->Mapped().data());
 		size_t      differ = 0, first = words, guest_zero = 0, gpu_zero = 0;
+		// A 10_11_11 image's host blue has one mantissa bit fewer than the guest's: an upload
+		// read back differs there (Guest10_11_11ToHost), which is not a difference.
+		const uint32_t compared = transform == ColorTransform::Reverse10_11_11 ? ~(1u << 21u) : ~0u;
+		const auto     same = [&](size_t i) { return ((held[i] ^ (*guest)[i]) & compared) == 0; };
 		for (size_t i = 0; i < words; i++) {
 			guest_zero += (*guest)[i] == 0 ? 1u : 0u;
 			gpu_zero += held[i] == 0 ? 1u : 0u;
-			if (held[i] != (*guest)[i]) {
+			if (!same(i)) {
 				first = differ++ == 0 ? i : first;
 			}
 		}
@@ -3881,11 +3892,12 @@ void TextureCache::CompareImageWithGuest(ImageId id, const std::string& label,
 			std::string  glyphs;
 			glyphs.reserve(layers);
 			for (uint32_t layer = 0; layer < layers; layer++) {
-				const auto at = static_cast<size_t>(layer) * layer_words;
-				glyphs +=
-				    std::memcmp(held + at, guest->data() + at, layer_words * sizeof(uint32_t)) == 0
-				        ? '='
-				        : 'x';
+				const auto at    = static_cast<size_t>(layer) * layer_words;
+				bool       equal = true;
+				for (size_t i = at; i < at + layer_words && equal; i++) {
+					equal = same(i);
+				}
+				glyphs += equal ? '=' : 'x';
 			}
 			LOGF("%s %s %s: '=' the GPU holds the layer as guest memory does, 'x' it does not:\n",
 			     label.c_str(), gpu ? "guest-equal layers" : "stale layers", description.c_str());

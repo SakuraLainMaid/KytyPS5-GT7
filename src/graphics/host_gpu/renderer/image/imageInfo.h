@@ -19,6 +19,39 @@ namespace Libs::Graphics {
 
 enum class ColorTransform : uint32_t { None, SwapBgra16, Reverse10_11_11 };
 
+// Reverse10_11_11 (the guest's BufferFormat::k10_11_11Float): the guest word holds red in its
+// low 10 bits (5-bit exponent, 5-bit mantissa), green in the next 11 and blue in the top 11; the
+// host's B10G11R11 holds red in its low 11 bits, green in the next 11 and blue in the top 10. Each
+// component keeps its place, so the host image holds red in red and its storage, sampled and
+// target views all agree (a storage view takes no swizzle); the narrower field drops the lowest
+// mantissa bit (truncated; a NaN stays a NaN). The GPU tiler does the same
+// (gpu_tiler_color.inc).
+[[nodiscard]] constexpr uint32_t NarrowSmallFloat(uint32_t bits, uint32_t mantissa_bits) {
+	const uint32_t narrow = bits >> 1u;
+	const uint32_t mask   = (1u << mantissa_bits) - 1u;
+	const bool     nan    = (bits >> mantissa_bits) == 0x1fu && (bits & mask) != 0u;
+	return nan && (narrow & (mask >> 1u)) == 0u ? narrow | 1u : narrow;
+}
+
+[[nodiscard]] constexpr uint32_t Guest10_11_11ToHost(uint32_t packed) {
+	const uint32_t red   = packed & 0x3ffu;
+	const uint32_t green = (packed >> 10u) & 0x7ffu;
+	const uint32_t blue  = NarrowSmallFloat(packed >> 21u, 6);
+	return (red << 1u) | (green << 11u) | (blue << 22u);
+}
+
+[[nodiscard]] constexpr uint32_t Host10_11_11ToGuest(uint32_t packed) {
+	const uint32_t red   = NarrowSmallFloat(packed & 0x7ffu, 6);
+	const uint32_t green = (packed >> 11u) & 0x7ffu;
+	const uint32_t blue  = packed >> 22u;
+	return red | (green << 10u) | ((blue << 1u) << 21u);
+}
+
+// A 32-bit clear or fill word of the guest's layout in the host's.
+[[nodiscard]] constexpr uint32_t GuestColorWordToHost(uint32_t word, ColorTransform transform) {
+	return transform == ColorTransform::Reverse10_11_11 ? Guest10_11_11ToHost(word) : word;
+}
+
 enum class VideoOutCompression : uint8_t { Uncompressed, Dcc256_256_0, Dcc256_64_64, Unsupported };
 
 enum class ImageMetadataKind : uint8_t { None, Htile, Dcc, Cmask };

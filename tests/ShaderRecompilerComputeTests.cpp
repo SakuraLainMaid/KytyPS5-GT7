@@ -11486,7 +11486,8 @@ public:
       constexpr std::array<u32, 4> words{0x883005e1u, 0x7c0e81c0u,
                                          0x800f0000u, 0x98120280u};
       constexpr std::array<std::array<float, 4>, 4> channels{{
-          {1.03125f, 2.03125f, 4.0625f, 1.f}, {0.5f, 0.75f, 1.5f, 1.f},
+          // Blue's lowest mantissa bit (1/64 of 4) does not fit the host's 10-bit blue.
+          {1.03125f, 2.03125f, 4.f, 1.f}, {0.5f, 0.75f, 1.5f, 1.f},
           {0.f, 1.f, 2.f, 1.f}, {32.f, 8.f, 16.f, 1.f}}};
       const auto target = TextureGetRenderTargetFormat(
           Prospero::ChannelLayout::k10_11_11, Prospero::ChannelType::kFloat,
@@ -11494,7 +11495,7 @@ public:
       Require(name, "10_11_11 reversed render target",
               target.format == vk::Format::eB10G11R11UfloatPack32 &&
                   target.guest_format == Prospero::BufferFormat::k10_11_11Float &&
-                  target.export_mapping == Prospero::ColorMappingRgba,
+                  target.export_mapping == Prospero::ColorMappingBgra,
               "PPSA24156 reversed packed-float target lost its physical encoding");
       std::memset(mapped, 0, allocation_size);
       std::array<u32, 4> offsets{0, 4, 8, 12};
@@ -11589,7 +11590,7 @@ public:
                 "packed-float guest texel is inaccessible");
       }
       Require(name, "10_11_11 exact guest words",
-              guest == std::array<u32, 4>{0x90110200u, 0x90110200u, 0x90110200u, 0x90110200u},
+              guest == std::array<u32, 4>{0x80110240u, 0x80110240u, 0x80110240u, 0x80110240u},
               "native packed-float write lost the guest 10/11/11 bit layout");
 
       clear({16.f, 8.f, 4.f, 1.f});
@@ -11604,7 +11605,7 @@ public:
       Require(name, "same-format transformed alias",
               alias != binding.image_id &&
                   ReadCachedTexel(name, context, alias, {}, {4, 1, 1}) ==
-                      std::vector<u32>(4, 0x98120220u),
+                      std::vector<u32>(4, 0x88120260u),
               "packed-float alias reused a transformed image or bypassed guest bytes");
       RenderExecutorTestAccess::ResetBindings(executor);
       context.UnmapMemory(base, allocation_size);

@@ -13222,6 +13222,29 @@ void TestRenderTargetReverseExportMapping() {
             standard_1555.export_mapping == Prospero::ColorMappingAbgr,
         "1:5:5:5 render target did not preserve its low one-bit component");
 
+  // The guest's 10_11_11 float (red 10 bits at the bottom, blue 11 at the top): the host image
+  // holds red in red, so a storage view (no swizzle) agrees with sampled and target views; the
+  // transfers convert the bits, each component keeping its place.
+  const auto standard_101111 = TextureGetRenderTargetFormat(
+      Prospero::ChannelLayout::k10_11_11, Prospero::ChannelType::kFloat,
+      Prospero::ChannelOrder::kStandard);
+  const auto reversed_101111 = TextureGetRenderTargetFormat(
+      Prospero::ChannelLayout::k10_11_11, Prospero::ChannelType::kFloat,
+      Prospero::ChannelOrder::kReversed);
+  Check(standard_101111.format == vk::Format::eB10G11R11UfloatPack32 &&
+            standard_101111.export_mapping.IsIdentity() &&
+            reversed_101111.export_mapping == Prospero::ColorMappingBgra &&
+            TextureGetSurfaceFormatInfo(Prospero::BufferFormat::k10_11_11Float)
+                .host_to_storage.IsIdentity(),
+        "10_11_11 float images held a component mapping a storage view cannot apply");
+  // 0x883005e1: red 1.03125 (0x1e1), green 2.03125 (0x401), blue 4.0625 (0x441, its lowest
+  // mantissa bit dropped in the host's 10-bit blue).
+  Check(Guest10_11_11ToHost(0x883005e1u) == (0x3c2u | (0x401u << 11u) | (0x220u << 22u)) &&
+            Host10_11_11ToGuest(0x3c2u | (0x401u << 11u) | (0x220u << 22u)) == 0x881005e1u &&
+            Host10_11_11ToGuest(Guest10_11_11ToHost(0x7c0e81c0u)) == 0x7c0e81c0u &&
+            NarrowSmallFloat(0x7c1u, 6) == 0x3e1u && NarrowSmallFloat(0x7c0u, 6) == 0x3e0u,
+        "10_11_11 guest words were not converted component by component");
+
   const auto argb = TextureGetRenderTargetFormat(
       Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
       Prospero::ChannelOrder::kAltReversed);

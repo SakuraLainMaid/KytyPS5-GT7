@@ -35,8 +35,12 @@ struct HostFormatInfo {
 
 HostFormatInfo ResolveHostFormat(Prospero::BufferFormat guest_format,
                                  Prospero::ChannelOrder order) {
+	// The host image holds red in red (the transfers convert the bits, Guest10_11_11ToHost): with a
+	// mapping here (blue held in red, losslessly), what a storage view stored, which takes no
+	// swizzle, came back with red and blue swapped when sampled. GT7's light probe arrays are this
+	// format, written by compute and sampled: orange street light lit the night blue (2026-10-15).
 	if (guest_format == Prospero::BufferFormat::k10_11_11Float) {
-		return {vk::Format::eB10G11R11UfloatPack32, Prospero::ColorMappingBgra};
+		return {vk::Format::eB10G11R11UfloatPack32, {}};
 	}
 	if (order == Prospero::ChannelOrder::kAlt) {
 		switch (guest_format) {
