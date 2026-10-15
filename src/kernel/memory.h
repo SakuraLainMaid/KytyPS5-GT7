@@ -149,6 +149,8 @@ bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data,
 // false (and no spans) when there are more.
 [[nodiscard]] bool     CommittedSpans(uint64_t vaddr, uint64_t size, size_t max_spans,
                                       std::vector<std::pair<uint64_t, uint64_t>>* spans);
+// From vaddr to the end of the last committed byte of [vaddr, vaddr + size) (0 when none is).
+[[nodiscard]] uint64_t CommittedExtent(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 // Diagnostics: KYTY_TRACE_MEMORY=0x<address>+<size>[,...]. What happens to these guest ranges is
 // logged as "Trace memory: ...": the kernel's mappings over them (maps, unmaps, protection

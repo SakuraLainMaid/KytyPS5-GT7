@@ -635,6 +635,28 @@ public:
 		return true;
 	}
 
+	uint64_t CommittedExtent(uint64_t start, uint64_t size) {
+		Common::LockGuard lock(m_mutex);
+		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
+			return 0;
+		}
+		const auto generation = m_coverage_generation.load(std::memory_order_relaxed);
+		if (m_spans_generation != generation) {
+			RebuildSpansUnlocked();
+			m_spans_generation = generation;
+		}
+		const auto end = start + size;
+		// The last span that starts before the end.
+		auto span = std::lower_bound(
+		    m_spans.begin(), m_spans.end(), end,
+		    [](const Span& candidate, uint64_t value) { return candidate.start < value; });
+		if (span == m_spans.begin()) {
+			return 0;
+		}
+		--span;
+		return span->end > start ? std::min(end, span->end) - start : 0;
+	}
+
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
 
@@ -1264,6 +1286,10 @@ bool CommittedSpans(uint64_t vaddr, uint64_t size, size_t max_spans,
 		return true;
 	}
 	return g_virtual_ranges->CommittedSpans(vaddr, size, max_spans, spans);
+}
+
+uint64_t CommittedExtent(uint64_t vaddr, uint64_t size) {
+	return g_virtual_ranges != nullptr ? g_virtual_ranges->CommittedExtent(vaddr, size) : size;
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {

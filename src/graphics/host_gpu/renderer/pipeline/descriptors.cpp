@@ -36,6 +36,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
+#include <set>
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
@@ -2383,6 +2384,44 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 }
 
+// KYTY_SPARSE_WRITES=0: a written buffer over memory with holes is bound up to its first hole.
+static bool SparseWrites() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SPARSE_WRITES");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// A written buffer binding over memory with holes in its mappings (sparse memory: the game maps
+// 64 KB pages only where it needs them) is bound to the end of its last mapped byte, holes and
+// all, instead of up to the first hole: the hardware's stores land in every mapped page (those to
+// a hole are dropped, and in the emulator they stay in the cached buffer, never written back).
+// Up to 1 GB and the device's storage-buffer range; `clamped` (up to the first hole) otherwise.
+static uint64_t SparseWriteSize(RenderContext& context, uint64_t shader, uint64_t address,
+                                uint64_t requested, uint64_t clamped) {
+	if (!SparseWrites()) {
+		return clamped;
+	}
+	const auto extent = Libs::LibKernel::Memory::CommittedExtent(address, requested);
+	const auto limit  = std::min<uint64_t>(
+        uint64_t {1} << 30u,
+        context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange - 256u);
+	if (extent <= clamped || extent > limit) {
+		return clamped;
+	}
+	static std::mutex                              mutex;
+	static std::set<std::pair<uint64_t, uint64_t>> logged;
+	std::lock_guard                                lock(mutex);
+	if (logged.size() < 32 && logged.insert({shader, address}).second) {
+		LOGF("RenderExecutor: shader %016" PRIx64 " writes 0x%016" PRIx64 "+0x%" PRIx64
+		     " over memory with holes: bound to its last mapped byte, 0x%" PRIx64
+		     " (up to the first hole it was 0x%" PRIx64 ")\n",
+		     shader, address, requested, extent, clamped);
+	}
+	return extent;
+}
+
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -2421,6 +2460,10 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		{
 			KYTY_PROFILER_BLOCK("FindBuffers::ClampRangeSize");
 			size = Libs::LibKernel::Memory::TryClampRangeSize(address, requested_size);
+		}
+		if (size != requested_size && resource < program.info.buffers.size() &&
+		    program.info.buffers[resource].written) {
+			size = SparseWriteSize(m_context, program.shader_hash, address, requested_size, size);
 		}
 		if (size == 0) {
 			// Nothing is mapped at the base yet. Streaming titles bind regions they back later (a

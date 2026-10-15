@@ -969,9 +969,9 @@ static bool FillMappedParts(RenderContext& context, uint64_t shader, uint64_t ba
 	return true;
 }
 
-// Diagnostics: a compute shader's buffer write over memory with holes in its mappings stops at
-// the first hole. Each such (shader, address) is logged once (the first 32) with the dispatch, its
-// V# and user data, and why it was not taken as a fill.
+// Diagnostics: a compute shader's buffer write over memory with holes in its mappings (bound
+// across them, SparseWriteSize in descriptors.cpp). Each such (shader, address) is logged once
+// (the first 32) with the dispatch, its V# and user data, and why it was not taken as a fill.
 // `groups`: the dispatch's group counts, or null for an indirect one (`args` holds its address).
 static void ReportWritesOverHoles(const ShaderComputeInputInfo& input, const char* fill_why,
                                   const uint32_t* groups, uint64_t args, uint32_t mode) {
@@ -1027,8 +1027,8 @@ static void ReportWritesOverHoles(const ShaderComputeInputInfo& input, const cha
 		}
 		const auto& fill = resources.uniform_fill;
 		LOGF("GraphicsRenderDispatch: cs %016" PRIx64 " %s threads %ux%ux%u%s writes buf[%u] "
-		     "0x%012" PRIx64 "+0x%" PRIx64 " over memory with holes: a binding stops at the first, "
-		     "0x%" PRIx64 " in, with mapped pieces past it; V# [%08x %08x %08x %08x] stride %u "
+		     "0x%012" PRIx64 "+0x%" PRIx64 " over memory with holes (its first 0x%" PRIx64
+		     " bytes mapped, more mapped pieces past them); V# [%08x %08x %08x %08x] stride %u "
 		     "records %u fmt %u; user data%s; uniform fill: kind %u words %u value 0x%08x; not "
 		     "taken as a fill: %s\n",
 		     program.shader_hash, shape.c_str(), input.threads_num[0], input.threads_num[1],

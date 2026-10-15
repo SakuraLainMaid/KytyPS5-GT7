@@ -1159,6 +1159,17 @@ void TestCommittedSpansAcrossHoles() {
 	      !Libs::LibKernel::Memory::CommittedSpans(base, SceKernelPageSize * 4, 1, &spans) &&
 	          spans.empty(),
 	      "more spans than asked for were not refused");
+	Check(test,
+	      Libs::LibKernel::Memory::CommittedExtent(base, SceKernelPageSize * 4) ==
+	              SceKernelPageSize * 3 &&
+	          Libs::LibKernel::Memory::CommittedExtent(base + SceKernelPageSize,
+	                                                   SceKernelPageSize * 2) ==
+	              SceKernelPageSize * 2 &&
+	          Libs::LibKernel::Memory::CommittedExtent(base + SceKernelPageSize,
+	                                                   SceKernelPageSize) == 0 &&
+	          Libs::LibKernel::Memory::CommittedExtent(base + SceKernelPageSize * 3,
+	                                                   SceKernelPageSize) == 0,
+	      "the committed extent does not end at the last mapped byte");
 	for (uint64_t page = 0; page < 4; page++) {
 		CheckOk(test,
 		        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize * page,
