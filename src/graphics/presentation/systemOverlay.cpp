@@ -199,6 +199,24 @@ std::mutex            g_status_mutex;
 std::string           g_status_text;
 std::atomic<bool>     g_status_active {false};
 std::atomic<uint64_t> g_status_revision {0};
+// SetSystemOverlayStatusFor: when the line goes (steady-clock milliseconds), 0 for never. While
+// it shows, the presenter shows the last frame again at every refresh to draw it, which a frame
+// counter (an overlay such as Afterburner's) counts as frames.
+std::atomic<uint64_t> g_status_until_ms {0};
+
+uint64_t StatusClockMs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+bool StatusShown() {
+	if (!g_status_active.load(std::memory_order_acquire)) {
+		return false;
+	}
+	const auto until = g_status_until_ms.load(std::memory_order_acquire);
+	return until == 0 || StatusClockMs() < until;
+}
 
 void ClearInputEvents() {
 	std::scoped_lock lock(g_input_mutex);
@@ -489,17 +507,23 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto dialog = DialogIme::GetVisualState();
 	const auto system = SystemDialog::GetVisualState();
 	const bool trophy_active = g_trophy_notification_active.load(std::memory_order_acquire);
-	const bool status_active = g_status_active.load(std::memory_order_acquire);
+	const bool status_active = StatusShown();
 	return {core.active || dialog.active || system.active || trophy_active || status_active,
 	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
 	            g_status_revision.load(std::memory_order_acquire)};
 }
 
-void SetSystemOverlayStatus(std::string_view text) {
+void SetSystemOverlayStatusFor(std::string_view text, uint32_t milliseconds) {
 	std::scoped_lock lock(g_status_mutex);
+	g_status_until_ms.store(milliseconds == 0 ? 0 : StatusClockMs() + milliseconds,
+	                        std::memory_order_release);
 	g_status_text = std::string(text);
 	g_status_active.store(!g_status_text.empty(), std::memory_order_release);
 	g_status_revision.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void SetSystemOverlayStatus(std::string_view text) {
+	SetSystemOverlayStatusFor(text, 0);
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -1169,6 +1193,9 @@ struct SystemOverlay::Impl {
 
 	// SetSystemOverlayStatus: its line at the top middle of the screen, yellow on black.
 	void DrawStatus(vk::Extent2D frame_extent) {
+		if (!StatusShown()) {
+			return;
+		}
 		std::string text;
 		{
 			std::scoped_lock lock(g_status_mutex);
@@ -1200,7 +1227,7 @@ struct SystemOverlay::Impl {
 		const bool      has_overlay = GetOverlaySnapshot(&snapshot);
 		const auto now = Clock::now();
 		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
-		    !g_status_active.load(std::memory_order_acquire)) {
+		    !StatusShown()) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;

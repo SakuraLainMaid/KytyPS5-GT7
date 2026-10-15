@@ -326,6 +326,23 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	done.acquire();
 }
 
+bool GuestGpu::TrySendCommandSync(Common::UniqueFunction<void>&& command) {
+	EXIT_IF(!command);
+	if (IsGpuThread()) {
+		command();
+		return true;
+	}
+	std::binary_semaphore done {0};
+	if (!TrySendCommand([operation = std::move(command), &done]() mutable {
+		    operation();
+		    done.release();
+	    })) {
+		return false;
+	}
+	done.acquire();
+	return true;
+}
+
 void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
                       std::span<const uint32_t> constant_commands) {
 	if (draw_commands.empty()) {

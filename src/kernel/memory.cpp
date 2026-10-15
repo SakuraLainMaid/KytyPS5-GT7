@@ -1326,6 +1326,16 @@ bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noex
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 
+bool IsGpuWrittenPage(uint64_t fault_vaddr) noexcept {
+	return g_gpu_resources != nullptr && g_gpu_resources->IsGpuWrittenPage(fault_vaddr);
+}
+
+bool TryWriteGpuFaultingBytes(uint64_t pc, uint64_t fault_vaddr, uint64_t vaddr, const void* data,
+                              uint64_t size) {
+	return g_gpu_resources != nullptr &&
+	       g_gpu_resources->TryWriteFaulting(pc, fault_vaddr, vaddr, data, size);
+}
+
 struct PrtAperture {
 	uint64_t address = 0;
 	uint64_t size    = 0;

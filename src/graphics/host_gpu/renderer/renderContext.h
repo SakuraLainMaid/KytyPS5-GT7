@@ -55,6 +55,13 @@ public:
 	// but none of them is GPU-written, so guest memory already holds their value.
 	[[nodiscard]] bool CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
 	                                     uint64_t size) const noexcept;
+	// A game thread's write fault: whether its page is protected because the GPU wrote to it.
+	[[nodiscard]] bool IsGpuWrittenPage(uint64_t fault_vaddr) noexcept;
+	// A game thread's store at `pc` that faulted at fault_vaddr on such a page: written to both
+	// copies by the GPU thread (BufferCache::WriteClean), the page left protected. False to
+	// decline.
+	[[nodiscard]] bool TryWriteFaulting(uint64_t pc, uint64_t fault_vaddr, uint64_t vaddr,
+	                                    const void* data, uint64_t size) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);

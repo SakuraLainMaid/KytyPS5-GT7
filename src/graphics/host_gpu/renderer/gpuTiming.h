@@ -39,6 +39,10 @@ inline void After(RenderContext& context, CommandBuffer& buffer, uint64_t key, u
 // Called once per presented frame.
 void Present(uint64_t frame);
 
+// Any thread: times the `frames` frames presented after the next one (KYTY_BISECT's gputime:<n>),
+// besides KYTY_GPU_TIMING's window.
+void RequestFrames(uint32_t frames);
+
 } // namespace GpuTiming
 } // namespace Libs::Graphics
 

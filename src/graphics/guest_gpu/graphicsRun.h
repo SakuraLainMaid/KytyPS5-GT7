@@ -35,6 +35,8 @@ public:
 	// Like SendCommand, but false instead of exiting once the GPU no longer accepts commands.
 	bool               TrySendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+	// Like SendCommandSync, but false instead of exiting once the GPU no longer accepts commands.
+	bool TrySendCommandSync(Common::UniqueFunction<void>&& command);
 
 	// End-of-pipe labels (RELEASE_MEM without an interrupt) become visible to the CPU once the
 	// host GPU has executed the work recorded before them, as on hardware, instead of when the

@@ -200,9 +200,27 @@ void AfterSlow(RenderContext& context, CommandBuffer& buffer, uint64_t key, uint
 
 } // namespace Detail
 
+namespace {
+// RequestFrames: how many frames to time from the next present on, and the window it set (the
+// frames after the presents first .. first + count - 1, as KYTY_GPU_TIMING's).
+std::atomic<uint32_t> g_requested_frames {0};
+uint64_t              g_requested_first = UINT64_MAX; // presenter thread
+uint64_t              g_requested_count = 0;
+} // namespace
+
+void RequestFrames(uint32_t frames) {
+	g_requested_frames.store(frames, std::memory_order_release);
+}
+
 void Present(uint64_t frame) {
 	const auto& window = GetWindow();
-	if (window.count == 0) {
+	if (const auto requested = g_requested_frames.exchange(0, std::memory_order_acq_rel);
+	    requested != 0) {
+		g_requested_first = frame;
+		g_requested_count = requested;
+	}
+	const bool requested_window = g_requested_count != 0;
+	if (window.count == 0 && !requested_window) {
 		return;
 	}
 	auto& state = GetState();
@@ -237,7 +255,15 @@ void Present(uint64_t frame) {
 		const auto watched = WatchedShaderFirstFrame();
 		first              = watched != UINT64_MAX ? watched + window.first : UINT64_MAX;
 	}
-	const bool active = first != UINT64_MAX && frame >= first && frame - first < window.count;
+	bool active =
+	    window.count != 0 && first != UINT64_MAX && frame >= first && frame - first < window.count;
+	if (requested_window) {
+		if (frame >= g_requested_first && frame - g_requested_first < g_requested_count) {
+			active = true;
+		} else if (frame >= g_requested_first) {
+			g_requested_count = 0;
+		}
+	}
 	Detail::g_active.store(active, std::memory_order_relaxed);
 }
 

@@ -3,6 +3,7 @@
 #include "common/cpuAffinity.h"
 #include "common/logging/log.h"
 #include "common/perfStats.h"
+#include "graphics/host_gpu/renderer/gpuTiming.h"
 
 #include <algorithm>
 #include <atomic>
@@ -29,6 +30,8 @@ struct Step {
 	bool              lit_all     = false;
 	bool              whole_cs    = false;
 	bool              log_off     = false;
+	bool              writes_off  = false;
+	uint32_t          gpu_frames  = 0;  // gputime:<n>
 	int64_t           readback_kb = -1; // -1: the usual window
 	std::string       cpu_set;          // empty: as at the start
 	std::string       name;             // for the screen and the picture's file name
@@ -74,6 +77,20 @@ bool ParseAction(std::string_view action, Step& step) {
 	if (action == "log:off") {
 		step.log_off = true;
 		return true;
+	}
+	if (action == "writes:off") {
+		step.writes_off = true;
+		return true;
+	}
+	if (action.starts_with("gputime:")) {
+		const auto frames = action.substr(8);
+		if (frames.empty() || frames.size() > 4 ||
+		    frames.find_first_not_of("0123456789") != std::string_view::npos) {
+			return false;
+		}
+		step.gpu_frames =
+		    static_cast<uint32_t>(std::strtoul(std::string(frames).c_str(), nullptr, 10));
+		return step.gpu_frames != 0;
 	}
 	if (action == "cpu:vcache" || action == "cpu:frequency" || action == "cpu:all") {
 		step.cpu_set = std::string(action.substr(4));
@@ -199,6 +216,11 @@ void ApplyEffects() {
 	const Step* step    = current == 0 || current > steps.size() ? nullptr : &steps[current - 1];
 	Common::PerfStats::SetConfiguration(step != nullptr ? step->name : std::string("normal"));
 	Log::SetMuted(step != nullptr && step->log_off);
+	if (step != nullptr && step->gpu_frames != 0) {
+		GpuTiming::RequestFrames(step->gpu_frames);
+		Log::WriteUnmuted(fmt::format("Bisect: gputime: timing the next {} frames on the GPU\n",
+		                              step->gpu_frames));
+	}
 	static std::string applied = StartCpuSet();
 	const auto wanted = step != nullptr && !step->cpu_set.empty() ? step->cpu_set : StartCpuSet();
 	if (wanted != applied) {
@@ -329,6 +351,11 @@ void Start() {
 int64_t ReadbackWindowKB() {
 	const auto* step = Current();
 	return step != nullptr ? step->readback_kb : -1;
+}
+
+bool CleanWritesOff() {
+	const auto* step = Current();
+	return step != nullptr && step->writes_off;
 }
 
 bool WholeUnnormalizedViews() {

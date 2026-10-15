@@ -2,19 +2,24 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/presentation/videoOut.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -118,6 +123,104 @@ bool RenderContext::CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
                                       uint64_t size) const noexcept {
 	return IsMapped(vaddr, size) && m_page_manager.IsReadWatched(fault_vaddr) &&
 	       m_buffer_cache.IsCleanForConcurrentRead(vaddr, size);
+}
+
+namespace {
+
+// Stores done in place: each is a round trip to the GPU thread that leaves the page protected. A
+// page the CPU writes over many times (a structure filled field by field) costs more that way than
+// one download, after which it is writable: after PageBudget of them within WindowMs, the page's
+// next store takes the download. A store that spends the budget of BulkPages pages within a second
+// is copying in bulk (a memcpy into GPU-written memory): it takes the download for BulkMs.
+constexpr uint32_t PageBudget = 8;
+constexpr uint64_t WindowMs   = 100;
+constexpr uint32_t BulkPages  = 2;
+constexpr uint64_t BulkMs     = 2000;
+
+bool TakeStoreBudget(uint64_t pc, uint64_t page) {
+	struct PageEntry {
+		uint64_t page     = UINT64_MAX;
+		uint64_t since_ms = 0;
+		uint32_t count    = 0;
+	};
+	struct SiteEntry {
+		uint64_t pc            = 0;
+		uint64_t since_ms      = 0;
+		uint32_t spent         = 0; // pages whose budget it spent since since_ms
+		uint64_t bulk_until_ms = 0;
+	};
+	static std::array<PageEntry, 1024> pages {};
+	static std::array<SiteEntry, 256>  sites {};
+	static std::mutex                  mutex;
+	const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                           std::chrono::steady_clock::now().time_since_epoch())
+	                                           .count());
+	std::scoped_lock lock(mutex);
+	auto&            site = sites[(pc ^ (pc >> 8u)) % sites.size()];
+	if (site.pc != pc) {
+		site = {pc, now, 0, 0};
+	}
+	if (now < site.bulk_until_ms) {
+		return false;
+	}
+	auto& entry = pages[(page / TRACKER_PAGE_SIZE) % pages.size()];
+	if (entry.page != page || now - entry.since_ms >= WindowMs) {
+		entry = {page, now, 0};
+	}
+	if (entry.count >= PageBudget) {
+		// This store takes the download, which leaves the page writable.
+		if (now - site.since_ms >= 1000) {
+			site.since_ms = now;
+			site.spent    = 0;
+		}
+		if (++site.spent >= BulkPages) {
+			site.bulk_until_ms = now + BulkMs;
+			site.spent         = 0;
+		}
+		return false;
+	}
+	entry.count++;
+	return true;
+}
+
+} // namespace
+
+bool RenderContext::IsGpuWrittenPage(uint64_t fault_vaddr) noexcept {
+	if (!IsMapped(fault_vaddr, 1)) {
+		return false;
+	}
+	const auto page = fault_vaddr & ~(TRACKER_PAGE_SIZE - 1);
+	return m_buffer_cache.IsRegionGpuModified(page, TRACKER_PAGE_SIZE);
+}
+
+bool RenderContext::TryWriteFaulting(uint64_t pc, uint64_t fault_vaddr, uint64_t vaddr,
+                                     const void* data, uint64_t size) noexcept {
+	if (m_gpu == nullptr || GuestGpu::IsGpuThread() || size == 0 || !IsMapped(vaddr, size)) {
+		return false;
+	}
+	// A page with no GPU-written bytes left (they were downloaded with another page) only has its
+	// protection lifted on the normal path, without a download: the stores after this one are then
+	// free, where done in place each would fault again.
+	const auto page = fault_vaddr & ~(TRACKER_PAGE_SIZE - 1);
+	if (m_buffer_cache.IsCleanForConcurrentRead(page, TRACKER_PAGE_SIZE)) {
+		return false;
+	}
+	if (!TakeStoreBudget(pc, page)) {
+		Common::PerfStats::AddDeclinedStore();
+		return false;
+	}
+	bool written = false;
+	if (!m_gpu->TrySendCommandSync([this, vaddr, data, size, &written] {
+		    written = m_buffer_cache.WriteClean(vaddr, data, size);
+	    })) {
+		return false;
+	}
+	if (!written) {
+		Common::PerfStats::AddDeclinedStore();
+		return false;
+	}
+	m_bindless_table.OnCpuWrite(vaddr, size);
+	return true;
 }
 
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {

@@ -3,6 +3,7 @@
 #include "common/common.h"
 #include "common/cpuAffinity.h"
 #include "common/logging/log.h"
+#include "common/sampler.h"
 
 #include <algorithm>
 #include <array>
@@ -63,8 +64,49 @@ struct Counters {
 	std::atomic<uint64_t> fault_emulated {0};
 	std::atomic<uint64_t> long_faults {0}; // 1 ms or more
 	std::atomic<uint64_t> longest_fault_ns {0};
+
+	// Game-thread accesses through the GPU thread (BufferCache::ReadMemory).
+	std::atomic<uint64_t> readbacks {0};
+	std::atomic<uint64_t> readback_pickup_ns {0};
+	std::atomic<uint64_t> readback_record_ns {0};
+	std::atomic<uint64_t> readback_wait_ns {0};
+	std::atomic<uint64_t> readback_longest_wait_ns {0};
+	std::atomic<uint64_t> readback_steps {0};
+	std::atomic<uint64_t> readback_ticks_behind {0};
+
+	// Stores to GPU-written pages.
+	std::atomic<uint64_t> clean_stores {0};
+	std::atomic<uint64_t> clean_store_ns {0};
+	std::atomic<uint64_t> declined_stores {0};
+	std::atomic<uint64_t> unsupported_stores {0};
+
+	// The host GPU's queue: submission to completion.
+	std::atomic<uint64_t> ticks_done {0};
+	std::atomic<uint64_t> tick_latency_ns {0};
+	std::atomic<uint64_t> longest_tick_latency_ns {0};
+	std::atomic<uint64_t> ticks_submitted {0};
 };
 Counters g_counters;
+
+uint64_t NowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+void StoreMax(std::atomic<uint64_t>& longest, uint64_t value) {
+	for (auto current = longest.load(std::memory_order_relaxed);
+	     value > current &&
+	     !longest.compare_exchange_weak(current, value, std::memory_order_relaxed);) {
+	}
+}
+
+// When each recent tick was submitted, by tick modulo the ring's size; a slot belongs to the tick
+// it names.
+constexpr size_t                                TickRingSize = 4096;
+std::array<std::atomic<uint64_t>, TickRingSize> g_tick_ids {};
+std::array<std::atomic<uint64_t>, TickRingSize> g_tick_submitted_ns {};
+std::atomic<uint64_t>                           g_last_completed_tick {0};
 
 // A thread's time in faults; slots are never freed (a thread that ends keeps its last values).
 struct FaultSlot {
@@ -215,6 +257,43 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 	    static_cast<double>(longs) / seconds, static_cast<double>(longest) / 1e6,
 	    static_cast<double>(loads) / seconds, static_cast<double>(bytes) / 1e6 / seconds));
 
+	// The host GPU's queue, and what game-thread accesses to GPU-written memory wait for.
+	{
+		const auto submitted   = take(c.ticks_submitted);
+		const auto done        = take(c.ticks_done);
+		const auto latency     = take(c.tick_latency_ns);
+		const auto latency_max = take(c.longest_tick_latency_ns);
+		const auto readbacks   = take(c.readbacks);
+		const auto pickup      = take(c.readback_pickup_ns);
+		const auto record      = take(c.readback_record_ns);
+		const auto wait        = take(c.readback_wait_ns);
+		const auto wait_max    = take(c.readback_longest_wait_ns);
+		const auto steps       = take(c.readback_steps);
+		const auto behind      = take(c.readback_ticks_behind);
+		const auto stores      = take(c.clean_stores);
+		const auto store_ns    = take(c.clean_store_ns);
+		const auto declined    = take(c.declined_stores);
+		const auto unsupported = take(c.unsupported_stores);
+		const auto per         = [](uint64_t sum, uint64_t count, double unit) {
+            return count == 0 ? 0.0 : static_cast<double>(sum) / unit / static_cast<double>(count);
+		};
+		Log::WriteUnmuted(fmt::format(
+		    "Perf GPU:{} command buffers {:.0f}/s, done {:.1f} ms after submission (longest "
+		    "{:.1f}) "
+		    "| readbacks {:.0f}/s: taken up in {:.0f} us, {:.0f} us on the GPU thread, landed "
+		    "{:.2f} ms later (longest {:.1f}), {:.1f} steps, {:.1f} command buffers unfinished | "
+		    "stores to GPU-written pages done in place {:.0f}/s ({:.0f} us each), declined "
+		    "{:.0f}/s, "
+		    "not handled {:.0f}/s\n",
+		    configuration, static_cast<double>(submitted) / seconds, per(latency, done, 1e6),
+		    static_cast<double>(latency_max) / 1e6, static_cast<double>(readbacks) / seconds,
+		    per(pickup, readbacks, 1e3), per(record, readbacks, 1e3), per(wait, readbacks, 1e6),
+		    static_cast<double>(wait_max) / 1e6, per(steps, readbacks, 1.0),
+		    per(behind, readbacks, 1.0), static_cast<double>(stores) / seconds,
+		    per(store_ns, stores, 1e3), static_cast<double>(declined) / seconds,
+		    static_cast<double>(unsupported) / seconds));
+	}
+
 	// The busiest threads, and those that spent longest in faults.
 	auto                                       now_cpu = ThreadCpuTimes();
 	std::vector<std::pair<uint64_t, uint32_t>> cpu;
@@ -327,7 +406,78 @@ void AddFaultSlow(uint64_t nanoseconds, bool read, bool emulated) {
 	t_slot->ns.fetch_add(nanoseconds, std::memory_order_relaxed);
 }
 
+void AddReadbackSlow(uint64_t pickup_ns, uint64_t record_ns, uint64_t wait_ns, uint32_t steps,
+                     uint64_t ticks_behind) {
+	auto& c = g_counters;
+	c.readbacks.fetch_add(1, std::memory_order_relaxed);
+	c.readback_pickup_ns.fetch_add(pickup_ns, std::memory_order_relaxed);
+	c.readback_record_ns.fetch_add(record_ns, std::memory_order_relaxed);
+	c.readback_wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+	c.readback_steps.fetch_add(steps, std::memory_order_relaxed);
+	c.readback_ticks_behind.fetch_add(ticks_behind, std::memory_order_relaxed);
+	StoreMax(c.readback_longest_wait_ns, wait_ns);
+}
+
+void AddCleanStoreSlow(uint64_t nanoseconds) {
+	g_counters.clean_stores.fetch_add(1, std::memory_order_relaxed);
+	g_counters.clean_store_ns.fetch_add(nanoseconds, std::memory_order_relaxed);
+}
+
+void AddDeclinedStoreSlow() {
+	g_counters.declined_stores.fetch_add(1, std::memory_order_relaxed);
+}
+
+void AddUnsupportedStoreSlow() {
+	g_counters.unsupported_stores.fetch_add(1, std::memory_order_relaxed);
+}
+
+void TickSubmittedSlow(uint64_t tick) {
+	const auto slot = tick % TickRingSize;
+	g_tick_submitted_ns[slot].store(NowNs(), std::memory_order_relaxed);
+	g_tick_ids[slot].store(tick, std::memory_order_release);
+	g_counters.ticks_submitted.fetch_add(1, std::memory_order_relaxed);
+}
+
+void TickCompletedSlow(uint64_t tick) {
+	// Once per tick, the first time a waiter sees it done (several operations wait for one tick).
+	for (auto last = g_last_completed_tick.load(std::memory_order_relaxed);;) {
+		if (tick <= last) {
+			return;
+		}
+		if (g_last_completed_tick.compare_exchange_weak(last, tick, std::memory_order_relaxed)) {
+			break;
+		}
+	}
+	const auto slot = tick % TickRingSize;
+	if (g_tick_ids[slot].load(std::memory_order_acquire) != tick) {
+		return;
+	}
+	const auto submitted = g_tick_submitted_ns[slot].load(std::memory_order_relaxed);
+	const auto now       = NowNs();
+	if (now < submitted) {
+		return;
+	}
+	auto& c = g_counters;
+	c.ticks_done.fetch_add(1, std::memory_order_relaxed);
+	c.tick_latency_ns.fetch_add(now - submitted, std::memory_order_relaxed);
+	StoreMax(c.longest_tick_latency_ns, now - submitted);
+}
+
 } // namespace Detail
+
+uint32_t CurrentOsThreadId() {
+	return OsThreadId();
+}
+
+std::string ThreadNameOf(uint32_t tid) {
+	return ThreadName(tid);
+}
+
+std::vector<std::pair<uint32_t, std::string>> NamedThreads() {
+	std::scoped_lock                              lock(g_names_mutex);
+	std::vector<std::pair<uint32_t, std::string>> threads(g_names.begin(), g_names.end());
+	return threads;
+}
 
 void NameThread(const char* name) {
 	if (name == nullptr || name[0] == '\0') {
@@ -366,6 +516,7 @@ void Start() {
 			LOGF("CPU: KYTY_CPU_SET=%s: %s\n", set, description.c_str());
 			(void)ok;
 		}
+		Common::Sampler::Start();
 		if (!Enabled()) {
 			return;
 		}

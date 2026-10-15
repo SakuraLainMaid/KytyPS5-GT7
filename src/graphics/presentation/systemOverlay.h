@@ -30,6 +30,8 @@ void                     NotifyTrophyUnlocked(std::string_view name, int32_t gra
 // Diagnostics: a line of text shown at the top of the screen until it is replaced, or cleared
 // with an empty one (KYTY_BISECT names its step there, so a screenshot shows which it was).
 void SetSystemOverlayStatus(std::string_view text);
+// The same, for `milliseconds` (0: until replaced).
+void SetSystemOverlayStatusFor(std::string_view text, uint32_t milliseconds);
 
 class SystemOverlay final {
 public:

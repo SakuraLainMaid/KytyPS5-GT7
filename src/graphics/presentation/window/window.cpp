@@ -210,7 +210,9 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 			case SDLK_F8:
 				if (!key.repeat) {
 					if (const auto status = Bisect::Advance(); !status.empty()) {
-						SetSystemOverlayStatus(status);
+						// For 3 s: while it shows, the last frame is presented again at every
+						// refresh to draw it, which frame counters count as frames.
+						SetSystemOverlayStatusFor(status, 3000);
 					}
 				}
 				break;

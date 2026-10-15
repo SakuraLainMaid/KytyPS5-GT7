@@ -24,6 +24,7 @@
 #include <fmt/format.h>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -509,7 +510,10 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
-	{
+	// Every CPU write fault comes through here (tens of thousands a second in races): without
+	// known fills there is nothing to forget, and the exclusive lock only made the game's threads
+	// queue behind each other and the GPU thread.
+	if (m_known_fill_count.load(std::memory_order_relaxed) != 0) {
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		ForgetFills(vaddr, size);
 	}
@@ -589,16 +593,59 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	const bool from_gpu_thread = GuestGpu::IsGpuThread();
 	const bool async           = g_async_readback && !from_gpu_thread;
+	// KYTY_PERF: what a game thread's access waits for (the "Perf GPU:" line).
+	const bool measure = !from_gpu_thread && Common::PerfStats::Active();
+	const auto now_ns  = [] {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+		                                  .count());
+	};
+	uint64_t pickup_ns    = 0;
+	uint64_t record_ns    = 0;
+	uint64_t wait_ns      = 0;
+	uint64_t ticks_behind = 0;
+	uint32_t steps        = 0;
 	for (;;) {
-		uint64_t wait_tick = 0;
-		m_scheduler.Context().GetGpu().SendCommandSync(
-		    [this, vaddr, size, is_write, from_gpu_thread, async, &wait_tick] {
-			    wait_tick = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async);
-		    });
-		if (wait_tick == 0) {
-			return;
+		uint64_t   wait_tick = 0;
+		uint64_t   taken_up  = 0;
+		uint64_t   recorded  = 0;
+		uint64_t   behind    = 0;
+		const auto sent      = measure ? now_ns() : 0;
+		m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write,
+		                                                from_gpu_thread, async, measure, &now_ns,
+		                                                &wait_tick, &taken_up, &recorded, &behind] {
+			if (measure) {
+				taken_up     = now_ns();
+				auto& master = m_scheduler.GetMasterSemaphore();
+				master.Refresh();
+				const auto current = m_scheduler.CurrentTick();
+				const auto done    = master.KnownGpuTick();
+				behind             = current > done ? current - done - 1 : 0;
+			}
+			wait_tick = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async);
+			if (measure) {
+				recorded = now_ns();
+			}
+		});
+		if (measure) {
+			pickup_ns += taken_up - sent;
+			record_ns += recorded - taken_up;
+			if (steps == 0) {
+				ticks_behind = behind;
+			}
 		}
+		steps++;
+		if (wait_tick == 0) {
+			break;
+		}
+		const auto wait_from = measure ? now_ns() : 0;
 		m_scheduler.WaitPriorityOperations(wait_tick);
+		if (measure) {
+			wait_ns += now_ns() - wait_from;
+		}
+	}
+	if (measure) {
+		Common::PerfStats::AddReadback(pickup_ns, record_ns, wait_ns, steps, ticks_behind);
 	}
 }
 

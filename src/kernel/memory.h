@@ -137,6 +137,16 @@ void SetGpuReadDelegate(bool delegate);
 // Any thread, for a read that faulted at fault_vaddr on a page protected because the GPU wrote to
 // it: reads [vaddr, vaddr + size) from the backing store when none of those bytes is GPU-written.
 bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size);
+// A game thread's write fault: whether the faulting page is protected because the GPU wrote to it
+// (rather than only watched for CPU writes).
+[[nodiscard]] bool IsGpuWrittenPage(uint64_t fault_vaddr) noexcept;
+// A game thread, for the store at `pc` that faulted at fault_vaddr on such a page: writes [vaddr,
+// vaddr + size) to both copies (guest memory and the GPU's) through the GPU thread and leaves the
+// page protected, instead of downloading what the GPU wrote there first. False to decline (the
+// page's or the store's budget is spent, a download of these bytes is in flight, no cached buffer
+// holds them); the fault then takes the normal path.
+bool TryWriteGpuFaultingBytes(uint64_t pc, uint64_t fault_vaddr, uint64_t vaddr, const void* data,
+                              uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 // Like ClampRangeSize, but 0 for a range that starts outside committed memory instead of EXIT.
 [[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size);

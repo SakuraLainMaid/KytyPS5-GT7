@@ -1,5 +1,6 @@
 #include "common/assert.h"
 
+#include "common/hostSymbols.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "kytyGitVersion.h"
@@ -18,9 +19,60 @@
 
 namespace Common {
 
+#ifdef _WIN32
+// dbghelp is not thread-safe: two threads symbolising at once crashed inside SymFromAddr.
+static std::mutex g_symbol_mutex;
+
+// g_symbol_mutex held. Symbols come from the PDB next to the executable or one directory up (the
+// install layout keeps the PDB in the build directory).
+static bool InitializeSymbols(HANDLE process) {
+	static const bool initialized = [process] {
+		char exe_path[MAX_PATH] {};
+		GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
+		std::string search = exe_path;
+		if (const auto slash = search.find_last_of("\\/"); slash != std::string::npos) {
+			search.resize(slash);
+			std::string parent = search;
+			if (const auto up = parent.find_last_of("\\/"); up != std::string::npos) {
+				parent.resize(up);
+				search += ";" + parent;
+			}
+		}
+		SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_LOAD_LINES);
+		return SymInitialize(process, search.c_str(), TRUE) != FALSE;
+	}();
+	return initialized;
+}
+#endif
+
+std::string HostSymbol(uint64_t address, uint64_t* start) {
+#ifdef _WIN32
+	const auto       process = GetCurrentProcess();
+	std::scoped_lock symbol_lock(g_symbol_mutex);
+	if (!InitializeSymbols(process)) {
+		return {};
+	}
+	alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 512] {};
+	auto*                     symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+	symbol->SizeOfStruct             = sizeof(SYMBOL_INFO);
+	symbol->MaxNameLen               = 512;
+	DWORD64 displacement             = 0;
+	if (SymFromAddr(process, address, &displacement, symbol) == FALSE) {
+		return {};
+	}
+	if (start != nullptr) {
+		*start = address - displacement;
+	}
+	return std::string(symbol->Name);
+#else
+	(void)address;
+	(void)start;
+	return {};
+#endif
+}
+
 // The host call stack of the failing thread, so a fatal report names its caller instead of
-// only the file that noticed. Symbols come from the PDB next to the executable or one
-// directory up (the install layout keeps the PDB in the build directory).
+// only the file that noticed.
 std::string HostBacktrace() {
 #ifdef _WIN32
 	static constexpr ULONG MaxFrames = 48;
@@ -30,23 +82,9 @@ std::string HostBacktrace() {
 		return {};
 	}
 
-	const auto process = GetCurrentProcess();
-	char       exe_path[MAX_PATH] {};
-	GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
-	std::string search = exe_path;
-	if (const auto slash = search.find_last_of("\\/"); slash != std::string::npos) {
-		search.resize(slash);
-		std::string parent = search;
-		if (const auto up = parent.find_last_of("\\/"); up != std::string::npos) {
-			parent.resize(up);
-			search += ";" + parent;
-		}
-	}
-	// dbghelp is not thread-safe: two threads symbolising at once crashed inside SymFromAddr.
-	static std::mutex symbol_mutex;
-	std::scoped_lock  symbol_lock(symbol_mutex);
-	SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_LOAD_LINES);
-	static const bool initialized = SymInitialize(process, search.c_str(), TRUE) != FALSE;
+	const auto       process = GetCurrentProcess();
+	std::scoped_lock symbol_lock(g_symbol_mutex);
+	const bool       initialized = InitializeSymbols(process);
 
 	std::string out = "--- Host stack ---\n";
 	for (ULONG i = 0; i < count; i++) {

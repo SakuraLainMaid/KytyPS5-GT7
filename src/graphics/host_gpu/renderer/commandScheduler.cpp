@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/cpuAffinity.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -396,6 +397,7 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 		}
 		m_master.Wait(operation.tick);
 		Timeline::Mark("tick-done", operation.tick);
+		Common::PerfStats::TickCompleted(operation.tick);
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
 		}
@@ -559,6 +561,7 @@ void CommandScheduler::QueueSubmit(SubmitJob& job) {
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 	Timeline::Mark("vk-submit", job.tick);
+	Common::PerfStats::TickSubmitted(job.tick);
 
 	if (result == vk::Result::eErrorDeviceLost) {
 		DumpDeviceLossDiagnostics(graphics);

@@ -15,6 +15,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -674,7 +675,13 @@ struct FaultStats {
 		uint64_t gpu     = 0;
 		uint64_t micros  = 0; // time in the handler: downloads and GPU waits show up here
 		uint64_t vaddr   = 0; // last faulting guest address
-		uint64_t emulated = 0; // reads of GPU-clean bytes completed by the handler itself
+		// Completed by the handler itself: reads of bytes the GPU did not write, and stores to
+		// pages it wrote, done in place.
+		uint64_t emulated = 0;
+		uint32_t tid      = 0; // the OS thread of the last fault here
+		// The instruction at the site (DescribeInstruction), once it has been reported.
+		bool        described = false;
+		std::string instruction;
 	};
 	std::mutex mutex;
 	// By host pc. A search of a list of them was ~4,000 sites long in GT7, a scan of 200 KB for
@@ -708,6 +715,7 @@ void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bo
 	site_entry.micros += micros;
 	site_entry.vaddr = guest_vaddr;
 	site_entry.emulated += emulated ? 1 : 0;
+	site_entry.tid = Common::PerfStats::CurrentOsThreadId();
 	// Every 50,000 faults: every 5,000 was five reports a second in races, each three sorts of
 	// the sites under this lock and 33 lines of log.
 	if (stats.total - stats.reported < 50000) {
@@ -726,12 +734,26 @@ void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bo
 	for (const auto& site: sites) {
 		gpu_total += site.gpu;
 	}
+	// The thread of a site's last fault and its instruction, decoded the first time it is named.
+	const auto describe = [&](const FaultStats::Site& site) {
+		auto& entry = stats.sites[site.address];
+		if (!entry.described) {
+			entry.described = true;
+			entry.instruction =
+			    IsReadableRange(site.address, 16)
+			        ? Loader::X64InstructionEmulator::DescribeInstruction(site.address)
+			        : std::string();
+		}
+		return fmt::format(" thread={} insn=\"{}\"", Common::PerfStats::ThreadNameOf(site.tid),
+		                   entry.instruction);
+	};
 	LOGF("TrackedFaults: total=%" PRIu64 " gpu_thread=%" PRIu64 " distinct_sites=%zu\n", stats.total,
 	     gpu_total, stats.sites.size());
 	for (size_t i = 0; i < std::min<size_t>(sites.size(), 12); i++) {
 		const auto& site = sites[i];
-		LOGF("\t pc=0x%016" PRIx64 " count=%" PRIu64 " reads=%" PRIu64 " gpu_thread=%" PRIu64 "\n",
-		     site.address, site.count, site.reads, site.gpu);
+		LOGF("\t pc=0x%016" PRIx64 " count=%" PRIu64 " reads=%" PRIu64 " gpu_thread=%" PRIu64
+		     " emulated=%" PRIu64 "%s\n",
+		     site.address, site.count, site.reads, site.gpu, site.emulated, describe(site).c_str());
 	}
 	std::sort(sites.begin(), sites.end(),
 	          [](const FaultStats::Site& a, const FaultStats::Site& b) { return a.gpu > b.gpu; });
@@ -746,12 +768,44 @@ void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bo
 	for (size_t i = 0; i < std::min<size_t>(sites.size(), 12); i++) {
 		const auto& site = sites[i];
 		LOGF("\t slow pc=0x%016" PRIx64 " ms=%" PRIu64 " count=%" PRIu64 " reads=%" PRIu64
-		     " emulated=%" PRIu64 " gpu_thread=%" PRIu64 " last_vaddr=0x%016" PRIx64 "\n",
+		     " emulated=%" PRIu64 " gpu_thread=%" PRIu64 " last_vaddr=0x%016" PRIx64 "%s\n",
 		     site.address, site.micros / 1000, site.count, site.reads, site.emulated, site.gpu,
-		     site.vaddr);
+		     site.vaddr, describe(site).c_str());
 	}
 }
 } // namespace
+
+// A store to a GPU-written page whose instruction the handler does not complete itself (not a
+// plain store): the first few such instructions are logged.
+static void NoteUnhandledStore(uint64_t pc) {
+	static std::mutex                             mutex;
+	static std::unordered_map<uint64_t, uint64_t> seen;
+	static std::atomic<uint32_t>                  logged {0};
+	std::scoped_lock                              lock(mutex);
+	if (seen.size() >= 4096 && !seen.contains(pc)) {
+		return;
+	}
+	auto& count = seen[pc];
+	if (count++ == 0 && logged.fetch_add(1, std::memory_order_relaxed) < 48) {
+		const auto text = IsReadableRange(pc, 16)
+		                      ? Loader::X64InstructionEmulator::DescribeInstruction(pc)
+		                      : std::string();
+		LOGF("Store emulation: the store at pc=0x%016" PRIx64 " (%s, %s) to a GPU-written page "
+		     "takes a download\n",
+		     pc, text.empty() ? "?" : text.c_str(),
+		     Common::PerfStats::ThreadNameOf(Common::PerfStats::CurrentOsThreadId()).c_str());
+	}
+}
+
+// Whether TryEmulateStore got as far as handing the store's bytes over (the instruction is one it
+// handles), for the handler's count of the ones it does not.
+static thread_local bool t_store_written = false;
+
+static bool WriteGpuFaultingBytes(uint64_t pc, uint64_t fault_vaddr, uint64_t vaddr,
+                                  const void* data, uint64_t size) {
+	t_store_written = true;
+	return Libs::LibKernel::Memory::TryWriteGpuFaultingBytes(pc, fault_vaddr, vaddr, data, size);
+}
 
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
@@ -792,6 +846,32 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			RecordTrackedFault(info->exception_address, info->access_violation_vaddr, true,
 			                   Libs::Graphics::GuestGpu::IsGpuThread(), ns / 1000u, true);
 			return true;
+		}
+		// A game thread's store to a page protected because the GPU wrote to it (often to other
+		// bytes of it): done in place, on both copies, by the GPU thread, which leaves the page
+		// protected for the bytes the GPU did write, instead of downloading the page first, which
+		// waits for the GPU (0.3 to 6 ms a store in GT7's races, 2026-10-15).
+		// KYTY_NO_CLEAN_WRITE_EMULATION=1, or KYTY_BISECT's writes:off, takes the old way.
+		static const bool emulate_clean_writes =
+		    std::getenv("KYTY_NO_CLEAN_WRITE_EMULATION") == nullptr;
+		if (access == GpuAccess::Write && emulate_clean_writes &&
+		    !Libs::Graphics::GuestGpu::IsGpuThread() && !Libs::Graphics::Bisect::CleanWritesOff() &&
+		    Libs::LibKernel::Memory::IsGpuWrittenPage(info->access_violation_vaddr)) {
+			t_store_written = false;
+			if (Loader::X64InstructionEmulator::TryEmulateStore(
+			        info->native_context, info->access_violation_vaddr, &WriteGpuFaultingBytes)) {
+				const auto ns = elapsed_ns();
+				Common::PerfStats::AddFault(ns, false, true);
+				Common::PerfStats::AddCleanStore(ns);
+				RecordTrackedFault(info->exception_address, info->access_violation_vaddr, false,
+				                   false, ns / 1000u, true);
+				return true;
+			}
+			// A declined write is counted where it was declined.
+			if (!t_store_written) {
+				Common::PerfStats::AddUnsupportedStore();
+				NoteUnhandledStore(info->exception_address);
+			}
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			const auto ns = elapsed_ns();

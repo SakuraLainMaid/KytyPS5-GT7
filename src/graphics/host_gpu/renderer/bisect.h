@@ -26,6 +26,11 @@
 //   readback:<n> a game thread's fault on GPU-written memory downloads a window of n KB around
 //                it (KYTY_READBACK_WINDOW_KB, default 4096; 0 the faulting pages only)
 //   log:off      LOGF writes nothing
+//   writes:off   a store to a page protected because the GPU wrote to it downloads the page first,
+//                as before 2026-10-16 (round 61), instead of being done in place
+//                (KYTY_NO_CLEAN_WRITE_EMULATION=1 for the whole run)
+//   gputime:<n>  the next n frames are timed on the host GPU (GpuTiming, "GpuTiming frame" lines),
+//                once, when the step turns on
 namespace Libs::Graphics::Bisect {
 
 // The GPU thread, at its start: applies the start step's CPU set and log setting.
@@ -48,6 +53,8 @@ void                      ApplyPending();
 [[nodiscard]] bool WholeUnnormalizedViews();
 // The readback window the step that is on asks for, in KB, or -1.
 [[nodiscard]] int64_t ReadbackWindowKB();
+// Any thread: whether the step that is on turns off stores done in place (writes:off).
+[[nodiscard]] bool CleanWritesOff();
 
 } // namespace Libs::Graphics::Bisect
 

@@ -1102,10 +1102,175 @@ bool TryEmulateLoad(void* native_context, uint64_t fault_vaddr, LoadReader read)
 	return true;
 }
 
+namespace {
+
+// Vector moves whose memory form stores the register (or its low part; MOVHPS and MOVHPD store
+// the high quadword).
+bool IsVectorStore(ZydisMnemonic mnemonic) {
+	switch (mnemonic) {
+		case ZYDIS_MNEMONIC_MOVUPS:
+		case ZYDIS_MNEMONIC_MOVAPS:
+		case ZYDIS_MNEMONIC_MOVUPD:
+		case ZYDIS_MNEMONIC_MOVAPD:
+		case ZYDIS_MNEMONIC_MOVDQU:
+		case ZYDIS_MNEMONIC_MOVDQA:
+		case ZYDIS_MNEMONIC_MOVNTPS:
+		case ZYDIS_MNEMONIC_MOVNTPD:
+		case ZYDIS_MNEMONIC_MOVNTDQ:
+		case ZYDIS_MNEMONIC_MOVSS:
+		case ZYDIS_MNEMONIC_MOVSD:
+		case ZYDIS_MNEMONIC_MOVQ:
+		case ZYDIS_MNEMONIC_MOVD:
+		case ZYDIS_MNEMONIC_MOVLPS:
+		case ZYDIS_MNEMONIC_MOVLPD:
+		case ZYDIS_MNEMONIC_MOVHPS:
+		case ZYDIS_MNEMONIC_MOVHPD:
+		case ZYDIS_MNEMONIC_VMOVUPS:
+		case ZYDIS_MNEMONIC_VMOVAPS:
+		case ZYDIS_MNEMONIC_VMOVUPD:
+		case ZYDIS_MNEMONIC_VMOVAPD:
+		case ZYDIS_MNEMONIC_VMOVDQU:
+		case ZYDIS_MNEMONIC_VMOVDQA:
+		case ZYDIS_MNEMONIC_VMOVNTPS:
+		case ZYDIS_MNEMONIC_VMOVNTPD:
+		case ZYDIS_MNEMONIC_VMOVNTDQ:
+		case ZYDIS_MNEMONIC_VMOVSS:
+		case ZYDIS_MNEMONIC_VMOVSD:
+		case ZYDIS_MNEMONIC_VMOVQ:
+		case ZYDIS_MNEMONIC_VMOVD:
+		case ZYDIS_MNEMONIC_VMOVLPS:
+		case ZYDIS_MNEMONIC_VMOVLPD:
+		case ZYDIS_MNEMONIC_VMOVHPS:
+		case ZYDIS_MNEMONIC_VMOVHPD: return true;
+		default: return false;
+	}
+}
+
+} // namespace
+
+bool TryEmulateStore(void* native_context, uint64_t fault_vaddr, StoreWriter write) {
+	auto* context = static_cast<PCONTEXT>(native_context);
+	if (context == nullptr || write == nullptr) {
+		return false;
+	}
+	ZydisDecodedInstruction instruction {};
+	ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+	if (!ZYAN_SUCCESS(
+	        ZydisDecoderDecodeFull(&LoadDecoder(), reinterpret_cast<const void*>(context->Rip),
+	                               ZYDIS_MAX_INSTRUCTION_LENGTH, &instruction, operands)) ||
+	    (instruction.encoding != ZYDIS_INSTRUCTION_ENCODING_LEGACY &&
+	     instruction.encoding != ZYDIS_INSTRUCTION_ENCODING_VEX) ||
+	    (instruction.attributes & ZYDIS_ATTRIB_HAS_LOCK) != 0 ||
+	    instruction.operand_count_visible != 2 || operands[0].type != ZYDIS_OPERAND_TYPE_MEMORY) {
+		return false;
+	}
+	const auto& mem     = operands[0];
+	const auto& source  = operands[1];
+	uint64_t    address = 0;
+	const auto  bytes   = static_cast<uint64_t>(mem.size) / 8u;
+	if (!EffectiveAddress(context, instruction, mem, address) || bytes == 0 || bytes > 32 ||
+	    fault_vaddr < address || fault_vaddr - address >= bytes) {
+		return false;
+	}
+	alignas(32) uint8_t data[32] {};
+
+	switch (instruction.mnemonic) {
+		case ZYDIS_MNEMONIC_MOV:
+		case ZYDIS_MNEMONIC_MOVNTI: {
+			uint64_t value = 0;
+			if (bytes > 8) {
+				return false;
+			}
+			if (source.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+				if (!ReadGpr(context, source.reg.value, static_cast<uint32_t>(bytes * 8u), value)) {
+					return false; // a segment or control register
+				}
+			} else if (source.type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+			           instruction.mnemonic == ZYDIS_MNEMONIC_MOV) {
+				// MOV r/m64, imm32 sign-extends; the decoder has done it.
+				value = source.imm.is_signed ? static_cast<uint64_t>(source.imm.value.s)
+				                             : source.imm.value.u;
+			} else {
+				return false;
+			}
+			std::memcpy(data, &value, bytes);
+			break;
+		}
+		default: {
+			if (!IsVectorStore(instruction.mnemonic) ||
+			    source.type != ZYDIS_OPERAND_TYPE_REGISTER) {
+				return false;
+			}
+			const auto reg = source.reg.value;
+			const bool ymm = reg >= ZYDIS_REGISTER_YMM0 && reg <= ZYDIS_REGISTER_YMM15;
+			if (!ymm && (reg < ZYDIS_REGISTER_XMM0 || reg > ZYDIS_REGISTER_XMM15)) {
+				return false; // MMX, or a general-purpose source (MOVD/MOVQ to a register)
+			}
+			const auto index =
+			    static_cast<uint32_t>(reg - (ymm ? ZYDIS_REGISTER_YMM0 : ZYDIS_REGISTER_XMM0));
+			alignas(32) uint8_t value[32] {};
+			std::memcpy(value, &context->Xmm0 + index, sizeof(M128A));
+			if (ymm) {
+				// The upper half from the AVX state; all zeros while it is in its initial state.
+				if ((context->ContextFlags & CONTEXT_XSTATE) != CONTEXT_XSTATE) {
+					return false;
+				}
+				if (const auto* upper = UpperYmm(context); upper != nullptr) {
+					std::memcpy(value + sizeof(M128A), upper + index, sizeof(M128A));
+				}
+			}
+			const bool high = instruction.mnemonic == ZYDIS_MNEMONIC_MOVHPS ||
+			                  instruction.mnemonic == ZYDIS_MNEMONIC_MOVHPD ||
+			                  instruction.mnemonic == ZYDIS_MNEMONIC_VMOVHPS ||
+			                  instruction.mnemonic == ZYDIS_MNEMONIC_VMOVHPD;
+			if (bytes > (ymm ? 32u : 16u) || (high && bytes != 8)) {
+				return false;
+			}
+			std::memcpy(data, value + (high ? 8 : 0), bytes);
+			break;
+		}
+	}
+	if (!write(context->Rip, fault_vaddr, address, data, bytes)) {
+		return false;
+	}
+	context->Rip += instruction.length;
+	return true;
+}
+
+std::string DescribeInstruction(uint64_t address) {
+	ZydisDecodedInstruction instruction {};
+	ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+	if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&LoadDecoder(), reinterpret_cast<const void*>(address),
+	                                         ZYDIS_MAX_INSTRUCTION_LENGTH, &instruction,
+	                                         operands))) {
+		return {};
+	}
+	static ZydisFormatter formatter = [] {
+		ZydisFormatter result {};
+		ZydisFormatterInit(&result, ZYDIS_FORMATTER_STYLE_INTEL);
+		return result;
+	}();
+	char text[128] {};
+	if (!ZYAN_SUCCESS(ZydisFormatterFormatInstruction(&formatter, &instruction, operands,
+	                                                  instruction.operand_count_visible, text,
+	                                                  sizeof(text), address, nullptr))) {
+		return {};
+	}
+	return text;
+}
+
 #else
 
 bool TryEmulateLoad(void* /*native_context*/, uint64_t /*fault_vaddr*/, LoadReader /*read*/) {
 	return false;
+}
+
+bool TryEmulateStore(void* /*native_context*/, uint64_t /*fault_vaddr*/, StoreWriter /*write*/) {
+	return false;
+}
+
+std::string DescribeInstruction(uint64_t /*address*/) {
+	return {};
 }
 
 #endif

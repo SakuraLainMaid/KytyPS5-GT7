@@ -5,12 +5,15 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 // Diagnostics: every KYTY_PERF seconds (default 2, 0 turns it off) a "Perf:" line with the
 // presented frame rate, how the GPU thread spent its time, the draws and dispatches it recorded,
-// the time threads spent in tracked-memory faults (GPU readbacks among them), and a "Perf
-// threads:" line with the busiest threads and the ones that waited longest in faults. Counting is
-// a relaxed atomic add; the reporter thread does the rest.
+// the time threads spent in tracked-memory faults (GPU readbacks among them), a "Perf threads:"
+// line with the busiest threads and the ones that waited longest in faults, and a "Perf GPU:" line
+// with how far behind the host GPU runs and what a game thread's access to GPU-written memory
+// waits for. Counting is a relaxed atomic add; the reporter thread does the rest.
 namespace Common::PerfStats {
 
 [[nodiscard]] bool Enabled();
@@ -28,39 +31,93 @@ void AddDispatchSlow();
 void AddPresentSlow();
 void AddDownloadSlow(uint64_t bytes);
 void AddFaultSlow(uint64_t nanoseconds, bool read, bool emulated);
+void AddReadbackSlow(uint64_t pickup_ns, uint64_t record_ns, uint64_t wait_ns, uint32_t steps,
+                     uint64_t ticks_behind);
+void AddCleanStoreSlow(uint64_t nanoseconds);
+void AddDeclinedStoreSlow();
+void AddUnsupportedStoreSlow();
+void TickSubmittedSlow(uint64_t tick);
+void TickCompletedSlow(uint64_t tick);
 } // namespace Detail
 
+// Whether the counters count (the reporter runs): for measurements that cost a clock read.
+[[nodiscard]] inline bool Active() {
+	return Detail::g_enabled.load(std::memory_order_relaxed);
+}
+
 inline void AddGpuThread(GpuThread phase, uint64_t nanoseconds) {
-	if (Detail::g_enabled.load(std::memory_order_relaxed)) {
+	if (Active()) {
 		Detail::AddGpuThreadSlow(phase, nanoseconds);
 	}
 }
 inline void AddDraw() {
-	if (Detail::g_enabled.load(std::memory_order_relaxed)) {
+	if (Active()) {
 		Detail::AddDrawSlow();
 	}
 }
 inline void AddDispatch() {
-	if (Detail::g_enabled.load(std::memory_order_relaxed)) {
+	if (Active()) {
 		Detail::AddDispatchSlow();
 	}
 }
 inline void AddPresent() {
-	if (Detail::g_enabled.load(std::memory_order_relaxed)) {
+	if (Active()) {
 		Detail::AddPresentSlow();
 	}
 }
 // A game thread's download of GPU-written memory (`bytes` downloaded).
 inline void AddDownload(uint64_t bytes) {
-	if (Detail::g_enabled.load(std::memory_order_relaxed)) {
+	if (Active()) {
 		Detail::AddDownloadSlow(bytes);
 	}
 }
-// A tracked-memory fault the calling thread spent `nanoseconds` in. `emulated`: a read the handler
-// completed itself, without lifting the protection.
+// A tracked-memory fault the calling thread spent `nanoseconds` in. `emulated`: an access the
+// handler completed itself, without lifting the protection (a read of bytes the GPU did not
+// write, or a store done in place).
 inline void AddFault(uint64_t nanoseconds, bool read, bool emulated) {
-	if (Detail::g_enabled.load(std::memory_order_relaxed)) {
+	if (Active()) {
 		Detail::AddFaultSlow(nanoseconds, read, emulated);
+	}
+}
+// A game thread's access to GPU-written memory that went through the GPU thread
+// (BufferCache::ReadMemory): the time until the GPU thread took the request up and the time it
+// spent on it (all its steps), the time the access then waited for downloads to land, the steps,
+// and how many command buffers the host GPU had not finished when the request was taken up.
+inline void AddReadback(uint64_t pickup_ns, uint64_t record_ns, uint64_t wait_ns, uint32_t steps,
+                        uint64_t ticks_behind) {
+	if (Active()) {
+		Detail::AddReadbackSlow(pickup_ns, record_ns, wait_ns, steps, ticks_behind);
+	}
+}
+// A store to a page protected because the GPU wrote to it, done in place (both copies, on the GPU
+// thread) instead of downloading the page first: `nanoseconds` in the handler.
+inline void AddCleanStore(uint64_t nanoseconds) {
+	if (Active()) {
+		Detail::AddCleanStoreSlow(nanoseconds);
+	}
+}
+// Such a store taken the old way: declined (the page's budget, or bytes on their way back from the
+// GPU), or an instruction the handler does not complete itself.
+inline void AddDeclinedStore() {
+	if (Active()) {
+		Detail::AddDeclinedStoreSlow();
+	}
+}
+inline void AddUnsupportedStore() {
+	if (Active()) {
+		Detail::AddUnsupportedStoreSlow();
+	}
+}
+// The host GPU's queue: a command buffer submitted with `tick`, and a thread that waited for that
+// tick seeing it complete (the priority-operation thread).
+inline void TickSubmitted(uint64_t tick) {
+	if (Active()) {
+		Detail::TickSubmittedSlow(tick);
+	}
+}
+inline void TickCompleted(uint64_t tick) {
+	if (Active()) {
+		Detail::TickCompletedSlow(tick);
 	}
 }
 
@@ -68,10 +125,17 @@ inline void AddFault(uint64_t nanoseconds, bool read, bool emulated) {
 // where it can.
 void NameThread(const char* name);
 
+// The OS id of the calling thread; the name NameThread gave a thread ("tid <id>" when none); every
+// named thread (OS id, name).
+[[nodiscard]] uint32_t                                      CurrentOsThreadId();
+[[nodiscard]] std::string                                   ThreadNameOf(uint32_t tid);
+[[nodiscard]] std::vector<std::pair<uint32_t, std::string>> NamedThreads();
+
 // The configuration the lines name (KYTY_BISECT's step), empty for none.
 void SetConfiguration(std::string_view name);
 
-// Starts the reporter (the first call; later ones do nothing).
+// Starts the reporter (the first call; later ones do nothing), and the sampler when KYTY_SAMPLE
+// asks for it (common/sampler.h).
 void Start();
 
 } // namespace Common::PerfStats
