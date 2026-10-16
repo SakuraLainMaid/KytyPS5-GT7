@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/timeline.h"
 #include "graphics/presentation/videoOut.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
@@ -218,7 +219,10 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		}
 		m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
 	} else {
+		// KYTY_TIMELINE / F6: a game thread's read of GPU-written memory, and when it went on.
+		Timeline::Mark("fault-read", fault_vaddr);
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+		Timeline::Mark("fault-read-end", fault_vaddr);
 	}
 	return true;
 }

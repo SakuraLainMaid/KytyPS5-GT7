@@ -45,6 +45,8 @@ struct Step {
 	bool              htile_depth  = false;
 	bool              pattern_off    = false;
 	bool              faultblock_off = false;
+	bool              pop_wait       = false;
+	bool              texmemo_off    = false;
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
 	uint32_t          gpu_frames  = 0;    // gputime:<n>
@@ -152,6 +154,14 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "faultblock:off") {
 		step.faultblock_off = true;
+		return true;
+	}
+	if (action == "popwait") {
+		step.pop_wait = true;
+		return true;
+	}
+	if (action == "texmemo:off") {
+		step.texmemo_off = true;
 		return true;
 	}
 	if (action.starts_with("tess:max:")) {
@@ -535,6 +545,16 @@ bool PatternFillsOff() {
 bool FaultBlocksOff() {
 	const auto* step = Current();
 	return step != nullptr && step->faultblock_off;
+}
+
+bool PopWait() {
+	const auto* step = Current();
+	return step != nullptr && step->pop_wait;
+}
+
+bool TextureMemoOff() {
+	const auto* step = Current();
+	return step != nullptr && step->texmemo_off;
 }
 
 bool WholeUnnormalizedViews() {

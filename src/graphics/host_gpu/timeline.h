@@ -6,7 +6,9 @@
 
 // Diagnostics: KYTY_TIMELINE=<first frame>:<frames> logs "TL <microseconds> <thread> <event>"
 // lines for guest submissions, GPU-thread processing, host GPU submissions and completions,
-// drains and presents, for that window of presented frames. Off by default.
+// drains, presents, the game's event-queue waits and flips, and game-thread reads of GPU-written
+// memory, for that window of presented frames. F6 (RequestCapture) logs the next frames the same
+// way; each capture first names the threads ("TL thread <id> <name>"). Off by default.
 namespace Libs::Graphics::Timeline {
 
 namespace Detail {
@@ -26,6 +28,9 @@ inline void Mark(const char* event, uint64_t a = 0, uint64_t b = 0) {
 
 // Called once per presented frame.
 void Present(uint64_t frame);
+
+// F6: the next `frames` presented frames are logged.
+void RequestCapture(uint32_t frames);
 
 } // namespace Libs::Graphics::Timeline
 

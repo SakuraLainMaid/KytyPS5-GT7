@@ -87,7 +87,11 @@ public:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
 	void                      Wait(uint64_t tick);
-	void                      PopPendingOperations();
+	// Runs the deferred operations whose ticks the GPU has finished, in tick order, each after the
+	// priority callbacks of its tick and before (WaitPriorityOperations). With `wait` false (the
+	// call at each draw and dispatch), one whose priority callbacks are still queued or running
+	// stays for a later call instead of making the GPU thread wait for the priority thread.
+	void                      PopPendingOperations(bool wait = true);
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
@@ -246,6 +250,9 @@ private:
 	uint32_t                     m_recorded_release_mem_writes     = 0;
 	uint32_t                     m_recorded_release_mem_interrupts = 0;
 	uint32_t                     m_recorded_draws                  = 0;
+	// m_operation_mutex held: a priority callback of `tick` or before is queued or running.
+	[[nodiscard]] bool PriorityPendingThrough(uint64_t tick) const;
+
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;

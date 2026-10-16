@@ -1,7 +1,9 @@
 #include "graphics/host_gpu/timeline.h"
 
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cstdlib>
@@ -43,6 +45,9 @@ uint64_t NowMicros() {
 	                                 .count());
 }
 
+// F6's request, taken up at the next presented frame.
+std::atomic<uint32_t> g_requested {0};
+
 uint32_t ThreadId() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	return static_cast<uint32_t>(GetCurrentThreadId());
@@ -62,12 +67,28 @@ void MarkSlow(const char* event, uint64_t a, uint64_t b) {
 
 } // namespace Detail
 
+void RequestCapture(uint32_t frames) {
+	g_requested.store(frames, std::memory_order_relaxed);
+}
+
 void Present(uint64_t frame) {
-	const auto& window = GetWindow();
-	if (window.count == 0) {
-		return;
+	// Called with the presenter's lock held (Presenter::Present), one call at a time.
+	static uint64_t key_first = 0;
+	static uint64_t key_count = 0;
+	if (const auto requested = g_requested.exchange(0, std::memory_order_relaxed); requested != 0) {
+		key_first = frame + 1;
+		key_count = requested;
+		LOGF("TL capture: presented frames %" PRIu64 " to %" PRIu64 " (F6)\n", key_first,
+		     key_first + key_count - 1);
+		for (const auto& [tid, name]: Common::PerfStats::NamedThreads()) {
+			LOGF("TL thread %u %s\n", tid, name.c_str());
+		}
 	}
-	const bool active = frame >= window.first && frame - window.first < window.count;
+	const auto& window = GetWindow();
+	const bool  in_window =
+	    window.count != 0 && frame >= window.first && frame - window.first < window.count;
+	const bool in_key = key_count != 0 && frame >= key_first && frame - key_first < key_count;
+	const bool active = in_window || in_key;
 	if (active || Detail::g_active.load(std::memory_order_relaxed)) {
 		Detail::MarkSlow("present", frame, 0);
 	}

@@ -74,6 +74,13 @@
 //                (KYTY_PATTERN_FILLS=0 for the whole run)
 //   faultblock:off a CPU write fault releases its own page from write tracking, as before round
 //                66, even in a block that faults again (KYTY_FAULT_BLOCK_KB=0 for the whole run)
+// and (round 67):
+//   popwait      the deferred operations a draw or a dispatch runs wait for the priority
+//                callbacks of their ticks, as before round 67, instead of being left for a later
+//                draw while those run (KYTY_POP_WAIT=1 for the whole run)
+//   texmemo:off  every texture binding is looked up in the texture cache again, as before round
+//                67, instead of reusing one the same command buffer resolved for the same
+//                descriptor (KYTY_TEXTURE_MEMO=0 for the whole run)
 namespace Libs::Graphics::Bisect {
 
 // The GPU thread, at its start: applies the start step's CPU set and log setting.
@@ -118,6 +125,9 @@ void                      ApplyPending();
 [[nodiscard]] bool HtileDepthOnly();
 [[nodiscard]] bool PatternFillsOff();
 [[nodiscard]] bool FaultBlocksOff();
+// Any thread: popwait; texmemo:off.
+[[nodiscard]] bool PopWait();
+[[nodiscard]] bool TextureMemoOff();
 
 } // namespace Libs::Graphics::Bisect
 

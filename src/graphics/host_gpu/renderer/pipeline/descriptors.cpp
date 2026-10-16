@@ -41,6 +41,8 @@
 #include <set>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cinttypes>
 #include <cstdlib>
 #include <cstring>
 #include <bit>
@@ -770,13 +772,92 @@ struct TextureDescKeyHash {
 	}
 };
 
+// The texture memo: what the texture cache gave a descriptor's binding the last time (the image
+// FindImage found, the view base it set, and the view FindTexture made), in the image set it was
+// given in (TextureCache::ImageSetGeneration). 88 % of a race frame's 31,600 texture bindings are
+// one the command before bound too (1,300 distinct ones): while no image is registered or
+// unregistered and the image stays unchanged (TextureCache::ReuseTextureBinding), the binding is
+// that again, without FindImage and FindTexture (each a lock and a search).
+struct TextureMemo {
+	ImageId       id;
+	vk::ImageView view       = nullptr;
+	uint64_t      generation = 0; // 0: none
+	uint32_t      base_level = 0;
+	uint32_t      base_layer = 0;
+};
+
 struct TextureDescEntry {
 	TextureCache::ImageDesc desc;
 	vk::Format              pixel_format      = vk::Format::eUndefined;
 	vk::Format              view_format       = vk::Format::eUndefined;
 	uint32_t                size              = 0;
 	bool                    shader_conversion = false;
+	TextureMemo             memo;
 };
+
+// The GPU thread's descriptions by descriptor (KYTY_TEXTURE_DESC_CACHE), with their memos.
+std::unordered_map<TextureDescKey, TextureDescEntry, TextureDescKeyHash>& TextureDescCache() {
+	thread_local std::unordered_map<TextureDescKey, TextureDescEntry, TextureDescKeyHash> cache;
+	return cache;
+}
+
+// KYTY_TEXTURE_MEMO=0, or KYTY_BISECT's texmemo:off: every binding is looked up again.
+bool TextureMemoEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_MEMO");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled && !Bisect::TextureMemoOff();
+}
+
+// A plain sampled image: no storage, atomics, bindless heap, per-mip views or depth comparison.
+bool TextureMemoEligible(const ShaderRecompiler::IR::ImageResource& resource) {
+	return !resource.written && !resource.atomic && !resource.atomic64 && !resource.bindless &&
+	       !resource.depth_compare &&
+	       resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic;
+}
+
+// A lookup the memo may keep (TextureBinding::memo_generation): the image was there with the same
+// backing, and the image set did not change during the lookup. Results that came out of overlap
+// resolution are left out: those can change with nothing registered or unregistered (an alias
+// that ages out is freed by a later lookup), and the view base they adjust is the last
+// candidate's.
+void KeepForMemo(TextureBinding& binding, bool use_memo, bool same_backing, uint64_t generation,
+                 const TextureCache& texture_cache) {
+	if (use_memo && same_backing && texture_cache.ImageSetGeneration() == generation) {
+		binding.memo_generation = generation;
+	}
+}
+
+// Counted on the GPU thread, logged every 10 s ("Texture memo").
+struct TextureMemoCounts {
+	uint64_t lookups  = 0; // memo bindings asked for
+	uint64_t found    = 0; // a memo held for the descriptor in this image set
+	uint64_t reused   = 0; // used again as it was
+	uint64_t refused  = 0; // the image had changed: looked up again
+	uint64_t recorded = 0;
+	std::chrono::steady_clock::time_point last {};
+};
+TextureMemoCounts g_texture_memo_counts;
+
+void ReportTextureMemo() {
+	auto&      c   = g_texture_memo_counts;
+	const auto now = std::chrono::steady_clock::now();
+	if (c.last.time_since_epoch().count() == 0) {
+		c.last = now;
+		return;
+	}
+	if (now - c.last < std::chrono::seconds(10)) {
+		return;
+	}
+	LOGF("Texture memo (%.0f s): %" PRIu64 " sampled bindings, %" PRIu64 " found in the memo (%" PRIu64
+	     " used again, %" PRIu64 " looked up again: the image had changed), %" PRIu64
+	     " kept for reuse%s\n",
+	     std::chrono::duration<double>(now - c.last).count(), c.lookups, c.found, c.reused, c.refused,
+	     c.recorded, TextureMemoEnabled() ? "" : " (off)");
+	c = {};
+	c.last = now;
+}
 
 TextureDescKey MakeTextureDescKey(const ShaderRecompiler::IR::ImageResource&   resource,
                                   const ShaderRecompiler::IR::DescriptorValue& value) {
@@ -827,7 +908,8 @@ static bool RejectBindlessTexture(const char* what, uint64_t address) {
 }
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+                                              const ShaderRecompiler::IR::DescriptorValue& value,
+                                              bool                                         memo) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
@@ -845,14 +927,39 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		return {id, nullptr, std::move(desc)};
 	}
 
-	thread_local std::unordered_map<TextureDescKey, TextureDescEntry, TextureDescKeyHash> cache;
+	auto&      cache     = TextureDescCache();
 	const bool use_cache = TextureDescCacheEnabled();
 	const auto key       = use_cache ? MakeTextureDescKey(resource, value) : TextureDescKey {};
+	// The texture memo (TextureMemo): a draw's or a dispatch's plain sampled binding.
+	const bool use_memo = memo && use_cache && TextureMemoEligible(resource) && TextureMemoEnabled();
+	if (use_memo) {
+		g_texture_memo_counts.lookups++;
+	}
 	if (use_cache) {
 		if (const auto it = cache.find(key); it != cache.end()) {
-			return FindResolvedTexture(resource, descriptor, it->second.desc,
-			                           it->second.shader_conversion, it->second.pixel_format,
-			                           it->second.view_format, it->second.size);
+			auto& entry = it->second;
+			if (use_memo && entry.memo.generation != 0 &&
+			    entry.memo.generation == texture_cache.ImageSetGeneration()) {
+				// The image FindImage would find: RebindImages checks it is unchanged before it
+				// uses the view again, and looks it up again otherwise.
+				const auto* image = texture_cache.m_slot_images.try_get(entry.memo.id);
+				if (image != nullptr && image->registered && !image->depth_id &&
+				    !image->binding.needs_rebind) {
+					g_texture_memo_counts.found++;
+					TextureBinding binding {entry.memo.id, nullptr, entry.desc};
+					binding.desc.view_info.base_level = entry.memo.base_level;
+					binding.desc.view_info.base_layer = entry.memo.base_layer;
+					binding.memo_view                 = entry.memo.view;
+					return binding;
+				}
+			}
+			const auto generation   = texture_cache.ImageSetGeneration();
+			bool       same_backing = false;
+			auto       binding      = FindResolvedTexture(
+                resource, descriptor, entry.desc, entry.shader_conversion, entry.pixel_format,
+                entry.view_format, entry.size, use_memo ? &same_backing : nullptr);
+			KeepForMemo(binding, use_memo, same_backing, generation, texture_cache);
+			return binding;
 		}
 	}
 
@@ -1064,8 +1171,42 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		cache.emplace(key, TextureDescEntry {desc, pixel_format, view_format, size.size,
 		                                     shader_conversion});
 	}
-	return FindResolvedTexture(resource, descriptor, std::move(desc), shader_conversion,
-	                           pixel_format, view_format, size.size);
+	const auto generation   = texture_cache.ImageSetGeneration();
+	bool       same_backing = false;
+	auto       binding = FindResolvedTexture(resource, descriptor, std::move(desc), shader_conversion,
+	                                         pixel_format, view_format, size.size,
+	                                         use_memo ? &same_backing : nullptr);
+	KeepForMemo(binding, use_memo, same_backing, generation, texture_cache);
+	return binding;
+}
+
+void RenderExecutor::ForgetTextureMemo(const ShaderRecompiler::IR::ImageResource&   resource,
+                                       const ShaderRecompiler::IR::DescriptorValue& value) {
+	auto& cache = TextureDescCache();
+	if (const auto it = cache.find(MakeTextureDescKey(resource, value)); it != cache.end()) {
+		it->second.memo = {};
+	}
+}
+
+void RenderExecutor::RecordTextureMemo(const ShaderRecompiler::IR::ImageResource&   resource,
+                                       const ShaderRecompiler::IR::DescriptorValue& value,
+                                       const TextureBinding&                        binding) {
+	if (binding.memo_generation == 0 || binding.image_view == nullptr || !TextureMemoEnabled() ||
+	    binding.desc.type != TextureCache::BindingType::Texture || binding.desc.info.HasMetadata()) {
+		return;
+	}
+	auto&      cache = TextureDescCache();
+	const auto it    = cache.find(MakeTextureDescKey(resource, value));
+	if (it == cache.end()) {
+		return;
+	}
+	if (!m_context.GetTextureCache().MayReuseTextureBinding(binding.image_id)) {
+		it->second.memo = {};
+		return;
+	}
+	it->second.memo = {binding.image_id, binding.image_view, binding.memo_generation,
+	                   binding.desc.view_info.base_level, binding.desc.view_info.base_layer};
+	g_texture_memo_counts.recorded++;
 }
 
 // ResolveTexture's texture cache lookup for a description (FindImage may adjust it).
@@ -1073,10 +1214,11 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
                                                    const ShaderTextureResource&               descriptor,
                                                    TextureCache::ImageDesc desc,
                                                    bool shader_conversion, vk::Format pixel_format,
-                                                   vk::Format view_format, uint32_t size) {
+                                                   vk::Format view_format, uint32_t size,
+                                                   bool* same_backing) {
 	auto&      texture_cache       = m_context.GetTextureCache();
 	const bool storage             = resource.written;
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+	auto       id                  = texture_cache.FindImage(desc, shader_conversion, same_backing);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -2415,7 +2557,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i], true);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();
@@ -2671,6 +2813,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	ReportTextureMemo();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
 	const auto& snapshot = *prepared.runtime->resources;
@@ -2747,6 +2890,31 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		auto& binding = images[i];
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
+		// The texture memo: a binding the descriptor had before uses its view again while the
+		// image is unchanged; otherwise it is looked up again from the start, as without the memo.
+		// (Only for the plain view below: the views of the other branches are made from the
+		// lookup, which a memo binding skipped.)
+		const bool plain_view =
+		    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic &&
+		    !(binding.desc.type != TextureCache::BindingType::Storage &&
+		      binding.desc.view_info.level_count > 1 && SampledUnnormalized(i)) &&
+		    !(binding.desc.type != TextureCache::BindingType::Storage && PassingDepth(i).has_value());
+		if (binding.memo_view != nullptr) {
+			if (plain_view && texture_cache.ReuseTextureBinding(binding.image_id)) {
+				g_texture_memo_counts.reused++;
+				binding.image_view = binding.memo_view;
+				auto& image        = texture_cache.GetImage(binding.image_id);
+				image.usage.texture = true;
+				continue;
+			}
+			// The next binding of the descriptor is looked up as without the memo, and kept again
+			// when the image may be kept.
+			g_texture_memo_counts.refused++;
+			ForgetTextureMemo(program.info.images[i], snapshot.images[i]);
+			binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+			binding.mip_views.clear();
+		}
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
 			EXIT_IF(resource.mip_count == 0u ||
 			        resource.mip_count != binding.desc.view_info.level_count);
@@ -2790,6 +2958,9 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			}
 		} else {
 			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
+			if (plain_view) {
+				RecordTextureMemo(resource, snapshot.images[i], binding);
+			}
 		}
 		// After FindTexture, which may refresh it from guest memory.
 		if (binding.desc.type != TextureCache::BindingType::Storage) {

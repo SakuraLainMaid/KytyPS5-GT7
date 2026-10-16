@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/host_gpu/timeline.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -428,6 +429,10 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 		     Common::Thread::GetThreadIdUnique());
 	}
 
+	// KYTY_TIMELINE / F6: when the game waits for an event (GPU events and flips among them) and
+	// what woke it (the first event's ident and filter).
+	Libs::Graphics::Timeline::Mark("eq-wait", static_cast<uint64_t>(eq),
+	                               timo == nullptr ? UINT64_MAX : static_cast<uint64_t>(*timo));
 	if (timo == nullptr) {
 		*out = owner->WaitForEvents(ev, num, 0);
 	}
@@ -439,6 +444,9 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 			*out = owner->WaitForEvents(ev, num, *timo);
 		}
 	}
+	Libs::Graphics::Timeline::Mark(
+	    "eq-woke", *out > 0 ? static_cast<uint64_t>(ev[0].ident) : 0,
+	    *out > 0 ? static_cast<uint64_t>(static_cast<uint32_t>(ev[0].filter)) : 0);
 
 	if (*out == KERNEL_ERROR_EBADF) {
 		return KERNEL_ERROR_EBADF;

@@ -72,11 +72,29 @@ public:
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
-	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// `same_backing`, when given, says whether the image is one that was there with the same
+	// backing (SameBacking), as it was: no overlap had to be resolved and no image was made.
+	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
+	                                      bool* same_backing = nullptr);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
+	// The texture memo (RenderExecutor::ResolveTexture). The image set's generation changes
+	// whenever an image is registered or unregistered: while it stays, FindImage gives a
+	// description the same image, so a binding resolved before can name it again.
+	[[nodiscard]] uint64_t ImageSetGeneration() const noexcept {
+		return m_image_set_generation.load(std::memory_order_acquire);
+	}
+	// GPU thread: whether a sampled texture binding of image `id` may be kept for reuse at all: a
+	// registered image that is not a depth image nor a depth image's stencil plane, without
+	// metadata, and not one whose bytes are compared with the guest's (ChecksGuestContent).
+	[[nodiscard]] bool MayReuseTextureBinding(ImageId id);
+	// GPU thread: whether such a binding of image `id`, and the view FindTexture gave it, can be
+	// used again as they were: the image may be kept (above), nothing has written it since (the
+	// CPU or a GPU buffer write), and its pages are all tracked, so that FindImage and FindTexture
+	// would find it and its view and leave it as it is. It is then touched as FindImage touches it.
+	[[nodiscard]] bool ReuseTextureBinding(ImageId id);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
@@ -379,6 +397,8 @@ private:
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
 
+	// Caller holds m_lock: MayReuseTextureBinding's checks of an image.
+	[[nodiscard]] bool ReusableTextureImage(const Image& image) const;
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
@@ -434,6 +454,8 @@ private:
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	TrackingSpinLock m_lock {Common::PerfStats::Lock::TextureCache};
+	// Registrations and unregistrations of images (ImageSetGeneration).
+	std::atomic<uint64_t> m_image_set_generation {1};
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
 	// Render-target fast clears decided on the GPU (MaterializeColorClear); made at first use.

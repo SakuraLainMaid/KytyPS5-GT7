@@ -12,6 +12,10 @@ namespace Common {
 // Windows only; empty elsewhere.
 [[nodiscard]] std::string HostSymbol(uint64_t address, uint64_t* start = nullptr);
 
+// The source line of the emulator's code at `address` ("descriptors.cpp:3091", the file without
+// its directory), from the PDB's line table; empty without one. Windows only; empty elsewhere.
+[[nodiscard]] std::string HostLine(uint64_t address);
+
 } // namespace Common
 
 #endif // KYTY_COMMON_HOSTSYMBOLS_H_

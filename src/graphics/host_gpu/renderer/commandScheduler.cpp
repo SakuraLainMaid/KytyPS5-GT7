@@ -371,7 +371,29 @@ void CommandScheduler::Wait(uint64_t tick) {
 	stall();
 }
 
-void CommandScheduler::PopPendingOperations() {
+// KYTY_POP_WAIT=1, or KYTY_BISECT's popwait: the deferred operations a draw or a dispatch runs
+// wait for the priority callbacks of their ticks, as before round 67.
+static bool PopWaitAlways() {
+	static const bool always = [] {
+		const char* value = std::getenv("KYTY_POP_WAIT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return always || Bisect::PopWait();
+}
+
+bool CommandScheduler::PriorityPendingThrough(uint64_t tick) const {
+	return (m_priority_active && m_priority_active_tick <= tick) ||
+	       (!m_priority_operations.empty() && m_priority_operations.front().tick <= tick);
+}
+
+void CommandScheduler::PopPendingOperations(bool wait) {
+	// A draw's or a dispatch's call (wait false) leaves an operation whose tick still has priority
+	// callbacks to come for its next call: those callbacks run on the priority thread once it has
+	// seen the tick complete, and waiting for that thread to wake and run them at each draw held
+	// the GPU thread up. The operations only release what finished work used. The priority
+	// callbacks of a finished tick are all queued already (DeferPriorityOperation queues the tick
+	// being recorded, which no finished tick reaches), so none can arrive after the check.
+	wait = wait || PopWaitAlways();
 	m_master.Refresh();
 	for (;;) {
 		PendingOperation operation;
@@ -381,10 +403,15 @@ void CommandScheduler::PopPendingOperations() {
 			    !m_master.IsFree(m_pending_operations.front().tick)) {
 				return;
 			}
+			if (!wait && PriorityPendingThrough(m_pending_operations.front().tick)) {
+				return;
+			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
 		}
-		WaitPriorityOperations(operation.tick);
+		if (wait) {
+			WaitPriorityOperations(operation.tick);
+		}
 		RunOperation(std::move(operation.callback));
 	}
 }

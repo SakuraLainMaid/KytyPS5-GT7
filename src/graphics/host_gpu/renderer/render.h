@@ -271,12 +271,23 @@ private:
 		std::optional<PreparedBindings> pixel;
 	};
 
+	// `memo`: a draw's or a dispatch's binding (PrepareBindings), which may be the one the same
+	// descriptor resolved to before (TextureBinding::memo_view) or be kept for that.
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
-	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	                                            const ShaderRecompiler::IR::DescriptorValue& value,
+	                                            bool memo = false);
+	// RebindImages: drops what the memo kept for a descriptor (its image had changed).
+	void ForgetTextureMemo(const ShaderRecompiler::IR::ImageResource&   resource,
+	                       const ShaderRecompiler::IR::DescriptorValue& value);
+	// RebindImages: keeps a binding just resolved and given its view for the descriptor's next uses.
+	void RecordTextureMemo(const ShaderRecompiler::IR::ImageResource&   resource,
+	                       const ShaderRecompiler::IR::DescriptorValue& value,
+	                       const TextureBinding&                        binding);
+	// `same_backing`: as TextureCache::FindImage's.
 	[[nodiscard]] TextureBinding FindResolvedTexture(
 	    const ShaderRecompiler::IR::ImageResource& resource, const ShaderTextureResource& descriptor,
 	    TextureCache::ImageDesc desc, bool shader_conversion, vk::Format pixel_format,
-	    vk::Format view_format, uint32_t size);
+	    vk::Format view_format, uint32_t size, bool* same_backing = nullptr);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,

@@ -18,6 +18,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -39,7 +40,7 @@ std::vector<std::string> Patterns() {
 		return patterns;
 	}
 	if (std::string_view(value) == "1") {
-		return {"Thread_Gpu", "Job#0", "GpuRecord", "Thread_DrawPrep"};
+		return {"Thread_Gpu", "Job#0", "Job#1", "GpuRecord", "Thread_DrawPrep", "GpuPriority"};
 	}
 	std::string_view rest(value);
 	while (!rest.empty()) {
@@ -83,8 +84,15 @@ std::vector<std::string> Patterns() {
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-constexpr size_t MaxFrames      = 24;
-constexpr size_t StackCopyBytes = 16384;
+constexpr size_t MaxFrames  = 48;
+constexpr size_t PathFrames = 6; // a "paths" entry: the leaf and five frames below it
+constexpr size_t ChainDepth = 5; // a "waits" entry: the leaf and four emulator frames
+// The stack copied at each sample, and zeroed room after it (what a sample did not copy is zeroed
+// too): the unwinder reads a frame's saved registers above its stack pointer, so a frame that
+// starts in the copy and runs past its end reads zeros instead of memory past the buffer (a frame
+// larger than the room would not fit a thread's stack).
+constexpr size_t StackCopyBytes = 64 * 1024;
+constexpr size_t UnwindPadBytes = 1024 * 1024;
 
 // The game's code (its modules and the instruction trampolines after them are mapped from
 // 0x8_0000_0000 up, below the emulator's own heaps): the samples there are reported with their
@@ -96,15 +104,37 @@ constexpr uint64_t GuestCodeEnd   = 0x10'0000'0000ull;
 	return address >= GuestCodeBegin && address < GuestCodeEnd;
 }
 
+// Up to PathFrames addresses, zero-padded.
+struct PathKey {
+	std::array<uint64_t, PathFrames> frames {};
+	[[nodiscard]] bool               operator==(const PathKey&) const = default;
+};
+
+struct PathKeyHash {
+	size_t operator()(const PathKey& key) const noexcept {
+		uint64_t hash = 0xcbf29ce484222325ull;
+		for (const auto frame: key.frames) {
+			hash = (hash ^ frame) * 0x100000001b3ull;
+			hash ^= hash >> 29u;
+		}
+		return static_cast<size_t>(hash);
+	}
+};
+
 struct Target {
 	uint32_t    tid = 0;
 	std::string name;
 	HANDLE      handle   = nullptr;
 	uint64_t    samples  = 0;
 	uint64_t    in_image = 0; // samples whose leaf is in the emulator's own code
+	uint64_t    frames   = 0; // frames walked, all samples
+	uint64_t    deep     = 0; // samples walked four frames or more
 	// Leaf addresses, and the emulator's addresses on the stack (once a sample), by samples.
 	std::unordered_map<uint64_t, uint32_t> self;
 	std::unordered_map<uint64_t, uint32_t> total;
+	// The leaf and the frames below it; the leaf and the emulator's frames below it.
+	std::unordered_map<PathKey, uint32_t, PathKeyHash> paths;
+	std::unordered_map<PathKey, uint32_t, PathKeyHash> chains;
 	// Samples whose leaf is in the game's code: by the leaf's 256-byte bucket, its callers (the
 	// return address of the frame-pointer chain's first frame).
 	std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint32_t>> guest_callers;
@@ -139,11 +169,11 @@ Image EmulatorImage() {
 
 // One sample's registers and the top of its stack. Copied while the thread is suspended: nothing
 // is allocated then (the thread may hold the heap's lock), and the stack it describes cannot
-// change underneath.
+// change underneath. The walk runs on the copy after the thread has gone on.
 struct Capture {
-	CONTEXT                             context {};
-	std::array<uint8_t, StackCopyBytes> stack {};
-	size_t                              copied = 0;
+	CONTEXT                                              context {};
+	std::array<uint8_t, StackCopyBytes + UnwindPadBytes> stack {};
+	size_t                                               copied = 0;
 };
 
 bool CaptureThread(HANDLE thread, Capture& capture) {
@@ -155,8 +185,19 @@ bool CaptureThread(HANDLE thread, Capture& capture) {
 	const bool ok                = GetThreadContext(thread, &capture.context) != FALSE;
 	capture.copied               = 0;
 	if (ok) {
-		// Near the top of a stack the copy's size reaches past its end: halve until it fits.
-		for (size_t size = StackCopyBytes; size >= 512 && capture.copied == 0; size /= 2) {
+		// The stack's committed pages from the stack pointer up (one region up to the stack's
+		// base), at most StackCopyBytes; halved until a read succeeds if that is unknown.
+		size_t                   size = StackCopyBytes;
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(capture.context.Rsp), &info,
+		                 sizeof(info)) != 0 &&
+		    info.State == MEM_COMMIT) {
+			const auto end = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+			if (end > capture.context.Rsp) {
+				size = static_cast<size_t>(std::min<uint64_t>(size, end - capture.context.Rsp));
+			}
+		}
+		for (; size >= 64 && capture.copied == 0; size /= 2) {
 			SIZE_T read = 0;
 			if (ReadProcessMemory(GetCurrentProcess(),
 			                      reinterpret_cast<const void*>(capture.context.Rsp),
@@ -166,12 +207,41 @@ bool CaptureThread(HANDLE thread, Capture& capture) {
 		}
 	}
 	ResumeThread(thread);
+	// Nothing of an earlier sample (another thread's, maybe) past this copy.
+	if (capture.copied < StackCopyBytes) {
+		std::memset(capture.stack.data() + capture.copied, 0, StackCopyBytes - capture.copied);
+	}
 	return ok;
 }
 
-// The leaf, then the return addresses of the frame-pointer chain within the copied stack (the
-// emulator keeps frame pointers, /Oy-; the chain stops where it leaves the copy or stops rising).
-size_t WalkFrames(const Capture& capture, std::array<uint64_t, MaxFrames>& frames) {
+// The register a function's unwind data names as its frame register (null: none), from its
+// UNWIND_INFO header (the frame register is the low nibble of its fourth byte; 0 is none).
+DWORD64* FrameRegister(CONTEXT& context, DWORD64 image_base, const RUNTIME_FUNCTION& function) {
+	const auto* info = reinterpret_cast<const uint8_t*>(image_base + function.UnwindData);
+	switch (info[3] & 0x0fu) {
+		case 1: return &context.Rcx;
+		case 2: return &context.Rdx;
+		case 3: return &context.Rbx;
+		case 4: return &context.Rsp;
+		case 5: return &context.Rbp;
+		case 6: return &context.Rsi;
+		case 7: return &context.Rdi;
+		case 8: return &context.R8;
+		case 9: return &context.R9;
+		case 10: return &context.R10;
+		case 11: return &context.R11;
+		case 12: return &context.R12;
+		case 13: return &context.R13;
+		case 14: return &context.R14;
+		case 15: return &context.R15;
+		default: return nullptr;
+	}
+}
+
+// The leaf, then the return addresses of the frame-pointer chain within the copied stack: for a
+// leaf in the game's code, whose frames have no unwind data (the chain stops where it leaves the
+// copy or stops rising).
+size_t WalkFramePointers(const Capture& capture, std::array<uint64_t, MaxFrames>& frames) {
 	size_t count    = 0;
 	frames[count++] = capture.context.Rip;
 	const auto base = capture.context.Rsp;
@@ -193,6 +263,107 @@ size_t WalkFrames(const Capture& capture, std::array<uint64_t, MaxFrames>& frame
 		rbp = next;
 	}
 	return count;
+}
+
+// The leaf, then the return addresses the Windows unwind data gives (RtlVirtualUnwind), on the
+// copy: every register that points into the copied stack is moved into the copy before each
+// step, so the unwinder reads the copy, not the thread's live stack. The walk stops at the game's
+// code (no unwind data), at a frame outside the copy, at a frame whose frame register points
+// outside it (one that runs past the copy's end), at a frame below the leaf without unwind data,
+// or after MaxFrames.
+size_t UnwindFrames(const Capture& capture, std::array<uint64_t, MaxFrames>& frames) {
+	size_t count    = 0;
+	frames[count++] = capture.context.Rip;
+	if (capture.copied < 64) {
+		return count;
+	}
+	CONTEXT        context  = capture.context;
+	const uint64_t original = capture.context.Rsp;
+	const uint64_t copy     = reinterpret_cast<uint64_t>(capture.stack.data());
+	const uint64_t copied   = capture.copied;
+	const auto     relocate = [&] {
+        for (DWORD64* reg: {&context.Rax, &context.Rcx, &context.Rdx, &context.Rbx, &context.Rsp,
+                            &context.Rbp, &context.Rsi, &context.Rdi, &context.R8, &context.R9,
+                            &context.R10, &context.R11, &context.R12, &context.R13, &context.R14,
+                            &context.R15}) {
+            if (*reg >= original && *reg < original + copied) {
+                *reg = *reg - original + copy;
+            }
+        }
+	};
+	relocate();
+	while (count < MaxFrames) {
+		const uint64_t pc = context.Rip;
+		if (pc == 0 || IsGuestCode(pc)) {
+			break;
+		}
+		if (context.Rsp < copy || context.Rsp + 8 > copy + copied) {
+			break;
+		}
+		DWORD64    image_base = 0;
+		const auto function   = RtlLookupFunctionEntry(pc, &image_base, nullptr);
+		if (function == nullptr) {
+			// A leaf function needs no unwind data: its return address is at the stack pointer.
+			// Below the leaf, a frame without it is code the walk cannot follow.
+			if (count != 1) {
+				break;
+			}
+			uint64_t ret = 0;
+			std::memcpy(&ret, reinterpret_cast<const void*>(context.Rsp), sizeof(ret));
+			context.Rip = ret;
+			context.Rsp += 8;
+		} else {
+			// A frame register outside the copy: the unwinder would read the live stack there.
+			if (const auto* frame = FrameRegister(context, image_base, *function);
+			    frame != nullptr && (*frame < copy || *frame >= copy + copied)) {
+				break;
+			}
+			PVOID   handler_data = nullptr;
+			DWORD64 establisher  = 0;
+			RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, pc, function, &context, &handler_data,
+			                 &establisher, nullptr);
+			// A machine frame (an exception's) gives the interrupted stack pointer as it was.
+			relocate();
+		}
+		if (context.Rip == 0) {
+			break;
+		}
+		frames[count++] = context.Rip;
+	}
+	return count;
+}
+
+// A leaf where a thread waits in the kernel: a lock, a condition variable, an event, a fence
+// (the display driver's wait), a sleep or a yield.
+[[nodiscard]] bool IsWaitName(std::string_view name) {
+	if (const auto bang = name.find('!'); bang != std::string_view::npos) {
+		name.remove_prefix(bang + 1);
+	}
+	if (name.find("GdiDdDDIWait") != std::string_view::npos ||
+	    name.find("RemoveIoCompletion") != std::string_view::npos) {
+		return true;
+	}
+	if (!name.starts_with("Nt") && !name.starts_with("Zw")) {
+		return false;
+	}
+	return name.find("Wait") != std::string_view::npos ||
+	       name.find("Delay") != std::string_view::npos ||
+	       name.find("Yield") != std::string_view::npos;
+}
+
+// Names in paths: without the namespaces every emulator name repeats, at most 70 characters.
+[[nodiscard]] std::string Shorten(std::string name) {
+	for (const std::string_view prefix: {"Libs::Graphics::ShaderRecompiler::IR::",
+	                                     "Libs::Graphics::", "Libs::LibKernel::Memory::",
+	                                     "Libs::LibKernel::", "Libs::", "Common::"}) {
+		for (size_t at = name.find(prefix); at != std::string::npos; at = name.find(prefix, at)) {
+			name.erase(at, prefix.size());
+		}
+	}
+	if (name.size() > 70) {
+		name.resize(70);
+	}
+	return name;
 }
 
 class Sampler {
@@ -232,7 +403,7 @@ public:
 			}
 			if (now - last_report >= std::chrono::seconds(m_report_seconds)) {
 				Report(std::chrono::duration<double>(now - last_report).count());
-				last_report = now;
+				last_report = std::chrono::steady_clock::now();
 			}
 		}
 	}
@@ -274,17 +445,22 @@ private:
 			return;
 		}
 		std::array<uint64_t, MaxFrames> frames {};
-		const auto                      count = WalkFrames(capture, frames);
+		const bool                      guest_leaf = IsGuestCode(capture.context.Rip);
+		const auto count = guest_leaf ? WalkFramePointers(capture, frames)
+		                              : UnwindFrames(capture, frames);
 		target.samples++;
+		target.frames += count;
+		target.deep += count >= 4 ? 1u : 0u;
 		if (m_image.Contains(frames[0])) {
 			target.in_image++;
 		}
 		target.self[frames[0]]++;
-		if (IsGuestCode(frames[0])) {
+		if (guest_leaf) {
 			target.guest_callers[frames[0] & ~uint64_t {0xff}][count > 1 ? frames[1] : 0]++;
+			return;
 		}
 		for (size_t i = 0; i < count; i++) {
-			// The emulator's own frames: the chain through the game's code is not reliable.
+			// The emulator's own frames, once a sample (recursion counts once).
 			if (!m_image.Contains(frames[i]) ||
 			    std::find(frames.begin(), frames.begin() + static_cast<std::ptrdiff_t>(i),
 			              frames[i]) != frames.begin() + static_cast<std::ptrdiff_t>(i)) {
@@ -292,6 +468,20 @@ private:
 			}
 			target.total[frames[i]]++;
 		}
+		PathKey path;
+		for (size_t i = 0; i < std::min(count, PathFrames); i++) {
+			path.frames[i] = frames[i];
+		}
+		target.paths[path]++;
+		PathKey chain;
+		chain.frames[0] = frames[0];
+		size_t depth    = 1;
+		for (size_t i = 1; i < count && depth < ChainDepth; i++) {
+			if (m_image.Contains(frames[i])) {
+				chain.frames[depth++] = frames[i];
+			}
+		}
+		target.chains[chain]++;
 	}
 
 	const std::string& Name(uint64_t address) {
@@ -307,23 +497,131 @@ private:
 		return m_names.emplace(address, std::move(name)).first->second;
 	}
 
-	std::string Top(const std::unordered_map<uint64_t, uint32_t>& counts, uint64_t samples) {
+	const std::string& Line(uint64_t address) {
+		if (const auto it = m_lines.find(address); it != m_lines.end()) {
+			return it->second;
+		}
+		auto line = HostLine(address);
+		if (line.empty()) {
+			line = fmt::format("+0x{:x}", address - m_image.begin);
+		}
+		return m_lines.emplace(address, std::move(line)).first->second;
+	}
+
+	[[nodiscard]] static double Share(uint64_t count, uint64_t samples) {
+		return 100.0 * static_cast<double>(count) / static_cast<double>(std::max<uint64_t>(samples, 1));
+	}
+
+	// The entries by count, largest first.
+	template <typename Key>
+	static std::vector<std::pair<uint64_t, Key>> Sorted(
+	    const std::unordered_map<Key, uint64_t>& counts) {
+		std::vector<std::pair<uint64_t, Key>> sorted;
+		sorted.reserve(counts.size());
+		for (const auto& [key, count]: counts) {
+			sorted.emplace_back(count, key);
+		}
+		std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.first > b.first; });
+		return sorted;
+	}
+
+	std::string Top(const std::unordered_map<uint64_t, uint32_t>& counts, uint64_t samples,
+	                size_t limit = 30) {
 		std::unordered_map<std::string, uint64_t> by_name;
 		for (const auto& [address, count]: counts) {
 			by_name[Name(address)] += count;
 		}
-		std::vector<std::pair<uint64_t, std::string>> sorted;
-		sorted.reserve(by_name.size());
-		for (auto& [name, count]: by_name) {
-			sorted.emplace_back(count, name);
-		}
-		std::ranges::sort(sorted, std::greater {});
+		const auto  sorted = Sorted(by_name);
 		std::string out;
-		for (size_t i = 0; i < std::min<size_t>(sorted.size(), 24); i++) {
-			out += fmt::format("{}{:.1f}% {}", i == 0 ? " " : "; ",
-			                   100.0 * static_cast<double>(sorted[i].first) /
-			                       static_cast<double>(std::max<uint64_t>(samples, 1)),
+		for (size_t i = 0; i < std::min<size_t>(sorted.size(), limit); i++) {
+			out += fmt::format("{}{:.1f}% {}", i == 0 ? " " : "; ", Share(sorted[i].first, samples),
 			                   sorted[i].second);
+		}
+		return out;
+	}
+
+	// "a < b < c": the names of a path's frames, a frame repeating the one above it (recursion)
+	// left out.
+	std::string Joined(const PathKey& key) {
+		std::string out;
+		std::string previous;
+		for (const auto frame: key.frames) {
+			if (frame == 0) {
+				break;
+			}
+			auto name = Shorten(Name(frame));
+			if (name == previous) {
+				continue;
+			}
+			out += out.empty() ? "" : " < ";
+			out += name;
+			previous = std::move(name);
+		}
+		return out;
+	}
+
+	std::string TopPaths(const Target& target, size_t limit) {
+		std::unordered_map<std::string, uint64_t> by_text;
+		for (const auto& [key, count]: target.paths) {
+			by_text[Joined(key)] += count;
+		}
+		const auto  sorted = Sorted(by_text);
+		std::string out;
+		for (size_t i = 0; i < std::min<size_t>(sorted.size(), limit); i++) {
+			out += fmt::format("{}{:.1f}% {}", i == 0 ? " " : " | ",
+			                   Share(sorted[i].first, target.samples), sorted[i].second);
+		}
+		return out;
+	}
+
+	// The waits by the emulator's frames below them, as a share of all samples, with the share of
+	// all samples that waited at all.
+	std::string TopWaits(const Target& target, size_t limit, uint64_t& waited) {
+		std::unordered_map<std::string, uint64_t> by_text;
+		waited = 0;
+		for (const auto& [key, count]: target.chains) {
+			if (m_image.Contains(key.frames[0]) || !IsWaitName(Name(key.frames[0]))) {
+				continue;
+			}
+			waited += count;
+			by_text[Joined(key)] += count;
+		}
+		const auto  sorted = Sorted(by_text);
+		std::string out;
+		for (size_t i = 0; i < std::min<size_t>(sorted.size(), limit); i++) {
+			out += fmt::format("{}{:.1f}% {}", i == 0 ? " " : " | ",
+			                   Share(sorted[i].first, target.samples), sorted[i].second);
+		}
+		return out;
+	}
+
+	// The busiest functions of the emulator's own code, each with its busiest source lines.
+	std::string TopLines(const Target& target, size_t functions, size_t lines) {
+		std::unordered_map<std::string, uint64_t>                         by_function;
+		std::unordered_map<std::string, std::vector<std::pair<uint64_t, uint32_t>>> addresses;
+		for (const auto& [address, count]: target.self) {
+			if (!m_image.Contains(address)) {
+				continue;
+			}
+			const auto& name = Name(address);
+			by_function[name] += count;
+			addresses[name].emplace_back(address, count);
+		}
+		const auto  sorted = Sorted(by_function);
+		std::string out;
+		for (size_t i = 0; i < std::min<size_t>(sorted.size(), functions); i++) {
+			std::unordered_map<std::string, uint64_t> by_line;
+			for (const auto& [address, count]: addresses[sorted[i].second]) {
+				by_line[Line(address)] += count;
+			}
+			const auto  ranked = Sorted(by_line);
+			std::string text;
+			for (size_t j = 0; j < std::min<size_t>(ranked.size(), lines); j++) {
+				text += fmt::format("{}{} {:.1f}%", j == 0 ? "" : ", ", ranked[j].second,
+				                    Share(ranked[j].first, target.samples));
+			}
+			out += fmt::format("{}{} {:.1f}%: {}", i == 0 ? " " : " | ", Shorten(sorted[i].second),
+			                   Share(sorted[i].first, target.samples), text);
 		}
 		return out;
 	}
@@ -360,10 +658,7 @@ private:
 		}
 		std::vector<std::pair<uint64_t, uint64_t>> sorted(buckets.begin(), buckets.end());
 		std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.second > b.second; });
-		const auto share = [&](uint64_t count) {
-			return 100.0 * static_cast<double>(count) /
-			       static_cast<double>(std::max<uint64_t>(target.samples, 1));
-		};
+		const auto share = [&](uint64_t count) { return Share(count, target.samples); };
 		for (size_t rank = 0; rank < std::min<size_t>(sorted.size(), 6); rank++) {
 			const auto [bucket, count] = sorted[rank];
 			if (share(count) < 1.0) {
@@ -419,20 +714,39 @@ private:
 			    "Sample {} (tid {}): {} samples in {:.0f} s, {:.0f}% in the emulator's code | "
 			    "self:{}\n",
 			    target->name, target->tid, target->samples, seconds,
-			    100.0 * static_cast<double>(target->in_image) /
-			        static_cast<double>(target->samples),
-			    Top(target->self, target->samples)));
+			    Share(target->in_image, target->samples), Top(target->self, target->samples)));
 			Log::WriteUnmuted(fmt::format("Sample {} (tid {}) total:{}\n", target->name,
-			                              target->tid, Top(target->total, target->samples)));
+			                              target->tid, Top(target->total, target->samples, 40)));
+			Log::WriteUnmuted(fmt::format(
+			    "Sample {} (tid {}) depth: {:.1f} frames a sample, {:.0f}% walked 4 or more\n",
+			    target->name, target->tid,
+			    static_cast<double>(target->frames) / static_cast<double>(target->samples),
+			    Share(target->deep, target->samples)));
+			uint64_t   waited = 0;
+			const auto waits  = TopWaits(*target, 16, waited);
+			Log::WriteUnmuted(fmt::format("Sample {} (tid {}) waits: {:.1f}% of its samples |{}\n",
+			                              target->name, target->tid,
+			                              Share(waited, target->samples), waits));
+			Log::WriteUnmuted(fmt::format("Sample {} (tid {}) paths:{}\n", target->name,
+			                              target->tid, TopPaths(*target, 24)));
+			Log::WriteUnmuted(fmt::format("Sample {} (tid {}) lines:{}\n", target->name,
+			                              target->tid, TopLines(*target, 14, 4)));
 			target->samples  = 0;
 			target->in_image = 0;
+			target->frames   = 0;
+			target->deep     = 0;
 			target->self.clear();
 			target->total.clear();
+			target->paths.clear();
+			target->chains.clear();
 			target->guest_callers.clear();
 		}
 		// The names stay: most addresses come back in the next report.
 		if (m_names.size() > 400'000) {
 			m_names.clear();
+		}
+		if (m_lines.size() > 400'000) {
+			m_lines.clear();
 		}
 	}
 
@@ -442,6 +756,7 @@ private:
 	Image                                     m_image;
 	std::vector<std::unique_ptr<Target>>      m_targets;
 	std::unordered_map<uint64_t, std::string> m_names;
+	std::unordered_map<uint64_t, std::string> m_lines;
 };
 
 #endif
@@ -463,7 +778,8 @@ void Start() {
 		const auto hz      = EnvNumber("KYTY_SAMPLE_HZ", 1000, 10, 5000);
 		const auto seconds = EnvNumber("KYTY_SAMPLE_REPORT", 10, 1, 3600);
 		Log::WriteUnmuted(fmt::format("Sample: {} times a second: {}; a report every {} s "
-		                              "(KYTY_SAMPLE, KYTY_SAMPLE_HZ, KYTY_SAMPLE_REPORT)\n",
+		                              "(KYTY_SAMPLE, KYTY_SAMPLE_HZ, KYTY_SAMPLE_REPORT); stacks "
+		                              "walked with the unwind data\n",
 		                              hz, list, seconds));
 		std::thread([patterns = std::move(patterns), hz, seconds]() mutable {
 			PerfStats::NameThread("Sampler");

@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/timeline.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -219,6 +220,13 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 			case SDLK_F9:
 				if (!key.repeat) {
 					FrameGraph::RequestCapture();
+				}
+				break;
+			case SDLK_F6:
+				if (!key.repeat) {
+					// The next eight presented frames' timeline (graphics/host_gpu/timeline.h). No
+					// status on screen: while one shows, the last frame is presented again.
+					Timeline::RequestCapture(8);
 				}
 				break;
 			case SDLK_F11:

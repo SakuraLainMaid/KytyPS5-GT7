@@ -10,6 +10,7 @@
 #include <fmt/format.h>
 #include <mutex>
 #include <string>
+#include <string_view>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -346,6 +347,31 @@ std::string HostSymbol(uint64_t address, uint64_t* start) {
 #else
 	(void)address;
 	(void)start;
+	return {};
+#endif
+}
+
+std::string HostLine(uint64_t address) {
+#ifdef _WIN32
+	const auto       process = SymbolProcess();
+	std::scoped_lock symbol_lock(g_symbol_mutex);
+	if (!InitializeSymbols(process)) {
+		return {};
+	}
+	IMAGEHLP_LINE64 line {};
+	line.SizeOfStruct  = sizeof(line);
+	DWORD displacement = 0;
+	if (SymGetLineFromAddr64(process, address, &displacement, &line) == FALSE ||
+	    line.FileName == nullptr) {
+		return {};
+	}
+	std::string_view file(line.FileName);
+	if (const auto slash = file.find_last_of("\\/"); slash != std::string_view::npos) {
+		file.remove_prefix(slash + 1);
+	}
+	return fmt::format("{}:{}", file, line.LineNumber);
+#else
+	(void)address;
 	return {};
 #endif
 }

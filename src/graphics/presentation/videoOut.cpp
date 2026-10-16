@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/timeline.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
 #include "kernel/pthread.h"
@@ -1594,6 +1595,7 @@ KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64
 	if (result != OK) {
 		return result;
 	}
+	Graphics::Timeline::Mark("flip-cpu", static_cast<uint64_t>(index), request_id);
 	g_video_out_driver->SubmitFlipPreparation(request_id);
 
 	return OK;
@@ -1608,6 +1610,7 @@ int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handl
 	if (result != OK) {
 		return result;
 	}
+	Graphics::Timeline::Mark("flip-eop", static_cast<uint64_t>(index), request_id);
 	m_impl->GetFlipQueue().Prepare(request_id, buffer);
 
 	return OK;
@@ -1628,7 +1631,9 @@ void VideoOutDriver::CompleteFlip(uint64_t request_id) {
 void VideoOutDriver::WaitForSubmitSlot(int handle) {
 	auto* cfg = m_impl->Get(handle);
 	EXIT_IF(cfg == nullptr);
+	Graphics::Timeline::Mark("flip-slot-wait", static_cast<uint64_t>(handle));
 	m_impl->GetFlipQueue().WaitForSubmitSlot(*cfg);
+	Graphics::Timeline::Mark("flip-slot-done", static_cast<uint64_t>(handle));
 }
 
 void VideoOutDriver::WaitFlipDone(int handle, int index) {

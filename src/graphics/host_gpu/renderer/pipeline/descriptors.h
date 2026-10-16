@@ -27,6 +27,13 @@ struct TextureBinding {
 	TextureCache::ImageDesc    desc;
 	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
 	std::vector<vk::ImageView> mip_views;
+	// The texture memo (RenderExecutor::ResolveTexture): the view a binding of the same
+	// descriptor was given before, for RebindImages to use again once the image is found
+	// unchanged; and, for a binding just looked up in the texture cache, the image set's
+	// generation of that lookup (TextureCache::ImageSetGeneration), so that RebindImages can keep
+	// it (0: it may not be kept).
+	vk::ImageView memo_view       = nullptr;
+	uint64_t      memo_generation = 0;
 };
 
 struct PreparedBindings {

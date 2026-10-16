@@ -957,6 +957,7 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_registered_pages.Add(page, 1);
 	});
 	image.registered = true;
+	m_image_set_generation.fetch_add(1, std::memory_order_acq_rel);
 	NoteBindlessStateChange(image);
 	image.lru_id     = m_lru_cache.Insert(id, LruClock());
 	m_total_used_memory += image.AccountedSize();
@@ -993,6 +994,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	}
 	m_total_used_memory -= accounted;
 	image.registered = false;
+	m_image_set_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -2749,7 +2751,10 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	return association;
 }
 
-ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_backing) {
+	if (same_backing != nullptr) {
+		*same_backing = false;
+	}
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
@@ -2773,6 +2778,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				result = id;
 			}
 		}
+		// Found with the same backing: the overlap loop below does not run.
+		const bool backing_match = static_cast<bool>(result);
 
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
@@ -2798,6 +2805,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				FreeImage(result, "a binding needs more mips or layers than it has");
 				result = {};
 			}
+		}
+		if (same_backing != nullptr) {
+			*same_backing = backing_match && static_cast<bool>(result);
 		}
 		if (!result) {
 			result         = InsertImage(desc.info);
@@ -2922,6 +2932,43 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
 	return image.FindView(desc.view_info);
+}
+
+bool TextureCache::ReusableTextureImage(const Image& image) const {
+	const auto& info = image.info;
+	if (!image.registered || info.data.Empty() || image.depth_id || info.IsDepth() ||
+	    info.HasStencil() || info.HasMetadata() ||
+	    info.metadata.compression != VideoOutCompression::Uncompressed ||
+	    image.binding.needs_rebind) {
+		return false;
+	}
+	// RefreshImage compares such an image's bytes with the guest's once a guest submission.
+	const auto limit = info.IsTiled() ? GuestHashTiledBytes() : GuestHashImageBytes();
+	return limit == 0 || info.data.size > limit;
+}
+
+bool TextureCache::MayReuseTextureBinding(ImageId id) {
+	std::scoped_lock lock {m_lock};
+	const auto*      image = m_slot_images.try_get(id);
+	return image != nullptr && ReusableTextureImage(*image);
+}
+
+bool TextureCache::ReuseTextureBinding(ImageId id) {
+	std::scoped_lock lock {m_lock};
+	auto*            image = m_slot_images.try_get(id);
+	if (image == nullptr || !ReusableTextureImage(*image) || image->IsCpuDirty() ||
+	    image->IsBufferModified()) {
+		return false;
+	}
+	// TrackImage would track it again (a CPU write next to it untracked part of it).
+	if (image->track_addr != image->info.data.address ||
+	    image->track_addr_end != image->info.data.End()) {
+		return false;
+	}
+	// As FindImage: its last use is in the command buffer being recorded.
+	image->tick_accessed_last = m_scheduler.CurrentTick();
+	TouchImage(*image);
+	return true;
 }
 
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
