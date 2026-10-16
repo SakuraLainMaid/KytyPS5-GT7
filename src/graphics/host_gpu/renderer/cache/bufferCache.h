@@ -145,6 +145,16 @@ public:
 	[[nodiscard]] bool              IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] bool              IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool              IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// A CPU write fault's whole block (RenderContext::HandleFault): its pages become CPU-dirty and
+	// writable at once, unless one of them holds GPU-written bytes (false: nothing changes, and the
+	// fault takes its own page). The known fills over it are forgotten, as the CPU's later stores
+	// there do not fault.
+	[[nodiscard]] bool ReleaseBlockForCpuWrite(uint64_t block, uint64_t size);
+	// Whether a shader has stored through shader addresses: those stores mark no range, so no
+	// block can be proven free of GPU-written bytes.
+	[[nodiscard]] bool AddressWritesSeen() const noexcept {
+		return m_address_writes_seen.load(std::memory_order_relaxed);
+	}
 	void                            ProcessFaultBuffer();
 	void                            NoteDmaShader(uint64_t hash, std::string label) {
         m_fault_manager.NoteDmaShader(hash, std::move(label));
@@ -350,6 +360,7 @@ private:
 	};
 	std::vector<UnrecordedWrite> m_unrecorded_writes;
 	uint64_t                     m_address_write_tick = 0;
+	std::atomic<bool>            m_address_writes_seen {false};
 	// The metadata ranges WatchMetadata watches, by first byte: whether something wrote any of
 	// their bytes since. Under m_dirty_ranges_mutex; m_metadata_watch_count mirrors their number
 	// for the paths that look without the lock.

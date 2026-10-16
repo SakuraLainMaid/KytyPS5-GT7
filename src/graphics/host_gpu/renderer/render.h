@@ -305,11 +305,18 @@ private:
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
-	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-	                                                     const CommandBuffer&          buffer);
+	// `code_address`: the guest code of the dispatch's shader, which may be the SDK's pattern fill
+	// (renderCompute.cpp); 0 leaves that out. The meta clear takes a pattern fill's value with the
+	// dispatch's shape (group_x 0: not known).
+	[[nodiscard]] bool TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
+	                                              const CommandBuffer&          buffer,
+	                                              uint64_t code_address = 0, uint32_t group_x = 0,
+	                                              uint32_t group_y = 0, uint32_t group_z = 0,
+	                                              uint32_t mode = 0);
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
-	                                              CommandBuffer& command, uint32_t group_x,
-	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
+	                                               CommandBuffer& command, uint32_t group_x,
+	                                               uint32_t group_y, uint32_t group_z,
+	                                               uint32_t mode, uint64_t code_address = 0);
 
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;

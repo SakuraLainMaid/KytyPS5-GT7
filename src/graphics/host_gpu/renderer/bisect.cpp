@@ -43,6 +43,8 @@ struct Step {
 	bool              recheck      = false;
 	bool              locks_spin   = false;
 	bool              htile_depth  = false;
+	bool              pattern_off    = false;
+	bool              faultblock_off = false;
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
 	uint32_t          gpu_frames  = 0;    // gputime:<n>
@@ -142,6 +144,14 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "htile:depth") {
 		step.htile_depth = true;
+		return true;
+	}
+	if (action == "patternfill:off") {
+		step.pattern_off = true;
+		return true;
+	}
+	if (action == "faultblock:off") {
+		step.faultblock_off = true;
 		return true;
 	}
 	if (action.starts_with("tess:max:")) {
@@ -515,6 +525,16 @@ bool LocksSpin() {
 bool HtileDepthOnly() {
 	const auto* step = Current();
 	return step != nullptr && step->htile_depth;
+}
+
+bool PatternFillsOff() {
+	const auto* step = Current();
+	return step != nullptr && step->pattern_off;
+}
+
+bool FaultBlocksOff() {
+	const auto* step = Current();
+	return step != nullptr && step->faultblock_off;
 }
 
 bool WholeUnnormalizedViews() {

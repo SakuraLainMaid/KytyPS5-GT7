@@ -526,6 +526,52 @@ void TestRangeInvalidation() {
   Release(memory);
 }
 
+// A write fault's whole block (RenderContext::HandleFault): released at once
+// when none of it is GPU-written, left as it was when a page of it is.
+void TestReleaseForCpuWrite() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  constexpr uint64_t pages = 16;
+  auto *memory = Allocate(page_manager, pages);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto size = page_size * pages;
+
+  tracker.ForEachUploadRange(
+      address, size, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(!tracker.IsRegionCpuModified(address, size) && !IsWritable(memory) &&
+            !IsWritable(memory + size - 1),
+        "block release setup did not arm write tracking");
+  Check(
+      tracker.ReleaseForCpuWrite(address, size) &&
+          tracker.IsRegionCpuModified(address, page_size) &&
+          tracker.IsRegionCpuModified(address + size - page_size, page_size) &&
+          IsWritable(memory) && IsWritable(memory + size - 1),
+      "a clean block was not released whole");
+
+  tracker.ForEachUploadRange(
+      address, size, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  tracker.ForEachUploadRange(
+      address + page_size * 5, page_size, true,
+      [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  Check(tracker.IsRegionGpuModified(address + page_size * 5, page_size) &&
+            !IsWritable(memory),
+        "block release setup did not take GPU ownership of one page");
+  Check(!tracker.ReleaseForCpuWrite(address, size) &&
+            !tracker.IsRegionCpuModified(address, page_size) &&
+            !IsWritable(memory) &&
+            tracker.IsRegionGpuModified(address + page_size * 5, page_size),
+        "a block holding a GPU-written page was released");
+
+  tracker.UnmarkRegionAsGpuModified(address + page_size * 5, page_size);
+  tracker.MarkRegionAsCpuModified(address, size);
+  tracker.UntrackMemory(address, size);
+  Release(memory);
+}
+
 void TestGpuReacquisitionAfterInvalidation() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1224,6 +1270,7 @@ int main(int argc, char **argv) {
   TestCpuDirtyUpload();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
+  TestReleaseForCpuWrite();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();
   TestExactDirtyIntervalsSharingTrackerPage();

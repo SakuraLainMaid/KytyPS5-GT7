@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <functional>
 #include <map>
@@ -36,6 +37,20 @@ class CommandBuffer;
 class CommandScheduler;
 class RenderExecutor;
 struct TextureCacheTestAccess;
+
+// How TextureCache::ClearImageFromBuffer takes a fill.
+struct BufferFillClear {
+	// Refuse when another image starts at the fill's address: a fill there reaches it too (a
+	// dispatch's buffer write gives it the written bytes), and a clear would not. Stencil planes
+	// that no buffer write reaches (multisampled or in an HTile) do not count. With `also_run`,
+	// such a plane is cleared anyway and *also_run says the fill must still run for the others.
+	bool  alone    = false;
+	bool* also_run = nullptr;
+	// The word is the guest memory's: a 16-bit depth target's word holds two of its texels.
+	bool guest_word = false;
+	// What it cleared, or why it did not, for logs (optional).
+	std::string* what = nullptr;
+};
 
 class TextureCache {
 public:
@@ -71,14 +86,20 @@ public:
 	}
 	void MarkGpuWritten(ImageId id);
 
+	// A fill of exactly an image's memory (a color or depth image's, or a depth image's stencil
+	// plane) as a clear of that image to the fill's word; false when there is no such image or the
+	// word does not decode for its format.
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
-	                                        uint32_t packed_clear);
+	                                        uint32_t packed_clear, const BufferFillClear& how = {});
 	// KYTY_PENDING_FILLS (default on, 0 turns it off): a GPU fill that found no image to clear
 	// (a compute shader's, which is then noted with BufferCache::NoteFill, or a DMA fill) still
 	// holds for its range, the bytes of it that were not mapped then among them: a render or depth
 	// target created later inside it starts as the fill instead of what its memory holds then.
 	[[nodiscard]] static bool ClearsTargetsFromFills();
 	void               InvalidateMemory(uint64_t address, uint64_t size);
+	// InvalidateMemory, and whether any image lies in [block, block + block_size) (one lock).
+	[[nodiscard]] bool InvalidateMemoryNear(uint64_t address, uint64_t size, uint64_t block,
+	                                        uint64_t block_size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
@@ -88,6 +109,8 @@ public:
 	// registers ask for).
 	[[nodiscard]] bool ClearMeta(uint64_t address, std::optional<uint32_t> fill = std::nullopt);
 	[[nodiscard]] std::optional<uint32_t> MetaFillValue(uint64_t address);
+	// The size of the HTile that starts at the address (its depth target's last binding), or 0.
+	[[nodiscard]] uint64_t MetaSize(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 	// Whether a color target's CMASK or DCC starts at this address (MaterializeColorClear notes
 	// them): a fill there that is also a depth target's HTile clear must still run.
@@ -278,6 +301,8 @@ private:
 		// The last fill's value (ClearMeta), when known.
 		uint32_t fill_value = 0;
 		bool     fill_known = false;
+		// The HTile's size (its depth target's last binding), 0 when not known.
+		uint64_t size = 0;
 	};
 
 	struct OverlapResult {
@@ -288,6 +313,31 @@ private:
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
 	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 44, 14>;
+
+	// The registered images of each page of the image page table: written under m_lock, read
+	// without it, so a CPU write fault on memory without images skips the lock (NeySlim's
+	// "skip texture invalidation on pages without images", KytyPS5 PR 1284).
+	class RegisteredPageCounts final {
+	public:
+		RegisteredPageCounts() = default;
+		~RegisteredPageCounts();
+		KYTY_CLASS_NO_COPY(RegisteredPageCounts);
+
+		void               Add(size_t page, int32_t delta);
+		[[nodiscard]] bool Any(size_t first, size_t last_exclusive) const noexcept;
+
+	private:
+		static constexpr size_t LeafBits = 10;
+		static constexpr size_t LeafSize = size_t {1} << LeafBits;
+		using Leaf                       = std::array<std::atomic<uint32_t>, LeafSize>;
+
+		static constexpr size_t LeafCount = ImagePageTable::kPageCount / LeafSize;
+		// On the heap: 128 KB, too much for a TextureCache on a thread's stack (the tests').
+		std::unique_ptr<std::atomic<Leaf*>[]> m_leaves =
+		    std::make_unique<std::atomic<Leaf*>[]>(LeafCount);
+	};
+	// Whether an image may lie in [address, address + size): false is exact.
+	[[nodiscard]] bool MayHaveImages(uint64_t address, uint64_t size) const noexcept;
 
 	// Callers have validated the nonempty 44-bit range with TryGetPageRange.
 	template <typename Func>
@@ -392,6 +442,7 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	RegisteredPageCounts                                          m_registered_pages;
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;

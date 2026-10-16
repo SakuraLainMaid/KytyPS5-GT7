@@ -170,6 +170,10 @@ public:
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
+	// A depth image's stencil associations (the images whose depth_id is it): deleting it frees
+	// them without a scan of the whole cache (upstream's "avoid full-cache scans when deleting
+	// stencil associations").
+	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;

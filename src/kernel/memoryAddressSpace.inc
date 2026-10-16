@@ -751,7 +751,9 @@ private:
 			return nullptr;
 		}
 
-		if (!ApplyProtection(ptr, size, mode)) {
+		// MapViewOfFile3 gave the view its protection already, except for no access (mapped
+		// read-write, then protected): upstream's "avoid redundant Windows view protection".
+		if (mode == VirtualMemory::Mode::NoAccess && !ApplyProtection(ptr, size, mode)) {
 			UnmapViewOfFile2(GetCurrentProcess(), ptr, MEM_PRESERVE_PLACEHOLDER);
 			SetFailure(failure_reason, FailureReason::ProtectFailed);
 			return nullptr;

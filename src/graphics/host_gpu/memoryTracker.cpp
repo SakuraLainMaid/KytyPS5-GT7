@@ -118,6 +118,19 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+bool MemoryTracker::ReleaseForCpuWrite(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	return !Iterate<false>(
+	    vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		    std::scoped_lock lock(manager->lock);
+		    if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
+			    return true;
+		    }
+		    manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+		    return false;
+	    });
+}
+
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {

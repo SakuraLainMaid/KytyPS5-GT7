@@ -246,6 +246,140 @@ void ForgetLandedReadbacks(uint64_t address, uint64_t size) {
 	return true;
 }
 
+[[nodiscard]] float HalfBitsToFloat(uint32_t bits) {
+	const uint32_t sign     = (bits & 0x8000u) << 16u;
+	const uint32_t exponent = (bits >> 10u) & 0x1fu;
+	uint32_t       mantissa = bits & 0x3ffu;
+	if (exponent == 0x1fu) {
+		return std::bit_cast<float>(sign | 0x7f800000u | (mantissa << 13u));
+	}
+	if (exponent != 0) {
+		return std::bit_cast<float>(sign | ((exponent + 112u) << 23u) | (mantissa << 13u));
+	}
+	if (mantissa == 0) {
+		return std::bit_cast<float>(sign);
+	}
+	uint32_t shift = 0;
+	while ((mantissa & 0x400u) == 0) {
+		mantissa <<= 1u;
+		++shift;
+	}
+	return std::bit_cast<float>(sign | ((113u - shift) << 23u) | ((mantissa & 0x3ffu) << 13u));
+}
+
+// Whether a clear to these float bits keeps them: zero or a normal number. A clear need not keep
+// a NaN's payload, an infinity or a denormal (the dispatch's store would).
+[[nodiscard]] bool ExactFloatBits(uint32_t bits) {
+	const auto exponent = (bits >> 23u) & 0xffu;
+	return bits == 0 || (exponent != 0 && exponent != 0xffu);
+}
+
+[[nodiscard]] bool ExactHalfBits(uint32_t bits) {
+	const auto exponent = (bits >> 10u) & 0x1fu;
+	return bits == 0 || (exponent != 0 && exponent != 0x1fu);
+}
+
+// A dword fill of a color image's memory as a clear of it: the formats DecodeColorDwordFill
+// knows, and for the others a fill of zero (every texel's bits zero), and the 8-, 16-bit-channel
+// and two- and four-channel 32-bit formats whose texels the word repeats (a byte or half-word
+// texel the word holds over and over, or a texel of whole words). Float channels must be zero or
+// normal numbers. False for the rest (the fill then runs or uploads as before).
+[[nodiscard]] bool DecodeFillWord(vk::Format format, uint32_t packed, vk::ClearColorValue& clear) {
+	if (format == vk::Format::eR32Sfloat && !ExactFloatBits(packed)) {
+		return false;
+	}
+	if (DecodeColorDwordFill(format, packed, clear)) {
+		return true;
+	}
+	const auto unorm = [](uint32_t value, uint32_t bits) {
+		return static_cast<float>(value) / static_cast<float>((1u << bits) - 1u);
+	};
+	const uint32_t      low         = packed & 0xffffu;
+	const uint32_t      high        = packed >> 16u;
+	const bool          same_bytes  = packed == (packed & 0xffu) * 0x01010101u;
+	const bool          same_halves = low == high;
+	vk::ClearColorValue next {};
+	switch (format) {
+		case vk::Format::eR8Unorm:
+			if (!same_bytes) return false;
+			next.float32[0] = unorm(packed & 0xffu, 8);
+			break;
+		case vk::Format::eR8Uint:
+			if (!same_bytes) return false;
+			next.uint32[0] = packed & 0xffu;
+			break;
+		case vk::Format::eR8G8Unorm:
+			if (!same_halves) return false;
+			next.float32[0] = unorm(low & 0xffu, 8);
+			next.float32[1] = unorm(low >> 8u, 8);
+			break;
+		case vk::Format::eR8G8Uint:
+			if (!same_halves) return false;
+			next.uint32[0] = low & 0xffu;
+			next.uint32[1] = low >> 8u;
+			break;
+		case vk::Format::eR16Unorm:
+			if (!same_halves) return false;
+			next.float32[0] = unorm(low, 16);
+			break;
+		case vk::Format::eR16Uint:
+			if (!same_halves) return false;
+			next.uint32[0] = low;
+			break;
+		case vk::Format::eR16Sfloat:
+			if (!same_halves || !ExactHalfBits(low)) return false;
+			next.float32[0] = HalfBitsToFloat(low);
+			break;
+		case vk::Format::eR16G16Unorm:
+			next.float32[0] = unorm(low, 16);
+			next.float32[1] = unorm(high, 16);
+			break;
+		case vk::Format::eR16G16Uint:
+			next.uint32[0] = low;
+			next.uint32[1] = high;
+			break;
+		case vk::Format::eR16G16Sfloat:
+			if (!ExactHalfBits(low) || !ExactHalfBits(high)) return false;
+			next.float32[0] = HalfBitsToFloat(low);
+			next.float32[1] = HalfBitsToFloat(high);
+			break;
+		case vk::Format::eR8G8B8A8Uint:
+			for (uint32_t channel = 0; channel < 4; ++channel) {
+				next.uint32[channel] = (packed >> (channel * 8u)) & 0xffu;
+			}
+			break;
+		case vk::Format::eR16G16B16A16Unorm:
+			next.float32[0] = next.float32[2] = unorm(low, 16);
+			next.float32[1] = next.float32[3] = unorm(high, 16);
+			break;
+		case vk::Format::eR16G16B16A16Uint:
+			next.uint32[0] = next.uint32[2] = low;
+			next.uint32[1] = next.uint32[3] = high;
+			break;
+		case vk::Format::eR16G16B16A16Sfloat:
+			if (!ExactHalfBits(low) || !ExactHalfBits(high)) return false;
+			next.float32[0] = next.float32[2] = HalfBitsToFloat(low);
+			next.float32[1] = next.float32[3] = HalfBitsToFloat(high);
+			break;
+		case vk::Format::eR32G32Uint:
+		case vk::Format::eR32G32B32A32Uint: next.uint32.fill(packed); break;
+		case vk::Format::eR32G32Sfloat:
+		case vk::Format::eR32G32B32A32Sfloat:
+			if (!ExactFloatBits(packed)) return false;
+			next.float32.fill(std::bit_cast<float>(packed));
+			break;
+		default:
+			// Zero bits are zero in any uncompressed color format.
+			if (packed != 0 || !vk::isColor(format) || vk::isCompressed(format) ||
+			    vk::planeCount(format) > 1 || vk::texelsPerBlock(format) != 1) {
+				return false;
+			}
+			break;
+	}
+	clear = next;
+	return true;
+}
+
 [[nodiscard]] std::vector<vk::BufferImageCopy> BuildDepthCopies(const ImageInfo& info,
                                                               uint64_t slice_stride,
                                                               vk::ImageAspectFlags aspect) {
@@ -775,6 +909,40 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	return id;
 }
 
+TextureCache::RegisteredPageCounts::~RegisteredPageCounts() {
+	for (size_t index = 0; index < LeafCount; index++) {
+		delete m_leaves[index].load(std::memory_order_relaxed);
+	}
+}
+
+void TextureCache::RegisteredPageCounts::Add(size_t page, int32_t delta) {
+	auto& slot = m_leaves[page >> LeafBits];
+	auto* leaf = slot.load(std::memory_order_relaxed);
+	if (leaf == nullptr) {
+		leaf = new Leaf {};
+		slot.store(leaf, std::memory_order_release);
+	}
+	(*leaf)[page & (LeafSize - 1)].fetch_add(static_cast<uint32_t>(delta),
+	                                         std::memory_order_release);
+}
+
+bool TextureCache::RegisteredPageCounts::Any(size_t first, size_t last_exclusive) const noexcept {
+	for (auto page = first; page < last_exclusive; page++) {
+		const auto* leaf = m_leaves[page >> LeafBits].load(std::memory_order_acquire);
+		if (leaf != nullptr &&
+		    (*leaf)[page & (LeafSize - 1)].load(std::memory_order_acquire) != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool TextureCache::MayHaveImages(uint64_t address, uint64_t size) const noexcept {
+	ImagePageTable::PageRange pages {};
+	return !ImagePageTable::TryGetPageRange(address, size, pages) ||
+	       m_registered_pages.Any(pages.first, pages.last_exclusive);
+}
+
 void TextureCache::RegisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.registered || image.info.data.Empty()) {
@@ -786,6 +954,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	}
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
+		m_registered_pages.Add(page, 1);
 	});
 	image.registered = true;
 	NoteBindlessStateChange(image);
@@ -815,6 +984,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		if (owners == nullptr || !owners->Erase(id)) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
+		m_registered_pages.Add(page, -1);
 	});
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
@@ -830,15 +1000,17 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image == nullptr || !image->registered) {
 		return;
 	}
-	if (!image->depth_id) {
-		std::vector<ImageId> associations;
-		m_slot_images.ForEach([&](ImageId candidate, const Image& associated) {
-			if (associated.depth_id == id) {
-				associations.push_back(candidate);
+	if (image->depth_id) {
+		if (auto* depth = m_slot_images.try_get(image->depth_id); depth != nullptr) {
+			std::erase(depth->stencil_ids, id);
+		}
+	} else {
+		// Taken first: deleting each association unlinks it from this list too.
+		for (const auto association: std::exchange(image->stencil_ids, {})) {
+			if (const auto* associated = m_slot_images.try_get(association);
+			    associated != nullptr && associated->depth_id == id) {
+				FreeImage(association);
 			}
-		});
-		for (const auto association: associations) {
-			FreeImage(association);
 		}
 	}
 	if (image->IsGpuModified()) {
@@ -2487,6 +2659,24 @@ void TextureCache::RefreshImage(ImageId id) {
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
 	     m_slot_images[image.depth_id].info.samples != 1)) {
+		// Bytes written to such a stencil plane (a buffer write or the CPU) never reach the host's
+		// stencil: each plane is logged once (the first 16), as a lead when a stencil-tested draw
+		// goes missing. A fill of the whole plane clears it instead (ClearImageFromBuffer).
+		if (image.IsBufferModified() || image.IsDefinitelyCpuDirty()) {
+			static std::mutex                   logged_mutex;
+			static std::unordered_set<uint64_t> logged;
+			const auto&                         depth = m_slot_images[image.depth_id].info;
+			std::lock_guard                     logged_lock(logged_mutex);
+			if (logged.size() < 16 && logged.insert(image.info.data.address).second) {
+				LOGF("TextureCache: what %s wrote to the stencil plane 0x%012" PRIx64 "+0x%" PRIx64
+				     " of depth target 0x%012" PRIx64 " %ux%u (%u samples%s) does not reach "
+				     "its stencil\n",
+				     image.IsBufferModified() ? "the GPU" : "the CPU", image.info.data.address,
+				     image.info.data.size, depth.data.address, depth.extent.width,
+				     depth.extent.height, depth.samples,
+				     depth.metadata.stencil_compressed ? ", the stencil in its HTile" : "");
+			}
+		}
 		return;
 	}
 	if (image.content_hash_valid && ChecksGuestContent(image)) {
@@ -2548,6 +2738,12 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	}
 	auto& record = m_slot_images[association];
 	TouchImage(record);
+	if (record.depth_id != depth_id) {
+		if (auto* previous = m_slot_images.try_get(record.depth_id); previous != nullptr) {
+			std::erase(previous->stencil_ids, association);
+		}
+		depth.stencil_ids.push_back(association);
+	}
 	record.depth_id             = depth_id;
 	record.stencil_subresources = depth.stencil_subresources;
 	return association;
@@ -2779,9 +2975,13 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.info.stencil = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
-		m_surface_metas.emplace(desc.info.metadata.range.address,
-		                        MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
-		                                      .clear_mask = image.info.htile_clear_mask});
+		const auto [meta, inserted] =
+		    m_surface_metas.emplace(desc.info.metadata.range.address,
+		                            MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
+		                                          .clear_mask = image.info.htile_clear_mask});
+		(void)inserted;
+		// The largest binding's: a binding of fewer slices has a smaller HTile range.
+		meta->second.size = std::max(meta->second.size, desc.info.metadata.range.size);
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -2853,16 +3053,23 @@ void TextureCache::CommitGpuWrite(Image& image) {
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
-                                        uint32_t packed_clear) {
+                                        uint32_t packed_clear, const BufferFillClear& how) {
 	if (command.IsInvalid() || !GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid image clear\n");
 	}
+	const auto refuse = [&how](std::string why) {
+		if (how.what != nullptr) {
+			*how.what = std::move(why);
+		}
+		return false;
+	};
 	std::scoped_lock      lock {m_lock};
 	ImageId               selected {};
 	ImageId               stencil_id {};
 	vk::ImageAspectFlags  aspect {};
 	ImageSubresourceRange subresources;
-	for (const auto id: FindImagesInRegion(address, size, false)) {
+	const auto            found = FindImagesInRegion(address, size, false);
+	for (const auto id: found) {
 		auto owner = m_slot_images.try_get(id);
 		if (owner == nullptr) {
 			continue;
@@ -2889,7 +3096,7 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 			continue;
 		}
 		if (selected && (selected != candidate_id || subresources != candidate_subresources)) {
-			return false;
+			return refuse("two images match it");
 		}
 		selected     = candidate_id;
 		stencil_id   = candidate == vk::ImageAspectFlagBits::eStencil ? id : ImageId {};
@@ -2897,23 +3104,62 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 		subresources = candidate_subresources;
 	}
 	if (!selected) {
-		return false;
+		return refuse("no image matches it");
+	}
+	// A stencil plane no buffer write reaches (TextureCache::RefreshImage): multisampled, or kept
+	// in the depth target's HTile.
+	const auto unreachable_plane = [this](const Image& plane) {
+		const auto* depth = plane.depth_id ? m_slot_images.try_get(plane.depth_id) : nullptr;
+		return depth != nullptr &&
+		       (depth->info.samples != 1 || depth->info.metadata.stencil_compressed);
+	};
+	bool run_too = false;
+	if (how.alone) {
+		for (const auto id: found) {
+			const auto* other = m_slot_images.try_get(id);
+			if (other == nullptr || id == selected || id == stencil_id ||
+			    other->info.data.address != address || other->depth_id == selected ||
+			    unreachable_plane(*other)) {
+				continue;
+			}
+			// The selected plane is out of a buffer write's reach: clear it, and let the fill
+			// still run for the other image.
+			if (stencil_id && how.also_run != nullptr &&
+			    unreachable_plane(m_slot_images[stencil_id])) {
+				run_too = true;
+				continue;
+			}
+			return refuse(fmt::format("image 0x{:012x}+0x{:x} {}x{} format {} starts there too",
+			                          other->info.data.address, other->info.data.size,
+			                          other->info.extent.width, other->info.extent.height,
+			                          static_cast<uint32_t>(other->info.pixel_format)));
+		}
 	}
 	auto&          image = m_slot_images[selected];
 	vk::ClearValue clear {};
 	if (aspect == vk::ImageAspectFlagBits::eColor) {
-		if (!DecodeColorDwordFill(
-		        image.info.pixel_format,
-		        GuestColorWordToHost(packed_clear, image.info.GetColorTransform()), clear.color)) {
-			return false;
+		if (!DecodeFillWord(image.info.pixel_format,
+		                    GuestColorWordToHost(packed_clear, image.info.GetColorTransform()),
+		                    clear.color)) {
+			return refuse("its word does not decode for the image's format");
 		}
 	} else {
 		uint8_t stencil_clear = 0;
-		if ((aspect == vk::ImageAspectFlagBits::eDepth &&
-		     !DecodePackedDepthClear(image.info.pixel_format, packed_clear, clear.depthStencil.depth)) ||
-		    (aspect == vk::ImageAspectFlagBits::eStencil &&
-		     !DecodePackedStencilClear(packed_clear, stencil_clear))) {
-			return false;
+		bool    decoded       = true;
+		if (aspect == vk::ImageAspectFlagBits::eDepth) {
+			if (how.guest_word && image.info.bytes_per_block == 2) {
+				// Two 16-bit texels a word: both the same.
+				decoded                  = (packed_clear >> 16u) == (packed_clear & 0xffffu);
+				clear.depthStencil.depth = static_cast<float>(packed_clear & 0xffffu) / 65535.0f;
+			} else {
+				decoded = DecodePackedDepthClear(image.info.pixel_format, packed_clear,
+				                                 clear.depthStencil.depth);
+			}
+		} else {
+			decoded = DecodePackedStencilClear(packed_clear, stencil_clear);
+		}
+		if (!decoded) {
+			return refuse("its word does not decode for the image's format");
 		}
 		clear.depthStencil.stencil = stencil_clear;
 	}
@@ -2923,6 +3169,20 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	if (stencil_id) {
 		TrackImage(stencil_id);
 		CommitGpuWrite(m_slot_images[stencil_id]);
+	}
+	if (how.also_run != nullptr) {
+		*how.also_run = run_too;
+	}
+	if (how.what != nullptr) {
+		const auto& info = image.info;
+		*how.what = fmt::format("the {} of {} 0x{:012x} {}x{}, {} layers, {} samples, format {}{}",
+		                        aspect == vk::ImageAspectFlagBits::eStencil ? "stencil"
+		                        : aspect == vk::ImageAspectFlagBits::eDepth ? "depth"
+		                                                                    : "color",
+		                        info.IsDepth() ? "depth target" : "image", info.data.address,
+		                        info.extent.width, info.extent.height, info.resources.layers,
+		                        info.samples, static_cast<uint32_t>(info.pixel_format),
+		                        run_too ? " (and runs, for another image there)" : "");
 	}
 	return true;
 }
@@ -2966,9 +3226,9 @@ bool TextureCache::ClearFromKnownFill(ImageId id) {
 			return false;
 		}
 		clear.depthStencil.stencil = 0;
-	} else if (!DecodeColorDwordFill(info.pixel_format,
-	                                 GuestColorWordToHost(value, info.GetColorTransform()),
-	                                 clear.color)) {
+	} else if (!DecodeFillWord(info.pixel_format,
+	                           GuestColorWordToHost(value, info.GetColorTransform()),
+	                           clear.color)) {
 		return false;
 	}
 	if (!m_buffer_cache.FillOfNewImage(info.data.address, info.data.size, value, true)) {
@@ -3086,8 +3346,27 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
+	// Images register their pages before they are tracked: a CPU write where none is has nothing
+	// to invalidate. Most write faults land there, and need not wait for the lock.
+	if (!MayHaveImages(address, size)) {
+		return;
+	}
 	std::scoped_lock lock {m_lock};
 	InvalidateCpuAliases(address, size);
+}
+
+bool TextureCache::InvalidateMemoryNear(uint64_t address, uint64_t size, uint64_t block,
+                                        uint64_t block_size) {
+	if (!GuestRange {address, size}.Valid() || !GuestRange {block, block_size}.Valid()) {
+		EXIT("TextureCache: invalid memory-invalidation range\n");
+	}
+	if (!MayHaveImages(std::min(address, block),
+	                   std::max(address + size, block + block_size) - std::min(address, block))) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	InvalidateCpuAliases(address, size);
+	return !FindImagesInRegion(block, block_size, true).empty();
 }
 
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {
@@ -4944,13 +5223,17 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 			static std::atomic<uint64_t> replaced {0};
 			const auto                   count = ++replaced;
 			if (count <= 32 || std::has_single_bit(count)) {
+				// The writer: the shader being bound, or none (a copy, a fill or a DMA).
+				const auto writer = BufferCache::s_diag_shader_hash;
 				LOGF("TextureCache: GPU buffer write 0x%012" PRIx64 "+0x%" PRIx64
 				     " at the base of GPU-written image 0x%012" PRIx64 "+0x%" PRIx64
 				     " %ux%u layers %u mips %u fmt %d: its next use takes the buffer's bytes over "
-				     "its pixels (%" PRIu64 " so far)\n",
+				     "its pixels (%" PRIu64 " so far; written by %s)\n",
 				     address, size, image.info.data.address, image.info.data.size,
 				     image.info.extent.width, image.info.extent.height, image.info.resources.layers,
-				     image.info.resources.levels, static_cast<int>(image.info.pixel_format), count);
+				     image.info.resources.levels, static_cast<int>(image.info.pixel_format), count,
+				     writer != 0 ? fmt::format("shader {:016x}", writer).c_str()
+				                 : "a copy, a fill or a DMA");
 			}
 			image.ClearGpuModified();
 		}
@@ -5021,6 +5304,12 @@ bool TextureCache::ClearMeta(uint64_t address, std::optional<uint32_t> fill) {
 	found->second.fill_known = fill.has_value();
 	found->second.fill_value = fill.value_or(0);
 	return true;
+}
+
+uint64_t TextureCache::MetaSize(uint64_t address) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	return found != m_surface_metas.end() ? found->second.size : 0;
 }
 
 std::optional<uint32_t> TextureCache::MetaFillValue(uint64_t address) {

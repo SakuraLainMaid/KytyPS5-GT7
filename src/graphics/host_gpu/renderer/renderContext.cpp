@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/presentation/videoOut.h"
 #include "kernel/memory.h"
@@ -13,17 +14,97 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <fmt/format.h>
 #include <mutex>
 #include <string>
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// KYTY_FAULT_BLOCK_KB (default 64; a power of two from 8 to 1024, 0 turns it off; the F8 step
+// "faultblock:off" too): a CPU write fault in a block of that size that also faulted less than
+// 100 ms before releases the whole aligned block from the buffer cache's write tracking, instead
+// of the faulting page alone, when no byte of it is GPU-written (checked in the same lock hold as
+// the release) and no image lies in it. The game rewrites some heaps every frame a page at a time,
+// and each of those pages faulted on its own (a signal, a protection change and a TLB flush on
+// every processor): 40,000 faults a second at Tokyo. Its other pages are uploaded at the block's
+// next use, changed or not. Not once a shader stores through shader addresses (those stores mark
+// no range). After netwarex's "release 64 KiB blocks on guest write faults" (KytyPS5 PR 1297), here
+// for blocks that fault again only.
+uint64_t FaultBlockBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_FAULT_BLOCK_KB");
+		uint64_t    kb    = 64;
+		if (value != nullptr && *value != '\0') {
+			kb = std::strtoull(value, nullptr, 10);
+			if (kb != 0 && (kb < 8 || kb > 1024 || !std::has_single_bit(kb))) {
+				kb = 64;
+			}
+		}
+		LOGF("Write faults: %s\n",
+		     kb == 0 ? "each releases its own page (KYTY_FAULT_BLOCK_KB=0)"
+		             : fmt::format("a block of {} KB that faults again within 100 ms is released "
+		                           "whole (KYTY_FAULT_BLOCK_KB)",
+		                           kb)
+		                   .c_str());
+		return kb * 1024u;
+	}();
+	return Bisect::FaultBlocksOff() ? 0 : bytes;
+}
+
+uint64_t NowMs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+// Whether the block faulted less than 100 ms before; notes this fault. A hint: threads race on
+// the slots, and a block that shares one with another may be missed.
+bool BlockFaultedRecently(uint64_t block_index, uint64_t now_ms) {
+	constexpr uint64_t                             WindowMs = 100;
+	constexpr uint64_t                             TimeBits = 24;
+	constexpr uint64_t                             TimeMask = (uint64_t {1} << TimeBits) - 1;
+	static std::array<std::atomic<uint64_t>, 4096> recent {};
+	auto&          slot     = recent[(block_index ^ (block_index >> 12u)) % recent.size()];
+	const uint64_t entry    = (block_index << TimeBits) | (now_ms & TimeMask);
+	const uint64_t previous = slot.exchange(entry, std::memory_order_relaxed);
+	return previous != 0 && (previous >> TimeBits) == block_index &&
+	       ((now_ms - previous) & TimeMask) < WindowMs;
+}
+
+// The blocks released (and the faults that did not release one) in the last 10 s or so, logged.
+std::atomic<uint64_t> g_released_blocks {0};
+std::atomic<uint64_t> g_page_faults {0};
+std::atomic<uint64_t> g_fault_report_ms {0};
+
+void NoteWriteFault(bool released, uint64_t now_ms) {
+	(released ? g_released_blocks : g_page_faults).fetch_add(1, std::memory_order_relaxed);
+	auto last = g_fault_report_ms.load(std::memory_order_relaxed);
+	if (last == 0) {
+		g_fault_report_ms.compare_exchange_strong(last, now_ms, std::memory_order_relaxed);
+		return;
+	}
+	if (now_ms - last < 10000 ||
+	    !g_fault_report_ms.compare_exchange_strong(last, now_ms, std::memory_order_relaxed)) {
+		return;
+	}
+	const auto blocks = g_released_blocks.exchange(0, std::memory_order_relaxed);
+	const auto pages  = g_page_faults.exchange(0, std::memory_order_relaxed);
+	LOGF("Write faults, %.0f s: %" PRIu64 " released a whole block, %" PRIu64 " their own page\n",
+	     static_cast<double>(now_ms - last) / 1000.0, blocks, pages);
+}
+
+} // namespace
 
 RenderContext::RenderContext(GraphicContext& graphics)
     : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
@@ -62,6 +143,8 @@ RenderContext::RenderContext(GraphicContext& graphics)
 	LOGF("Recording thread: %s, async queue submit: %s\n",
 	     m_command_scheduler.Threaded() ? "on" : "off",
 	     m_command_scheduler.AsyncSubmit() ? "on" : "off");
+	// Reads KYTY_FAULT_BLOCK_KB (and logs it) here rather than in the first fault's handler.
+	(void)FaultBlockBytes();
 }
 
 RenderContext::~RenderContext() {
@@ -110,8 +193,29 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
+		bool texture_done = false;
+		if (const auto block_bytes = FaultBlockBytes(); block_bytes != 0) {
+			const auto now      = NowMs();
+			const auto block    = Common::AlignDown(fault_vaddr, block_bytes);
+			bool       released = false;
+			if (BlockFaultedRecently(block / block_bytes, now) &&
+			    !m_buffer_cache.AddressWritesSeen() && IsMapped(block, block_bytes)) {
+				// The texture cache first: an image in the block keeps it to the faulting page.
+				texture_done = true;
+				released     = !m_texture_cache.InvalidateMemoryNear(fault_vaddr, fault_size, block,
+				                                                     block_bytes) &&
+				           m_buffer_cache.ReleaseBlockForCpuWrite(block, block_bytes);
+			}
+			NoteWriteFault(released, now);
+			if (released) {
+				m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
+				return true;
+			}
+		}
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		if (!texture_done) {
+			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		}
 		m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);

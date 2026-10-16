@@ -546,6 +546,20 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+bool BufferCache::ReleaseBlockForCpuWrite(uint64_t block, uint64_t size) {
+	// One tracker region, so a refusal leaves the whole block as it was.
+	if (!GuestRange {block, size}.Valid() ||
+	    block / TRACKER_REGION_SIZE != (block + size - 1) / TRACKER_REGION_SIZE ||
+	    !m_memory_tracker.ReleaseForCpuWrite(block, size)) {
+		return false;
+	}
+	if (m_known_fill_count.load(std::memory_order_relaxed) != 0) {
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		ForgetFills(block, size);
+	}
+	return true;
+}
+
 void BufferCache::ForgetUnmapped(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return;
@@ -2038,6 +2052,12 @@ void BufferCache::WritesRecorded(bool address_writes, uint64_t shader) {
 	const auto current = m_scheduler.CurrentTick();
 	if (address_writes) {
 		m_address_write_tick = std::max(m_address_write_tick, current);
+		if (!m_address_writes_seen.exchange(true, std::memory_order_relaxed)) {
+			LOGF("Write faults: shader %016" PRIx64
+			     " stores through shader addresses, which mark no range: each write fault "
+			     "releases its own page from now on\n",
+			     shader);
+		}
 		// Stores through shader addresses mark no range: any watched metadata may be among them.
 		if (m_metadata_watch_count.load(std::memory_order_relaxed) != 0) {
 			std::unique_lock lock(m_dirty_ranges_mutex);

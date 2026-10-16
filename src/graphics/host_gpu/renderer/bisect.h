@@ -68,6 +68,12 @@
 //   htile:depth  a depth target's HTile fill clears its depth alone, as before round 65, even
 //                when the fill's value clears its stencil too (KYTY_HTILE_STENCIL_CLEARS=0 for
 //                the whole run)
+// and (round 66):
+//   patternfill:off the SDK's pattern fill shader runs as a dispatch, as before round 66, instead
+//                of clearing the image (a stencil plane, a target) whose memory it fills
+//                (KYTY_PATTERN_FILLS=0 for the whole run)
+//   faultblock:off a CPU write fault releases its own page from write tracking, as before round
+//                66, even in a block that faults again (KYTY_FAULT_BLOCK_KB=0 for the whole run)
 namespace Libs::Graphics::Bisect {
 
 // The GPU thread, at its start: applies the start step's CPU set and log setting.
@@ -106,10 +112,12 @@ void                      ApplyPending();
 [[nodiscard]] bool MsaaCmaskOff();
 [[nodiscard]] bool FastReadbackOff();
 [[nodiscard]] bool FastReadbackAnyAddress();
-// Any thread: recheck; locks:spin; htile:depth.
+// Any thread: recheck; locks:spin; htile:depth; patternfill:off; faultblock:off.
 [[nodiscard]] bool GpuClearRecheck();
 [[nodiscard]] bool LocksSpin();
 [[nodiscard]] bool HtileDepthOnly();
+[[nodiscard]] bool PatternFillsOff();
+[[nodiscard]] bool FaultBlocksOff();
 
 } // namespace Libs::Graphics::Bisect
 

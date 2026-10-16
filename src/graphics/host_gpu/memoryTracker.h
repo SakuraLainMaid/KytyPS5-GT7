@@ -50,6 +50,10 @@ public:
 	[[nodiscard]] bool IsRangeCpuCleanHint(uint64_t vaddr, uint64_t size) const noexcept;
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// A CPU write fault's release of [vaddr, vaddr + size) at once: each tracker region of it is
+	// marked CPU-dirty (and writable) in the same lock hold that finds no GPU-written page there.
+	// False when one holds GPU-written pages: that region is left as it was.
+	[[nodiscard]] bool ReleaseForCpuWrite(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);

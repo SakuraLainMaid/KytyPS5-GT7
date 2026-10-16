@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -827,8 +828,220 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 	return true;
 }
 
+// The SDK's buffer fill shader. With 64 threads a group, invocation i stores pattern[i & 3] (user
+// data s4..s7) to element i of the V# in s[0:3] while i < s8, with buffer_store_format_x. The
+// recompiler's uniform fill does not describe it (each invocation picks its word from a VGPR
+// array with v_movrels), so its fills ran as buffer writes. A buffer write to a multisampled
+// stencil plane never reaches the host's stencil (TextureCache::RefreshImage): the course maps'
+// stencil kept what the frames before left in it, and their track, drawn with a stencil test that
+// lets each pixel be drawn once, was not drawn at all. A buffer write over a render target makes
+// its next use upload the written bytes over it.
+constexpr std::array<uint32_t, 23> SdkPatternFillCode {
+    0xbfa00001u,              // s_inst_prefetch 0x1
+    0xd7460004u, 0x04010c09u, // v_lshl_add_u32 v4, s9, 6, v0
+    0x7e000204u,              // v_mov_b32 v0, s4
+    0x7e020205u,              // v_mov_b32 v1, s5
+    0x7e040206u,              // v_mov_b32 v2, s6
+    0x7e060207u,              // v_mov_b32 v3, s7
+    0x7da80808u,              // v_cmpx_gt_u32 s8, v4
+    0xbf88000du,              // s_cbranch_execz (to s_endpgm)
+    0x360a0883u,              // v_and_b32 v5, 3, v4
+    0xbe84047eu,              // s_mov_b64 s[4:5], exec
+    0xbe86047eu,              // s_mov_b64 s[6:7], exec
+    0x7e100505u,              // v_readfirstlane_b32 s8, v5
+    0x7da40a08u,              // v_cmpx_eq_u32 s8, v5
+    0xbefc0308u,              // s_mov_b32 m0, s8
+    0x7e0c8700u,              // v_movrels_b32 v6, v0
+    0x8a867e06u,              // s_andn2_b64 s[6:7], s[6:7], exec
+    0xbefe0406u,              // s_mov_b64 exec, s[6:7]
+    0xbf85fff9u,              // s_cbranch_scc1 (to v_readfirstlane_b32)
+    0xbefe0404u,              // s_mov_b64 exec, s[4:5]
+    0xe0102000u, 0x80000604u, // buffer_store_format_x v6, v4, s[0:3], 0 idxen
+    0xbf810000u,              // s_endpgm
+};
+
+// KYTY_PATTERN_FILLS=0 (or the F8 step "patternfill:off"): the SDK's pattern fills run as
+// dispatches, as before round 66.
+static bool PatternFillsOn() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PATTERN_FILLS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled && !Bisect::PatternFillsOff();
+}
+
+// Whether the guest code at `code_address` (the program `shader_hash` was made from) is the SDK's
+// pattern fill: compared once a program.
+static bool IsSdkPatternFillCode(uint64_t shader_hash, uint64_t code_address) {
+	static std::mutex                         mutex;
+	static std::unordered_map<uint64_t, bool> checked;
+	std::scoped_lock                          lock(mutex);
+	if (const auto found = checked.find(shader_hash); found != checked.end()) {
+		return found->second;
+	}
+	constexpr uint64_t Bytes = sizeof(SdkPatternFillCode);
+	const bool         match = ShaderCodeSizeBytes(code_address) >= Bytes &&
+	                   Libs::LibKernel::Memory::TryClampRangeSize(code_address, Bytes) == Bytes &&
+	                   std::memcmp(reinterpret_cast<const void*>(code_address),
+	                               SdkPatternFillCode.data(), Bytes) == 0;
+	if (checked.size() < 65536) {
+		checked.emplace(shader_hash, match);
+	}
+	if (match) {
+		LOGF("Dispatch: cs %016" PRIx64 " at 0x%012" PRIx64
+		     " is the SDK's pattern fill: a fill of one word clears the image whose memory it "
+		     "fills (KYTY_PATTERN_FILLS=0 runs it as a dispatch)\n",
+		     shader_hash, code_address);
+	}
+	return match;
+}
+
+namespace {
+
+struct SdkPatternFill {
+	ShaderBufferResource    descriptor; // the V# its store writes through (s[0:3])
+	std::array<uint32_t, 4> pattern {}; // s4..s7
+	uint32_t                count = 0;  // s8: the elements it stores at most
+};
+
+// A dispatch fill of one 32-bit word: the recompiler's uniform fill, or the SDK's pattern fill.
+struct DispatchFill {
+	uint64_t address = 0;
+	uint64_t size    = 0;
+	uint32_t value   = 0;
+	bool     pattern = false; // the SDK's pattern fill
+};
+
+} // namespace
+
+// The dispatch's program as the SDK's pattern fill, with its V#, pattern and count; none when it
+// is another program (or KYTY_PATTERN_FILLS=0).
+static std::optional<SdkPatternFill> FindSdkPatternFill(const ShaderComputeInputInfo& input,
+                                                        uint64_t code_address) {
+	const auto& program   = *input.stage.program;
+	const auto& resources = *input.stage.resources;
+	// Its one buffer is stored to and never read; s9 is the group's index (after 9 user SGPRs).
+	if (code_address == 0 || program.info.buffers.size() != 1 || resources.buffers.size() != 1 ||
+	    !program.info.buffers[0].written || program.info.buffers[0].read ||
+	    program.info.buffers[0].atomic || !program.info.images.empty() ||
+	    program.user_data_base != 0 || resources.user_data.size() < 9 ||
+	    input.workgroup_register != 9 || !input.group_id[0] || !PatternFillsOn() ||
+	    !IsSdkPatternFillCode(program.shader_hash, code_address)) {
+		return std::nullopt;
+	}
+	SdkPatternFill fill;
+	fill.descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[0]);
+	std::copy_n(resources.user_data.begin() + 4, 4, fill.pattern.begin());
+	fill.count = resources.user_data[8];
+	// The V# bound for its store is the one in s[0:3].
+	ShaderBufferResource user {};
+	std::copy_n(resources.user_data.begin(), 4, user.fields);
+	if (user.Base48() != fill.descriptor.Base48() || user.Stride() != fill.descriptor.Stride() ||
+	    user.NumRecords() != fill.descriptor.NumRecords() ||
+	    user.RawFormat() != fill.descriptor.RawFormat()) {
+		return std::nullopt;
+	}
+	return fill;
+}
+
+// The word an SDK pattern fill writes throughout, when its four pattern words are the same.
+static std::optional<uint32_t> PatternFillWord(const SdkPatternFill& fill) {
+	const auto& pattern = fill.pattern;
+	if (pattern[1] != pattern[0] || pattern[2] != pattern[0] || pattern[3] != pattern[0]) {
+		return std::nullopt;
+	}
+	return pattern[0];
+}
+
+// The memory an SDK pattern fill of one word writes, as ResolveComputeBufferFill resolves the
+// recompiler's uniform fills: its first min(s8, invocations, records) dwords.
+static bool ResolveSdkPatternFill(const ShaderComputeInputInfo& input, uint64_t code_address,
+                                  uint32_t group_x, uint32_t group_y, uint32_t group_z,
+                                  uint32_t mode, DispatchFill& resolved, const char** why) {
+	const auto fail = [why](const char* reason) {
+		if (why != nullptr) {
+			*why = reason;
+		}
+		return false;
+	};
+	const auto fill = FindSdkPatternFill(input, code_address);
+	if (!fill) {
+		return false;
+	}
+	const auto word = PatternFillWord(*fill);
+	if (!word) {
+		return fail("the SDK's pattern fill of more than one word");
+	}
+	const auto& descriptor = fill->descriptor;
+	const auto  format     = descriptor.Format();
+	// Bounds checked by index (OOB_SELECT 0 or 1), so its records bound the elements it stores.
+	if (descriptor.Stride() != 4 || descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 ||
+	    descriptor.AddTid() || descriptor.Base48() == 0 || descriptor.OutOfBounds() > 1 ||
+	    descriptor.Type() != 0 ||
+	    (format != Prospero::BufferFormat::k32UInt && format != Prospero::BufferFormat::k32SInt &&
+	     format != Prospero::BufferFormat::k32Float)) {
+		return fail("the SDK's pattern fill through a V# that is not a plain array of dwords");
+	}
+	if (input.threads_num[0] != 64 || input.threads_num[1] != 1 || input.threads_num[2] != 1 ||
+	    input.dispatch_thread_dimensions || mode != 0x41u || group_x == 0 || group_y != 1 ||
+	    group_z != 1) {
+		return fail("the SDK's pattern fill in a dispatch of another shape");
+	}
+	const uint64_t elements = std::min(
+	    {uint64_t {fill->count}, uint64_t {group_x} * 64u, uint64_t {descriptor.NumRecords()}});
+	if (elements == 0 || elements * 4u > UINT32_MAX ||
+	    !GuestRange {descriptor.Base48(), elements * 4u}.Valid()) {
+		return fail("the SDK's pattern fill of no memory, of too much, or outside guest memory");
+	}
+	resolved = {descriptor.Base48(), elements * 4u, *word, true};
+	return true;
+}
+
+// The fill of one word a dispatch is, if any: the recompiler's uniform fill, or else the SDK's
+// pattern fill (its code at `code_address`; 0 leaves that out). `why`: as for
+// ResolveComputeBufferFill.
+static bool ResolveDispatchFill(const ShaderComputeInputInfo& input, uint64_t code_address,
+                                uint32_t group_x, uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                DispatchFill& resolved, const char** why) {
+	ShaderBufferResource descriptor;
+	uint32_t             value = 0;
+	uint64_t             size  = 0;
+	if (ResolveComputeBufferFill(input, group_x, group_y, group_z, mode, descriptor, value, size,
+	                             why)) {
+		resolved = {descriptor.Base48(), size, value, false};
+		return true;
+	}
+	return input.stage.resources->uniform_fill.kind ==
+	           ShaderRecompiler::IR::UniformFillKind::None &&
+	       ResolveSdkPatternFill(input, code_address, group_x, group_y, group_z, mode, resolved,
+	                             why);
+}
+
+// What became of the SDK's pattern fills: a "Dispatch: SDK pattern fills" line every 10 s
+// (while there are any) counts them. The GPU thread's (the renderer's lock held).
+enum class PatternFillOutcome : uint32_t { Stencil, Image, Meta, MappedParts, Ran, Count };
+
+static void NotePatternFill(PatternFillOutcome outcome) {
+	static std::array<uint64_t, static_cast<size_t>(PatternFillOutcome::Count)> counts {};
+	static auto since = std::chrono::steady_clock::now();
+	counts[static_cast<size_t>(outcome)]++;
+	const auto now     = std::chrono::steady_clock::now();
+	const auto elapsed = std::chrono::duration<double>(now - since).count();
+	if (elapsed < 10.0) {
+		return;
+	}
+	LOGF("Dispatch: SDK pattern fills in %.0f s: %" PRIu64 " cleared a stencil plane, %" PRIu64
+	     " another image, %" PRIu64 " metadata (an HTile, CMASK or DCC), %" PRIu64
+	     " filled the mapped parts of memory with holes, %" PRIu64 " ran as dispatches\n",
+	     elapsed, counts[0], counts[1], counts[2], counts[3], counts[4]);
+	counts = {};
+	since  = now;
+}
+
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-                                                const CommandBuffer&          buffer) {
+                                                const CommandBuffer& buffer, uint64_t code_address,
+                                                uint32_t group_x, uint32_t group_y,
+                                                uint32_t group_z, uint32_t mode) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
 	if (resources.buffers.size() != program.info.buffers.size()) {
@@ -846,6 +1059,14 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	}
 
 	if (!program.info.has_bitwise_xor) {
+		// An SDK pattern fill of one word, whose value an HTile it covers whole takes, as from the
+		// recompiler's uniform fills (group_x 0: the dispatch is not known, no value).
+		DispatchFill pattern_fill;
+		const bool   pattern =
+		    resources.uniform_fill.kind == ShaderRecompiler::IR::UniformFillKind::None &&
+		    group_x != 0 &&
+		    ResolveSdkPatternFill(input, code_address, group_x, group_y, group_z, mode,
+		                          pattern_fill, nullptr);
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 			const auto& resource = program.info.buffers[i];
 			if (resource.written) {
@@ -859,11 +1080,19 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 				if (fill.kind == ShaderRecompiler::IR::UniformFillKind::Buffer &&
 				    fill.resource == i && fill.words == 1) {
 					value = fill.value;
+				} else if (pattern && i == 0 && pattern_fill.address == base) {
+					const auto meta_size = cache.MetaSize(base);
+					if (meta_size != 0 && pattern_fill.size >= meta_size) {
+						value = pattern_fill.value;
+					}
 				}
 				if (!cache.ClearMeta(base, value)) {
 					continue;
 				}
 				if (!cache.IsColorMeta(base)) {
+					if (pattern && i == 0) {
+						NotePatternFill(PatternFillOutcome::Meta);
+					}
 					return true;
 				}
 				// A color target's CMASK or DCC starts here as well (memory reused within the
@@ -1068,8 +1297,8 @@ static void ReportWritesOverHoles(const ShaderComputeInputInfo& input, const cha
 
 bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
                                                  CommandBuffer& command, uint32_t group_x,
-                                                 uint32_t group_y, uint32_t group_z,
-                                                 uint32_t mode) {
+                                                 uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                                 uint64_t code_address) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
@@ -1120,21 +1349,51 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		cache.ClearImage(command, binding.image_id, image.backing.format, range, clear);
 		return true;
 	}
-	ShaderBufferResource descriptor;
-	uint32_t             packed_clear = 0;
-	uint64_t             size         = 0;
-	if (!ResolveComputeBufferFill(input, group_x, group_y, group_z, mode, descriptor, packed_clear,
-	                              size)) {
+	DispatchFill buffer_fill;
+	if (!ResolveDispatchFill(input, code_address, group_x, group_y, group_z, mode, buffer_fill,
+	                         nullptr)) {
 		return false;
 	}
-	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
+	// An SDK pattern fill clears an image only when no other image starts at its address (the
+	// dispatch's buffer write gives those the written bytes too), and its word is the guest
+	// memory's. What it cleared, or why not, is logged once per address (the first 64).
+	BufferFillClear how;
+	std::string     what;
+	bool            also_run = false;
+	if (buffer_fill.pattern) {
+		how = {.alone = true, .also_run = &also_run, .guest_word = true, .what = &what};
+	}
+	const bool cleared = cache.ClearImageFromBuffer(command, buffer_fill.address, buffer_fill.size,
+	                                                buffer_fill.value, how);
+	// (Fills that find no image are not logged: most fill metadata, an FMASK or a buffer.)
+	if (buffer_fill.pattern && (cleared || !what.starts_with("no image"))) {
+		static std::mutex                   logged_mutex;
+		static std::unordered_set<uint64_t> logged_patterns;
+		std::lock_guard                     lock(logged_mutex);
+		if (logged_patterns.size() < 64 &&
+		    logged_patterns.insert(buffer_fill.address | (cleared ? 1u : 0u)).second) {
+			LOGF("Dispatch: the SDK's pattern fill 0x%012" PRIx64 "+0x%" PRIx64
+			     " with 0x%08x %s%s\n",
+			     buffer_fill.address, buffer_fill.size, buffer_fill.value,
+			     cleared ? "clears " : "runs as a dispatch: ", what.c_str());
+		}
+	}
+	if (!cleared) {
 		return false;
+	}
+	if (buffer_fill.pattern) {
+		NotePatternFill(what.starts_with("the stencil") ? PatternFillOutcome::Stencil
+		                                                : PatternFillOutcome::Image);
+		// A stencil plane no buffer write reaches is cleared, and the fill still runs for another
+		// image at its address.
+		return !also_run;
 	}
 	static std::atomic<uint32_t> logged_clears {0};
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
 		LOGF("GraphicsRenderDispatchDirect: compute image clear shader=0x%016" PRIx64
 		     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
-		     input.stage.program->shader_hash, descriptor.Base48(), size, packed_clear);
+		     input.stage.program->shader_hash, buffer_fill.address, buffer_fill.size,
+		     buffer_fill.value);
 	}
 	return true;
 }
@@ -1295,9 +1554,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	{
 		KYTY_PROFILER_BLOCK("Dispatch::TryConsumeClears");
 		if (resources.specialization_reads.empty() &&
-		    (TryConsumeComputeMetaClear(input_info, buffer) ||
+		    (TryConsumeComputeMetaClear(input_info, buffer, cs_regs.cs_regs.data_addr,
+		                                thread_group_x, thread_group_y, thread_group_z, mode) ||
 		     TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
-		                                 thread_group_z, mode))) {
+		                                 thread_group_z, mode, cs_regs.cs_regs.data_addr))) {
 			if (FrameGraph::Logging()) {
 				FrameGraph::Log("  consumed as a clear: cs %016" PRIx64, program.shader_hash);
 			}
@@ -1318,26 +1578,35 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	} fill_note;
 	const char* fill_why = "its program is specialized on guest memory it reads";
 	if (resources.specialization_reads.empty()) {
-		ShaderBufferResource fill_descriptor;
-		uint32_t             fill_value    = 0;
-		uint64_t             fill_size     = 0;
-		constexpr uint64_t   SmallestNoted = 64u * 1024u;
-		const bool           fill =
-		    ResolveComputeBufferFill(input_info, thread_group_x, thread_group_y, thread_group_z,
-		                             mode, fill_descriptor, fill_value, fill_size, &fill_why);
+		DispatchFill       fill_found;
+		constexpr uint64_t SmallestNoted = 64u * 1024u;
+		const bool         fill =
+		    ResolveDispatchFill(input_info, cs_regs.cs_regs.data_addr, thread_group_x,
+		                        thread_group_y, thread_group_z, mode, fill_found, &fill_why);
 		if (fill && SparseFills() &&
-		    FillMappedParts(m_context, program.shader_hash, fill_descriptor.Base48(), fill_size,
-		                    fill_value)) {
+		    FillMappedParts(m_context, program.shader_hash, fill_found.address, fill_found.size,
+		                    fill_found.value)) {
+			if (fill_found.pattern) {
+				NotePatternFill(PatternFillOutcome::MappedParts);
+			}
 			if (FrameGraph::Logging()) {
 				FrameGraph::Log("  consumed as a fill of the mapped parts of 0x%012" PRIx64
 				                "+0x%" PRIx64 ": cs %016" PRIx64,
-				                fill_descriptor.Base48(), fill_size, program.shader_hash);
+				                fill_found.address, fill_found.size, program.shader_hash);
 			}
 			ResetBindings();
 			return;
 		}
-		if (fill && TextureCache::ClearsTargetsFromFills() && fill_size >= SmallestNoted) {
-			fill_note = {fill_descriptor.Base48(), fill_size, fill_value};
+		if (fill && fill_found.pattern) {
+			NotePatternFill(PatternFillOutcome::Ran);
+			if (FrameGraph::Logging()) {
+				FrameGraph::Log("  the SDK's pattern fill of 0x%012" PRIx64 "+0x%" PRIx64
+				                " with 0x%08x: it clears no image, it runs",
+				                fill_found.address, fill_found.size, fill_found.value);
+			}
+		}
+		if (fill && TextureCache::ClearsTargetsFromFills() && fill_found.size >= SmallestNoted) {
+			fill_note = {fill_found.address, fill_found.size, fill_found.value};
 		}
 		if (fill) {
 			fill_why = nullptr;
