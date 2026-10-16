@@ -18,8 +18,22 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cinttypes>
+#include <cstdlib>
+#include <mutex>
+#include <unordered_set>
 
 namespace Libs::Graphics {
+
+// KYTY_MSAA_CMASK_CLEARS=0: a multisampled target's CMASK fast clears are left out, as before
+// round 63 (its image then keeps what earlier frames drew into it).
+static bool MsaaCmaskClears() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MSAA_CMASK_CLEARS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
 
 static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 	switch (info.format) {
@@ -287,10 +301,27 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.info.samples         = samples;
 	desc.info.tile_mode       = rt.attrib3.tile_mode;
 	const bool has_dcc        = rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0;
-	const bool has_cmask      = !rt.info.dcc_compression_enable && rt.info.cmask_fast_clear_enable &&
-	                            rt.cmask.addr != 0 && samples == 1 &&
-	                            !rt.info.fmask_compression_enable &&
-	                            !rt.attrib3.write_vrs_rate_hint_to_cmask;
+	// A multisampled target's CMASK too (it covers pixels, as a single-sample one's, and a fast
+	// clear zeroes it when no DCC owns the clear; its FMASK only maps samples to fragments, which
+	// the host image does not need). GT7 clears its course maps (513x326 and 833x466, 2 samples)
+	// every frame by zeroing their CMASK and FMASK with a compute fill: without this the maps
+	// kept every frame's car icons (2026-10-16). Its metadata must start on a 4 KiB block.
+	const bool msaa_cmask = samples > 1 && MsaaCmaskClears() && rt.cmask.addr % 0x1000u == 0;
+	const bool has_cmask  = !rt.info.dcc_compression_enable && rt.info.cmask_fast_clear_enable &&
+	                       rt.cmask.addr != 0 &&
+	                       (samples == 1 ? !rt.info.fmask_compression_enable : msaa_cmask) &&
+	                       !rt.attrib3.write_vrs_rate_hint_to_cmask;
+	if (has_cmask && samples > 1) {
+		static std::mutex                   logged_mutex;
+		static std::unordered_set<uint64_t> logged;
+		std::lock_guard                     lock(logged_mutex);
+		if (logged.size() < 16 && logged.insert(rt.base.addr).second) {
+			LOGF("Render target: 0x%012" PRIx64 " %ux%u, %u samples: its CMASK fast clears "
+			     "(CMASK 0x%012" PRIx64 ", FMASK 0x%012" PRIx64 ") clear it "
+			     "(KYTY_MSAA_CMASK_CLEARS=0 leaves them out)\n",
+			     rt.base.addr, width, height, samples, rt.cmask.addr, rt.fmask.addr);
+		}
+	}
 	if (has_dcc || has_cmask) {
 		TileSizeAlign metadata_size {};
 		const auto layers = volume ? depth : view.image_layers;
