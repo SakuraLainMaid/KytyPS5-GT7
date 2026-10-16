@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
+#include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/image/imageDump.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -2270,6 +2271,28 @@ static void LogFrameGraphStage(RenderContext& context, const ShaderStageRuntime&
 	}
 }
 
+// Watch mode: a pixel shader among the slowest draws (GpuTiming::ProbesGridsOf): its light grids
+// against their guest bytes now and then, as this draw will read them.
+static void ProbeSlowShaderGrids(RenderContext& context, const ShaderStageRuntime& runtime,
+                                 const PreparedBindings& prepared) {
+	const auto& program  = *runtime.program;
+	auto&       textures = context.GetTextureCache();
+	for (size_t i = 0; i < prepared.images.size() && i < program.info.images.size(); i++) {
+		const auto& binding = prepared.images[i];
+		const auto& info    = binding.desc.info;
+		if (program.info.images[i].written || !binding.image_id ||
+		    info.pixel_format != vk::Format::eR32G32Uint || info.resources.layers <= 1 ||
+		    info.data.size > 0x40000u || !GpuTiming::ClaimGridProbe(info.data.address)) {
+			continue;
+		}
+		LOGF("GpuTiming: ps %016" PRIx64 " drew slowly before: its grid tex[%zu] 0x%012" PRIx64
+		     " (%ux%u, %u layers) against its guest bytes in the \"FG 0 grid\" lines\n",
+		     program.shader_hash, i, info.data.address, info.extent.width, info.extent.height,
+		     info.resources.layers);
+		textures.CompareWithGuest(binding.image_id, 0);
+	}
+}
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
@@ -2454,6 +2477,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 	if (FrameGraph::Logging()) {
 		LogFrameGraphStage(m_context, runtime, prepared);
+	} else if (program.stage == ShaderType::Pixel &&
+	           GpuTiming::ProbesGridsOf(program.shader_hash)) {
+		ProbeSlowShaderGrids(m_context, runtime, prepared);
 	}
 }
 

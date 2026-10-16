@@ -19,6 +19,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -82,7 +83,11 @@ public:
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
-	[[nodiscard]] bool ClearMeta(uint64_t address);
+	// `fill`: the value a fill of the metadata wrote throughout, when known (a DMA fill, a compute
+	// shader's uniform fill); MetaFillValue gives the last one (none for a clear the draw's
+	// registers ask for).
+	[[nodiscard]] bool ClearMeta(uint64_t address, std::optional<uint32_t> fill = std::nullopt);
+	[[nodiscard]] std::optional<uint32_t> MetaFillValue(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 	// Whether a color target's CMASK or DCC starts at this address (MaterializeColorClear notes
 	// them): a fill there that is also a depth target's HTile clear must still run.
@@ -270,6 +275,9 @@ private:
 
 		Type     type;
 		uint32_t clear_mask = UINT32_MAX;
+		// The last fill's value (ClearMeta), when known.
+		uint32_t fill_value = 0;
+		bool     fill_known = false;
 	};
 
 	struct OverlapResult {
@@ -337,9 +345,12 @@ private:
 	// The GPU-side MaterializeColorClear of GPU-written render-target metadata; false when it
 	// does not apply (the caller then reads the metadata back).
 	void                        DescribeUintArrayImage(ImageId id, const ImageDesc& desc);
-	bool                        MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
-	                                                       uint32_t first, uint32_t image_first,
-	                                                       uint32_t count, uint64_t slice_size);
+	// `unwritten`: nothing wrote the metadata since its last check (a recheck, for the outcome's
+	// report); `check` gets the first slice's check number.
+	bool MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc, uint32_t first,
+	                                uint32_t image_first, uint32_t count, uint64_t slice_size,
+	                                bool unwritten, uint32_t* check);
+	[[nodiscard]] static bool   RechecksColorClears();
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
@@ -372,7 +383,7 @@ private:
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
-	TrackingSpinLock                                  m_lock;
+	TrackingSpinLock m_lock {Common::PerfStats::Lock::TextureCache};
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
 	// Render-target fast clears decided on the GPU (MaterializeColorClear); made at first use.

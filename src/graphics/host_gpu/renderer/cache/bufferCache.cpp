@@ -535,8 +535,15 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		ForgetFills(vaddr, size);
 	}
-	m_memory_tracker.InvalidateRegion(vaddr, size,
-	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+	m_memory_tracker.InvalidateRegion(vaddr, size, [this, vaddr, size] {
+		// A CPU store to GPU-written bytes: a fast clear checked on the GPU there no longer holds.
+		if (m_metadata_watch_count.load(std::memory_order_relaxed) != 0) {
+			const auto       page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+			std::unique_lock lock(m_dirty_ranges_mutex);
+			NoteMetadataWrite(page, TRACKER_PAGE_SIZE);
+		}
+		ReadMemory(vaddr, size, true);
+	});
 }
 
 void BufferCache::ForgetUnmapped(uint64_t vaddr, uint64_t size) {
@@ -546,6 +553,8 @@ void BufferCache::ForgetUnmapped(uint64_t vaddr, uint64_t size) {
 	uint64_t dropped = 0;
 	{
 		std::unique_lock lock(m_dirty_ranges_mutex);
+		// Memory mapped there again holds other bytes: its metadata checks start over.
+		NoteMetadataWrite(vaddr, size);
 		if (!m_gpu_modified_ranges.Intersects(vaddr, size)) {
 			return;
 		}
@@ -583,6 +592,7 @@ bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 	{
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		ForgetFills(vaddr, size);
+		NoteMetadataWrite(vaddr, size);
 		if (m_gpu_modified_ranges.Intersects(vaddr, size)) {
 			// Overwritten in full: guest memory holds the value the GPU copy will have.
 			m_gpu_modified_ranges.Subtract(vaddr, size);
@@ -590,6 +600,53 @@ bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 	}
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	return true;
+}
+
+void BufferCache::WatchMetadata(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	// A bound on the watches kept: past it they start again (every range then checks once more).
+	constexpr size_t MaxWatches = 4096;
+	std::unique_lock lock(m_dirty_ranges_mutex);
+	if (m_metadata_watches.size() >= MaxWatches) {
+		m_metadata_watches.clear();
+		m_metadata_watch_span = 0;
+	}
+	// Watches over the range that start elsewhere go: the range is current as checked now.
+	for (auto it = m_metadata_watches.lower_bound(
+	         vaddr >= m_metadata_watch_span ? vaddr - m_metadata_watch_span : 0);
+	     it != m_metadata_watches.end() && it->first < vaddr + size;) {
+		if (it->second.end > vaddr && it->first != vaddr) {
+			it = m_metadata_watches.erase(it);
+		} else {
+			++it;
+		}
+	}
+	m_metadata_watches[vaddr] = {vaddr + size, false};
+	m_metadata_watch_span     = std::max(m_metadata_watch_span, size);
+	m_metadata_watch_count.store(m_metadata_watches.size(), std::memory_order_relaxed);
+}
+
+bool BufferCache::MetadataUnwritten(uint64_t vaddr, uint64_t size) const {
+	std::shared_lock lock(m_dirty_ranges_mutex);
+	const auto       found = m_metadata_watches.find(vaddr);
+	return found != m_metadata_watches.end() && found->second.end == vaddr + size &&
+	       !found->second.written;
+}
+
+void BufferCache::NoteMetadataWrite(uint64_t vaddr, uint64_t size) {
+	if (m_metadata_watches.empty() || size == 0) {
+		return;
+	}
+	const auto end = vaddr + size;
+	for (auto it = m_metadata_watches.lower_bound(
+	         vaddr >= m_metadata_watch_span ? vaddr - m_metadata_watch_span : 0);
+	     it != m_metadata_watches.end() && it->first < end; ++it) {
+		if (it->second.end > vaddr) {
+			it->second.written = true;
+		}
+	}
 }
 
 // A game thread's fault on GPU-written memory no longer makes the GPU thread wait for the GPU.
@@ -1384,6 +1441,13 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    });
 	}
 	RecordSync(size, is_written, static_cast<bool>(source), timed ? walk_timer.GetTimeS() : 0.0);
+	if (source && m_metadata_watch_count.load(std::memory_order_relaxed) != 0) {
+		// Bytes the CPU wrote, uploaded over what a fast-clear check left there.
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		for (const auto& copy: copies) {
+			NoteMetadataWrite(buffer.CpuAddress() + copy.dstOffset, copy.size);
+		}
+	}
 	if (source) {
 		KYTY_PROFILER_BLOCK("Sync::Copy");
 		m_scheduler.NoteTransfer(StallWatch::Transfer::BufferUpload, total_size);
@@ -1974,6 +2038,14 @@ void BufferCache::WritesRecorded(bool address_writes, uint64_t shader) {
 	const auto current = m_scheduler.CurrentTick();
 	if (address_writes) {
 		m_address_write_tick = std::max(m_address_write_tick, current);
+		// Stores through shader addresses mark no range: any watched metadata may be among them.
+		if (m_metadata_watch_count.load(std::memory_order_relaxed) != 0) {
+			std::unique_lock lock(m_dirty_ranges_mutex);
+			for (auto& [address, watch]: m_metadata_watches) {
+				(void)address;
+				watch.written = true;
+			}
+		}
 		// Which shaders hold fast readbacks up this way (the first 16).
 		static std::unordered_set<uint64_t> logged;
 		if (logged.size() < 16 && logged.insert(shader).second) {
@@ -2051,6 +2123,7 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 		m_write_ticks.Assign(vaddr, vaddr + size, tick);
 		m_unrecorded_writes.push_back({vaddr, vaddr + size, tick, tracked});
 		ForgetFills(vaddr, size);
+		NoteMetadataWrite(vaddr, size);
 	}
 	RecordGpuWriter(vaddr, size, s_diag_shader_hash, m_scheduler.CurrentTick());
 	QueueReadahead(vaddr, size);
@@ -2203,7 +2276,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
-	const bool known_meta = m_texture_cache.ClearMeta(vaddr);
+	const bool known_meta = m_texture_cache.ClearMeta(vaddr, value);
 	if (Libs::LibKernel::Memory::TracesMemory(vaddr, size)) {
 		Libs::LibKernel::Memory::TraceMemory(
 		    "fill 0x%016" PRIx64 "+0x%" PRIx64 " with 0x%08x on the %s%s", vaddr, size, value,

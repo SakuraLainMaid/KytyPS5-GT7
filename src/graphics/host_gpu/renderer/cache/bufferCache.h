@@ -124,6 +124,17 @@ public:
 	// `shader`) also stored through shader addresses, which mark no range; fast readbacks wait for
 	// its tick.
 	void WritesRecorded(bool address_writes = false, uint64_t shader = 0);
+	// GPU thread, for the render targets' fast clears decided on the GPU (TextureCache::
+	// MaterializeColorClear): such a check rewrites the color metadata it reads where the GPU
+	// holds it, so what it found holds until something writes those bytes again. WatchMetadata
+	// starts watching [vaddr, vaddr + size) as written by nothing since; MetadataUnwritten says
+	// whether it is still watched as such. A write is any GPU write marked (a fill, a copy, a
+	// shader's store, another check, a command storing through shader addresses, which marks all
+	// of them), a CPU store to the bytes while GPU-written (done in place, or after a download), an
+	// upload of CPU-written bytes into it, an image's download into the cached buffer over it, and
+	// an unmap. (CPU-dirty bytes are the caller's to look for: IsRegionCpuModified.)
+	void               WatchMetadata(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool MetadataUnwritten(uint64_t vaddr, uint64_t size) const;
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool              IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool              HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
@@ -339,6 +350,18 @@ private:
 	};
 	std::vector<UnrecordedWrite> m_unrecorded_writes;
 	uint64_t                     m_address_write_tick = 0;
+	// The metadata ranges WatchMetadata watches, by first byte: whether something wrote any of
+	// their bytes since. Under m_dirty_ranges_mutex; m_metadata_watch_count mirrors their number
+	// for the paths that look without the lock.
+	struct MetadataWatch {
+		uint64_t end     = 0;
+		bool     written = false;
+	};
+	std::map<uint64_t, MetadataWatch> m_metadata_watches;
+	uint64_t                          m_metadata_watch_span = 0; // the longest watched range
+	std::atomic<size_t>               m_metadata_watch_count {0};
+	// Marks the watches over [vaddr, vaddr + size) written; m_dirty_ranges_mutex held.
+	void NoteMetadataWrite(uint64_t vaddr, uint64_t size);
 	// Set by a fast readback that let the access go on (GPU thread), for ReadMemory's counts.
 	bool m_fast_step = false;
 	// Readahead (ReadaheadEnabled), GPU thread only: the blocks learned in this generation and

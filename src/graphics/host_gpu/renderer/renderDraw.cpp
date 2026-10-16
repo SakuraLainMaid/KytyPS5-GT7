@@ -605,6 +605,62 @@ static vk::Extent2D ClampToBacking(const Image& image, uint32_t base_level, vk::
 	return {std::min(extent.width, backing.width), std::min(extent.height, backing.height)};
 }
 
+// A depth target's HTile fill and its stencil (round 65). With the stencil's compression in the
+// HTile (DB_STENCIL_INFO.TILE_STENCIL_DISABLE=0) a word holds ZMask [3:0], the stencil results
+// SR0/SR1 [7:4], SMem [9:8] and the depth range [31:12]; SMem 0 is the stencil's cleared state, as
+// ZMask 0 is the depth's (Mesa, radv_get_htile_fast_clear_value). The host cleared only the depth
+// of a target whose HTile a fill cleared, so its stencil kept what earlier frames left in it. GT7
+// clears its course maps' depth targets with one compute fill a frame and draws their track with
+// a stencil test. The track went from the maps once round 63b cleared their colors every frame,
+// and the cursors stayed, as a stencil left by earlier frames would have it (before that, the
+// track the first frames drew stayed in the image, under the cursors' trails; round 64's "cmask
+// off" brought the trails back but not the track). KYTY_HTILE_STENCIL_CLEARS=0 (or KYTY_BISECT's
+// htile:depth) clears the depth alone, as before.
+[[nodiscard]] static bool HtileStencilClears() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_HTILE_STENCIL_CLEARS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled && !Bisect::HtileDepthOnly();
+}
+
+[[nodiscard]] static constexpr uint32_t HtileZMask(uint32_t value) {
+	return value & 0xfu;
+}
+[[nodiscard]] static constexpr uint32_t HtileSMem(uint32_t value) {
+	return (value >> 8u) & 0x3u;
+}
+
+// The first HTile clears of each depth target (up to 32), with what the fill held.
+static void LogHtileClear(const RenderDepthInfo& depth, std::optional<uint32_t> fill,
+                          bool stencil_cleared) {
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> logged;
+	const auto&                         info = depth.desc.info;
+	{
+		std::lock_guard lock(mutex);
+		if (logged.size() >= 32 || !logged.insert(info.data.address).second) {
+			return;
+		}
+	}
+	const auto  fill_text    = fill.has_value()
+	                               ? fmt::format("its HTile fill 0x{:08x} (ZMask {}, SMem {})", *fill,
+	                                             HtileZMask(*fill), HtileSMem(*fill))
+	                               : std::string("its HTile clear (the value unknown)");
+	std::string stencil_text = "kept";
+	if (!info.metadata.stencil_compressed) {
+		stencil_text = "is not in the HTile (kept)";
+	} else if (stencil_cleared) {
+		stencil_text = fmt::format("too, to {}", depth.stencil_clear_value);
+	} else if (fill.has_value() && HtileSMem(*fill) == 0) {
+		stencil_text = "kept (KYTY_HTILE_STENCIL_CLEARS=0 or htile:depth)";
+	}
+	LOGF("DepthTarget: 0x%012" PRIx64 " %ux%u, %u samples, %s: the depth is cleared to %g, the "
+	     "stencil %s\n",
+	     info.data.address, info.extent.width, info.extent.height, info.samples, fill_text.c_str(),
+	     depth.depth_clear_value, stencil_text.c_str());
+}
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
@@ -663,6 +719,16 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    metadata.kind == ImageMetadataKind::Htile &&
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
 		depth.depth_load_clear_enable = depth.depth_clear_enable || meta_clear;
+		if (meta_clear && depth.desc.info.HasStencil()) {
+			// The fill's value says whether it cleared the stencil too (HtileSMem).
+			const auto fill           = cache.MetaFillValue(metadata.range.address);
+			const bool clears_stencil = metadata.stencil_compressed && fill.has_value() &&
+			                            HtileSMem(*fill) == 0 && HtileStencilClears();
+			if (clears_stencil) {
+				depth.stencil_clear_enable = true;
+			}
+			LogHtileClear(depth, fill, clears_stencil);
+		}
 		if (meta_clear &&
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");
@@ -1426,6 +1492,21 @@ static void LogFrameGraphDraw(RenderContext& context, const CommandBuffer& buffe
 		    color.guest_mip_level, color.guest_array_layer, static_cast<int>(info.pixel_format),
 		    static_cast<uint32_t>(info.guest_format), info.samples,
 		    static_cast<uint32_t>(info.tile_mode), flags, cached.overlaps, cached.gpu_overlaps);
+		// How the draw writes it (round 65): the guest's blend control and the slot's write mask.
+		const auto& registers = buffer.GetRegisters();
+		const auto& blend     = registers.GetBlendControl(color.target_slot);
+		FrameGraph::Log(
+		    "  rt slot %u blend: enable %d color %u %u %u alpha %u %u %u separate %d, "
+		    "write mask 0x%x, bypass %d, clear word 0x%08x",
+		    color.target_slot, blend.enable ? 1 : 0, static_cast<uint32_t>(blend.color_srcblend),
+		    static_cast<uint32_t>(blend.color_comb_fcn),
+		    static_cast<uint32_t>(blend.color_destblend),
+		    static_cast<uint32_t>(blend.alpha_srcblend),
+		    static_cast<uint32_t>(blend.alpha_comb_fcn),
+		    static_cast<uint32_t>(blend.alpha_destblend), blend.separate_alpha_blend ? 1 : 0,
+		    (registers.GetRenderTargetMask() >> (color.target_slot * 4u)) & 0xfu,
+		    registers.GetRenderTarget(color.target_slot).info.blend_bypass ? 1 : 0,
+		    info.metadata.clear_word);
 		// A small linear target, the kind the CPU reads back: shown after the frame as guest
 		// memory holds it.
 		if (info.tile_mode == Prospero::TileMode::kLinear && info.data.size <= 64u * 1024u) {
@@ -1451,6 +1532,23 @@ static void LogFrameGraphDraw(RenderContext& context, const CommandBuffer& buffe
 		                                    depth.desc.view_info.base_layer)
 		        ? 1
 		        : 0);
+		// The values a clear of it takes, and the stencil test (round 65: the course maps' track,
+		// drawn with depth and stencil tests, went missing while the cursors drew).
+		FrameGraph::Log("  depth clear value %g, stencil clear %d value %u",
+		                depth.depth_clear_value, depth.stencil_clear_enable ? 1 : 0,
+		                static_cast<uint32_t>(depth.stencil_clear_value));
+		if (depth.stencil_test_enable) {
+			const auto face = [](const vk::StencilOpState& op) {
+				return fmt::format(
+				    "compare {} ref 0x{:02x} read 0x{:02x} write 0x{:02x} fail {} pass "
+				    "{} depth-fail {}",
+				    vk::to_string(op.compareOp), op.reference, op.compareMask, op.writeMask,
+				    vk::to_string(op.failOp), vk::to_string(op.passOp),
+				    vk::to_string(op.depthFailOp));
+			};
+			FrameGraph::Log("  stencil front: %s", face(depth.stencil_front).c_str());
+			FrameGraph::Log("  stencil back: %s", face(depth.stencil_back).c_str());
+		}
 	}
 	const auto& shaders = buffer.GetShaders();
 	const auto  note    = [](const char* stage, uint64_t address) {
@@ -1645,6 +1743,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
+	if (FrameGraph::Logging() && state.depth_info.image_id) {
+		// What the depth attachment's rendering starts with (an HTile clear among them).
+		const auto& ds = rendering.depth_stencil_attachment;
+		FrameGraph::Log("  depth attachment: depth %s, stencil %s",
+		                !ds.has_depth    ? "none"
+		                : ds.depth_clear ? "cleared"
+		                                 : "loaded",
+		                !ds.has_stencil    ? "none"
+		                : ds.stencil_clear ? "cleared"
+		                                   : "loaded");
+	}
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest

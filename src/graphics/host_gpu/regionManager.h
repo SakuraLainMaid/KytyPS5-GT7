@@ -2,12 +2,19 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "common/perfStats.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
+#include <thread>
 #include <utility>
+
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
@@ -26,23 +33,75 @@
 
 namespace Libs::Graphics {
 
+// The lock of the texture cache and of each memory-tracker region. Every CPU write fault takes the
+// texture cache's (TextureCache::InvalidateMemory), and the GPU thread holds it for each image it
+// looks up: in GT7 the game's six job threads spent near half their time in fault handlers, all
+// about as long as one another (round 64), as if queued behind the GPU thread. A waiter used to
+// spin on test-and-set, writing the lock's cache line in a loop under the holder and taking the
+// processor from the holder when they share a core. It now reads the lock until it is free,
+// pausing, and yields the processor after a while (KYTY_LOCKS_SPIN=1 or KYTY_BISECT's locks:spin
+// for the old way); the waits are counted on the "Perf locks:" line.
 class TrackingSpinLock final {
 public:
+	explicit TrackingSpinLock(
+	    Common::PerfStats::Lock kind = Common::PerfStats::Lock::MemoryTracker) noexcept
+	    : m_kind(kind) {}
+	KYTY_CLASS_NO_COPY(TrackingSpinLock);
+
 	void lock() noexcept {
 		const auto thread = CurrentThread();
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
-			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
-			std::atomic_signal_fence(std::memory_order_seq_cst);
+		if (m_lock.exchange(true, std::memory_order_acquire)) {
+			Wait(thread);
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
 	void unlock() noexcept {
 		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) != CurrentThread());
 		m_owner.store(0, std::memory_order_relaxed);
-		m_lock.clear(std::memory_order_release);
+		m_lock.store(false, std::memory_order_release);
 	}
 
 private:
+	// Held by another thread (by this one: a recursive lock ends the emulator).
+	void Wait(uint32_t thread) noexcept {
+		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
+		const bool timed = Common::PerfStats::Active();
+		const auto start =
+		    timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+		if (Common::PerfStats::SpinLocks()) {
+			while (m_lock.exchange(true, std::memory_order_acquire)) {
+				EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
+				std::atomic_signal_fence(std::memory_order_seq_cst);
+			}
+		} else {
+			uint32_t spins = 0;
+			do {
+				while (m_lock.load(std::memory_order_relaxed)) {
+					if (spins < 256) {
+						spins++;
+						Pause();
+					} else {
+						std::this_thread::yield();
+					}
+				}
+			} while (m_lock.exchange(true, std::memory_order_acquire));
+		}
+		if (timed) {
+			Common::PerfStats::AddLockWait(
+			    m_kind, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                      std::chrono::steady_clock::now() - start)
+			                                      .count()));
+		}
+	}
+
+	static void Pause() noexcept {
+#if defined(_M_X64) || defined(__x86_64__)
+		_mm_pause();
+#else
+		std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+	}
+
 	static uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		return GetCurrentThreadId();
@@ -57,8 +116,9 @@ private:
 #endif
 	}
 
-	std::atomic_flag     m_lock = ATOMIC_FLAG_INIT;
-	std::atomic_uint32_t m_owner {0};
+	std::atomic<bool>       m_lock {false};
+	std::atomic_uint32_t    m_owner {0};
+	Common::PerfStats::Lock m_kind;
 };
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);

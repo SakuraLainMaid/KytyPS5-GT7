@@ -100,6 +100,11 @@ struct Counters {
 	std::atomic<uint64_t>                                               stalls {0};
 	std::atomic<uint64_t>                                               longest_stall_ns {0};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(Host::Count)> longest_host_ns {};
+
+	// Waits for the graphics caches' spin locks, by lock.
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(Lock::Count)> lock_waits {};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(Lock::Count)> lock_wait_ns {};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(Lock::Count)> longest_lock_wait_ns {};
 };
 Counters g_counters;
 
@@ -335,6 +340,24 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 		    static_cast<double>(lock_max) / 1e6, extra));
 	}
 
+	// The graphics caches' locks: how often a thread found one held, and how long it waited.
+	{
+		std::string          line = fmt::format("Perf locks:{}", configuration);
+		constexpr std::array names {"texture cache", "memory tracker"};
+		static_assert(names.size() == static_cast<size_t>(Lock::Count));
+		for (size_t i = 0; i < names.size(); i++) {
+			const auto waits        = take(c.lock_waits[i]);
+			const auto wait_ns      = take(c.lock_wait_ns[i]);
+			const auto longest_wait = take(c.longest_lock_wait_ns[i]);
+			line += fmt::format("{} {} {:.0f} waits/s, {:.1f} ms/s, longest {:.2f} ms",
+			                    i == 0 ? "" : " |", names[i], static_cast<double>(waits) / seconds,
+			                    static_cast<double>(wait_ns) / 1e6 / seconds,
+			                    static_cast<double>(longest_wait) / 1e6);
+		}
+		line += SpinLocks() ? " (spinning as before round 65)" : "";
+		Log::WriteUnmuted(line + "\n");
+	}
+
 	// The busiest threads, and those that spent longest in faults.
 	auto                                       now_cpu = ThreadCpuTimes();
 	std::vector<std::pair<uint64_t, uint32_t>> cpu;
@@ -529,7 +552,28 @@ void AddFastReadbackSlow(uint64_t wait_ns, uint64_t bytes) {
 	StoreMax(g_counters.longest_fast_readback_ns, wait_ns);
 }
 
+void AddLockWaitSlow(uint32_t lock, uint64_t nanoseconds) {
+	if (lock >= g_counters.lock_waits.size()) {
+		return;
+	}
+	g_counters.lock_waits[lock].fetch_add(1, std::memory_order_relaxed);
+	g_counters.lock_wait_ns[lock].fetch_add(nanoseconds, std::memory_order_relaxed);
+	StoreMax(g_counters.longest_lock_wait_ns[lock], nanoseconds);
+}
+
 } // namespace Detail
+
+void SetSpinLocks(bool spin) {
+	Detail::g_spin_locks.store(spin, std::memory_order_relaxed);
+}
+
+bool SpinLocksFromEnvironment() {
+	static const bool spin = [] {
+		const char* value = std::getenv("KYTY_LOCKS_SPIN");
+		return value != nullptr && value[0] == '1';
+	}();
+	return spin;
+}
 
 void SetExtraReporter(ExtraReporter reporter) {
 	g_extra_reporter.store(reporter, std::memory_order_release);
@@ -599,6 +643,7 @@ void Start() {
 			LOGF("CPU: KYTY_CPU_SET=%s: %s\n", set, description.c_str());
 			(void)ok;
 		}
+		SetSpinLocks(SpinLocksFromEnvironment());
 		Common::Sampler::Start();
 		if (!Enabled()) {
 			return;

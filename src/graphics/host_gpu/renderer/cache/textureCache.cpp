@@ -1874,9 +1874,21 @@ void TextureCache::InitializeImage(ImageId id) {
 	image.initialized = true;
 }
 
+// KYTY_GPU_CLEAR_RECHECK=1, or KYTY_BISECT's recheck: a fast clear is checked on the GPU again at
+// the first binding of each command buffer even when nothing wrote its metadata since the last
+// check, as before round 65.
+bool TextureCache::RechecksColorClears() {
+	static const bool always = [] {
+		const char* value = std::getenv("KYTY_GPU_CLEAR_RECHECK");
+		return value != nullptr && value[0] == '1';
+	}();
+	return always || Bisect::GpuClearRecheck();
+}
+
 bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc, uint32_t first,
                                               uint32_t image_first, uint32_t count,
-                                              uint64_t slice_size) {
+                                              uint64_t slice_size, bool unwritten,
+                                              uint32_t* check) {
 	const auto& view    = desc.view_info;
 	const auto  decline = [&](const char* why) {
 		// Once per reason: the metadata is then read back, draining the GPU.
@@ -1972,10 +1984,23 @@ bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
 		command.MarkTransfer(CommandBufferDebugOp::InternalWork, address, image.info.data.address,
 		                     static_cast<uint32_t>(InternalWork::ColorClearCheck),
 		                     static_cast<uint32_t>(slice_size / sizeof(uint32_t)), first + slice);
-		m_conditional_clear->Record(command, buffer->BufferDeviceAddress() + offset,
-		                            static_cast<uint32_t>(slice_size / sizeof(uint32_t)),
-		                            candidates, image.FindView(target), view.format, samples,
-		                            extent);
+		ConditionalColorClear::Note note {};
+		note.target         = image.info.data.address;
+		note.metadata       = address;
+		note.layer          = image_first + slice;
+		note.width          = extent.width;
+		note.height         = extent.height;
+		note.samples        = samples;
+		note.dcc            = desc.info.metadata.kind == ImageMetadataKind::Dcc;
+		note.unwritten      = unwritten;
+		note.fg_op          = FrameGraph::Logging() ? FrameGraph::CurrentOp() : 0;
+		const auto recorded = m_conditional_clear->Record(
+		    command, buffer->BufferDeviceAddress() + offset,
+		    static_cast<uint32_t>(slice_size / sizeof(uint32_t)), candidates,
+		    image.FindView(target), view.format, samples, extent, note);
+		if (check != nullptr && slice == 0) {
+			*check = recorded;
+		}
 		CommitGpuWrite(image);
 	}
 	static std::atomic<uint64_t> checks {0}, texture_checks {0};
@@ -2242,16 +2267,60 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		const char* value = std::getenv("KYTY_DCC_CLEAR_READBACK");
 		return value == nullptr || value[0] != '0';
 	}();
-	if (gpu_written && !known_fill &&
-	    MaterializeColorClearOnGpu(id, desc, first, image_first, count, range.size / layers)) {
-		if (FrameGraph::Logging()) {
-			FrameGraph::Log("  color clear of 0x%012" PRIx64 " (%s 0x%012" PRIx64
-			                ", layers %u+%u, %u samples): checked on the GPU",
-			                desc.info.data.address,
-			                desc.info.metadata.kind == ImageMetadataKind::Dcc ? "DCC" : "CMASK",
-			                range.address, first, count, desc.info.samples);
+	// A check on the GPU rewrites the metadata it reads (to expanded keys, when they held one
+	// code), so what it found holds until something writes those bytes again. The first draw of
+	// each command buffer checked again (one pause of the GPU's work and a render pass break each,
+	// 376 a frame in a race); a check that cleared again would also wipe what was drawn before it,
+	// a suspect for the course maps' missing track (the outcome of each check is now read back:
+	// ConditionalColorClear). KYTY_GPU_CLEAR_RECHECK=1 or KYTY_BISECT's recheck checks again
+	// anyway, as before (the check's outcome is then reported as one of unwritten metadata).
+	const auto slice_bytes   = range.size / layers;
+	const auto checked_begin = range.address + slice_bytes * first;
+	const auto checked_bytes = slice_bytes * count;
+	if (gpu_written && !known_fill && GpuColorClearEnabled() &&
+	    desc.type != BindingType::VideoOut) {
+		// (A CPU write to bytes the GPU had not written leaves them CPU-dirty, which the watch
+		// does not see.)
+		const bool unwritten = !m_buffer_cache.IsRegionCpuModified(checked_begin, checked_bytes) &&
+		                       m_buffer_cache.MetadataUnwritten(checked_begin, checked_bytes);
+		if (unwritten && !RechecksColorClears()) {
+			ConditionalColorClear::NoteSkipped();
+			if (FrameGraph::Logging()) {
+				FrameGraph::Log("  color clear of 0x%012" PRIx64 " (%s 0x%012" PRIx64
+				                ", layers %u+%u): nothing wrote its metadata since its last check",
+				                desc.info.data.address,
+				                desc.info.metadata.kind == ImageMetadataKind::Dcc ? "DCC" : "CMASK",
+				                range.address, first, count);
+			}
+			return;
 		}
-		return;
+		uint32_t check = 0;
+		if (MaterializeColorClearOnGpu(id, desc, first, image_first, count, slice_bytes, unwritten,
+		                               &check)) {
+			// After the check's own write of the metadata (ObtainBuffer marked it GPU-written).
+			// Only a check that ran: a binding with no code to clear with (a texture's, which
+			// cannot decode a register clear) records none, and the render-target binding after
+			// it must still check.
+			if (check != 0) {
+				m_buffer_cache.WatchMetadata(checked_begin, checked_bytes);
+			}
+			if (FrameGraph::Logging() && check == 0) {
+				FrameGraph::Log(
+				    "  color clear of 0x%012" PRIx64 " (%s 0x%012" PRIx64
+				    ", layers %u+%u): no code this binding could clear with, not checked",
+				    desc.info.data.address,
+				    desc.info.metadata.kind == ImageMetadataKind::Dcc ? "DCC" : "CMASK",
+				    range.address, first, count);
+			} else if (FrameGraph::Logging()) {
+				FrameGraph::Log("  color clear of 0x%012" PRIx64 " (%s 0x%012" PRIx64
+				                ", layers %u+%u, %u samples): checked on the GPU (check %u%s)",
+				                desc.info.data.address,
+				                desc.info.metadata.kind == ImageMetadataKind::Dcc ? "DCC" : "CMASK",
+				                range.address, first, count, desc.info.samples, check,
+				                unwritten ? ", its metadata unwritten since the last" : "");
+			}
+			return;
+		}
 	}
 	if (gpu_written && !known_fill) {
 		if (!readback && desc.type == BindingType::RenderTarget) {
@@ -3180,6 +3249,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		std::unique_lock dirty_lock(m_dirty_ranges_mutex);
 		m_write_ticks.Assign(image.info.data.address, image.info.data.address + copy_size,
 		                     m_scheduler.CurrentTick());
+		NoteMetadataWrite(image.info.data.address, copy_size);
 	}
 	return true;
 }
@@ -4941,14 +5011,25 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	return (found->second.clear_mask & (1u << slice)) != 0;
 }
 
-bool TextureCache::ClearMeta(uint64_t address) {
+bool TextureCache::ClearMeta(uint64_t address, std::optional<uint32_t> fill) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end()) {
 		return false;
 	}
 	found->second.clear_mask = UINT32_MAX;
+	found->second.fill_known = fill.has_value();
+	found->second.fill_value = fill.value_or(0);
 	return true;
+}
+
+std::optional<uint32_t> TextureCache::MetaFillValue(uint64_t address) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end() || !found->second.fill_known) {
+		return std::nullopt;
+	}
+	return found->second.fill_value;
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {

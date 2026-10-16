@@ -45,6 +45,8 @@ void AddStallSlow(uint64_t nanoseconds, bool distinct);
 void AddHostSlow(uint32_t which, uint64_t nanoseconds);
 void AddReadaheadSlow(uint64_t bytes);
 void AddFastReadbackSlow(uint64_t wait_ns, uint64_t bytes);
+void AddLockWaitSlow(uint32_t lock, uint64_t nanoseconds);
+inline std::atomic<bool> g_spin_locks {false};
 } // namespace Detail
 
 // Whether the counters count (the reporter runs): for measurements that cost a clock read.
@@ -149,6 +151,23 @@ inline void AddFastReadback(uint64_t wait_ns, uint64_t bytes) {
 		Detail::AddFastReadbackSlow(wait_ns, bytes);
 	}
 }
+// The graphics caches' spin locks (graphics/host_gpu/regionManager.h): a thread found one held by
+// another and waited `nanoseconds` for it. The "Perf locks:" line gives them by lock.
+enum class Lock : uint32_t { TextureCache, MemoryTracker, Count };
+inline void AddLockWait(Lock lock, uint64_t nanoseconds) {
+	if (Active()) {
+		Detail::AddLockWaitSlow(static_cast<uint32_t>(lock), nanoseconds);
+	}
+}
+// Whether those locks spin on a test-and-set as before round 65 (KYTY_LOCKS_SPIN=1, or
+// KYTY_BISECT's locks:spin), instead of reading the lock until it is free, pausing and then
+// yielding the processor.
+[[nodiscard]] inline bool SpinLocks() {
+	return Detail::g_spin_locks.load(std::memory_order_relaxed);
+}
+void               SetSpinLocks(bool spin);
+[[nodiscard]] bool SpinLocksFromEnvironment();
+
 // Host-side sections that can hold the GPU's queue up; the line gives the longest of each.
 enum class Host : uint32_t { Acquire, Present, QueueLock, Count };
 inline void AddHost(Host which, uint64_t nanoseconds) {

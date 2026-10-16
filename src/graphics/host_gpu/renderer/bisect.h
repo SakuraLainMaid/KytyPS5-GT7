@@ -58,6 +58,16 @@
 //   fastread:any the fast readback copies bytes even while a command that stores through shader
 //                addresses is unfinished (it may miss what that command stores there: a test of
 //                what waiting for those commands costs)
+// and (round 65):
+//   recheck      a render target's fast clear is checked on the GPU again at the first draw of
+//                every command buffer, as before round 65, even when nothing wrote its metadata
+//                since the last check (KYTY_GPU_CLEAR_RECHECK=1 for the whole run)
+//   locks:spin   the texture cache's and the memory tracker's locks spin as before round 65
+//                (a test-and-set loop) instead of waiting politely (KYTY_LOCKS_SPIN=1 for the
+//                whole run)
+//   htile:depth  a depth target's HTile fill clears its depth alone, as before round 65, even
+//                when the fill's value clears its stencil too (KYTY_HTILE_STENCIL_CLEARS=0 for
+//                the whole run)
 namespace Libs::Graphics::Bisect {
 
 // The GPU thread, at its start: applies the start step's CPU set and log setting.
@@ -96,6 +106,10 @@ void                      ApplyPending();
 [[nodiscard]] bool MsaaCmaskOff();
 [[nodiscard]] bool FastReadbackOff();
 [[nodiscard]] bool FastReadbackAnyAddress();
+// Any thread: recheck; locks:spin; htile:depth.
+[[nodiscard]] bool GpuClearRecheck();
+[[nodiscard]] bool LocksSpin();
+[[nodiscard]] bool HtileDepthOnly();
 
 } // namespace Libs::Graphics::Bisect
 

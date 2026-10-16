@@ -27,7 +27,7 @@ namespace {
 constexpr uint32_t BlockQueries = 2048;
 constexpr uint32_t BlockCount   = 32;
 // A block's pipeline statistics queries: one per timed command (watch mode, when the device
-// has pipelineStatisticsQuery; KYTY_GPU_WATCH_STATS=0 leaves them out).
+// has pipelineStatisticsQuery and KYTY_GPU_WATCH_STATS=1 asks for them).
 constexpr uint32_t BlockStats = BlockQueries / 2;
 
 // What each statistics query counts, in the order Vulkan writes them (by bit). Not the input
@@ -164,11 +164,13 @@ bool Watching() {
 	return WatchFromEnvironment() || g_watch_step.load(std::memory_order_relaxed);
 }
 
-// KYTY_GPU_WATCH_STATS=0: watch mode without the pipeline statistics queries.
+// KYTY_GPU_WATCH_STATS=1: watch mode with a pipeline statistics query around every draw and
+// dispatch (the fragments and primitives of the slow ones). Off by default since round 65: with
+// them on, round 64's runs had the host GPU 8-17 ms behind instead of 2-6.
 bool WatchStats() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_GPU_WATCH_STATS");
-		return value == nullptr || value[0] != '0';
+		return value != nullptr && value[0] == '1';
 	}();
 	return on;
 }
@@ -180,6 +182,22 @@ double WatchMs() {
 		return parsed > 0.0 ? parsed : 30.0;
 	}();
 	return ms;
+}
+
+// The shaders of the slowest draws watch mode found (ProbesGridsOf), up to MaxSlowShaders.
+constexpr size_t      MaxSlowShaders = 32;
+std::mutex            g_slow_mutex;
+std::vector<uint64_t> g_slow_shaders; // under g_slow_mutex
+std::atomic<uint32_t> g_slow_count {0};
+
+void NoteSlowShader(uint64_t key) {
+	std::lock_guard lock(g_slow_mutex);
+	if (g_slow_shaders.size() >= MaxSlowShaders ||
+	    std::ranges::find(g_slow_shaders, key) != g_slow_shaders.end()) {
+		return;
+	}
+	g_slow_shaders.push_back(key);
+	g_slow_count.store(static_cast<uint32_t>(g_slow_shaders.size()), std::memory_order_release);
 }
 
 // A slow command buffer in watch mode: its commands by GPU time, the largest gap between two.
@@ -223,6 +241,12 @@ void ReportSlowBlock(const Block& block, const std::vector<uint64_t>& values, do
 		previous_key = pair.key;
 	}
 	std::ranges::sort(timed, [](const Timed& a, const Timed& b) { return a.ms > b.ms; });
+	// A draw of 10 ms or more: its shader's light grids are looked at as it draws again.
+	for (size_t i = 0; i < timed.size() && i < 3; i++) {
+		if (timed[i].kind == Draw && timed[i].ms >= 10.0) {
+			NoteSlowShader(timed[i].key);
+		}
+	}
 	std::string costliest;
 	for (size_t i = 0; i < timed.size() && i < 6; i++) {
 		costliest +=
@@ -377,6 +401,9 @@ void BeginBlockSlow(RenderContext& context, CommandScheduler& scheduler,
 			}
 			LOGF("GpuTiming: watch mode counts fragments and primitives of each timed draw: %s\n",
 			     state.stats_pool ? "yes" : "no (the query pool was refused)");
+		} else if (graphics.pipeline_statistics_enabled) {
+			LOGF("GpuTiming: watch mode times commands without pipeline statistics "
+			     "(KYTY_GPU_WATCH_STATS=1 counts the fragments and primitives of each)\n");
 		}
 	}
 	auto& block = state.blocks[state.next_block % BlockCount];
@@ -475,6 +502,37 @@ bool                  g_frame_lines     = false; // presenter thread: the frame 
 
 void RequestFrames(uint32_t frames) {
 	g_requested_frames.store(frames, std::memory_order_release);
+}
+
+bool ProbesGridsOf(uint64_t pixel_shader) {
+	if (g_slow_count.load(std::memory_order_acquire) == 0 || !Watching()) {
+		return false;
+	}
+	std::lock_guard lock(g_slow_mutex);
+	return std::ranges::find(g_slow_shaders, pixel_shader) != g_slow_shaders.end();
+}
+
+bool ClaimGridProbe(uint64_t address) {
+	// GPU thread only: each grid once in 3 s, 8 probes in 10 s at most.
+	using Clock = std::chrono::steady_clock;
+	static std::unordered_map<uint64_t, Clock::time_point> last;
+	static std::vector<Clock::time_point>                  recent;
+	const auto                                             now = Clock::now();
+	std::erase_if(recent,
+	              [&](Clock::time_point at) { return now - at >= std::chrono::seconds(10); });
+	if (recent.size() >= 8) {
+		return false;
+	}
+	if (last.size() >= 4096) {
+		last.clear();
+	}
+	auto& previous = last[address];
+	if (previous != Clock::time_point {} && now - previous < std::chrono::seconds(3)) {
+		return false;
+	}
+	previous = now;
+	recent.push_back(now);
+	return true;
 }
 
 void SetWatch(bool on) {

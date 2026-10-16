@@ -40,6 +40,9 @@ struct Step {
 	bool              cmask_off    = false;
 	bool              fastread_off = false;
 	bool              fastread_any = false;
+	bool              recheck      = false;
+	bool              locks_spin   = false;
+	bool              htile_depth  = false;
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
 	uint32_t          gpu_frames  = 0;    // gputime:<n>
@@ -127,6 +130,18 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "fastread:any") {
 		step.fastread_any = true;
+		return true;
+	}
+	if (action == "recheck") {
+		step.recheck = true;
+		return true;
+	}
+	if (action == "locks:spin") {
+		step.locks_spin = true;
+		return true;
+	}
+	if (action == "htile:depth") {
+		step.htile_depth = true;
 		return true;
 	}
 	if (action.starts_with("tess:max:")) {
@@ -292,6 +307,8 @@ void ApplyEffects() {
 		                              step->gpu_frames));
 	}
 	GpuTiming::SetWatch(step != nullptr && step->gpu_watch);
+	Common::PerfStats::SetSpinLocks(Common::PerfStats::SpinLocksFromEnvironment() ||
+	                                (step != nullptr && step->locks_spin));
 	static std::string applied = StartCpuSet();
 	const auto wanted = step != nullptr && !step->cpu_set.empty() ? step->cpu_set : StartCpuSet();
 	if (wanted != applied) {
@@ -483,6 +500,21 @@ bool FastReadbackOff() {
 bool FastReadbackAnyAddress() {
 	const auto* step = Current();
 	return step != nullptr && step->fastread_any;
+}
+
+bool GpuClearRecheck() {
+	const auto* step = Current();
+	return step != nullptr && step->recheck;
+}
+
+bool LocksSpin() {
+	const auto* step = Current();
+	return step != nullptr && step->locks_spin;
+}
+
+bool HtileDepthOnly() {
+	const auto* step = Current();
+	return step != nullptr && step->htile_depth;
 }
 
 bool WholeUnnormalizedViews() {

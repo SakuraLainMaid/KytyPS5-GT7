@@ -114,6 +114,45 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 	                   properties.deviceID, properties.driverVersion, uuid);
 }
 
+// The largest driver cache file kept (and loaded): pipelines of older builds stay in the file. The
+// limit was 1 GiB until round 64, and GT7's grew past it after two weeks of races: the next run
+// refused it, compiled every pipeline again (60,000 draws were skipped while they compiled in one
+// race, the track among them) and kept four cores busy for minutes. 3.75 GiB: under 4 GiB, which
+// the file reads and writes count in.
+constexpr uint64_t DriverCacheMaxBytes = uint64_t {3840} << 20u;
+
+// Reads and writes of the cache file, 256 MiB at a time (one call for a gigabyte-sized buffer is
+// the kind of request a file system may refuse).
+constexpr uint64_t DriverCacheChunk = uint64_t {256} << 20u;
+
+uint64_t ReadInChunks(Common::File& file, uint8_t* data, uint64_t size) {
+	uint64_t done = 0;
+	while (done < size) {
+		const auto part = static_cast<uint32_t>(std::min(size - done, DriverCacheChunk));
+		uint32_t   read = 0;
+		file.Read(data + done, part, &read);
+		done += read;
+		if (read != part) {
+			break;
+		}
+	}
+	return done;
+}
+
+uint64_t WriteInChunks(Common::File& file, const uint8_t* data, uint64_t size) {
+	uint64_t done = 0;
+	while (done < size) {
+		const auto part    = static_cast<uint32_t>(std::min(size - done, DriverCacheChunk));
+		uint32_t   written = 0;
+		file.Write(data + done, part, &written);
+		done += written;
+		if (written != part) {
+			break;
+		}
+	}
+	return done;
+}
+
 std::string PipelineCacheTitleId() {
 	std::string title_id;
 	if ((!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) &&
@@ -2402,20 +2441,16 @@ void PipelineCache::InitializeDriverCache() {
 		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
 		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-		// Pipelines of older builds stay in the file; past 1 GiB it starts over.
-		constexpr uint64_t max_file_size = uint64_t {1} << 30u;
-		if (file_size >= signature.size() + sizeof(uint64_t) && file_size <= max_file_size) {
+		if (file_size >= signature.size() + sizeof(uint64_t) && file_size <= DriverCacheMaxBytes) {
 			std::string cached_signature(signature.size(), '\0');
 			uint64_t    payload_hash = 0;
 			initial_data.resize(file_size - signature.size() - sizeof(payload_hash));
 			uint32_t signature_read = 0;
 			uint32_t hash_read      = 0;
-			uint32_t payload_read   = 0;
 			file.Read(cached_signature.data(), static_cast<uint32_t>(cached_signature.size()),
 			          &signature_read);
 			file.Read(&payload_hash, sizeof(payload_hash), &hash_read);
-			file.Read(initial_data.data(), static_cast<uint32_t>(initial_data.size()),
-			          &payload_read);
+			const auto payload_read = ReadInChunks(file, initial_data.data(), initial_data.size());
 			file.Close();
 			if (signature_read != cached_signature.size() || hash_read != sizeof(payload_hash) ||
 			    payload_read != initial_data.size() || cached_signature != signature ||
@@ -2427,7 +2462,9 @@ void PipelineCache::InitializeDriverCache() {
 			}
 		} else {
 			file.Close();
-			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size)", path);
+			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size: {} MB, "
+			                 "the limit is {} MB)",
+			                 path, file_size >> 20u, DriverCacheMaxBytes >> 20u);
 		}
 	}
 
@@ -2449,8 +2486,10 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 	if (!initial_data.empty()) {
-		PipelineCacheLog("Vulkan pipeline cache: loaded {} bytes from {}", initial_data.size(),
-		                 path);
+		PipelineCacheLog(
+		    "Vulkan pipeline cache: loaded {} bytes from {} ({} MB of the {} MB a file "
+		    "may hold)",
+		    initial_data.size(), path, initial_data.size() >> 20u, DriverCacheMaxBytes >> 20u);
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
@@ -2493,6 +2532,16 @@ void PipelineCache::Save() {
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
+	if (prefix.size() + payload.size() > DriverCacheMaxBytes) {
+		// The next run would refuse a file this large and compile everything again (round 64's
+		// runs, after the file passed the old 1 GiB limit). The file already there stays.
+		PipelineCacheLog("Vulkan pipeline cache: {} MB is past the {} MB a file may hold; not "
+		                 "saved (the file from before stays)",
+		                 payload.size() >> 20u, DriverCacheMaxBytes >> 20u);
+		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+		m_driver_cache = nullptr;
+		return;
+	}
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
 		return;
@@ -2501,10 +2550,10 @@ void PipelineCache::Save() {
 	temp_path += ".tmp";
 	Common::File file;
 	uint32_t     prefix_written  = 0;
-	uint32_t     payload_written = 0;
+	uint64_t     payload_written = 0;
 	if (file.Create(temp_path)) {
 		file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
-		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
+		payload_written = WriteInChunks(file, payload.data(), payload.size());
 	}
 	const bool flushed = !file.IsInvalid() && file.Flush();
 	file.Close();

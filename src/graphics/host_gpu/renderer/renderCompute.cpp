@@ -48,6 +48,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <span>
 #include <tuple>
@@ -851,7 +852,15 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
 				const auto base = descriptor.Base48();
-				if (!cache.ClearMeta(base)) {
+				// The value a uniform fill of this buffer writes, which says what the HTile clears
+				// (a depth target's stencil too, or not: TextureCache::MetaFillValue).
+				const auto&             fill = resources.uniform_fill;
+				std::optional<uint32_t> value;
+				if (fill.kind == ShaderRecompiler::IR::UniformFillKind::Buffer &&
+				    fill.resource == i && fill.words == 1) {
+					value = fill.value;
+				}
+				if (!cache.ClearMeta(base, value)) {
 					continue;
 				}
 				if (!cache.IsColorMeta(base)) {

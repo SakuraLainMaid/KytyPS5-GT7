@@ -99,6 +99,16 @@ void RequestFrames(uint32_t frames);
 // KYTY_GPU_WATCH_MS (default 30) or more is logged with its costliest ones ("GpuTiming slow").
 void SetWatch(bool on);
 
+// Watch mode (round 65): the shaders of the draws of 10 ms or more in the "GpuTiming slow" lines
+// are kept (up to 32), and as such a pixel shader draws again, its light grids (R32G32_UINT array
+// textures) are compared with their guest bytes now and then (ClaimGridProbe: each once in 3 s,
+// 8 in 10 s), with their most lights a cell per layer ("GpuTiming: ps ... drew slowly" and
+// "FG 0 grid" lines): GT7's light loops run as many times a pixel as a cell's count says, and
+// counts of tens of thousands would make the reflection cube map's draws that take 30-80 ms where
+// the same shader's others take 0.1 ms. GPU thread.
+[[nodiscard]] bool ProbesGridsOf(uint64_t pixel_shader);
+[[nodiscard]] bool ClaimGridProbe(uint64_t address);
+
 } // namespace GpuTiming
 } // namespace Libs::Graphics
 
