@@ -44,6 +44,13 @@ public:
 	// Any thread that waited `waited_ns` for this scheduler's `tick` (`known`: the last tick seen
 	// done when the wait began): a stall report when it waited long (StallWatch).
 	void OnWaited(uint64_t tick, uint64_t known, uint64_t waited_ns);
+	// Runs in Flush, on the thread that flushes, before the command buffer is submitted, for what
+	// belongs at its end (the buffer cache's readahead downloads); not re-entered. Null for none.
+	using BeforeFlush = void (*)(void* user);
+	void SetBeforeFlush(BeforeFlush hook, void* user) noexcept {
+		m_before_flush      = hook;
+		m_before_flush_user = user;
+	}
 
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
 	void           BeginRendering(const RenderState& state);
@@ -275,6 +282,9 @@ private:
 	// being recorded.
 	std::unique_ptr<StallWatch::Timeline> m_timeline;
 	uint64_t                              m_open_tick = 0;
+	BeforeFlush                           m_before_flush      = nullptr;
+	void*                                 m_before_flush_user = nullptr;
+	bool                                  m_in_before_flush   = false;
 };
 
 } // namespace Libs::Graphics

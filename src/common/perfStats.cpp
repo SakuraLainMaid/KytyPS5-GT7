@@ -81,6 +81,10 @@ struct Counters {
 	std::atomic<uint64_t> declined_stores {0};
 	std::atomic<uint64_t> unsupported_stores {0};
 
+	// Readahead downloads (BufferCache, KYTY_READAHEAD).
+	std::atomic<uint64_t> readaheads {0};
+	std::atomic<uint64_t> readahead_bytes {0};
+
 	// The host GPU's queue: submission to completion.
 	std::atomic<uint64_t> ticks_done {0};
 	std::atomic<uint64_t> tick_latency_ns {0};
@@ -282,6 +286,8 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 		const auto store_ns    = take(c.clean_store_ns);
 		const auto declined    = take(c.declined_stores);
 		const auto unsupported = take(c.unsupported_stores);
+		const auto aheads      = take(c.readaheads);
+		const auto ahead_bytes = take(c.readahead_bytes);
 		const auto stalls      = take(c.stalls);
 		const auto stall_max   = take(c.longest_stall_ns);
 		const auto acquire_max = take(c.longest_host_ns[static_cast<size_t>(Host::Acquire)]);
@@ -302,7 +308,8 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 		    "{:.2f} ms later (longest {:.1f}), {:.1f} steps, {:.1f} command buffers unfinished | "
 		    "stores to GPU-written pages done in place {:.0f}/s ({:.0f} us each), declined "
 		    "{:.0f}/s, "
-		    "not handled {:.0f}/s | stalls {} (longest {:.0f} ms) | longest swapchain acquire "
+		    "not handled {:.0f}/s | readahead {:.0f}/s ({:.1f} MB/s) | stalls {} (longest {:.0f} "
+		    "ms) | longest swapchain acquire "
 		    "{:.1f} ms, present {:.1f} ms, queue lock wait {:.1f} ms{}\n",
 		    configuration, static_cast<double>(submitted) / seconds, per(latency, done, 1e6),
 		    static_cast<double>(latency_max) / 1e6, static_cast<double>(readbacks) / seconds,
@@ -310,7 +317,8 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 		    static_cast<double>(wait_max) / 1e6, per(steps, readbacks, 1.0),
 		    per(behind, readbacks, 1.0), static_cast<double>(stores) / seconds,
 		    per(store_ns, stores, 1e3), static_cast<double>(declined) / seconds,
-		    static_cast<double>(unsupported) / seconds, stalls,
+		    static_cast<double>(unsupported) / seconds, static_cast<double>(aheads) / seconds,
+		    static_cast<double>(ahead_bytes) / 1e6 / seconds, stalls,
 		    static_cast<double>(stall_max) / 1e6, static_cast<double>(acquire_max) / 1e6,
 		    static_cast<double>(present_max) / 1e6, static_cast<double>(lock_max) / 1e6, extra));
 	}
@@ -495,6 +503,11 @@ void AddHostSlow(uint32_t which, uint64_t nanoseconds) {
 	if (which < g_counters.longest_host_ns.size()) {
 		StoreMax(g_counters.longest_host_ns[which], nanoseconds);
 	}
+}
+
+void AddReadaheadSlow(uint64_t bytes) {
+	g_counters.readaheads.fetch_add(1, std::memory_order_relaxed);
+	g_counters.readahead_bytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 } // namespace Detail

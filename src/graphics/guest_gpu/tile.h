@@ -134,6 +134,12 @@ void     TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint3
 void     TileGetTextureTotalSize(Prospero::BufferFormat format, uint32_t width, uint32_t height,
                                  uint32_t depth, uint32_t levels, Prospero::TileMode tile,
                                  bool volume_texture, TileSizeAlign& total_size);
+// Whether TileGetTextureTotalSize knows the layout of such a texture: it ends the emulator on one
+// it does not. A descriptor read from memory that no longer holds a texture (a T# the game has
+// reused) can name a tiling its format has no layout for, or more mips than its extent allows.
+bool     TileTextureLayoutKnown(Prospero::BufferFormat format, uint32_t width, uint32_t height,
+                                uint32_t depth, uint32_t levels, Prospero::TileMode tile,
+                                bool volume_texture);
 uint32_t TileGetTexturePitch(Prospero::BufferFormat format, uint32_t width,
                              Prospero::TileMode tile);
 

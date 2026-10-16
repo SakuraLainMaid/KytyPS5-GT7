@@ -999,7 +999,8 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, vk::PrimitiveTopology& t
 			topology = vk::PrimitiveTopology::eTriangleStrip;
 			break;
 		case Prospero::PrimitiveType::kPatch:
-			if (!Config::TessellationEnabled()) return false;
+			// KYTY_BISECT's tess:off leaves the tessellated draws out.
+			if (!Config::TessellationEnabled() || Bisect::TessOff()) return false;
 			[[fallthrough]];
 		case Prospero::PrimitiveType::kRectList:
 		case Prospero::PrimitiveType::kRectListLegacy:
@@ -1882,10 +1883,38 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                    : vertex_stages.back().stage.program->shader_hash,
 	    static_cast<bool>(vertex_indirect_buffer) || static_cast<bool>(mesh_indirect_buffer));
 	GpuProfiler::End(buffer, gpu_zone);
-	GpuTiming::After(m_context, buffer,
-	                 state.ps_active ? state.ps_input_info.stage.program->shader_hash
-	                                 : vertex_stages.back().stage.program->shader_hash,
-	                 GpuTiming::Draw);
+	GpuTiming::AfterDraw(
+	    m_context, buffer,
+	    state.ps_active ? state.ps_input_info.stage.program->shader_hash
+	                    : vertex_stages.back().stage.program->shader_hash,
+	    [&] {
+		    GpuTiming::DrawDetail detail;
+		    detail.vs        = vertex_stages.front().stage.program->shader_hash;
+		    detail.count     = draw.index_count;
+		    detail.instances = draw.instance_count;
+		    detail.width     = rendering.width;
+		    detail.height    = rendering.height;
+		    detail.layers    = rendering.num_layers;
+		    detail.color_samples =
+		        state.color_count != 0 ? state.color_info[0].desc.info.samples : 0u;
+		    detail.depth_samples =
+		        state.depth_info.image_id ? state.depth_info.desc.info.samples : 0u;
+		    detail.flags = (draw.IsIndexed() ? GpuTiming::DrawDetail::Indexed : 0u) |
+		                   (static_cast<bool>(vertex_indirect_buffer) ||
+		                            static_cast<bool>(mesh_indirect_buffer)
+		                        ? GpuTiming::DrawDetail::GpuArguments
+		                        : 0u) |
+		                   (mesh_active ? GpuTiming::DrawDetail::Mesh : 0u);
+		    if (vertex_stages.size() == 3) {
+			    const auto& tess    = state.vertex_info[0].tess;
+			    detail.flags       |= GpuTiming::DrawDetail::Tessellated;
+			    detail.hs           = vertex_stages[1].stage.program->shader_hash;
+			    detail.patch_points = tess.input_control_points;
+			    detail.tess_min     = std::bit_cast<float>(tess.min_level_bits);
+			    detail.tess_max     = std::bit_cast<float>(tess.max_level_bits);
+		    }
+		    return detail;
+	    });
 
 	SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
 	vk::PipelineStageFlags shader_write_stages = {};

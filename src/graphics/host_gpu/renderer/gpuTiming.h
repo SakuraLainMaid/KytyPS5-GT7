@@ -37,6 +37,35 @@ inline void BeginCommandBuffer(RenderContext& context, CommandScheduler& schedul
 
 enum Kind : uint32_t { Draw = 1, Dispatch = 2 };
 
+// What a draw was, for the "GpuTiming slow" lines: which draws of a shader take the GPU tens of
+// milliseconds when the rest of them take microseconds.
+struct DrawDetail {
+	enum Flag : uint32_t {
+		Indexed      = 1u << 0u,
+		GpuArguments = 1u << 1u, // counts read on the GPU (indirect)
+		Mesh         = 1u << 2u, // through a mesh shader
+		Tessellated  = 1u << 3u,
+	};
+	uint64_t vs            = 0; // the first vertex stage (a tessellated draw's LS)
+	uint64_t hs            = 0; // a tessellated draw's HS
+	uint32_t count         = 0; // vertices or indices
+	uint32_t instances     = 0;
+	uint32_t width         = 0; // the render area
+	uint32_t height        = 0;
+	uint32_t layers        = 0;
+	uint32_t color_samples = 0; // 0 without color targets
+	uint32_t depth_samples = 0; // 0 without a depth target
+	uint32_t patch_points  = 0; // a tessellated draw's input control points
+	float    tess_min      = 0.0f; // the factor range it is made for (0: no clamp)
+	float    tess_max      = 0.0f;
+	uint32_t flags         = 0;
+};
+
+namespace Detail {
+void AfterDrawSlow(RenderContext& context, CommandBuffer& buffer, uint64_t key,
+                   const DrawDetail& detail);
+} // namespace Detail
+
 inline void Before(RenderContext& context, CommandBuffer& buffer) {
 	if (Detail::g_active.load(std::memory_order_relaxed)) {
 		Detail::BeforeSlow(context, buffer);
@@ -46,6 +75,15 @@ inline void Before(RenderContext& context, CommandBuffer& buffer) {
 inline void After(RenderContext& context, CommandBuffer& buffer, uint64_t key, uint32_t kind) {
 	if (Detail::g_active.load(std::memory_order_relaxed)) {
 		Detail::AfterSlow(context, buffer, key, kind);
+	}
+}
+
+// A draw's After with what it was; `detail` is called only while timing.
+template <typename DescribeDraw>
+inline void AfterDraw(RenderContext& context, CommandBuffer& buffer, uint64_t key,
+                      DescribeDraw&& detail) {
+	if (Detail::g_active.load(std::memory_order_relaxed)) {
+		Detail::AfterDrawSlow(context, buffer, key, detail());
 	}
 }
 

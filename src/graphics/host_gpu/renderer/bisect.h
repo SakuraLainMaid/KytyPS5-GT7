@@ -40,6 +40,15 @@
 //   gpuwatch     every draw and dispatch is timed on the host GPU, and a command buffer that
 //                takes KYTY_GPU_WATCH_MS (default 30) or more is logged with its costliest ones
 //                ("GpuTiming slow" lines; KYTY_GPU_WATCH=1 for the whole run)
+// and, for what holds the frame rate (round 63):
+//   tess:off     tessellated draws (patch primitives) are not run
+//   tess:max:<f> the tessellator draws factors up to f at most: a larger VGT_HOS_MAX_TESS_LEVEL
+//                (or none) is lowered to f, so the tessellation shaders are made again for it on
+//                their next draws
+//   flush:<n>    a command buffer goes to the GPU after n draws (KYTY_DRAW_FLUSH_INTERVAL for the
+//                whole run, default 16)
+//   readahead    what game threads read back is downloaded as soon as the GPU writes it again,
+//                so their reads find it in memory (KYTY_READAHEAD=1 for the whole run)
 namespace Libs::Graphics::Bisect {
 
 // The GPU thread, at its start: applies the start step's CPU set and log setting.
@@ -68,6 +77,12 @@ void                      ApplyPending();
 [[nodiscard]] bool NanCheckOff();
 [[nodiscard]] bool PresentFence();
 [[nodiscard]] bool GcOff();
+// Any thread: tess:off; tess:max's factor (0 for none); flush:'s draws (0 for the usual);
+// readahead.
+[[nodiscard]] bool     TessOff();
+[[nodiscard]] float    TessMaxLevel();
+[[nodiscard]] uint32_t FlushInterval();
+[[nodiscard]] bool     Readahead();
 
 } // namespace Libs::Graphics::Bisect
 

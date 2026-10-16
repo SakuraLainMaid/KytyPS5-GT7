@@ -937,6 +937,32 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                             type == Prospero::ImageType::kColor2DMsaaArray;
 	const auto    image_layers = layered ? depth : 1u;
 	auto          view_base    = static_cast<uint32_t>(base_level);
+	// A tiling the format has no layout for, or more mips than the extent allows: no texture's
+	// T#. A 20-kart race ended the emulator on k16_16UNorm 65x1 with 15 levels in swizzle mode 4
+	// (2026-10-15). Sampled as a null texture, as with a first mip past the last.
+	if (!multisampled && !TileTextureLayoutKnown(format, width, height,
+	                                             volume ? depth : image_layers, physical_levels,
+	                                             tile, volume)) {
+		if (RejectBindlessTexture("no known layout", address)) {
+			return {};
+		}
+		static std::atomic<uint32_t> reports {0};
+		const auto                   report = reports.fetch_add(1, std::memory_order_relaxed);
+		if (report < 8u || (report & (report + 1u)) == 0u) {
+			LOGF("Texture with no known layout (format %u, %ux%ux%u, %u levels, tile %u) at "
+			     "0x%016" PRIx64 " bound as a null texture (%" PRIu32 " so far): "
+			     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			     static_cast<uint32_t>(format), width, height, depth, physical_levels,
+			     static_cast<uint32_t>(tile), address, report + 1u, descriptor.fields[0],
+			     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
+			     descriptor.fields[4], descriptor.fields[5], descriptor.fields[6],
+			     descriptor.fields[7]);
+		}
+		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                    : TextureCache::BindingType::Texture);
+		const auto id   = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
 	if (levels > physical_levels) {
 		const TileSurfaceDescription physical {
 		    format, tile, volume ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D,

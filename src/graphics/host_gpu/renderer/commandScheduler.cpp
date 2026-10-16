@@ -8,6 +8,7 @@
 #include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/stallWatch.h"
@@ -258,7 +259,9 @@ void CommandScheduler::CompleteReleaseMemInterrupt() {
 }
 
 void CommandScheduler::CompleteDraw() {
-	const auto interval = DrawFlushInterval();
+	// KYTY_BISECT's flush:<n>, an A/B test within one run.
+	const auto step     = Bisect::FlushInterval();
+	const auto interval = step != 0 ? step : DrawFlushInterval();
 	if (interval == 0u || ++m_recorded_draws < interval) {
 		return;
 	}
@@ -267,6 +270,12 @@ void CommandScheduler::CompleteDraw() {
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
+	if (m_before_flush != nullptr && !m_in_before_flush && Active() && !m_command.IsInvalid()) {
+		// What it records can flush (a download ring that wraps): that flush skips the hook.
+		m_in_before_flush = true;
+		m_before_flush(m_before_flush_user);
+		m_in_before_flush = false;
+	}
 	Submit(submit);
 	BeginNext();
 }

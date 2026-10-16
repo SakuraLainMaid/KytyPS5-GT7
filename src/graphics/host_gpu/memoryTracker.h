@@ -176,6 +176,10 @@ public:
 		s_upload_owner = previous_upload_owner;
 	}
 
+	// Whether the calling thread is inside one of this tracker's upload callbacks, where the
+	// tracker cannot be used.
+	[[nodiscard]] bool InUploadCallback() const noexcept { return s_upload_owner == this; }
+
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;

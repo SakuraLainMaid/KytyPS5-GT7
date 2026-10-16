@@ -1334,6 +1334,33 @@ void TileGetTextureTotalSize(Prospero::BufferFormat format, uint32_t width, uint
 	total_size.size = static_cast<uint32_t>(total);
 }
 
+bool TileTextureLayoutKnown(Prospero::BufferFormat format, uint32_t width, uint32_t height,
+                            uint32_t depth, uint32_t levels, Prospero::TileMode tile,
+                            bool volume_texture) {
+	if (levels == 0 || levels > 16 || depth == 0 || width == 0 || height == 0) {
+		return false;
+	}
+	if (volume_texture && tile != Prospero::TileMode::kLinear) {
+		TileSurfaceLayout            layout {};
+		const TileSurfaceDescription description {
+		    format, tile, TileSurfaceDimension::Dim3D, width, height, depth, levels, 1};
+		return TileGetTiledTextureLayout(description, layout) && layout.total_size <= UINT32_MAX;
+	}
+	// TileGetTextureSize's two paths: linear with a known element layout, else a tiled layout.
+	TileTextureElementLayout element {};
+	if (tile != Prospero::TileMode::kLinear || !TileGetTextureElementLayout(format, element)) {
+		TileSurfaceLayout            layout {};
+		const TileSurfaceDescription description {
+		    format, tile, TileSurfaceDimension::Dim2D, width, height, 1, levels, 1};
+		if (!TileGetTiledTextureLayout(description, layout)) {
+			return false;
+		}
+	}
+	TileSizeAlign slice_size {};
+	TileGetTextureSize(format, width, height, levels, tile, &slice_size, nullptr, nullptr);
+	return slice_size.size != 0 && static_cast<uint64_t>(slice_size.size) * depth <= 0xffffffffull;
+}
+
 uint32_t TileGetTexturePitch(Prospero::BufferFormat format, uint32_t width,
                              Prospero::TileMode tile) {
 	uint32_t pitch = width;

@@ -304,6 +304,7 @@ void Timeline::Collect(uint64_t first, uint64_t last, std::vector<Row>& rows) co
 		}
 	}
 	const auto test_times = g_test_times.load(std::memory_order_acquire);
+	const auto first_row  = rows.size();
 	for (const auto& record: records) {
 		Row row;
 		row.timeline = this;
@@ -325,6 +326,21 @@ void Timeline::Collect(uint64_t first, uint64_t last, std::vector<Row>& rows) co
 			}
 		}
 		rows.push_back(row);
+	}
+	// One queue runs a timeline's command buffers in tick order. A query slot not run again yet
+	// still holds the times of the tick Slots before it, available: such a row goes back in time
+	// (2.7 s before the stall in round 62's reports), and is taken as not timed.
+	uint64_t latest_begin = 0;
+	for (auto i = first_row; i < rows.size(); i++) {
+		auto& row = rows[i];
+		if (!row.has_gpu) {
+			continue;
+		}
+		if (row.gpu_begin < latest_begin) {
+			row.has_gpu = false;
+			continue;
+		}
+		latest_begin = row.gpu_begin;
 	}
 }
 

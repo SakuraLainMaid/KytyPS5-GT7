@@ -13,7 +13,8 @@
 // the time threads spent in tracked-memory faults (GPU readbacks among them), a "Perf threads:"
 // line with the busiest threads and the ones that waited longest in faults, and a "Perf GPU:" line
 // with how far behind the host GPU runs, what a game thread's access to GPU-written memory waits
-// for, the stalls (waits of KYTY_STALL_MS or more for the host GPU, renderer/stallWatch.h), the
+// for, the readahead downloads, the stalls (waits of KYTY_STALL_MS or more for the host GPU,
+// renderer/stallWatch.h), the
 // longest swapchain acquire, present and queue lock wait, and the video memory in use. Counting is
 // a relaxed atomic add; the reporter thread does the rest.
 namespace Common::PerfStats {
@@ -42,6 +43,7 @@ void TickSubmittedSlow(uint64_t tick);
 void TickCompletedSlow(uint64_t tick);
 void AddStallSlow(uint64_t nanoseconds, bool distinct);
 void AddHostSlow(uint32_t which, uint64_t nanoseconds);
+void AddReadaheadSlow(uint64_t bytes);
 } // namespace Detail
 
 // Whether the counters count (the reporter runs): for measurements that cost a clock read.
@@ -130,6 +132,13 @@ inline void TickCompleted(uint64_t tick) {
 inline void AddStall(uint64_t nanoseconds, bool distinct) {
 	if (Active()) {
 		Detail::AddStallSlow(nanoseconds, distinct);
+	}
+}
+// A readahead download (BufferCache, KYTY_READAHEAD): GPU-written bytes game threads read before,
+// downloaded as soon as the GPU wrote them again.
+inline void AddReadahead(uint64_t bytes) {
+	if (Active()) {
+		Detail::AddReadaheadSlow(bytes);
 	}
 }
 // Host-side sections that can hold the GPU's queue up; the line gives the longest of each.

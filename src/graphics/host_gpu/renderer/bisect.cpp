@@ -35,7 +35,11 @@ struct Step {
 	bool              fence       = false;
 	bool              gc_off      = false;
 	bool              gpu_watch   = false;
-	uint32_t          gpu_frames  = 0;  // gputime:<n>
+	bool              tess_off    = false;
+	bool              readahead   = false;
+	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
+	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
+	uint32_t          gpu_frames  = 0;    // gputime:<n>
 	int64_t           readback_kb = -1; // -1: the usual window
 	std::string       cpu_set;          // empty: as at the start
 	std::string       name;             // for the screen and the picture's file name
@@ -101,6 +105,37 @@ bool ParseAction(std::string_view action, Step& step) {
 	if (action == "gpuwatch") {
 		step.gpu_watch = true;
 		return true;
+	}
+	if (action == "tess:off") {
+		step.tess_off = true;
+		return true;
+	}
+	if (action == "readahead") {
+		step.readahead = true;
+		return true;
+	}
+	if (action.starts_with("tess:max:")) {
+		const auto text = std::string(action.substr(9));
+		if (text.empty() || text.size() > 8 ||
+		    text.find_first_not_of("0123456789.") != std::string::npos) {
+			return false;
+		}
+		const auto factor = std::strtof(text.c_str(), nullptr);
+		// The host tessellates factors from 1 to 64.
+		if (!(factor >= 1.0f && factor <= 64.0f)) {
+			return false;
+		}
+		step.tess_max = factor;
+		return true;
+	}
+	if (action.starts_with("flush:")) {
+		const auto draws = action.substr(6);
+		if (draws.empty() || draws.size() > 5 ||
+		    draws.find_first_not_of("0123456789") != std::string_view::npos) {
+			return false;
+		}
+		step.flush = static_cast<uint32_t>(std::strtoul(std::string(draws).c_str(), nullptr, 10));
+		return step.flush != 0;
 	}
 	if (action.starts_with("gputime:")) {
 		const auto frames = action.substr(8);
@@ -205,7 +240,7 @@ const std::vector<Step>& Steps() {
 	return steps;
 }
 
-// Whether this step's first use of each action was logged (bit 0 skip, 1 lit, 2 mips).
+// Whether this step's first use of each action was logged (bit 0 skip, 1 lit, 2 mips, 3 tess:off).
 std::atomic<uint32_t> g_logged {0};
 // Advance's picture and the step that follows it.
 std::mutex              g_pending_mutex;
@@ -392,6 +427,32 @@ bool PresentFence() {
 bool GcOff() {
 	const auto* step = Current();
 	return step != nullptr && step->gc_off;
+}
+
+bool TessOff() {
+	const auto* step = Current();
+	if (step == nullptr || !step->tess_off) {
+		return false;
+	}
+	if (FirstUse(8u)) {
+		LOGF("Bisect: tess:off: a tessellated draw is left out, the first this step\n");
+	}
+	return true;
+}
+
+float TessMaxLevel() {
+	const auto* step = Current();
+	return step != nullptr ? step->tess_max : 0.0f;
+}
+
+uint32_t FlushInterval() {
+	const auto* step = Current();
+	return step != nullptr ? step->flush : 0u;
+}
+
+bool Readahead() {
+	const auto* step = Current();
+	return step != nullptr && step->readahead;
 }
 
 bool WholeUnnormalizedViews() {

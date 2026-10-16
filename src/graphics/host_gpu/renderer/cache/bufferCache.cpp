@@ -144,19 +144,22 @@ void BufferCache::ReleaseBuffer(BufferId id) {
 }
 
 template <bool async>
-bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                       uint64_t* downloaded) {
 	// One reservation cannot exceed the download ring, so a larger range goes in ring-sized
 	// windows; a window that does not fit drains the ring before it is mapped.
 	const auto capacity = m_download_buffer.Size();
 	bool       any      = false;
 	for (uint64_t offset = 0; offset < size; offset += capacity) {
-		any |= DownloadBufferWindow<async>(buffer, vaddr + offset, std::min(capacity, size - offset));
+		any |= DownloadBufferWindow<async>(buffer, vaddr + offset, std::min(capacity, size - offset),
+		                                   downloaded);
 	}
 	return any;
 }
 
 template <bool async>
-bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                       uint64_t* downloaded) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -176,6 +179,11 @@ bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t 
 	    });
 	if (copies.empty()) {
 		return false;
+	}
+	if (downloaded != nullptr) {
+		for (const auto& copy: copies) {
+			*downloaded += copy.size;
+		}
 	}
 	const auto capacity = m_download_buffer.Size();
 	for (size_t first = 0; first < copies.size();) {
@@ -335,6 +343,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
+	// Readahead's downloads go at the end of the command buffer that wrote their bytes.
+	m_scheduler.SetBeforeFlush(&BufferCache::IssueReadaheadHook, this);
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
@@ -362,6 +372,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	m_scheduler.SetBeforeFlush(nullptr, nullptr);
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}
@@ -585,6 +596,11 @@ static const bool g_async_readback = [] {
 	return value == nullptr || value[0] != '0';
 }();
 
+// Game threads' accesses through ReadMemory: done in one step (the bytes were in guest memory),
+// or after waiting for a download. Readahead's summary line reports them.
+static std::atomic<uint64_t> g_reads_direct {0};
+static std::atomic<uint64_t> g_reads_waited {0};
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	KYTY_PROFILER_FUNCTION();
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
@@ -650,6 +666,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	if (measure) {
 		Common::PerfStats::AddReadback(pickup_ns, record_ns, wait_ns, steps, ticks_behind);
+	}
+	if (!from_gpu_thread) {
+		(steps <= 1 ? g_reads_direct : g_reads_waited).fetch_add(1, std::memory_order_relaxed);
 	}
 }
 
@@ -743,6 +762,17 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 			downloading = m_downloading_ranges.Intersects(page_begin, page_end - page_begin);
 		}
 		if (downloading && m_last_async_download_tick != 0) {
+			// Downloads are submitted as they are recorded (readahead's in its before-flush hook,
+			// a game thread's below), so this tick should be submitted already. Were it not, it
+			// would be submitted here: on the GPU thread without the hook, which must not run in
+			// the middle of a command (it downloads ranges the command has yet to write).
+			if (m_last_async_download_tick >= m_scheduler.CurrentTick()) {
+				if (from_gpu_thread) {
+					m_scheduler.Wait(m_last_async_download_tick);
+				} else {
+					m_scheduler.Flush();
+				}
+			}
 			if (async) {
 				return m_last_async_download_tick;
 			}
@@ -754,6 +784,12 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 			const auto window = ReadbackWindow();
 			const auto begin  = std::max(Common::AlignDown(vaddr, window), buffer.CpuAddress());
 			const auto end    = std::min(begin + window, buffer.CpuAddress() + buffer.Size());
+			if (!from_gpu_thread && ReadaheadEnabled()) {
+				// Its bytes were in memory (a readahead, or a window downloaded before): the
+				// window's blocks stay learned while game threads keep reading them (its other
+				// pages are lifted now, so they fault no more).
+				LearnReadahead(begin, end, true);
+			}
 			std::vector<uint64_t> current;
 			{
 				std::shared_lock lock(m_dirty_ranges_mutex);
@@ -780,6 +816,8 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 				}
 				first = last;
 			}
+		} else if (!from_gpu_thread && ReadaheadEnabled()) {
+			LearnReadahead(page_begin, page_end, true);
 		}
 		m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
 		if (is_write) {
@@ -826,7 +864,12 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 	}
 
 	if (!from_gpu_thread) {
-		ReportGameThreadDownload(vaddr, window_end - window_begin);
+		auto& master = m_scheduler.GetMasterSemaphore();
+		master.Refresh();
+		ReportGameThreadDownload(vaddr, window_end - window_begin, master.KnownGpuTick());
+		if (ReadaheadEnabled()) {
+			LearnReadahead(window_begin, window_end, false);
+		}
 	}
 	Timeline::Mark("readmem", vaddr, from_gpu_thread ? 1u : 0u);
 	if (async) {
@@ -844,7 +887,9 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 				tick = m_scheduler.CurrentTick();
 			}
 			m_scheduler.Flush();
-			m_last_async_download_tick = tick;
+			// Readahead's downloads, recorded as Flush submitted, can be in a later tick (a
+			// download ring that wraps there): the latest one is kept.
+			m_last_async_download_tick = std::max(m_last_async_download_tick, tick);
 			return tick;
 		}
 	} else if (DownloadBufferMemory<false>(buffer, window_begin, window_end - window_begin)) {
@@ -1397,8 +1442,10 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 // write), so that the downloads game threads wait for can be put down to their writers.
 namespace {
 struct GpuWriter {
-	uint64_t end    = 0;
-	uint64_t shader = 0;
+	uint64_t end     = 0;
+	uint64_t shader  = 0;
+	uint64_t tick    = 0; // the command buffer the write was recorded in
+	uint64_t when_ns = 0; // when it was recorded
 };
 std::mutex                     g_writers_mutex;
 std::map<uint64_t, GpuWriter>  g_writers;
@@ -1407,17 +1454,23 @@ struct WriterDownloads {
 	uint64_t count = 0;
 	uint64_t bytes = 0;
 	uint64_t first = 0;
+	// Downloads whose writer record was found: how long after the write they came, and how many
+	// of them came after the GPU had run the write (readahead's case).
+	uint64_t aged    = 0;
+	uint64_t age_ns  = 0;
+	uint64_t done    = 0;
 };
 std::unordered_map<uint64_t, WriterDownloads> g_writer_downloads;
 uint64_t                                      g_game_downloads = 0;
 } // namespace
 
-void BufferCache::RecordGpuWriter(uint64_t vaddr, uint64_t size, uint64_t shader) {
+void BufferCache::RecordGpuWriter(uint64_t vaddr, uint64_t size, uint64_t shader, uint64_t tick) {
+	const auto      now = StallWatch::NowNs();
 	std::lock_guard lock(g_writers_mutex);
 	if (g_writers.size() >= 65536) {
 		g_writers.clear();
 	}
-	g_writers[vaddr] = {vaddr + size, shader};
+	g_writers[vaddr] = {vaddr + size, shader, tick, now};
 }
 
 std::string BufferCache::GpuWritersOf(uint64_t vaddr, uint64_t size) {
@@ -1440,16 +1493,19 @@ std::string BufferCache::GpuWritersOf(uint64_t vaddr, uint64_t size) {
 	return text;
 }
 
-void BufferCache::ReportGameThreadDownload(uint64_t vaddr, uint64_t bytes) {
+void BufferCache::ReportGameThreadDownload(uint64_t vaddr, uint64_t bytes, uint64_t done_tick) {
 	Common::PerfStats::AddDownload(bytes);
-	std::lock_guard lock(g_writers_mutex);
-	uint64_t        shader = UINT64_MAX; // no record
+	const auto       now = StallWatch::NowNs();
+	std::lock_guard  lock(g_writers_mutex);
+	uint64_t         shader = UINT64_MAX; // no record
+	const GpuWriter* writer = nullptr;
 	if (auto it = g_writers.upper_bound(vaddr); it != g_writers.begin()) {
 		--it;
 		// Ranges overlap: the closest start at or below the address that still covers it.
 		for (int steps = 0; steps < 64; steps++) {
 			if (vaddr < it->second.end) {
 				shader = it->second.shader;
+				writer = &it->second;
 				break;
 			}
 			if (it == g_writers.begin()) {
@@ -1463,6 +1519,11 @@ void BufferCache::ReportGameThreadDownload(uint64_t vaddr, uint64_t bytes) {
 		entry.first = vaddr;
 	}
 	entry.bytes += bytes;
+	if (writer != nullptr && writer->when_ns != 0 && now >= writer->when_ns) {
+		entry.aged++;
+		entry.age_ns += now - writer->when_ns;
+		entry.done += writer->tick != 0 && writer->tick <= done_tick ? 1u : 0u;
+	}
 	if (++g_game_downloads % 1024 != 0) {
 		return;
 	}
@@ -1477,9 +1538,181 @@ void BufferCache::ReportGameThreadDownload(uint64_t vaddr, uint64_t bytes) {
 		                    : hash == 0        ? std::string("copy")
 		                                       : fmt::format("{:016x}", hash),
 		                    writer.count, writer.bytes >> 10, writer.first);
+		if (writer.aged != 0) {
+			// How long after the write the game thread read it, and how often the GPU had run
+			// the write by then.
+			line += fmt::format(" (written {:.1f} ms before, done on the GPU in {:.0f}%)",
+			                    static_cast<double>(writer.age_ns) / 1e6 /
+			                        static_cast<double>(writer.aged),
+			                    100.0 * static_cast<double>(writer.done) /
+			                        static_cast<double>(writer.aged));
+		}
 	}
 	LOGF("ReadMemory: %" PRIu64 " game-thread downloads, by writer:%s\n", g_game_downloads,
 	     line.c_str());
+}
+
+bool BufferCache::ReadaheadEnabled() {
+	static const bool whole_run = [] {
+		const char* value = std::getenv("KYTY_READAHEAD");
+		const bool  on    = value != nullptr && value[0] == '1';
+		if (on) {
+			LOGF("Readahead: on for the whole run (KYTY_READAHEAD=1): what game threads read back "
+			     "is downloaded as soon as the GPU writes it again\n");
+		}
+		return on;
+	}();
+	return whole_run || Bisect::Readahead();
+}
+
+void BufferCache::RotateReadahead() {
+	const auto now = StallWatch::NowNs();
+	if (m_readahead_generation_ns == 0) {
+		// The counts of the first summary start here.
+		m_readahead_generation_ns = now;
+		g_reads_direct.store(0, std::memory_order_relaxed);
+		g_reads_waited.store(0, std::memory_order_relaxed);
+		return;
+	}
+	constexpr uint64_t Generation = 4'000'000'000ull;
+	if (now - m_readahead_generation_ns < Generation) {
+		return;
+	}
+	const double seconds      = static_cast<double>(now - m_readahead_generation_ns) / 1e9;
+	m_readahead_generation_ns = now;
+	uint64_t learned          = 0;
+	m_readahead_current.ForEach([&](uint64_t begin, uint64_t end) { learned += end - begin; });
+	const auto direct = g_reads_direct.exchange(0, std::memory_order_relaxed);
+	const auto waited = g_reads_waited.exchange(0, std::memory_order_relaxed);
+	if (ReadaheadEnabled() || m_readahead_downloads != 0) {
+		LOGF("Readahead: %.0f downloads/s (%.1f MB/s); game-thread reads of GPU-written memory "
+		     "%.0f/s, %.0f%% of them found their bytes in memory; %.1f MB learned\n",
+		     static_cast<double>(m_readahead_downloads) / seconds,
+		     static_cast<double>(m_readahead_bytes) / 1e6 / seconds,
+		     static_cast<double>(direct + waited) / seconds,
+		     direct + waited == 0 ? 0.0
+		                          : 100.0 * static_cast<double>(direct) /
+		                                static_cast<double>(direct + waited),
+		     static_cast<double>(learned) / 1048576.0);
+	}
+	m_readahead_downloads = 0;
+	m_readahead_bytes     = 0;
+	m_readahead_previous  = std::move(m_readahead_current);
+	m_readahead_current.Clear();
+	m_readahead_learned_bytes = 0;
+}
+
+void BufferCache::LearnReadahead(uint64_t begin, uint64_t end, bool refresh) {
+	RotateReadahead();
+	const auto first = Common::AlignDown(begin, ReadaheadBlock);
+	const auto last  = Common::AlignUp(end, ReadaheadBlock);
+	if (last <= first || m_readahead_current.Contains(first, last - first)) {
+		return;
+	}
+	if (refresh) {
+		// Only the blocks of the older generation: a read that finds its bytes in memory because
+		// another window brought them is not a reason to start downloading them.
+		m_readahead_previous.ForEachInRange(first, last - first, [&](uint64_t b, uint64_t e) {
+			const auto block_begin = Common::AlignDown(b, ReadaheadBlock);
+			m_readahead_current.Add(block_begin, Common::AlignUp(e, ReadaheadBlock) - block_begin);
+		});
+		return;
+	}
+	if (m_readahead_learned_bytes >= ReadaheadMaxLearned) {
+		return;
+	}
+	m_readahead_current.Add(first, last - first);
+	m_readahead_learned_bytes += last - first;
+}
+
+void BufferCache::QueueReadahead(uint64_t vaddr, uint64_t size) {
+	if ((m_readahead_current.Empty() && m_readahead_previous.Empty()) || size == 0 ||
+	    !GuestGpu::IsGpuThread() || !ReadaheadEnabled()) {
+		return;
+	}
+	const auto add = [this](uint64_t begin, uint64_t end) {
+		if (!m_readahead_queue.empty() && m_readahead_queue.back().first <= end &&
+		    begin <= m_readahead_queue.back().second) {
+			auto& last  = m_readahead_queue.back();
+			last.first  = std::min(last.first, begin);
+			last.second = std::max(last.second, end);
+			return;
+		}
+		if (m_readahead_queue.size() < ReadaheadMaxQueue) {
+			m_readahead_queue.emplace_back(begin, end);
+		}
+	};
+	m_readahead_current.ForEachInRange(vaddr, size, add);
+	m_readahead_previous.ForEachInRange(vaddr, size, add);
+}
+
+void BufferCache::IssueReadaheadHook(void* cache) {
+	static_cast<BufferCache*>(cache)->IssueReadahead();
+}
+
+void BufferCache::IssueReadahead() {
+	// Inside an upload's callback the tracker cannot be walked: the next flush takes them.
+	if (m_readahead_queue.empty() || !GuestGpu::IsGpuThread() ||
+	    m_memory_tracker.InUploadCallback()) {
+		return;
+	}
+	auto queue = std::move(m_readahead_queue);
+	m_readahead_queue.clear();
+	if (!ReadaheadEnabled()) {
+		return; // the step went off
+	}
+	RotateReadahead();
+	// At most 32 MB a command buffer: what is left over waits for the game thread's read, as
+	// without readahead (the priority thread copies every byte into guest memory).
+	constexpr uint64_t MaxBytes = 32ull << 20u;
+	uint64_t           bytes    = 0;
+	for (const auto& [begin, end]: queue) {
+		for (auto at = begin; at < end && bytes < MaxBytes;) {
+			const auto  next  = Common::AlignDown(at, CACHING_PAGESIZE) + CACHING_PAGESIZE;
+			const auto* owner = m_page_table.Find(at >> PageTable::kPageBits);
+			if (owner == nullptr || !*owner || IsBufferInvalid(*owner)) {
+				at = next;
+				continue;
+			}
+			auto&      buffer = m_slot_buffers[*owner];
+			const auto stop   = std::min(end, buffer.CpuAddress() + buffer.Size());
+			if (stop <= at) {
+				at = next;
+				continue;
+			}
+			// Only the bytes still GPU-written are copied: a game thread's download, or another
+			// readahead, may have taken them already. A block with a download still in flight is
+			// left to the game thread's read: re-downloading a block the GPU keeps rewriting
+			// could keep that read waiting for one publication after another.
+			std::vector<std::pair<uint64_t, uint64_t>> runs;
+			{
+				std::shared_lock lock(m_dirty_ranges_mutex);
+				for (auto block = at; block < stop;) {
+					const auto block_end =
+					    std::min(stop, Common::AlignDown(block, ReadaheadBlock) + ReadaheadBlock);
+					if (!m_downloading_ranges.Intersects(block, block_end - block)) {
+						if (!runs.empty() && runs.back().second == block) {
+							runs.back().second = block_end;
+						} else {
+							runs.emplace_back(block, block_end);
+						}
+					}
+					block = block_end;
+				}
+			}
+			for (const auto& [run_begin, run_end]: runs) {
+				(void)DownloadBufferMemory<true>(buffer, run_begin, run_end - run_begin, &bytes);
+			}
+			at = stop;
+		}
+	}
+	if (bytes != 0) {
+		// The tick of the last copy (a download ring that wraps submits the earlier ones).
+		m_last_async_download_tick = std::max(m_last_async_download_tick, m_scheduler.CurrentTick());
+		m_readahead_downloads++;
+		m_readahead_bytes += bytes;
+		Common::PerfStats::AddReadahead(bytes);
+	}
 }
 
 void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
@@ -1522,7 +1755,8 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetFills(vaddr, size);
 	}
-	RecordGpuWriter(vaddr, size, s_diag_shader_hash);
+	RecordGpuWriter(vaddr, size, s_diag_shader_hash, m_scheduler.CurrentTick());
+	QueueReadahead(vaddr, size);
 	if (Libs::LibKernel::Memory::TracesMemory(vaddr, size)) {
 		// KYTY_TRACE_MEMORY: each writer's first eight writes, then at powers of two.
 		static std::map<uint64_t, uint64_t> writes;

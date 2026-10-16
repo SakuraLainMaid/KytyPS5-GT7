@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -1018,6 +1019,17 @@ bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Con
 	// The tessellator's factor clamp (not part of the analysis or its cache key).
 	tess.min_level_bits = sh.m_vgtHosMinTessLevel;
 	tess.max_level_bits = sh.m_vgtHosMaxTessLevel;
+	// KYTY_BISECT's tess:max:<f>: factors up to f at most (a larger clamp, or none, is lowered),
+	// which keys new shaders. A test of whether the giant draws are tessellated (2026-10-16).
+	if (const float cap = Libs::Graphics::Bisect::TessMaxLevel(); cap > 0.0f) {
+		const auto max = std::bit_cast<float>(tess.max_level_bits);
+		if (tess.max_level_bits == 0u || !(max <= cap)) {
+			tess.max_level_bits = std::bit_cast<uint32_t>(cap);
+		}
+		if (std::bit_cast<float>(tess.min_level_bits) > cap) {
+			tess.min_level_bits = std::bit_cast<uint32_t>(cap);
+		}
+	}
 	{
 		static std::mutex                   logged_mutex;
 		static std::unordered_set<uint64_t> logged;

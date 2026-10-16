@@ -190,9 +190,20 @@ public:
 
 	// Diagnostics: the guest shader whose bindings are being prepared on this thread, if any.
 	inline static thread_local uint64_t s_diag_shader_hash = 0;
-	// Diagnostics: the last writer of a GPU-written range, and game-thread downloads by writer.
-	static void                     RecordGpuWriter(uint64_t vaddr, uint64_t size, uint64_t shader);
-	static void                     ReportGameThreadDownload(uint64_t vaddr, uint64_t bytes);
+	// Diagnostics: the last writer of a GPU-written range (with the tick it was recorded in), and
+	// game-thread downloads by writer: how long after the write, and how often the GPU had already
+	// run it (`done_tick`: the last tick known done), which is what readahead can save.
+	static void RecordGpuWriter(uint64_t vaddr, uint64_t size, uint64_t shader, uint64_t tick);
+	static void ReportGameThreadDownload(uint64_t vaddr, uint64_t bytes, uint64_t done_tick);
+
+	// Readahead (KYTY_READAHEAD=1, or KYTY_BISECT's readahead): the ranges game threads had to
+	// download (ReadMemoryStep) are learned in 64 KB blocks, and when the GPU writes into them
+	// again their download is recorded at the end of that command buffer (the scheduler's
+	// before-flush hook). The game thread's read that follows then finds the bytes in guest memory
+	// and only lifts the page's protection, instead of waiting for the GPU to catch up and
+	// download them (about a millisecond each, 30-40 times a frame in GT7's races). A block game
+	// threads stop reading ages out after 4 to 8 seconds.
+	[[nodiscard]] static bool ReadaheadEnabled();
 	// Diagnostics: the shaders (hex, "copy" for copies, fills and label writes) whose last
 	// recorded writes overlap [vaddr, vaddr + size), at most four; empty when none.
 	[[nodiscard]] static std::string GpuWritersOf(uint64_t vaddr, uint64_t size);
@@ -242,10 +253,22 @@ private:
 	[[nodiscard]] uint64_t ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
 	                                      bool from_gpu_thread, bool async);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
+	// `downloaded`, when given, is increased by the bytes copied.
 	template <bool async>
-	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                        uint64_t* downloaded = nullptr);
 	template <bool async>
-	[[nodiscard]] bool DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                        uint64_t* downloaded = nullptr);
+	// Readahead (ReadaheadEnabled), GPU thread: a game thread had to download [begin, end), or
+	// found bytes of it already downloaded (`refresh`: only keeps a block it learned before);
+	// the GPU marks [vaddr, vaddr + size) written; the scheduler is about to submit.
+	void        LearnReadahead(uint64_t begin, uint64_t end, bool refresh);
+	void        QueueReadahead(uint64_t vaddr, uint64_t size);
+	void        IssueReadahead();
+	static void IssueReadaheadHook(void* cache);
+	// Every 4 s: the learned blocks become the older generation (and a summary is logged).
+	void        RotateReadahead();
 	template <bool async>
 	void DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
 	                          uint64_t total_size);
@@ -276,8 +299,23 @@ private:
 	std::unordered_map<uint64_t, uint64_t>             m_bitmap_ticks;
 	uint64_t                                           m_bitmap_dropped_pages = 0;
 	uint64_t                                           m_bitmap_written_pages = 0;
-	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK); GPU thread only.
+	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK), or readahead download;
+	// GPU thread only.
 	uint64_t                                           m_last_async_download_tick = 0;
+	// Readahead (ReadaheadEnabled), GPU thread only: the blocks learned in this generation and
+	// the one before, the GPU-written pieces of them waiting for the next flush, and what it did.
+	static constexpr uint64_t                          ReadaheadBlock      = 64 * 1024;
+	static constexpr uint64_t                          ReadaheadMaxLearned = 512ull << 20u;
+	static constexpr size_t                            ReadaheadMaxQueue   = 4096;
+	RangeSet                                           m_readahead_current;
+	RangeSet                                           m_readahead_previous;
+	uint64_t                                           m_readahead_learned_bytes   = 0;
+	uint64_t                                           m_readahead_generation_ns   = 0;
+	std::vector<std::pair<uint64_t, uint64_t>>         m_readahead_queue;
+	uint64_t                                           m_readahead_downloads       = 0;
+	uint64_t                                           m_readahead_bytes           = 0;
+	uint64_t                                           m_readahead_found           = 0;
+	uint64_t                                           m_readahead_missed          = 0;
 	// Guards changes to both range sets (GPU thread and download completions) against
 	// IsCleanForConcurrentRead; the GPU thread reads them without it.
 	mutable std::shared_mutex                          m_dirty_ranges_mutex;

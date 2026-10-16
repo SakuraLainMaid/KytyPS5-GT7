@@ -28,11 +28,47 @@ constexpr uint32_t BlockQueries = 2048;
 constexpr uint32_t BlockCount   = 32;
 
 struct Pair {
-	uint32_t before = 0;
-	uint32_t after  = 0;
-	uint64_t key    = 0;
-	uint32_t kind   = 0;
+	uint32_t   before     = 0;
+	uint32_t   after      = 0;
+	uint64_t   key        = 0;
+	uint32_t   kind       = 0;
+	bool       has_detail = false;
+	DrawDetail detail;
 };
+
+// "[VS ..., 1234 indices x1; 3840x2160, color 1x, depth 4x]" and the like.
+std::string Describe(const DrawDetail& detail) {
+	std::string text;
+	if ((detail.flags & DrawDetail::Tessellated) != 0) {
+		text = fmt::format("LS {:016x} HS {:016x}, {} control points, factors ", detail.vs,
+		                   detail.hs, detail.patch_points);
+		text += detail.tess_max > 0.0f
+		            ? fmt::format("{:g}-{:g}", static_cast<double>(detail.tess_min),
+		                          static_cast<double>(detail.tess_max))
+		            : std::string("unclamped");
+	} else {
+		text = fmt::format("{} {:016x}", (detail.flags & DrawDetail::Mesh) != 0 ? "mesh" : "VS",
+		                   detail.vs);
+	}
+	if ((detail.flags & DrawDetail::GpuArguments) != 0) {
+		text += ", counts on the GPU";
+	} else {
+		text += fmt::format(", {} {} x{}", detail.count,
+		                    (detail.flags & DrawDetail::Indexed) != 0 ? "indices" : "vertices",
+		                    detail.instances);
+	}
+	text += fmt::format("; {}x{}", detail.width, detail.height);
+	if (detail.layers > 1) {
+		text += fmt::format("x{}", detail.layers);
+	}
+	if (detail.color_samples != 0) {
+		text += fmt::format(", color {}x", detail.color_samples);
+	}
+	if (detail.depth_samples != 0) {
+		text += fmt::format(", depth {}x", detail.depth_samples);
+	}
+	return "[" + text + "]";
+}
 
 struct Block {
 	uint64_t          tick = 0;
@@ -102,9 +138,11 @@ void ReportSlowBlock(const Block& block, const std::vector<uint64_t>& values, do
 	reported++;
 	last = now;
 	struct Timed {
-		double   ms   = 0.0;
-		uint64_t key  = 0;
-		uint32_t kind = 0;
+		double      ms     = 0.0;
+		uint64_t    key    = 0;
+		uint32_t    kind   = 0;
+		const Pair* pair   = nullptr;
+		size_t      index  = 0; // its place among the command buffer's timed commands
 	};
 	std::vector<Timed> timed;
 	double             gap_ms       = 0.0;
@@ -115,8 +153,8 @@ void ReportSlowBlock(const Block& block, const std::vector<uint64_t>& values, do
 		const auto before = values[pair.before];
 		const auto after  = values[pair.after];
 		if (after >= before) {
-			timed.push_back(
-			    {static_cast<double>(after - before) * period_ns / 1e6, pair.key, pair.kind});
+			timed.push_back({static_cast<double>(after - before) * period_ns / 1e6, pair.key,
+			                 pair.kind, &pair, static_cast<size_t>(&pair - block.pairs.data())});
 		}
 		if (previous != 0 && before >= previous) {
 			const auto gap = static_cast<double>(before - previous) * period_ns / 1e6;
@@ -134,6 +172,11 @@ void ReportSlowBlock(const Block& block, const std::vector<uint64_t>& values, do
 		costliest +=
 		    fmt::format("{} {} {:016x} {:.2f} ms", i == 0 ? "" : ",",
 		                timed[i].kind == Draw ? "draw" : "dispatch", timed[i].key, timed[i].ms);
+		// What the three costliest draws were, and where they came in the command buffer.
+		if (i < 3 && timed[i].pair != nullptr && timed[i].pair->has_detail) {
+			costliest += fmt::format(" (#{} of {}) {}", timed[i].index + 1, block.pairs.size(),
+			                         Describe(timed[i].pair->detail));
+		}
 	}
 	LOGF("GpuTiming slow tick %" PRIu64 ": %.1f ms from the first command to the last, %zu "
 	     "commands timed; costliest:%s; largest gap %.2f ms (after %016" PRIx64 ")\n",
@@ -285,9 +328,25 @@ void AfterSlow(RenderContext& context, CommandBuffer& buffer, uint64_t key, uint
 	const auto base = static_cast<uint32_t>(block - state.blocks.data()) * BlockQueries;
 	buffer.Recorder().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, state.pool,
 	                                 base + block->used);
-	block->pairs.push_back({static_cast<uint32_t>(block->open), block->used, key, kind});
+	Pair pair;
+	pair.before = static_cast<uint32_t>(block->open);
+	pair.after  = block->used;
+	pair.key    = key;
+	pair.kind   = kind;
+	block->pairs.push_back(pair);
 	block->used++;
 	block->open = -1;
+}
+
+void AfterDrawSlow(RenderContext& context, CommandBuffer& buffer, uint64_t key,
+                   const DrawDetail& detail) {
+	auto&      state  = GetState();
+	const auto before = state.current != nullptr ? state.current->pairs.size() : 0;
+	AfterSlow(context, buffer, key, Draw);
+	if (state.current != nullptr && state.current->pairs.size() == before + 1) {
+		state.current->pairs.back().has_detail = true;
+		state.current->pairs.back().detail     = detail;
+	}
 }
 
 } // namespace Detail
