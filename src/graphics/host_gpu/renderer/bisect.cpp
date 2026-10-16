@@ -31,6 +31,10 @@ struct Step {
 	bool              whole_cs    = false;
 	bool              log_off     = false;
 	bool              writes_off  = false;
+	bool              nan_off     = false;
+	bool              fence       = false;
+	bool              gc_off      = false;
+	bool              gpu_watch   = false;
 	uint32_t          gpu_frames  = 0;  // gputime:<n>
 	int64_t           readback_kb = -1; // -1: the usual window
 	std::string       cpu_set;          // empty: as at the start
@@ -80,6 +84,22 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "writes:off") {
 		step.writes_off = true;
+		return true;
+	}
+	if (action == "nancheck:off") {
+		step.nan_off = true;
+		return true;
+	}
+	if (action == "present:fence") {
+		step.fence = true;
+		return true;
+	}
+	if (action == "gc:off") {
+		step.gc_off = true;
+		return true;
+	}
+	if (action == "gpuwatch") {
+		step.gpu_watch = true;
 		return true;
 	}
 	if (action.starts_with("gputime:")) {
@@ -221,6 +241,7 @@ void ApplyEffects() {
 		Log::WriteUnmuted(fmt::format("Bisect: gputime: timing the next {} frames on the GPU\n",
 		                              step->gpu_frames));
 	}
+	GpuTiming::SetWatch(step != nullptr && step->gpu_watch);
 	static std::string applied = StartCpuSet();
 	const auto wanted = step != nullptr && !step->cpu_set.empty() ? step->cpu_set : StartCpuSet();
 	if (wanted != applied) {
@@ -356,6 +377,21 @@ int64_t ReadbackWindowKB() {
 bool CleanWritesOff() {
 	const auto* step = Current();
 	return step != nullptr && step->writes_off;
+}
+
+bool NanCheckOff() {
+	const auto* step = Current();
+	return step != nullptr && step->nan_off;
+}
+
+bool PresentFence() {
+	const auto* step = Current();
+	return step != nullptr && step->fence;
+}
+
+bool GcOff() {
+	const auto* step = Current();
+	return step != nullptr && step->gc_off;
 }
 
 bool WholeUnnormalizedViews() {

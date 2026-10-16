@@ -1877,6 +1877,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	Profiler::Add(Profiler::Counter::Draws);
 	Common::PerfStats::AddDraw();
+	m_context.GetCommandScheduler().NoteDraw(
+	    state.ps_active ? state.ps_input_info.stage.program->shader_hash
+	                    : vertex_stages.back().stage.program->shader_hash,
+	    static_cast<bool>(vertex_indirect_buffer) || static_cast<bool>(mesh_indirect_buffer));
 	GpuProfiler::End(buffer, gpu_zone);
 	GpuTiming::After(m_context, buffer,
 	                 state.ps_active ? state.ps_input_info.stage.program->shader_hash

@@ -12,15 +12,28 @@
 namespace Libs::Graphics {
 
 class CommandBuffer;
+class CommandRecorder;
+class CommandScheduler;
 class RenderContext;
 
 namespace GpuTiming {
 
 namespace Detail {
 inline std::atomic<bool> g_active {false};
+void                     BeginBlockSlow(RenderContext& context, CommandScheduler& scheduler,
+                                        const CommandRecorder& recorder, uint64_t tick);
 void BeforeSlow(RenderContext& context, CommandBuffer& buffer);
 void AfterSlow(RenderContext& context, CommandBuffer& buffer, uint64_t key, uint32_t kind);
 } // namespace Detail
+
+// A scheduler's command buffer for `tick` has begun (outside any render pass): while timing, the
+// renderer's gets the queries its commands are timed with, reset here.
+inline void BeginCommandBuffer(RenderContext& context, CommandScheduler& scheduler,
+                               const CommandRecorder& recorder, uint64_t tick) {
+	if (Detail::g_active.load(std::memory_order_relaxed)) {
+		Detail::BeginBlockSlow(context, scheduler, recorder, tick);
+	}
+}
 
 enum Kind : uint32_t { Draw = 1, Dispatch = 2 };
 
@@ -42,6 +55,11 @@ void Present(uint64_t frame);
 // Any thread: times the `frames` frames presented after the next one (KYTY_BISECT's gputime:<n>),
 // besides KYTY_GPU_TIMING's window.
 void RequestFrames(uint32_t frames);
+
+// Any thread: watch mode on or off (KYTY_BISECT's gpuwatch; KYTY_GPU_WATCH=1 keeps it on): every
+// draw and dispatch is timed, without the frame lines, and a command buffer whose commands span
+// KYTY_GPU_WATCH_MS (default 30) or more is logged with its costliest ones ("GpuTiming slow").
+void SetWatch(bool on);
 
 } // namespace GpuTiming
 } // namespace Libs::Graphics

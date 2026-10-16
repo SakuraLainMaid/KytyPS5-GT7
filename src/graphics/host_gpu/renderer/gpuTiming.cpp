@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -10,9 +11,12 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cinttypes>
 #include <cstdlib>
+#include <fmt/format.h>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -59,6 +63,81 @@ struct State {
 State& GetState() {
 	static State state;
 	return state;
+}
+
+// Watch mode (KYTY_GPU_WATCH=1, or KYTY_BISECT's gpuwatch): every command is timed, and a command
+// buffer that takes KYTY_GPU_WATCH_MS (default 30) or more is logged with its costliest commands.
+std::atomic<bool> g_watch_step {false};
+
+bool WatchFromEnvironment() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_GPU_WATCH");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
+bool Watching() {
+	return WatchFromEnvironment() || g_watch_step.load(std::memory_order_relaxed);
+}
+
+double WatchMs() {
+	static const double ms = [] {
+		const char* value  = std::getenv("KYTY_GPU_WATCH_MS");
+		const auto  parsed = value != nullptr ? std::strtod(value, nullptr) : 30.0;
+		return parsed > 0.0 ? parsed : 30.0;
+	}();
+	return ms;
+}
+
+// A slow command buffer in watch mode: its commands by GPU time, the largest gap between two.
+void ReportSlowBlock(const Block& block, const std::vector<uint64_t>& values, double period_ns,
+                     double span_ms) {
+	static uint64_t reported = 0;
+	static auto     last     = std::chrono::steady_clock::time_point {};
+	const auto      now      = std::chrono::steady_clock::now();
+	if (reported >= 64 && now - last < std::chrono::seconds(5)) {
+		return;
+	}
+	reported++;
+	last = now;
+	struct Timed {
+		double   ms   = 0.0;
+		uint64_t key  = 0;
+		uint32_t kind = 0;
+	};
+	std::vector<Timed> timed;
+	double             gap_ms       = 0.0;
+	uint64_t           gap_after    = 0;
+	uint64_t           previous     = 0;
+	uint64_t           previous_key = 0;
+	for (const auto& pair: block.pairs) {
+		const auto before = values[pair.before];
+		const auto after  = values[pair.after];
+		if (after >= before) {
+			timed.push_back(
+			    {static_cast<double>(after - before) * period_ns / 1e6, pair.key, pair.kind});
+		}
+		if (previous != 0 && before >= previous) {
+			const auto gap = static_cast<double>(before - previous) * period_ns / 1e6;
+			if (gap > gap_ms) {
+				gap_ms    = gap;
+				gap_after = previous_key;
+			}
+		}
+		previous     = after;
+		previous_key = pair.key;
+	}
+	std::ranges::sort(timed, [](const Timed& a, const Timed& b) { return a.ms > b.ms; });
+	std::string costliest;
+	for (size_t i = 0; i < timed.size() && i < 6; i++) {
+		costliest +=
+		    fmt::format("{} {} {:016x} {:.2f} ms", i == 0 ? "" : ",",
+		                timed[i].kind == Draw ? "draw" : "dispatch", timed[i].key, timed[i].ms);
+	}
+	LOGF("GpuTiming slow tick %" PRIu64 ": %.1f ms from the first command to the last, %zu "
+	     "commands timed; costliest:%s; largest gap %.2f ms (after %016" PRIx64 ")\n",
+	     block.tick, span_ms, timed.size(), costliest.c_str(), gap_ms, gap_after);
 }
 
 struct Window {
@@ -113,7 +192,11 @@ void ReadBlock(State& state, Block& block) {
 				const auto first = values[block.pairs.front().before];
 				const auto last  = values[block.pairs.back().after];
 				if (last >= first) {
-					state.total_ms += static_cast<double>(last - first) * state.period_ns / 1e6;
+					const auto span = static_cast<double>(last - first) * state.period_ns / 1e6;
+					state.total_ms += span;
+					if (span >= WatchMs() && Watching()) {
+						ReportSlowBlock(block, values, state.period_ns, span);
+					}
 				}
 			}
 		}
@@ -124,15 +207,30 @@ void ReadBlock(State& state, Block& block) {
 	block.in_flight.store(false, std::memory_order_release);
 }
 
-// The block for the recording in progress, or null when none is free.
-Block* CurrentBlock(RenderContext& context, CommandBuffer& buffer) {
-	auto&      state     = GetState();
-	auto&      scheduler = context.GetCommandScheduler();
-	const auto tick      = scheduler.CurrentTick();
+// The block for the recording in progress, or null when it has none (BeginBlockSlow gives a
+// command buffer its block when it begins, outside any render pass: resetting the queries ended
+// the draw's rendering when the first draw of a command buffer did it here, 2026-10-16).
+Block* CurrentBlock(RenderContext& context, CommandBuffer& /*buffer*/) {
+	auto&      state = GetState();
+	const auto tick  = context.GetCommandScheduler().CurrentTick();
 	if (state.current != nullptr && state.current->tick == tick &&
 	    state.current->used + 2 <= BlockQueries) {
 		return state.current;
 	}
+	return nullptr;
+}
+
+} // namespace
+
+namespace Detail {
+
+void BeginBlockSlow(RenderContext& context, CommandScheduler& scheduler,
+                    const CommandRecorder& recorder, uint64_t tick) {
+	if (&context.GetCommandScheduler() != &scheduler) {
+		return; // the presenter's command buffers are not timed
+	}
+	auto& state   = GetState();
+	state.current = nullptr;
 	if (!state.pool) {
 		const auto& graphics = context.GetGraphics();
 		state.device         = graphics.device;
@@ -141,14 +239,14 @@ Block* CurrentBlock(RenderContext& context, CommandBuffer& buffer) {
 		info.queryType  = vk::QueryType::eTimestamp;
 		info.queryCount = BlockQueries * BlockCount;
 		if (state.device.createQueryPool(&info, nullptr, &state.pool) != vk::Result::eSuccess) {
-			Detail::g_active.store(false);
-			return nullptr;
+			state.pool = nullptr;
+			g_active.store(false);
+			return;
 		}
 	}
 	auto& block = state.blocks[state.next_block % BlockCount];
 	if (block.in_flight.load(std::memory_order_acquire)) {
-		state.current = nullptr;
-		return nullptr;
+		return; // every block waits for its command buffer: this one is not timed
 	}
 	state.next_block++;
 	block.tick = tick;
@@ -156,19 +254,13 @@ Block* CurrentBlock(RenderContext& context, CommandBuffer& buffer) {
 	block.open = -1;
 	block.pairs.clear();
 	block.in_flight.store(true, std::memory_order_release);
-	buffer.EndRendering();
-	buffer.Handle().resetQueryPool(state.pool,
-	                               static_cast<uint32_t>(&block - state.blocks.data()) * BlockQueries,
-	                               BlockQueries);
+	recorder.resetQueryPool(state.pool,
+	                        static_cast<uint32_t>(&block - state.blocks.data()) * BlockQueries,
+	                        BlockQueries);
 	// Runs once this tick has executed, so every query of the block is written.
 	scheduler.DeferPriorityOperation([&state, &block] { ReadBlock(state, block); });
 	state.current = &block;
-	return &block;
 }
-
-} // namespace
-
-namespace Detail {
 
 void BeforeSlow(RenderContext& context, CommandBuffer& buffer) {
 	auto* block = CurrentBlock(context, buffer);
@@ -177,8 +269,8 @@ void BeforeSlow(RenderContext& context, CommandBuffer& buffer) {
 	}
 	auto&      state = GetState();
 	const auto base  = static_cast<uint32_t>(block - state.blocks.data()) * BlockQueries;
-	buffer.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, state.pool,
-	                               base + block->used);
+	buffer.Recorder().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, state.pool,
+	                                 base + block->used);
 	block->open = block->used++;
 }
 
@@ -191,8 +283,8 @@ void AfterSlow(RenderContext& context, CommandBuffer& buffer, uint64_t key, uint
 		return;
 	}
 	const auto base = static_cast<uint32_t>(block - state.blocks.data()) * BlockQueries;
-	buffer.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, state.pool,
-	                               base + block->used);
+	buffer.Recorder().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, state.pool,
+	                                 base + block->used);
 	block->pairs.push_back({static_cast<uint32_t>(block->open), block->used, key, kind});
 	block->used++;
 	block->open = -1;
@@ -206,10 +298,21 @@ namespace {
 std::atomic<uint32_t> g_requested_frames {0};
 uint64_t              g_requested_first = UINT64_MAX; // presenter thread
 uint64_t              g_requested_count = 0;
+bool                  g_frame_lines     = false; // presenter thread: the frame is in a window
 } // namespace
 
 void RequestFrames(uint32_t frames) {
 	g_requested_frames.store(frames, std::memory_order_release);
+}
+
+void SetWatch(bool on) {
+	const bool was = g_watch_step.exchange(on, std::memory_order_acq_rel);
+	if (on && !was) {
+		Detail::g_active.store(true, std::memory_order_relaxed);
+		LOGF("GpuTiming: watching: every draw and dispatch is timed on the GPU; command buffers of "
+		     "%.0f ms or more are logged (\"GpuTiming slow\")\n",
+		     WatchMs());
+	}
 }
 
 void Present(uint64_t frame) {
@@ -220,11 +323,18 @@ void Present(uint64_t frame) {
 		g_requested_count = requested;
 	}
 	const bool requested_window = g_requested_count != 0;
-	if (window.count == 0 && !requested_window) {
+	const bool watching         = Watching();
+	if (window.count == 0 && !requested_window && !watching) {
+		Detail::g_active.store(false, std::memory_order_relaxed);
 		return;
 	}
 	auto& state = GetState();
-	if (Detail::g_active.load(std::memory_order_relaxed)) {
+	if (watching && !g_frame_lines) {
+		// Watch mode alone: no frame lines, only the slow command buffers (ReadBlock).
+		std::lock_guard lock(state.stats_mutex);
+		state.stats.clear();
+		state.total_ms = 0.0;
+	} else if (Detail::g_active.load(std::memory_order_relaxed)) {
 		std::vector<std::pair<uint64_t, Stat>> sorted;
 		double                                 timed = 0.0;
 		double                                 total = 0.0;
@@ -264,7 +374,9 @@ void Present(uint64_t frame) {
 			g_requested_count = 0;
 		}
 	}
-	Detail::g_active.store(active, std::memory_order_relaxed);
+	// The frame lines are for the timing windows; watch mode times without them.
+	g_frame_lines = active;
+	Detail::g_active.store(active || watching, std::memory_order_relaxed);
 }
 
 } // namespace Libs::Graphics::GpuTiming

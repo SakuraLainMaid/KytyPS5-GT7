@@ -2,6 +2,7 @@
 
 #include "common/common.h"
 #include "common/cpuAffinity.h"
+#include "common/hostSymbols.h"
 #include "common/logging/log.h"
 #include "common/sampler.h"
 
@@ -85,8 +86,15 @@ struct Counters {
 	std::atomic<uint64_t> tick_latency_ns {0};
 	std::atomic<uint64_t> longest_tick_latency_ns {0};
 	std::atomic<uint64_t> ticks_submitted {0};
+
+	// Waits of KYTY_STALL_MS or more for the host GPU, and the longest host-side sections.
+	std::atomic<uint64_t>                                               stalls {0};
+	std::atomic<uint64_t>                                               longest_stall_ns {0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(Host::Count)> longest_host_ns {};
 };
 Counters g_counters;
+
+std::atomic<ExtraReporter> g_extra_reporter {nullptr};
 
 uint64_t NowNs() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -274,9 +282,19 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 		const auto store_ns    = take(c.clean_store_ns);
 		const auto declined    = take(c.declined_stores);
 		const auto unsupported = take(c.unsupported_stores);
+		const auto stalls      = take(c.stalls);
+		const auto stall_max   = take(c.longest_stall_ns);
+		const auto acquire_max = take(c.longest_host_ns[static_cast<size_t>(Host::Acquire)]);
+		const auto present_max = take(c.longest_host_ns[static_cast<size_t>(Host::Present)]);
+		const auto lock_max    = take(c.longest_host_ns[static_cast<size_t>(Host::QueueLock)]);
 		const auto per         = [](uint64_t sum, uint64_t count, double unit) {
             return count == 0 ? 0.0 : static_cast<double>(sum) / unit / static_cast<double>(count);
 		};
+		std::string extra;
+		if (const auto reporter = g_extra_reporter.load(std::memory_order_acquire);
+		    reporter != nullptr) {
+			extra = reporter();
+		}
 		Log::WriteUnmuted(fmt::format(
 		    "Perf GPU:{} command buffers {:.0f}/s, done {:.1f} ms after submission (longest "
 		    "{:.1f}) "
@@ -284,14 +302,17 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 		    "{:.2f} ms later (longest {:.1f}), {:.1f} steps, {:.1f} command buffers unfinished | "
 		    "stores to GPU-written pages done in place {:.0f}/s ({:.0f} us each), declined "
 		    "{:.0f}/s, "
-		    "not handled {:.0f}/s\n",
+		    "not handled {:.0f}/s | stalls {} (longest {:.0f} ms) | longest swapchain acquire "
+		    "{:.1f} ms, present {:.1f} ms, queue lock wait {:.1f} ms{}\n",
 		    configuration, static_cast<double>(submitted) / seconds, per(latency, done, 1e6),
 		    static_cast<double>(latency_max) / 1e6, static_cast<double>(readbacks) / seconds,
 		    per(pickup, readbacks, 1e3), per(record, readbacks, 1e3), per(wait, readbacks, 1e6),
 		    static_cast<double>(wait_max) / 1e6, per(steps, readbacks, 1.0),
 		    per(behind, readbacks, 1.0), static_cast<double>(stores) / seconds,
 		    per(store_ns, stores, 1e3), static_cast<double>(declined) / seconds,
-		    static_cast<double>(unsupported) / seconds));
+		    static_cast<double>(unsupported) / seconds, stalls,
+		    static_cast<double>(stall_max) / 1e6, static_cast<double>(acquire_max) / 1e6,
+		    static_cast<double>(present_max) / 1e6, static_cast<double>(lock_max) / 1e6, extra));
 	}
 
 	// The busiest threads, and those that spent longest in faults.
@@ -463,7 +484,24 @@ void TickCompletedSlow(uint64_t tick) {
 	StoreMax(c.longest_tick_latency_ns, now - submitted);
 }
 
+void AddStallSlow(uint64_t nanoseconds, bool distinct) {
+	if (distinct) {
+		g_counters.stalls.fetch_add(1, std::memory_order_relaxed);
+	}
+	StoreMax(g_counters.longest_stall_ns, nanoseconds);
+}
+
+void AddHostSlow(uint32_t which, uint64_t nanoseconds) {
+	if (which < g_counters.longest_host_ns.size()) {
+		StoreMax(g_counters.longest_host_ns[which], nanoseconds);
+	}
+}
+
 } // namespace Detail
+
+void SetExtraReporter(ExtraReporter reporter) {
+	g_extra_reporter.store(reporter, std::memory_order_release);
+}
 
 uint32_t CurrentOsThreadId() {
 	return OsThreadId();
@@ -510,6 +548,14 @@ void SetConfiguration(std::string_view name) {
 void Start() {
 	static std::once_flag started;
 	std::call_once(started, [] {
+		// The host symbols (dbghelp, else the map file next to the executable) load in the
+		// background: the first slow wait's host stack (MasterSemaphore) then does not pay for
+		// them on a thread that matters.
+		std::thread([] {
+			NameThread("SymbolLoad");
+			std::this_thread::sleep_for(std::chrono::seconds(3));
+			(void)Common::HostSymbol(reinterpret_cast<uint64_t>(&Report));
+		}).detach();
 		if (const char* set = std::getenv("KYTY_CPU_SET"); set != nullptr && set[0] != '\0') {
 			std::string description;
 			const bool  ok = Common::SetProcessCpuSet(set, &description);

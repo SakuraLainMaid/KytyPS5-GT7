@@ -12,8 +12,10 @@
 // presented frame rate, how the GPU thread spent its time, the draws and dispatches it recorded,
 // the time threads spent in tracked-memory faults (GPU readbacks among them), a "Perf threads:"
 // line with the busiest threads and the ones that waited longest in faults, and a "Perf GPU:" line
-// with how far behind the host GPU runs and what a game thread's access to GPU-written memory
-// waits for. Counting is a relaxed atomic add; the reporter thread does the rest.
+// with how far behind the host GPU runs, what a game thread's access to GPU-written memory waits
+// for, the stalls (waits of KYTY_STALL_MS or more for the host GPU, renderer/stallWatch.h), the
+// longest swapchain acquire, present and queue lock wait, and the video memory in use. Counting is
+// a relaxed atomic add; the reporter thread does the rest.
 namespace Common::PerfStats {
 
 [[nodiscard]] bool Enabled();
@@ -38,6 +40,8 @@ void AddDeclinedStoreSlow();
 void AddUnsupportedStoreSlow();
 void TickSubmittedSlow(uint64_t tick);
 void TickCompletedSlow(uint64_t tick);
+void AddStallSlow(uint64_t nanoseconds, bool distinct);
+void AddHostSlow(uint32_t which, uint64_t nanoseconds);
 } // namespace Detail
 
 // Whether the counters count (the reporter runs): for measurements that cost a clock read.
@@ -120,6 +124,25 @@ inline void TickCompleted(uint64_t tick) {
 		Detail::TickCompletedSlow(tick);
 	}
 }
+// A wait for the host GPU of KYTY_STALL_MS or more (renderer/stallWatch.h); `distinct` when it
+// began after the last one counted ended (other threads waiting through the same stall are not
+// counted again, only their waits for the longest).
+inline void AddStall(uint64_t nanoseconds, bool distinct) {
+	if (Active()) {
+		Detail::AddStallSlow(nanoseconds, distinct);
+	}
+}
+// Host-side sections that can hold the GPU's queue up; the line gives the longest of each.
+enum class Host : uint32_t { Acquire, Present, QueueLock, Count };
+inline void AddHost(Host which, uint64_t nanoseconds) {
+	if (Active()) {
+		Detail::AddHostSlow(static_cast<uint32_t>(which), nanoseconds);
+	}
+}
+// Text appended to the Perf GPU line (the renderer's video memory), called on the reporter's
+// thread; null for none.
+using ExtraReporter = std::string (*)();
+void SetExtraReporter(ExtraReporter reporter);
 
 // Names the calling thread for the thread report, and for the OS (debuggers and Process Explorer)
 // where it can.

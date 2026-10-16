@@ -23,11 +23,27 @@
 
 namespace Libs::Graphics {
 
+namespace StallWatch {
+class Timeline;
+enum class Transfer : uint8_t;
+} // namespace StallWatch
+
 class CommandScheduler {
 public:
 	CommandScheduler(RenderContext& context, GraphicContext& graphics);
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
+
+	// Diagnostics (renderer/stallWatch.h, KYTY_STALL_WATCH): the name its stall reports give it
+	// ("render" unless set, before the first command buffer), and what the command buffer being
+	// recorded holds. The scheduler's own thread only.
+	void SetName(const char* name);
+	void NoteDraw(uint64_t shader, bool indirect);
+	void NoteDispatch(uint64_t shader, bool indirect, uint64_t groups);
+	void NoteTransfer(StallWatch::Transfer kind, uint64_t bytes);
+	// Any thread that waited `waited_ns` for this scheduler's `tick` (`known`: the last tick seen
+	// done when the wait began): a stall report when it waited long (StallWatch).
+	void OnWaited(uint64_t tick, uint64_t known, uint64_t waited_ns);
 
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
 	void           BeginRendering(const RenderState& state);
@@ -255,6 +271,10 @@ private:
 	uint64_t                            m_record_report_drains  = 0;
 	std::chrono::steady_clock::time_point m_record_report_time {};
 	std::jthread                        m_record_thread;
+	// KYTY_STALL_WATCH: the command buffers' timeline (null when off), and the tick of the one
+	// being recorded.
+	std::unique_ptr<StallWatch::Timeline> m_timeline;
+	uint64_t                              m_open_tick = 0;
 };
 
 } // namespace Libs::Graphics

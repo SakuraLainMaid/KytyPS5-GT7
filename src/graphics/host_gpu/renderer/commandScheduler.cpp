@@ -8,6 +8,9 @@
 #include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/gpuTiming.h"
+#include "graphics/host_gpu/renderer/stallWatch.h"
 #include "graphics/host_gpu/timeline.h"
 
 #include <algorithm>
@@ -120,7 +123,39 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }),
+      m_timeline(StallWatch::Enabled() ? std::make_unique<StallWatch::Timeline>(graphics, "render")
+                                       : nullptr) {}
+
+void CommandScheduler::SetName(const char* name) {
+	if (m_timeline) {
+		m_timeline->SetName(name);
+	}
+}
+
+void CommandScheduler::NoteDraw(uint64_t shader, bool indirect) {
+	if (m_timeline) {
+		m_timeline->NoteDraw(shader, indirect);
+	}
+}
+
+void CommandScheduler::NoteDispatch(uint64_t shader, bool indirect, uint64_t groups) {
+	if (m_timeline) {
+		m_timeline->NoteDispatch(shader, indirect, groups);
+	}
+}
+
+void CommandScheduler::NoteTransfer(StallWatch::Transfer kind, uint64_t bytes) {
+	if (m_timeline) {
+		m_timeline->NoteTransfer(kind, bytes);
+	}
+}
+
+void CommandScheduler::OnWaited(uint64_t tick, uint64_t known, uint64_t waited_ns) {
+	if (m_timeline) {
+		m_timeline->OnWait(tick, known, waited_ns);
+	}
+}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
@@ -294,6 +329,15 @@ void CommandScheduler::Wait(uint64_t tick) {
 	EXIT_IF(tick > CurrentTick());
 	Common::Timer timer;
 	timer.Start();
+	const auto known      = m_master.KnownGpuTick();
+	const auto wait_begin = StallWatch::NowNs();
+	const auto stall      = [&] {
+        const auto wait_end = StallWatch::NowNs();
+        StallWatch::NoteSection(StallWatch::Section::OwnerWait, wait_begin, wait_end, tick);
+        if (m_timeline) {
+            m_timeline->OnWait(tick, known, wait_end - wait_begin);
+        }
+	};
 	if (tick == CurrentTick()) {
 		CheckActive();
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
@@ -315,6 +359,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 		Timeline::Mark("wait-end", tick);
 		RecordWait(timer.GetTimeS(), false);
 	}
+	stall();
 }
 
 void CommandScheduler::PopPendingOperations() {
@@ -380,6 +425,7 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	bool named = false;
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
 		{
@@ -395,11 +441,25 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active      = true;
 			m_priority_active_tick = operation.tick;
 		}
+		if (!named && m_timeline) {
+			// For the thread report and the stall reports (set once the scheduler has its name).
+			Common::PerfStats::NameThread(m_timeline->Name() == "render" ? "GpuPriority"
+			                                                             : "PresentPriority");
+			named = true;
+		}
+		const auto known      = m_master.KnownGpuTick();
+		const auto wait_begin = StallWatch::NowNs();
 		m_master.Wait(operation.tick);
+		const auto wait_end = StallWatch::NowNs();
+		if (m_timeline) {
+			m_timeline->OnWait(operation.tick, known, wait_end - wait_begin);
+		}
 		Timeline::Mark("tick-done", operation.tick);
 		Common::PerfStats::TickCompleted(operation.tick);
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
+			StallWatch::NoteSection(StallWatch::Section::Callback, wait_end, StallWatch::NowNs(),
+			                        operation.tick);
 		}
 		{
 			std::lock_guard lock(m_operation_mutex);
@@ -419,6 +479,7 @@ void CommandScheduler::DrainPriorityOperations() {
 
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
+	const auto       begin = GuestGpu::IsGpuThread() ? StallWatch::NowNs() : 0;
 	std::unique_lock lock(m_operation_mutex);
 	m_operation_available.wait(lock, [this, tick] {
 		const bool active_before_or_at = m_priority_active && m_priority_active_tick <= tick;
@@ -426,6 +487,11 @@ void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 		    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
 		return !active_before_or_at && !queued_before_or_at;
 	});
+	if (begin != 0) {
+		lock.unlock();
+		StallWatch::NoteSection(StallWatch::Section::PriorityWait, begin, StallWatch::NowNs(),
+		                        tick);
+	}
 }
 
 void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
@@ -458,6 +524,10 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	// Ticks are allocated in submit order, so this command buffer will be submitted with the
 	// current one.
 	const auto tick = m_master.CurrentTick();
+	m_open_tick     = tick;
+	if (m_timeline) {
+		m_timeline->Open(tick);
+	}
 	if (m_threaded) {
 		m_command.m_buffer = nullptr;
 		Record([this, tick](vk::CommandBuffer) {
@@ -465,11 +535,19 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 			vk::CommandBufferBeginInfo begin_info {};
 			begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
 			EXIT_NOT_IMPLEMENTED(m_worker_buffer.begin(&begin_info) != vk::Result::eSuccess);
+			if (m_timeline) {
+				m_timeline->WriteBegin(m_worker_buffer, tick);
+			}
 		});
+		GpuTiming::BeginCommandBuffer(m_context, *this, m_command.Recorder(), tick);
 		return m_command;
 	}
 	m_command.m_buffer = m_command_pool.Commit(tick);
 	m_command.Begin();
+	if (m_timeline) {
+		m_timeline->WriteBegin(m_command.m_buffer, tick);
+	}
+	GpuTiming::BeginCommandBuffer(m_context, *this, m_command.Recorder(), tick);
 	return m_command;
 }
 
@@ -479,6 +557,15 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+	if (m_timeline) {
+		// The tick this command buffer was begun with; Submit allocates the same one below (or
+		// QueueSubmit does).
+		if (!m_threaded) {
+			m_command.EndRendering();
+			m_timeline->WriteEnd(m_command.m_buffer, m_open_tick);
+		}
+		m_timeline->Close(m_open_tick);
+	}
 	m_command.End();
 	EXIT_IF(m_graphics.queue == nullptr);
 	Profiler::Add(Profiler::Counter::CommandBuffersSubmitted);
@@ -506,6 +593,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		job.tick = m_master.NextTick();
 		job.submit.AddSignal(m_master.Handle(), job.tick);
 		Record([this, job](vk::CommandBuffer command) mutable {
+			if (m_timeline) {
+				m_timeline->WriteEnd(command, job.tick);
+			}
 			EXIT_NOT_IMPLEMENTED(command.end() != vk::Result::eSuccess);
 			job.buffer = command;
 			QueueSubmit(job);
@@ -534,8 +624,12 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 void CommandScheduler::QueueSubmit(SubmitJob& job) {
 	auto&      graphics = m_graphics;
 	vk::Result result;
+	const auto lock_begin = StallWatch::NowNs();
+	uint64_t   locked     = 0;
+	uint64_t   submitted  = 0;
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
+		locked = StallWatch::NowNs();
 		if (!m_async_submit) {
 			job.tick = m_master.NextTick();
 			job.submit.AddSignal(m_master.Handle(), job.tick);
@@ -558,10 +652,17 @@ void CommandScheduler::QueueSubmit(SubmitJob& job) {
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+		result    = graphics.queue.submit(1, &submit_info, nullptr);
+		submitted = StallWatch::NowNs();
 	}
 	Timeline::Mark("vk-submit", job.tick);
 	Common::PerfStats::TickSubmitted(job.tick);
+	Common::PerfStats::AddHost(Common::PerfStats::Host::QueueLock, locked - lock_begin);
+	StallWatch::NoteSection(StallWatch::Section::QueueLock, lock_begin, locked, job.tick);
+	StallWatch::NoteSection(StallWatch::Section::QueueSubmit, locked, submitted, job.tick);
+	if (m_timeline) {
+		m_timeline->Queued(job.tick);
+	}
 
 	if (result == vk::Result::eErrorDeviceLost) {
 		DumpDeviceLossDiagnostics(graphics);
@@ -700,12 +801,17 @@ void CommandScheduler::RecordingThread(std::stop_token stop) {
 			chunk = std::move(m_record_queue.front());
 			m_record_queue.pop_front();
 		}
+		const auto chunk_begin = StallWatch::NowNs();
+		uint64_t   commands    = 0;
 		for (auto* command = chunk->first; command != nullptr;) {
 			auto* next = command->next;
 			command->Execute(m_worker_buffer);
 			command->~RecordedCommand();
 			command = next;
+			commands++;
 		}
+		StallWatch::NoteSection(StallWatch::Section::Record, chunk_begin, StallWatch::NowNs(),
+		                        commands);
 		chunk->first = nullptr;
 		chunk->last  = nullptr;
 		chunk->used  = 0;

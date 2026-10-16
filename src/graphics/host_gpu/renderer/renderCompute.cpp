@@ -1470,6 +1470,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 		Profiler::Add(Profiler::Counter::Dispatches);
 		Common::PerfStats::AddDispatch();
+		m_context.GetCommandScheduler().NoteDispatch(
+		    program.shader_hash, false,
+		    uint64_t {thread_group_x} * uint64_t {thread_group_y} * uint64_t {thread_group_z});
 		GpuProfiler::End(buffer, gpu_zone);
 		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
 		Timeline::Mark("dispatch", program.shader_hash,
@@ -1658,6 +1661,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
 		Profiler::Add(Profiler::Counter::Dispatches);
 		Common::PerfStats::AddDispatch();
+		m_context.GetCommandScheduler().NoteDispatch(program.shader_hash, true, 0);
 		GpuProfiler::End(buffer, gpu_zone);
 		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
 		Timeline::Mark("dispatch-indirect", program.shader_hash, 0);

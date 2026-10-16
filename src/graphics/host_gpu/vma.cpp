@@ -254,6 +254,26 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});
 }
 
+uint64_t GraphicContext::GetRawMemoryBudget() const {
+	if (allocator == nullptr || !CanReportMemoryUsage()) {
+		return 0;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	const bool discrete =
+	    physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
+	uint64_t budget = 0;
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		const bool device_local =
+		    static_cast<bool>(physical_device_memory_properties.memoryHeaps[heap].flags &
+		                      vk::MemoryHeapFlagBits::eDeviceLocal);
+		if (!discrete || device_local) {
+			budget += budgets[heap].budget;
+		}
+	}
+	return budget;
+}
+
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);

@@ -31,6 +31,15 @@
 //                (KYTY_NO_CLEAN_WRITE_EMULATION=1 for the whole run)
 //   gputime:<n>  the next n frames are timed on the host GPU (GpuTiming, "GpuTiming frame" lines),
 //                once, when the step turns on
+// and, for the stalls (renderer/stallWatch.h):
+//   nancheck:off the NaN check (KYTY_NAN_CHECK) checks and scrubs nothing
+//   present:fence the presenter waits on the CPU for the swapchain image it acquires, and its
+//                command buffer waits for nothing on the GPU (KYTY_PRESENT_ACQUIRE=fence for the
+//                whole run), instead of making the GPU queue wait for the image
+//   gc:off       neither the buffer cache nor the texture cache collects anything
+//   gpuwatch     every draw and dispatch is timed on the host GPU, and a command buffer that
+//                takes KYTY_GPU_WATCH_MS (default 30) or more is logged with its costliest ones
+//                ("GpuTiming slow" lines; KYTY_GPU_WATCH=1 for the whole run)
 namespace Libs::Graphics::Bisect {
 
 // The GPU thread, at its start: applies the start step's CPU set and log setting.
@@ -55,6 +64,10 @@ void                      ApplyPending();
 [[nodiscard]] int64_t ReadbackWindowKB();
 // Any thread: whether the step that is on turns off stores done in place (writes:off).
 [[nodiscard]] bool CleanWritesOff();
+// Any thread: nancheck:off, present:fence, gc:off.
+[[nodiscard]] bool NanCheckOff();
+[[nodiscard]] bool PresentFence();
+[[nodiscard]] bool GcOff();
 
 } // namespace Libs::Graphics::Bisect
 

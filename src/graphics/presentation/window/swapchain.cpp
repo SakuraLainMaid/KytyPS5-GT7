@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/timeline.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/stallWatch.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/host_gpu/renderer/bisect.h"
@@ -507,6 +508,10 @@ private:
 	std::vector<vk::Semaphore>     m_image_acquired;
 	std::vector<vk::Semaphore>     m_render_complete;
 	std::unique_ptr<SystemOverlay> m_system_overlay;
+	// present:fence (KYTY_PRESENT_ACQUIRE=fence): the image is acquired with this fence, waited
+	// for on the CPU, and the present command buffer then waits for nothing on the GPU.
+	vk::Fence                      m_acquire_fence       = nullptr;
+	bool                           m_fence_acquired      = false;
 	vk::DescriptorSetLayout        m_overlay_descriptors = nullptr;
 	vk::PipelineLayout             m_overlay_layout      = nullptr;
 	vk::Pipeline                   m_overlay_pipeline    = nullptr;
@@ -520,6 +525,7 @@ struct Presenter::Impl {
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
 	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
 		EXIT_IF(owner.render_context == nullptr);
+		present_scheduler.SetName("present");
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
 		frame_dump = FrameDump::FromEnvironment(owner.graphic_ctx);
@@ -664,6 +670,15 @@ void Swapchain::Create() {
 		    return graphics.device.getSwapchainImagesKHR(m_handle, count, images);
 	    });
 	EXIT_NOT_IMPLEMENTED(m_images.empty());
+	LOGF("Swapchain: %ux%u, %zu images (%u asked), present mode %s\n", m_extent.width,
+	     m_extent.height, m_images.size(), image_count,
+	     vk::to_string(create_info.presentMode).c_str());
+	{
+		vk::FenceCreateInfo fence_info {};
+		RequireVulkanSuccess(graphics.device.createFence(&fence_info, nullptr, &m_acquire_fence),
+		                     "create swapchain acquire fence");
+		m_fence_acquired = false;
+	}
 
 	m_image_views.resize(m_images.size());
 	for (size_t i = 0; i < m_images.size(); i++) {
@@ -737,6 +752,10 @@ void Swapchain::Destroy() {
 			graphics.device.destroySemaphore(semaphore, nullptr);
 		}
 	}
+	if (m_acquire_fence != nullptr) {
+		graphics.device.destroyFence(m_acquire_fence, nullptr);
+		m_acquire_fence = nullptr;
+	}
 	for (const auto view: m_image_views) {
 		if (view != nullptr) {
 			graphics.device.destroyImageView(view, nullptr);
@@ -780,12 +799,46 @@ bool Swapchain::NeedsResize() const {
 	       m_window_extent.height != m_window.graphic_ctx.screen_height;
 }
 
+// KYTY_PRESENT_ACQUIRE=fence, or KYTY_BISECT's present:fence: the presenter waits on the CPU for
+// the image it acquires, and its command buffer waits for nothing on the GPU, so the queue never
+// waits for the presentation engine.
+static bool AcquireWithFence() {
+	static const bool always = [] {
+		const char* value = std::getenv("KYTY_PRESENT_ACQUIRE");
+		return value != nullptr && std::string(value) == "fence";
+	}();
+	const bool  fence        = always || Bisect::PresentFence();
+	static bool logged_fence = false;
+	if (fence && !logged_fence) {
+		logged_fence = true;
+		LOGF("Presenter: acquiring the swapchain image with a fence, waited for on the CPU; the "
+		     "present command buffer waits for nothing on the GPU\n");
+	}
+	return fence;
+}
+
 Swapchain::Status Swapchain::AcquireNextImage() {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
 	m_image_index     = static_cast<uint32_t>(-1);
+	const bool fence  = AcquireWithFence() && m_acquire_fence != nullptr;
+	const auto begin  = StallWatch::NowNs();
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
-	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
-	    &m_image_index);
+	    m_handle, std::numeric_limits<uint64_t>::max(),
+	    fence ? vk::Semaphore {} : m_image_acquired[m_frame_index],
+	    fence ? m_acquire_fence : vk::Fence {}, &m_image_index);
+	if (fence && (result == vk::Result::eSuccess || result == vk::Result::eSuboptimalKHR)) {
+		// The image is acquired either way, and the fence then signals.
+		RequireVulkanSuccess(
+		    m_window.graphic_ctx.device.waitForFences(1, &m_acquire_fence, VK_TRUE,
+		                                              std::numeric_limits<uint64_t>::max()),
+		    "wait for the swapchain acquire fence");
+		RequireVulkanSuccess(m_window.graphic_ctx.device.resetFences(1, &m_acquire_fence),
+		                     "reset the swapchain acquire fence");
+	}
+	m_fence_acquired = fence;
+	const auto end   = StallWatch::NowNs();
+	StallWatch::NoteSection(StallWatch::Section::Acquire, begin, end, fence ? 1u : 0u);
+	Common::PerfStats::AddHost(Common::PerfStats::Host::Acquire, end - begin);
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
@@ -1050,7 +1103,9 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 	EXIT_IF(m_frame_index >= m_image_acquired.size() || m_image_index >= m_render_complete.size());
 	SubmitInfo submit;
-	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
+	if (!m_fence_acquired) {
+		submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
+	}
 	submit.AddSignal(m_render_complete[m_image_index]);
 	return scheduler.Submit(submit);
 }
@@ -1067,10 +1122,14 @@ Swapchain::Status Swapchain::Present() {
 	present.waitSemaphoreCount = 1;
 
 	vk::Result result;
+	const auto begin = StallWatch::NowNs();
 	{
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}
+	const auto end = StallWatch::NowNs();
+	StallWatch::NoteSection(StallWatch::Section::Present, begin, end, m_image_index);
+	Common::PerfStats::AddHost(Common::PerfStats::Host::Present, end - begin);
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
@@ -1177,6 +1236,7 @@ void Presenter::Present(std::span<const Layer> layers) {
 	Timeline::Present(presented);
 	GpuTiming::Present(presented);
 	Common::PerfStats::AddPresent();
+	StallWatch::UpdateMemoryText(m_impl->window.graphic_ctx);
 	m_impl->Present();
 }
 

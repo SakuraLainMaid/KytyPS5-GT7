@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/stallWatch.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -89,6 +90,54 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 
 void CommandBuffer::MarkTransfer(CommandBufferDebugOp op, uint64_t destination, uint64_t source,
                                  uint32_t arg0, uint32_t arg1, uint32_t arg2) const {
+	if (!IsInvalid()) {
+		// What this command buffer moves, for the stall reports (renderer/stallWatch.h).
+		using StallWatch::Transfer;
+		auto     kind  = Transfer::Other;
+		uint64_t bytes = 0;
+		switch (op) {
+			case CommandBufferDebugOp::ImageUpload:
+				kind  = Transfer::ImageUpload;
+				bytes = arg1;
+				break;
+			case CommandBufferDebugOp::ImageDownload:
+				kind  = Transfer::ImageDownload;
+				bytes = arg1;
+				break;
+			case CommandBufferDebugOp::BufferCopy:
+				kind  = Transfer::BufferCopy;
+				bytes = arg0;
+				break;
+			case CommandBufferDebugOp::ImageCopy:
+			case CommandBufferDebugOp::ImageResolve:
+			case CommandBufferDebugOp::ImageCopyThroughBuffer:
+			case CommandBufferDebugOp::ImageMipCopy:
+			case CommandBufferDebugOp::DepthCopy: kind = Transfer::ImageCopy; break;
+			case CommandBufferDebugOp::InternalWork:
+				switch (static_cast<InternalWork>(arg0)) {
+					case InternalWork::Detile:
+						kind  = Transfer::Detile;
+						bytes = arg1;
+						break;
+					case InternalWork::Tile:
+						kind  = Transfer::Tile;
+						bytes = arg1;
+						break;
+					case InternalWork::BufferDownload:
+						kind  = Transfer::BufferDownload;
+						bytes = arg1;
+						break;
+					case InternalWork::NanScan:
+						kind  = Transfer::NanScan;
+						bytes = arg1;
+						break;
+					default: break;
+				}
+				break;
+			default: break;
+		}
+		m_scheduler.NoteTransfer(kind, bytes);
+	}
 	if (!m_graphics.diagnostic_checkpoints_enabled || IsInvalid()) {
 		return;
 	}

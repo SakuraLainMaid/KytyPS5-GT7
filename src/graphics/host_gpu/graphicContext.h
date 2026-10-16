@@ -213,6 +213,9 @@ struct GraphicContext {
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
+	// The driver's budget for the device-local heaps (VK_EXT_memory_budget), without the reserve
+	// and the video memory target GetTotalMemoryBudget takes off; 0 when it cannot be read.
+	[[nodiscard]] uint64_t GetRawMemoryBudget() const;
 	// Memory pressure in bytes, read at most every 250 ms; the caches' collectors lower their
 	// thresholds by it, and DeviceMemoryAtLeast reports true while it is not 0. The larger of:
 	// - the system's free commit below a reserve (KYTY_COMMIT_RESERVE_MB; default 0 = off, see

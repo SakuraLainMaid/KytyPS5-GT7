@@ -8,6 +8,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
@@ -18,6 +19,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/stallWatch.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -4464,6 +4466,10 @@ void TextureCache::NoteNanCheckCandidate(const Image& image) {
 }
 
 void TextureCache::RunNanCheck() {
+	// KYTY_BISECT's nancheck:off: no image is checked (or scrubbed) while the step is on.
+	if (Bisect::NanCheckOff()) {
+		return;
+	}
 	const auto frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
 	// One image a frame end: a copy of its mips and a scan, on the GPU.
 	bool scanned = false;
@@ -4948,6 +4954,12 @@ void TextureCache::ReleaseDroppedByGuest(ImageId id) {
 }
 
 void TextureCache::RunGarbageCollector() {
+	struct GcSection {
+		uint64_t begin = StallWatch::NowNs();
+		~GcSection() {
+			StallWatch::NoteSection(StallWatch::Section::TextureGc, begin, StallWatch::NowNs());
+		}
+	} gc_section;
 	std::scoped_lock lock {m_lock};
 	m_gc_tick++;
 	const uint64_t clock = LruClock();
@@ -4972,6 +4984,10 @@ void TextureCache::RunGarbageCollector() {
 		FreeImage(pending.id, "evicted, written back", true);
 		return true;
 	});
+	// KYTY_BISECT's gc:off: nothing else is collected while the step is on.
+	if (Bisect::GcOff()) {
+		return;
+	}
 	// Memory pressure (GraphicContext::MemoryShortfall: device use past 90 % of the video memory
 	// target): the thresholds sit that far below what the cache holds, so the collector frees its
 	// oldest images until there is room again.

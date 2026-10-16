@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/stallWatch.h"
 #include "graphics/host_gpu/timeline.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -638,8 +639,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (wait_tick == 0) {
 			break;
 		}
-		const auto wait_from = measure ? now_ns() : 0;
+		const auto wait_from  = measure ? now_ns() : 0;
+		const auto known      = m_scheduler.GetMasterSemaphore().KnownGpuTick();
+		const auto stall_from = StallWatch::NowNs();
 		m_scheduler.WaitPriorityOperations(wait_tick);
+		m_scheduler.OnWaited(wait_tick, known, StallWatch::NowNs() - stall_from);
 		if (measure) {
 			wait_ns += now_ns() - wait_from;
 		}
@@ -1082,6 +1086,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	RecordSync(size, is_written, static_cast<bool>(source), timed ? walk_timer.GetTimeS() : 0.0);
 	if (source) {
 		KYTY_PROFILER_BLOCK("Sync::Copy");
+		m_scheduler.NoteTransfer(StallWatch::Transfer::BufferUpload, total_size);
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Recorder();
@@ -1908,6 +1913,21 @@ void BufferCache::RunGarbageCollector() {
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
+	// KYTY_BISECT's gc:off: neither cache collects while the step is on (an A/B test of what
+	// collecting costs).
+	if (Bisect::GcOff()) {
+		return;
+	}
+	struct GcSection {
+		uint64_t  begin = StallWatch::NowNs();
+		uint64_t* deleted;
+		~GcSection() {
+			StallWatch::NoteSection(StallWatch::Section::BufferGc, begin, StallWatch::NowNs(),
+			                        *deleted);
+		}
+	};
+	uint64_t  section_deleted = 0;
+	GcSection gc_section {.deleted = &section_deleted};
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
 	// Ages in frames, as in the texture cache: a buffer used this frame or the last is
@@ -1962,6 +1982,7 @@ void BufferCache::RunGarbageCollector() {
 			DeleteBuffer(id);
 		}
 		gc_deleted++;
+		section_deleted++;
 		return ++retire_count == limit;
 	});
 	gc_seconds += gc_timer.GetTimeS();
