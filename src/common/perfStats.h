@@ -44,6 +44,7 @@ void TickCompletedSlow(uint64_t tick);
 void AddStallSlow(uint64_t nanoseconds, bool distinct);
 void AddHostSlow(uint32_t which, uint64_t nanoseconds);
 void AddReadaheadSlow(uint64_t bytes);
+void AddFastReadbackSlow(uint64_t wait_ns, uint64_t bytes);
 } // namespace Detail
 
 // Whether the counters count (the reporter runs): for measurements that cost a clock read.
@@ -141,6 +142,13 @@ inline void AddReadahead(uint64_t bytes) {
 		Detail::AddReadaheadSlow(bytes);
 	}
 }
+// A game thread's read copied on the readback queue (BufferCache::FastReadback): how long the GPU
+// thread waited for the copy, and its bytes.
+inline void AddFastReadback(uint64_t wait_ns, uint64_t bytes) {
+	if (Active()) {
+		Detail::AddFastReadbackSlow(wait_ns, bytes);
+	}
+}
 // Host-side sections that can hold the GPU's queue up; the line gives the longest of each.
 enum class Host : uint32_t { Acquire, Present, QueueLock, Count };
 inline void AddHost(Host which, uint64_t nanoseconds) {
@@ -165,6 +173,8 @@ void NameThread(const char* name);
 
 // The configuration the lines name (KYTY_BISECT's step), empty for none.
 void SetConfiguration(std::string_view name);
+// The name SetConfiguration gave (empty: none).
+[[nodiscard]] std::string Configuration();
 
 // Starts the reporter (the first call; later ones do nothing), and the sampler when KYTY_SAMPLE
 // asks for it (common/sampler.h).

@@ -26,6 +26,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstdio>
@@ -428,6 +429,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	}
 }
 
+// The family VulkanCreateDevice asked the readback queue of (ReadbackQueue), or -1: none.
+static uint32_t g_readback_family = static_cast<uint32_t>(-1);
+
 static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	                                 const std::vector<const char*>& device_extensions) {
 	// Aftermath must be enabled before the device exists (KYTY_AFTERMATH_DLL, opt-in).
@@ -437,11 +441,49 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
-	vk::DeviceQueueCreateInfo queue_create_info {};
-	queue_create_info.queueFamilyIndex = queue_family;
-	queue_create_info.queueCount       = 1;
-	queue_create_info.pQueuePriorities = &queue_priority;
+	// The queue for game threads' reads of bytes the GPU has finished writing (ReadbackQueue): one
+	// of the copy engines' family (transfer only), which runs beside the graphics engine; else the
+	// universal family's second queue, which the GPU may only time-slice with the renderer's.
+	// KYTY_FAST_READBACK: 0 none, 2 the universal family's second queue.
+	uint32_t family_queues   = 0;
+	uint32_t transfer_family = static_cast<uint32_t>(-1);
+	{
+		uint32_t count = 0;
+		physical_device.getQueueFamilyProperties(&count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(count);
+		physical_device.getQueueFamilyProperties(&count, families.data());
+		family_queues = queue_family < count ? families[queue_family].queueCount : 0;
+		for (uint32_t index = 0; index < count; index++) {
+			const auto flags = families[index].queueFlags;
+			if (index != queue_family && families[index].queueCount != 0 &&
+			    (flags & vk::QueueFlagBits::eTransfer) &&
+			    !(flags & (vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute))) {
+				transfer_family = index;
+				break;
+			}
+		}
+	}
+	const char* fast_readback = std::getenv("KYTY_FAST_READBACK");
+	const bool  readback_off  = fast_readback != nullptr && fast_readback[0] == '0';
+	const bool  second_queue  = fast_readback != nullptr && fast_readback[0] == '2';
+	g_readback_family         = static_cast<uint32_t>(-1);
+	if (!readback_off && !second_queue && transfer_family != static_cast<uint32_t>(-1)) {
+		g_readback_family = transfer_family;
+	} else if (!readback_off && family_queues >= 2) {
+		g_readback_family = queue_family;
+	}
+	const float                              queue_priorities[2] = {1.0f, 1.0f};
+	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {};
+	uint32_t                                 queue_create_count = 1;
+	queue_create_infos[0].queueFamilyIndex                      = queue_family;
+	queue_create_infos[0].queueCount       = g_readback_family == queue_family ? 2u : 1u;
+	queue_create_infos[0].pQueuePriorities = queue_priorities;
+	if (g_readback_family != static_cast<uint32_t>(-1) && g_readback_family != queue_family) {
+		queue_create_infos[1].queueFamilyIndex = g_readback_family;
+		queue_create_infos[1].queueCount       = 1;
+		queue_create_infos[1].pQueuePriorities = queue_priorities;
+		queue_create_count                     = 2;
+	}
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -643,6 +685,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
+	// Optional: what GPU timing counts for each timed draw (fragments shaded, primitives clipped).
+	if (supported_features2.features.pipelineStatisticsQuery == VK_TRUE) {
+		device_features.pipelineStatisticsQuery = VK_TRUE;
+		graphics.pipeline_statistics_enabled    = true;
+	}
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64 =
 	    supported_features2.features.shaderFloat64 &&
@@ -781,8 +828,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 			graphics.device_fault_enabled = true;
 		}
 	}
-	create_info.pQueueCreateInfos       = &queue_create_info;
-	create_info.queueCreateInfoCount    = 1;
+	create_info.pQueueCreateInfos       = queue_create_infos.data();
+	create_info.queueCreateInfoCount    = queue_create_count;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
@@ -1284,6 +1331,30 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (g_readback_family != static_cast<uint32_t>(-1)) {
+		const bool universal = g_readback_family == graphic_ctx.queue_family;
+		graphic_ctx.device.getQueue(g_readback_family, universal ? 1u : 0u,
+		                            &graphic_ctx.readback_queue);
+		if (graphic_ctx.readback_queue != nullptr) {
+			graphic_ctx.readback_family = g_readback_family;
+		}
+	}
+	{
+		const char* setting = std::getenv("KYTY_FAST_READBACK");
+		std::string where   = "none (no copy engines' family, and the universal family has one "
+		                      "queue)";
+		if (graphic_ctx.readback_queue != nullptr &&
+		    graphic_ctx.readback_family == graphic_ctx.queue_family) {
+			where = "queue 1 of the universal family";
+		} else if (graphic_ctx.readback_queue != nullptr) {
+			where =
+			    fmt::format("the copy engines' family {} (transfer only; buffers shared with it)",
+			                graphic_ctx.readback_family);
+		} else if (setting != nullptr && setting[0] == '0') {
+			where = "off (KYTY_FAST_READBACK=0)";
+		}
+		LOGF("Vulkan readback queue: %s\n", where.c_str());
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

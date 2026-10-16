@@ -850,9 +850,24 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 			if (resource.written) {
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
+				const auto base = descriptor.Base48();
+				if (!cache.ClearMeta(base)) {
+					continue;
+				}
+				if (!cache.IsColorMeta(base)) {
 					return true;
 				}
+				// A color target's CMASK or DCC starts here as well (memory reused within the
+				// frame): the depth target's clear is noted and the fill still runs, so the color
+				// target finds it in its metadata, as the hardware's memory would hold it for both.
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+					LOGF("Dispatch: a fill at 0x%012" PRIx64 " by cs %016" PRIx64
+					     " clears a depth target's HTile and a color target's metadata there: it "
+					     "still runs\n",
+					     base, program.shader_hash);
+				}
+				return false;
 			}
 		}
 	}
@@ -1482,6 +1497,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// The removed host fence also ordered read-only dispatches before later writers.
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	} while (recovery.Retry());
+	// The dispatch's writes are in this command buffer now.
+	m_context.GetBufferCache().WritesRecorded(program.has_address_writes, program.shader_hash);
 	if (TracedShader(program.shader_hash)) {
 		TraceDispatch(m_context, input_info.stage, bindings,
 		              fmt::format("{}x{}x{}", thread_group_x, thread_group_y, thread_group_z));
@@ -1667,6 +1684,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		Timeline::Mark("dispatch-indirect", program.shader_hash, 0);
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	} while (recovery.Retry());
+	// The dispatch's writes are in this command buffer now.
+	m_context.GetBufferCache().WritesRecorded(program.has_address_writes, program.shader_hash);
 	if (TracedShader(program.shader_hash)) {
 		TraceDispatch(m_context, input_info.stage, bindings,
 		              fmt::format("indirect (arguments at 0x{:012x})", args_addr));

@@ -26,6 +26,25 @@ namespace {
 
 constexpr uint32_t BlockQueries = 2048;
 constexpr uint32_t BlockCount   = 32;
+// A block's pipeline statistics queries: one per timed command (watch mode, when the device
+// has pipelineStatisticsQuery; KYTY_GPU_WATCH_STATS=0 leaves them out).
+constexpr uint32_t BlockStats = BlockQueries / 2;
+
+// What each statistics query counts, in the order Vulkan writes them (by bit). Not the input
+// assembly or vertex shader counts: a mesh shader draw must not run inside a query of those.
+constexpr vk::QueryPipelineStatisticFlags StatFlags =
+    vk::QueryPipelineStatisticFlagBits::eClippingInvocations |
+    vk::QueryPipelineStatisticFlagBits::eClippingPrimitives |
+    vk::QueryPipelineStatisticFlagBits::eFragmentShaderInvocations |
+    vk::QueryPipelineStatisticFlagBits::eComputeShaderInvocations;
+constexpr uint32_t StatCount = 4;
+
+struct Stats {
+	uint64_t clip_in   = 0; // primitives that reached clipping
+	uint64_t clip_out  = 0; // primitives clipping put out
+	uint64_t fragments = 0; // fragment shader invocations
+	uint64_t threads   = 0; // compute shader invocations
+};
 
 struct Pair {
 	uint32_t   before     = 0;
@@ -34,7 +53,32 @@ struct Pair {
 	uint32_t   kind       = 0;
 	bool       has_detail = false;
 	DrawDetail detail;
+	int32_t    stats_query = -1; // its statistics query in the block, or -1
+	bool       has_stats   = false;
+	Stats      stats;
 };
+
+std::string Count(uint64_t value) {
+	if (value >= 10'000'000) {
+		return fmt::format("{:.0f}M", static_cast<double>(value) / 1e6);
+	}
+	if (value >= 1'000'000) {
+		return fmt::format("{:.1f}M", static_cast<double>(value) / 1e6);
+	}
+	if (value >= 10'000) {
+		return fmt::format("{:.0f}K", static_cast<double>(value) / 1e3);
+	}
+	return fmt::format("{}", value);
+}
+
+// "{1.2M fragments, 128 primitives clipped to 256}" and the like.
+std::string DescribeStats(const Stats& stats, uint32_t kind) {
+	if (kind == Dispatch) {
+		return fmt::format("{{{} threads}}", Count(stats.threads));
+	}
+	return fmt::format("{{{} fragments, {} primitives clipped to {}}}", Count(stats.fragments),
+	                   Count(stats.clip_in), Count(stats.clip_out));
+}
 
 // "[VS ..., 1234 indices x1; 3840x2160, color 1x, depth 4x]" and the like.
 std::string Describe(const DrawDetail& detail) {
@@ -74,6 +118,8 @@ struct Block {
 	uint64_t          tick = 0;
 	uint32_t          used = 0;
 	int64_t           open = -1; // query index of a Before without its After yet
+	uint32_t          stats_used = 0;
+	int32_t           stats_open = -1; // statistics query begun by that Before
 	std::vector<Pair> pairs;
 	std::atomic<bool> in_flight {false};
 };
@@ -87,6 +133,7 @@ struct Stat {
 struct State {
 	vk::Device                           device;
 	vk::QueryPool                        pool;
+	vk::QueryPool                        stats_pool; // null without pipeline statistics
 	double                               period_ns = 1.0;
 	std::array<Block, BlockCount>        blocks;
 	uint32_t                             next_block = 0;
@@ -115,6 +162,15 @@ bool WatchFromEnvironment() {
 
 bool Watching() {
 	return WatchFromEnvironment() || g_watch_step.load(std::memory_order_relaxed);
+}
+
+// KYTY_GPU_WATCH_STATS=0: watch mode without the pipeline statistics queries.
+bool WatchStats() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_GPU_WATCH_STATS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
 }
 
 double WatchMs() {
@@ -177,6 +233,10 @@ void ReportSlowBlock(const Block& block, const std::vector<uint64_t>& values, do
 			costliest += fmt::format(" (#{} of {}) {}", timed[i].index + 1, block.pairs.size(),
 			                         Describe(timed[i].pair->detail));
 		}
+		// And what they made the GPU do (pipeline statistics, round 64).
+		if (i < 3 && timed[i].pair != nullptr && timed[i].pair->has_stats) {
+			costliest += " " + DescribeStats(timed[i].pair->stats, timed[i].kind);
+		}
 	}
 	LOGF("GpuTiming slow tick %" PRIu64 ": %.1f ms from the first command to the last, %zu "
 	     "commands timed; costliest:%s; largest gap %.2f ms (after %016" PRIx64 ")\n",
@@ -206,6 +266,24 @@ const Window& GetWindow() {
 }
 
 void ReadBlock(State& state, Block& block) {
+	if (block.stats_used != 0 && state.stats_pool) {
+		std::vector<uint64_t> counts(static_cast<size_t>(block.stats_used) * StatCount);
+		const auto            result = state.device.getQueryPoolResults(
+            state.stats_pool, static_cast<uint32_t>(&block - state.blocks.data()) * BlockStats,
+            block.stats_used, counts.size() * sizeof(uint64_t), counts.data(),
+            StatCount * sizeof(uint64_t), vk::QueryResultFlagBits::e64);
+		if (result == vk::Result::eSuccess) {
+			for (auto& pair: block.pairs) {
+				if (pair.stats_query < 0 ||
+				    static_cast<uint32_t>(pair.stats_query) >= block.stats_used) {
+					continue;
+				}
+				const auto* c  = counts.data() + static_cast<size_t>(pair.stats_query) * StatCount;
+				pair.stats     = {c[0], c[1], c[2], c[3]};
+				pair.has_stats = true;
+			}
+		}
+	}
 	if (block.used != 0) {
 		std::vector<uint64_t> values(block.used);
 		const auto result = state.device.getQueryPoolResults(
@@ -245,8 +323,10 @@ void ReadBlock(State& state, Block& block) {
 		}
 	}
 	block.pairs.clear();
-	block.used = 0;
-	block.open = -1;
+	block.used       = 0;
+	block.open       = -1;
+	block.stats_used = 0;
+	block.stats_open = -1;
 	block.in_flight.store(false, std::memory_order_release);
 }
 
@@ -286,20 +366,39 @@ void BeginBlockSlow(RenderContext& context, CommandScheduler& scheduler,
 			g_active.store(false);
 			return;
 		}
+		if (graphics.pipeline_statistics_enabled && WatchStats()) {
+			vk::QueryPoolCreateInfo stats_info {};
+			stats_info.queryType          = vk::QueryType::ePipelineStatistics;
+			stats_info.queryCount         = BlockStats * BlockCount;
+			stats_info.pipelineStatistics = StatFlags;
+			if (state.device.createQueryPool(&stats_info, nullptr, &state.stats_pool) !=
+			    vk::Result::eSuccess) {
+				state.stats_pool = nullptr;
+			}
+			LOGF("GpuTiming: watch mode counts fragments and primitives of each timed draw: %s\n",
+			     state.stats_pool ? "yes" : "no (the query pool was refused)");
+		}
 	}
 	auto& block = state.blocks[state.next_block % BlockCount];
 	if (block.in_flight.load(std::memory_order_acquire)) {
 		return; // every block waits for its command buffer: this one is not timed
 	}
 	state.next_block++;
-	block.tick = tick;
-	block.used = 0;
-	block.open = -1;
+	block.tick       = tick;
+	block.used       = 0;
+	block.open       = -1;
+	block.stats_used = 0;
+	block.stats_open = -1;
 	block.pairs.clear();
 	block.in_flight.store(true, std::memory_order_release);
 	recorder.resetQueryPool(state.pool,
 	                        static_cast<uint32_t>(&block - state.blocks.data()) * BlockQueries,
 	                        BlockQueries);
+	if (state.stats_pool) {
+		recorder.resetQueryPool(state.stats_pool,
+		                        static_cast<uint32_t>(&block - state.blocks.data()) * BlockStats,
+		                        BlockStats);
+	}
 	// Runs once this tick has executed, so every query of the block is written.
 	scheduler.DeferPriorityOperation([&state, &block] { ReadBlock(state, block); });
 	state.current = &block;
@@ -315,6 +414,13 @@ void BeforeSlow(RenderContext& context, CommandBuffer& buffer) {
 	buffer.Recorder().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, state.pool,
 	                                 base + block->used);
 	block->open = block->used++;
+	// Its statistics, in watch mode (one query each, ended by its After in the same render pass).
+	block->stats_open = -1;
+	if (state.stats_pool && Watching() && block->stats_used < BlockStats) {
+		const auto stats_base = static_cast<uint32_t>(block - state.blocks.data()) * BlockStats;
+		buffer.Recorder().beginQuery(state.stats_pool, stats_base + block->stats_used);
+		block->stats_open = static_cast<int32_t>(block->stats_used++);
+	}
 }
 
 void AfterSlow(RenderContext& context, CommandBuffer& buffer, uint64_t key, uint32_t kind) {
@@ -326,16 +432,23 @@ void AfterSlow(RenderContext& context, CommandBuffer& buffer, uint64_t key, uint
 		return;
 	}
 	const auto base = static_cast<uint32_t>(block - state.blocks.data()) * BlockQueries;
+	if (block->stats_open >= 0) {
+		const auto stats_base = static_cast<uint32_t>(block - state.blocks.data()) * BlockStats;
+		buffer.Recorder().endQuery(state.stats_pool,
+		                           stats_base + static_cast<uint32_t>(block->stats_open));
+	}
 	buffer.Recorder().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, state.pool,
 	                                 base + block->used);
 	Pair pair;
-	pair.before = static_cast<uint32_t>(block->open);
-	pair.after  = block->used;
-	pair.key    = key;
-	pair.kind   = kind;
+	pair.before      = static_cast<uint32_t>(block->open);
+	pair.after       = block->used;
+	pair.key         = key;
+	pair.kind        = kind;
+	pair.stats_query = block->stats_open;
 	block->pairs.push_back(pair);
 	block->used++;
-	block->open = -1;
+	block->open       = -1;
+	block->stats_open = -1;
 }
 
 void AfterDrawSlow(RenderContext& context, CommandBuffer& buffer, uint64_t key,

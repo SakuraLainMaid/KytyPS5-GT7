@@ -49,6 +49,15 @@
 //                whole run, default 16)
 //   readahead    what game threads read back is downloaded as soon as the GPU writes it again,
 //                so their reads find it in memory (KYTY_READAHEAD=1 for the whole run)
+// and (round 64):
+//   cmask:off    a multisampled color target's CMASK fast clears are left out, as before round
+//                63b (KYTY_MSAA_CMASK_CLEARS=0 for the whole run)
+//   fastread:off a game thread's read of bytes the GPU has finished writing waits for a download
+//                behind the GPU's queue, as before round 64, instead of one on the readback queue
+//                (KYTY_FAST_READBACK=0 for the whole run)
+//   fastread:any the fast readback copies bytes even while a command that stores through shader
+//                addresses is unfinished (it may miss what that command stores there: a test of
+//                what waiting for those commands costs)
 namespace Libs::Graphics::Bisect {
 
 // The GPU thread, at its start: applies the start step's CPU set and log setting.
@@ -83,6 +92,10 @@ void                      ApplyPending();
 [[nodiscard]] float    TessMaxLevel();
 [[nodiscard]] uint32_t FlushInterval();
 [[nodiscard]] bool     Readahead();
+// Any thread: cmask:off; fastread:off; fastread:any.
+[[nodiscard]] bool MsaaCmaskOff();
+[[nodiscard]] bool FastReadbackOff();
+[[nodiscard]] bool FastReadbackAnyAddress();
 
 } // namespace Libs::Graphics::Bisect
 

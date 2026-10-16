@@ -111,6 +111,8 @@ struct GraphicContext {
 	bool                               host_query_reset_enabled              = false;
 	bool                               calibrated_timestamps_enabled         = false;
 	bool                               device_fault_enabled                  = false;
+	// pipelineStatisticsQuery: GPU timing's counts for each timed draw (gpuTiming.cpp).
+	bool                               pipeline_statistics_enabled           = false;
 	bool                               shader_device_clock_enabled           = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	// subgroupSizeControl is enabled: the device has more than one subgroup size.
@@ -143,6 +145,13 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// The queue for game threads' reads of bytes the GPU has finished writing (BufferCache's fast
+	// readback, ReadbackQueue), and its family: the copy engines' (transfer-only) family when the
+	// device has one, else the universal family's second queue; null with KYTY_FAST_READBACK=0 or
+	// neither. Buffers are shared with a family other than queue_family (Buffer). Only the GPU
+	// thread submits to it.
+	vk::Queue readback_queue  = nullptr;
+	uint32_t  readback_family = static_cast<uint32_t>(-1);
 	// Frames presented so far: the clock the caches age their entries by.
 	std::atomic<uint64_t>              presented_frames {0};
 

@@ -37,6 +37,9 @@ struct Step {
 	bool              gpu_watch   = false;
 	bool              tess_off    = false;
 	bool              readahead   = false;
+	bool              cmask_off    = false;
+	bool              fastread_off = false;
+	bool              fastread_any = false;
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
 	uint32_t          gpu_frames  = 0;    // gputime:<n>
@@ -112,6 +115,18 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "readahead") {
 		step.readahead = true;
+		return true;
+	}
+	if (action == "cmask:off") {
+		step.cmask_off = true;
+		return true;
+	}
+	if (action == "fastread:off") {
+		step.fastread_off = true;
+		return true;
+	}
+	if (action == "fastread:any") {
+		step.fastread_any = true;
 		return true;
 	}
 	if (action.starts_with("tess:max:")) {
@@ -453,6 +468,21 @@ uint32_t FlushInterval() {
 bool Readahead() {
 	const auto* step = Current();
 	return step != nullptr && step->readahead;
+}
+
+bool MsaaCmaskOff() {
+	const auto* step = Current();
+	return step != nullptr && step->cmask_off;
+}
+
+bool FastReadbackOff() {
+	const auto* step = Current();
+	return step != nullptr && step->fastread_off;
+}
+
+bool FastReadbackAnyAddress() {
+	const auto* step = Current();
+	return step != nullptr && step->fastread_any;
 }
 
 bool WholeUnnormalizedViews() {

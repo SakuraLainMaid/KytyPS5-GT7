@@ -971,6 +971,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		DrawPrep::ClearCurrent();
 	}
 	while (!execution.m_buffer_stack.empty()) {
+		// The packets before this one have recorded their commands: the GPU writes they marked
+		// take the ticks those went into (before a game thread's read below copies any).
+		m_renderer.GetBufferCache().WritesRecorded();
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
 		}

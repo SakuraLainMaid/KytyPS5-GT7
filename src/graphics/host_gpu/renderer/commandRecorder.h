@@ -213,6 +213,12 @@ public:
 	void resetQueryPool(vk::QueryPool pool, uint32_t first, uint32_t count) const {
 		Run([=](vk::CommandBuffer command) { command.resetQueryPool(pool, first, count); });
 	}
+	void beginQuery(vk::QueryPool pool, uint32_t query) const {
+		Run([=](vk::CommandBuffer command) { command.beginQuery(pool, query, {}); });
+	}
+	void endQuery(vk::QueryPool pool, uint32_t query) const {
+		Run([=](vk::CommandBuffer command) { command.endQuery(pool, query); });
+	}
 	void fillBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
 	                uint32_t value) const {
 		Run([=](vk::CommandBuffer command) { command.fillBuffer(buffer, offset, size, value); });

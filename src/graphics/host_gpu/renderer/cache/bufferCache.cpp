@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/bisect.h"
+#include "graphics/host_gpu/renderer/cache/readbackQueue.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
@@ -35,6 +36,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -345,6 +347,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
 	// Readahead's downloads go at the end of the command buffer that wrote their bytes.
 	m_scheduler.SetBeforeFlush(&BufferCache::IssueReadaheadHook, this);
+	// Game threads' reads of bytes the GPU has finished writing go on a queue of their own.
+	m_readback_queue =
+	    std::make_unique<ReadbackQueue>(m_graphics, m_scheduler, m_scheduler.GetMasterSemaphore());
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
@@ -373,6 +378,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 
 BufferCache::~BufferCache() {
 	m_scheduler.SetBeforeFlush(nullptr, nullptr);
+	m_readback_queue.reset();
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}
@@ -622,28 +628,30 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	uint64_t wait_ns      = 0;
 	uint64_t ticks_behind = 0;
 	uint32_t steps        = 0;
+	bool     fast         = false; // a fast readback copied its bytes (FastReadback)
 	for (;;) {
 		uint64_t   wait_tick = 0;
 		uint64_t   taken_up  = 0;
 		uint64_t   recorded  = 0;
 		uint64_t   behind    = 0;
 		const auto sent      = measure ? now_ns() : 0;
-		m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write,
-		                                                from_gpu_thread, async, measure, &now_ns,
-		                                                &wait_tick, &taken_up, &recorded, &behind] {
-			if (measure) {
-				taken_up     = now_ns();
-				auto& master = m_scheduler.GetMasterSemaphore();
-				master.Refresh();
-				const auto current = m_scheduler.CurrentTick();
-				const auto done    = master.KnownGpuTick();
-				behind             = current > done ? current - done - 1 : 0;
-			}
-			wait_tick = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async);
-			if (measure) {
-				recorded = now_ns();
-			}
-		});
+		m_scheduler.Context().GetGpu().SendCommandSync(
+		    [this, vaddr, size, is_write, from_gpu_thread, async, measure, &now_ns, &wait_tick,
+		     &taken_up, &recorded, &behind, &fast] {
+			    if (measure) {
+				    taken_up     = now_ns();
+				    auto& master = m_scheduler.GetMasterSemaphore();
+				    master.Refresh();
+				    const auto current = m_scheduler.CurrentTick();
+				    const auto done    = master.KnownGpuTick();
+				    behind             = current > done ? current - done - 1 : 0;
+			    }
+			    wait_tick = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async);
+			    fast      = fast || std::exchange(m_fast_step, false);
+			    if (measure) {
+				    recorded = now_ns();
+			    }
+		    });
 		if (measure) {
 			pickup_ns += taken_up - sent;
 			record_ns += recorded - taken_up;
@@ -668,7 +676,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		Common::PerfStats::AddReadback(pickup_ns, record_ns, wait_ns, steps, ticks_behind);
 	}
 	if (!from_gpu_thread) {
-		(steps <= 1 ? g_reads_direct : g_reads_waited).fetch_add(1, std::memory_order_relaxed);
+		// A fast readback's bytes were not in memory yet either.
+		(steps <= 1 && !fast ? g_reads_direct : g_reads_waited)
+		    .fetch_add(1, std::memory_order_relaxed);
 	}
 }
 
@@ -697,6 +707,263 @@ static bool ReadbackRetick() {
 		return value == nullptr || value[0] != '0';
 	}();
 	return enabled;
+}
+
+void BufferCache::LiftCurrentPages(const Buffer& buffer, uint64_t vaddr) {
+	const auto window = ReadbackWindow();
+	if (window == 0) {
+		return;
+	}
+	const auto            begin = std::max(Common::AlignDown(vaddr, window), buffer.CpuAddress());
+	const auto            end   = std::min(begin + window, buffer.CpuAddress() + buffer.Size());
+	std::vector<uint64_t> current;
+	{
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		for (auto page = Common::AlignDown(begin, TRACKER_PAGE_SIZE); page < end;
+		     page += TRACKER_PAGE_SIZE) {
+			if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) &&
+			    !m_downloading_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+				current.push_back(page);
+			}
+		}
+	}
+	// One lift per run of neighbouring pages: each lift is a protection change, and page by page
+	// they were most of the GPU thread's VirtualProtect calls.
+	for (size_t first = 0; first < current.size();) {
+		size_t last = first + 1;
+		while (last < current.size() && current[last] == current[last - 1] + TRACKER_PAGE_SIZE) {
+			last++;
+		}
+		const auto run_begin = current[first];
+		const auto run_size  = current[last - 1] + TRACKER_PAGE_SIZE - run_begin;
+		if (m_memory_tracker.IsRegionGpuModified(run_begin, run_size)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(run_begin, run_size);
+		}
+		first = last;
+	}
+}
+
+// KYTY_FAST_READBACK=0 (or KYTY_BISECT's fastread:off): every game-thread read of GPU-written
+// bytes downloads them behind the renderer's queue, as before round 64.
+static bool FastReadbackEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FAST_READBACK");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled && !Bisect::FastReadbackOff();
+}
+
+namespace {
+// What the fast readback did, and why reads went the old way, for the "Fast readback:" line (GPU
+// thread only).
+struct FastReadbackStats {
+	uint64_t attempts    = 0;
+	uint64_t done        = 0;
+	uint64_t bytes       = 0;
+	uint64_t wait_ns     = 0;
+	uint64_t longest_ns  = 0;
+	uint64_t left        = 0; // ranges elsewhere in the windows, left for a later read
+	uint64_t recording   = 0; // the faulting pages' writer is in the command buffer being recorded
+	uint64_t in_flight   = 0; // submitted, not finished
+	uint64_t downloading = 0; // a download of the faulting pages' bytes is on its way
+	uint64_t too_big     = 0;
+	uint64_t nothing     = 0; // no GPU-written bytes it could copy in the window
+	uint64_t address     = 0; // a command storing through shader addresses is still on the GPU
+	uint64_t other       = 0; // a range outside the buffer, or the copy could not be made
+};
+FastReadbackStats g_fast_readback;
+
+// Every 4096 attempts, when an attempt ends: what those did (then the counts start again), with
+// the KYTY_BISECT step they ran in.
+struct FastReadbackReport {
+	FastReadbackStats& stats;
+	~FastReadbackReport() {
+		if (stats.attempts < 4096) {
+			return;
+		}
+		const double average = stats.done != 0 ? static_cast<double>(stats.wait_ns) / 1e3 /
+		                                             static_cast<double>(stats.done)
+		                                       : 0.0;
+		const auto   step    = Common::PerfStats::Configuration();
+		const auto   tag     = step.empty() ? std::string() : " [" + step + "]";
+		LOGF("Fast readback: %" PRIu64 " of %" PRIu64
+		     " reads copied on the readback queue%s (%.1f MB, waited %.0f us on average, longest "
+		     "%.0f us; %" PRIu64 " ranges elsewhere in their windows left for later); the others "
+		     "waited for the renderer's queue: %" PRIu64 " written in the command buffer being "
+		     "recorded, %" PRIu64 " in one not finished, %" PRIu64 " being downloaded, %" PRIu64
+		     " too big, %" PRIu64 " without GPU-written bytes to copy, %" PRIu64
+		     " behind shader address stores, %" PRIu64 " other\n",
+		     stats.done, stats.attempts, tag.c_str(), static_cast<double>(stats.bytes) / 1e6,
+		     average, static_cast<double>(stats.longest_ns) / 1e3, stats.left, stats.recording,
+		     stats.in_flight, stats.downloading, stats.too_big, stats.nothing, stats.address,
+		     stats.other);
+		stats = {};
+	}
+};
+} // namespace
+
+bool BufferCache::FastReadback(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t window_begin,
+                               uint64_t window_end, bool is_write) {
+	if (m_readback_queue == nullptr || !m_readback_queue->Available() || !FastReadbackEnabled() ||
+	    window_end <= window_begin) {
+		return false;
+	}
+	auto& stats = g_fast_readback;
+	stats.attempts++;
+	const FastReadbackReport report {stats};
+	// Between commands: every write marked so far has its command in a command buffer, and its
+	// range the tick of that command buffer.
+	WritesRecorded();
+
+	const auto page_begin     = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto page_end       = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	const auto buffer_address = buffer.CpuAddress();
+	const auto buffer_end     = buffer_address + buffer.Size();
+	// Image write-backs still to land put their bytes in guest memory after these (on the
+	// priority thread): bytes under one stay for a later read.
+	const auto writebacks      = m_texture_cache.PendingWriteBacks();
+	const auto under_writeback = [&](uint64_t start, uint64_t end) {
+		return std::ranges::any_of(writebacks, [&](const std::pair<uint64_t, uint64_t>& pending) {
+			return pending.first < end && start < pending.first + pending.second;
+		});
+	};
+	{
+		// A download or an image write-back of the faulting pages on its way publishes its bytes
+		// when it lands: the read waits for it the old way.
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		if (m_downloading_ranges.Intersects(page_begin, page_end - page_begin) ||
+		    (!writebacks.empty() && under_writeback(page_begin, page_end))) {
+			stats.downloading++;
+			return false;
+		}
+	}
+	auto& master = m_scheduler.GetMasterSemaphore();
+	master.Refresh();
+	const auto known   = master.KnownGpuTick();
+	const auto current = m_scheduler.CurrentTick();
+	if (m_address_write_tick > known && !Bisect::FastReadbackAnyAddress()) {
+		// A command still on the GPU stores through shader addresses, which mark no range: these
+		// bytes may be among its stores, which a download behind it takes. (KYTY_BISECT's
+		// fastread:any copies anyway, to measure what this costs.)
+		stats.address++;
+		return false;
+	}
+
+	// The GPU-written ranges of the window's GPU-written pages, as a download takes them
+	// (DownloadBufferWindow). One whose last writer has not finished stays for a later read, as
+	// does one a download or an image write-back still on its way also holds: its publication
+	// (on the priority thread) would land over these bytes after them. On the faulting pages
+	// either sends the read the old way. So does one the GPU write bitmap tracks: its bits were
+	// taken as downloaded with the window (RefineWithWriteBitmap).
+	enum class Refusal : uint8_t { None, Recording, InFlight, Downloading, Other };
+	auto                        refusal = Refusal::None;
+	std::vector<vk::BufferCopy> copies;
+	uint64_t                    total = 0;
+	uint64_t                    left  = 0;
+	m_memory_tracker.ForEachDownloadRange<false>(
+	    window_begin, window_end - window_begin, [&](uint64_t address, uint64_t bytes) noexcept {
+		    std::shared_lock lock(m_dirty_ranges_mutex);
+		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+			    const auto tick   = m_write_ticks.Max(start, end);
+			    auto       reason = Refusal::None;
+			    if (start < buffer_address || end > buffer_end) {
+				    reason = Refusal::Other;
+			    } else if (m_downloading_ranges.Intersects(start, end - start) ||
+			               (!writebacks.empty() && under_writeback(start, end))) {
+				    reason = Refusal::Downloading;
+			    } else if (tick >= current) {
+				    reason = Refusal::Recording;
+			    } else if (tick > known) {
+				    reason = Refusal::InFlight;
+			    }
+			    if (reason == Refusal::None) {
+				    copies.emplace_back(start - buffer_address, total, end - start);
+				    // Packed ranges on separate cache lines, as the old path does.
+				    total += Common::AlignUp(end - start, 64);
+				    return;
+			    }
+			    const bool faulting = start < page_end && end > page_begin;
+			    const bool bitmap =
+			        m_write_bitmap != nullptr && m_bitmap_tracked.Intersects(start, end - start);
+			    if (refusal == Refusal::None && (faulting || reason == Refusal::Other)) {
+				    refusal = reason;
+			    } else if (refusal == Refusal::None && bitmap) {
+				    refusal = Refusal::Other;
+			    }
+			    left++;
+		    });
+	    });
+	switch (refusal) {
+		case Refusal::None: break;
+		case Refusal::Recording: stats.recording++; return false;
+		case Refusal::InFlight: stats.in_flight++; return false;
+		case Refusal::Downloading: stats.downloading++; return false;
+		case Refusal::Other: stats.other++; return false;
+	}
+	if (copies.empty()) {
+		stats.nothing++;
+		return false;
+	}
+	if (total > m_readback_queue->Capacity()) {
+		stats.too_big++;
+		return false;
+	}
+	// After every tick the GPU is known to have finished, not only the copied ranges' writers (all
+	// done by then): a command storing through shader addresses may have written them later. The
+	// wait is free, the tick being done.
+	uint64_t       waited_ns = 0;
+	const uint8_t* bytes = m_readback_queue->Copy(buffer.Handle(), copies, total, known, waited_ns);
+	if (bytes == nullptr) {
+		stats.other++;
+		return false;
+	}
+	// Into guest memory, as a download's publication puts them (DownloadBufferCopies).
+	for (const auto& copy: copies) {
+		const auto  address = buffer_address + copy.srcOffset;
+		const auto* source  = bytes + copy.dstOffset;
+		if (Libs::LibKernel::Memory::TryWriteBacking(address, source, copy.size)) {
+			continue;
+		}
+		// Bytes the guest has unmapped since the GPU wrote them: the pages still mapped get theirs.
+		for (uint64_t done = 0; done < copy.size;) {
+			const auto at = address + done;
+			const auto piece =
+			    std::min<uint64_t>(copy.size - done, Common::AlignDown(at, 0x1000u) + 0x1000u - at);
+			if (!Libs::LibKernel::Memory::TryWriteBacking(at, source + done, piece) &&
+			    Libs::LibKernel::Memory::TryClampRangeSize(at, piece) == piece) {
+				EXIT("Memory: required direct-backing write failed, addr=0x%016" PRIx64
+				     " size=0x%016" PRIx64 "\n",
+				     at, piece);
+			}
+			done += piece;
+		}
+	}
+	{
+		// Nothing recorded a GPU write since the ranges were collected: only the GPU thread
+		// records them, and it is here.
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		for (const auto& copy: copies) {
+			m_gpu_modified_ranges.Subtract(buffer_address + copy.srcOffset, copy.size);
+		}
+	}
+	// A page under an image write-back still to land is lifted too: a guest read of its bytes,
+	// not GPU-written ones, took them from guest memory before, as the clean-read emulation does.
+	LiftCurrentPages(buffer, vaddr);
+	if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin) &&
+	    !HasGpuDirtyBytes(page_begin, page_end - page_begin)) {
+		m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
+	}
+	if (is_write) {
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	}
+	m_fast_step = true;
+	stats.done++;
+	stats.bytes += total;
+	stats.wait_ns += waited_ns;
+	stats.longest_ns = std::max(stats.longest_ns, waited_ns);
+	stats.left += left;
+	Common::PerfStats::AddFastReadback(waited_ns, total);
+	return true;
 }
 
 uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
@@ -781,41 +1048,16 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 		if (async && ReadbackWindow() != 0) {
 			// The whole download window, as the synchronous path lifts it: page by page, each
 			// page of the window faulted on its own and went through the GPU thread again.
-			const auto window = ReadbackWindow();
-			const auto begin  = std::max(Common::AlignDown(vaddr, window), buffer.CpuAddress());
-			const auto end    = std::min(begin + window, buffer.CpuAddress() + buffer.Size());
 			if (!from_gpu_thread && ReadaheadEnabled()) {
 				// Its bytes were in memory (a readahead, or a window downloaded before): the
 				// window's blocks stay learned while game threads keep reading them (its other
 				// pages are lifted now, so they fault no more).
+				const auto window = ReadbackWindow();
+				const auto begin  = std::max(Common::AlignDown(vaddr, window), buffer.CpuAddress());
+				const auto end    = std::min(begin + window, buffer.CpuAddress() + buffer.Size());
 				LearnReadahead(begin, end, true);
 			}
-			std::vector<uint64_t> current;
-			{
-				std::shared_lock lock(m_dirty_ranges_mutex);
-				for (auto page = Common::AlignDown(begin, TRACKER_PAGE_SIZE); page < end;
-				     page += TRACKER_PAGE_SIZE) {
-					if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) &&
-					    !m_downloading_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
-						current.push_back(page);
-					}
-				}
-			}
-			// One lift per run of neighbouring pages: each lift is a protection change, and
-			// page by page they were most of the GPU thread's VirtualProtect calls.
-			for (size_t first = 0; first < current.size();) {
-				size_t last = first + 1;
-				while (last < current.size() &&
-				       current[last] == current[last - 1] + TRACKER_PAGE_SIZE) {
-					last++;
-				}
-				const auto run_begin = current[first];
-				const auto run_size  = current[last - 1] + TRACKER_PAGE_SIZE - run_begin;
-				if (m_memory_tracker.IsRegionGpuModified(run_begin, run_size)) {
-					m_memory_tracker.UnmarkRegionAsGpuModified(run_begin, run_size);
-				}
-				first = last;
-			}
+			LiftCurrentPages(buffer, vaddr);
 		} else if (!from_gpu_thread && ReadaheadEnabled()) {
 			LearnReadahead(page_begin, page_end, true);
 		}
@@ -863,15 +1105,21 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 		window_end   = std::min(std::max(window_begin + window, vaddr + size), buffer_end);
 	}
 
+	if (!from_gpu_thread && ReadaheadEnabled()) {
+		LearnReadahead(window_begin, window_end, false);
+	}
+	Timeline::Mark("readmem", vaddr, from_gpu_thread ? 1u : 0u);
+	// Bytes the GPU has finished writing: copied on the readback queue at once, instead of behind
+	// what the renderer's queue still has to run.
+	if (async && FastReadback(buffer, vaddr, size, window_begin, window_end, is_write)) {
+		return 0;
+	}
 	if (!from_gpu_thread) {
+		// The downloads game threads wait for, by writer (the fast readbacks are not among them).
 		auto& master = m_scheduler.GetMasterSemaphore();
 		master.Refresh();
 		ReportGameThreadDownload(vaddr, window_end - window_begin, master.KnownGpuTick());
-		if (ReadaheadEnabled()) {
-			LearnReadahead(window_begin, window_end, false);
-		}
 	}
-	Timeline::Mark("readmem", vaddr, from_gpu_thread ? 1u : 0u);
 	if (async) {
 		// The download publishes when its tick completes; the page stays protected until the
 		// caller's next step finds its bytes downloaded and lifts it.
@@ -1008,6 +1256,13 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	}
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	{
+		// The new buffer holds the old one's GPU-written bytes once this tick has run: a fast
+		// readback of them (FastReadback) waits for it.
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		m_write_ticks.Assign(overlap.CpuAddress(), overlap.CpuAddress() + overlap.Size(),
+		                     m_scheduler.CurrentTick());
+	}
 	DeleteBuffer(overlap_id);
 }
 
@@ -1715,6 +1970,43 @@ void BufferCache::IssueReadahead() {
 	}
 }
 
+void BufferCache::WritesRecorded(bool address_writes, uint64_t shader) {
+	const auto current = m_scheduler.CurrentTick();
+	if (address_writes) {
+		m_address_write_tick = std::max(m_address_write_tick, current);
+		// Which shaders hold fast readbacks up this way (the first 16).
+		static std::unordered_set<uint64_t> logged;
+		if (logged.size() < 16 && logged.insert(shader).second) {
+			LOGF("Fast readback: shader %016" PRIx64 " stores through shader addresses: fast "
+			     "readbacks wait for each of its commands to finish\n",
+			     shader);
+		}
+	}
+	if (m_unrecorded_writes.empty()) {
+		return;
+	}
+	std::unique_lock lock(m_dirty_ranges_mutex);
+	for (const auto& write: m_unrecorded_writes) {
+		if (write.tick == current) {
+			continue;
+		}
+		// The scheduler submitted between the binding and its command: the command went into a
+		// later tick, this one at the latest. The write bitmap's regions wait for it too
+		// (RefineWithWriteBitmap takes their bits as final once their tick is done).
+		m_write_ticks.Assign(write.begin, write.end, current);
+		if (write.tracked) {
+			const auto first = Common::AlignDown(write.begin, WriteBitmapPage);
+			const auto last  = Common::AlignUp(write.end, WriteBitmapPage);
+			for (auto region = first >> WriteBitmapRegionBits;
+			     region <= (last - 1) >> WriteBitmapRegionBits; region++) {
+				auto& tick = m_bitmap_ticks[region];
+				tick       = std::max(tick, current);
+			}
+		}
+	}
+	m_unrecorded_writes.clear();
+}
+
 void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 	KYTY_PROFILER_BLOCK("Obtain::MarkWritten");
 	{
@@ -1753,6 +2045,11 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 			m_bitmap_tracked.Subtract(first, last - first);
 		}
 		m_gpu_modified_ranges.Add(vaddr, size);
+		// The tick the writing command goes into, unless the scheduler submits before it is
+		// recorded (WritesRecorded then moves it on).
+		const auto tick = m_scheduler.CurrentTick();
+		m_write_ticks.Assign(vaddr, vaddr + size, tick);
+		m_unrecorded_writes.push_back({vaddr, vaddr + size, tick, tracked});
 		ForgetFills(vaddr, size);
 	}
 	RecordGpuWriter(vaddr, size, s_diag_shader_hash, m_scheduler.CurrentTick());

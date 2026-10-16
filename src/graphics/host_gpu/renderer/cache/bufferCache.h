@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/cache/writeTicks.h"
 
 #include <atomic>
 #include <map>
@@ -26,6 +27,7 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 class CommandScheduler;
+class ReadbackQueue;
 class TextureCache;
 
 using BufferId = Common::SlotId;
@@ -114,6 +116,14 @@ public:
 	void FillMappedSpans(std::span<const std::pair<uint64_t, uint64_t>> spans, uint32_t value);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
+	// GPU thread, where every GPU write marked so far has its command in a command buffer: the end
+	// of a draw or a dispatch, the start of each PM4 packet, and before a fast readback. A write
+	// is marked when its binding is prepared, and the scheduler can submit before its command is
+	// recorded (a stream buffer that wraps): the ranges whose tick went by since take the current
+	// one (FastReadback copies a range once its tick is done). `address_writes`: the command (of
+	// `shader`) also stored through shader addresses, which mark no range; fast readbacks wait for
+	// its tick.
+	void WritesRecorded(bool address_writes = false, uint64_t shader = 0);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool              IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool              HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
@@ -252,6 +262,18 @@ private:
 	// One readback attempt on the GPU thread: 0 when done, else the tick to wait for.
 	[[nodiscard]] uint64_t ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
 	                                      bool from_gpu_thread, bool async);
+	// A game thread's read (ReadMemoryStep, GPU thread) of [window_begin, window_end): the
+	// GPU-written bytes of the window from ticks the GPU has finished are copied on the readback
+	// queue and waited for there, then put in guest memory, and the window's pages that hold no
+	// GPU-written bytes any more are lifted. Bytes of an unfinished tick, or that a download or an
+	// image write-back on its way also holds, stay for a later read. False when the faulting pages
+	// hold such bytes, a command storing through shader addresses is unfinished, or nothing could
+	// be copied (the old download then runs).
+	[[nodiscard]] bool FastReadback(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                uint64_t window_begin, uint64_t window_end, bool is_write);
+	// The pages of the readback window around vaddr that hold no GPU-written bytes, nor bytes
+	// still being downloaded, lose their GPU-written protection (a run of pages at a time).
+	void LiftCurrentPages(const Buffer& buffer, uint64_t vaddr);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	// `downloaded`, when given, is increased by the bytes copied.
 	template <bool async>
@@ -302,6 +324,23 @@ private:
 	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK), or readahead download;
 	// GPU thread only.
 	uint64_t                                           m_last_async_download_tick = 0;
+	// The tick of the last GPU write recorded to each range (MarkGpuWritten), under
+	// m_dirty_ranges_mutex; and the fast readback's queue (FastReadback).
+	WriteTicks                     m_write_ticks;
+	std::unique_ptr<ReadbackQueue> m_readback_queue;
+	// The writes marked since the last WritesRecorded(), with the tick they were marked in (GPU
+	// thread, under m_dirty_ranges_mutex); and the last tick a command that stores through shader
+	// addresses went into (GPU thread).
+	struct UnrecordedWrite {
+		uint64_t begin   = 0;
+		uint64_t end     = 0;
+		uint64_t tick    = 0;
+		bool     tracked = false; // through a write-bitmap binding (m_bitmap_ticks)
+	};
+	std::vector<UnrecordedWrite> m_unrecorded_writes;
+	uint64_t                     m_address_write_tick = 0;
+	// Set by a fast readback that let the access go on (GPU thread), for ReadMemory's counts.
+	bool m_fast_step = false;
 	// Readahead (ReadaheadEnabled), GPU thread only: the blocks learned in this generation and
 	// the one before, the GPU-written pieces of them waiting for the next flush, and what it did.
 	static constexpr uint64_t                          ReadaheadBlock      = 64 * 1024;

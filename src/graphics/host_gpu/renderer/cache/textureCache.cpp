@@ -2159,8 +2159,30 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		std::scoped_lock lock {m_lock};
 		auto& image         = m_slot_images[id];
 		image.info.metadata = desc.info.metadata;
-		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
-		m_surface_metas.erase(range.address);
+		// A depth target's HTile that starts here too keeps its entry: GT7 reuses memory within a
+		// frame, and the HTile of its in-car map's depth target is where an 833x800 dashboard
+		// target keeps its CMASK. Erasing the entry here, as before round 64, left that depth
+		// target's next HTile clear unseen once round 63b gave multisampled targets their CMASK:
+		// its depth kept old values and the map's track failed its depth test (only the cursor
+		// was drawn, 2026-10-16). A fill here now clears the depth target and still runs, so this
+		// target sees its bytes too (RenderExecutor::TryConsumeComputeMetaClear, IsColorMeta).
+		if (m_color_metas.size() >= 4096) {
+			m_color_metas.clear();
+		}
+		m_color_metas.insert(range.address);
+		if (const auto shared = m_surface_metas.find(range.address);
+		    shared != m_surface_metas.end() && shared->second.type == MetaDataInfo::Type::HTile) {
+			static std::unordered_set<uint64_t> logged;
+			if (logged.size() < 16 && logged.insert(range.address).second) {
+				LOGF("TextureCache: color target 0x%012" PRIx64
+				     " %ux%u (%u samples) keeps its %s at "
+				     "0x%012" PRIx64 ", where a depth target keeps its HTile: both are kept\n",
+				     desc.info.data.address, desc.info.extent.width, desc.info.extent.height,
+				     desc.info.samples,
+				     desc.info.metadata.kind == ImageMetadataKind::Dcc ? "DCC" : "CMASK",
+				     range.address);
+			}
+		}
 		if (range.size == 0 || desc.info.resources.levels != 1) {
 			return;
 		}
@@ -2222,6 +2244,13 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}();
 	if (gpu_written && !known_fill &&
 	    MaterializeColorClearOnGpu(id, desc, first, image_first, count, range.size / layers)) {
+		if (FrameGraph::Logging()) {
+			FrameGraph::Log("  color clear of 0x%012" PRIx64 " (%s 0x%012" PRIx64
+			                ", layers %u+%u, %u samples): checked on the GPU",
+			                desc.info.data.address,
+			                desc.info.metadata.kind == ImageMetadataKind::Dcc ? "DCC" : "CMASK",
+			                range.address, first, count, desc.info.samples);
+		}
 		return;
 	}
 	if (gpu_written && !known_fill) {
@@ -2271,6 +2300,11 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			}
 		}
 		found_clear = true;
+		if (FrameGraph::Logging()) {
+			FrameGraph::Log("  color clear of 0x%012" PRIx64 " layer %u (code 0x%02x, %s): cleared",
+			                desc.info.data.address, image_first + slice, code,
+			                known_fill ? "a known fill" : "its metadata bytes");
+		}
 		{
 			std::scoped_lock lock {m_lock};
 			ClearImage(m_scheduler.Current(), id, view.format,
@@ -3141,6 +3175,12 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		}
 	}
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, std::move(transfer));
+	{
+		// A GPU write to the buffer too: a fast readback of these bytes waits for this tick.
+		std::unique_lock dirty_lock(m_dirty_ranges_mutex);
+		m_write_ticks.Assign(image.info.data.address, image.info.data.address + copy_size,
+		                     m_scheduler.CurrentTick());
+	}
 	return true;
 }
 
@@ -3220,14 +3260,34 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 		landed_flag = std::make_shared<std::atomic<bool>>(false);
 		*landed     = landed_flag;
 	}
+	// Until it lands, a fast readback leaves the bytes under it (PendingWriteBacks).
+	auto pending = m_pending_writebacks;
+	{
+		std::lock_guard lock(pending->mutex);
+		pending->ranges.emplace_back(range.address, range.size);
+	}
 	m_scheduler.DeferPriorityOperation([download, dedicated, range, mapped, offset, guard,
-	                                    readback_guard, guest_hash, landed_flag] {
+	                                    readback_guard, guest_hash, landed_flag, pending] {
 		struct Landed {
 			const std::shared_ptr<std::atomic<bool>>& flag;
 			~Landed() {
 				if (flag != nullptr) flag->store(true, std::memory_order_release);
 			}
 		} landed_scope {landed_flag};
+		// Last (declared after the flag's scope): landed, dropped or not, it is no longer pending.
+		struct Pending {
+			const std::shared_ptr<PendingWriteBackList>& list;
+			std::pair<uint64_t, uint64_t>                entry;
+			~Pending() {
+				std::lock_guard lock(list->mutex);
+				auto&           ranges = list->ranges;
+				if (const auto found = std::find(ranges.begin(), ranges.end(), entry);
+				    found != ranges.end()) {
+					*found = ranges.back();
+					ranges.pop_back();
+				}
+			}
+		} pending_scope {pending, {range.address, range.size}};
 		download->Invalidate(offset, range.size);
 		uint64_t current = 0;
 		if (guard && (!HashGuestBacking(range.address, range.size, current) ||
@@ -4862,6 +4922,16 @@ bool TextureCache::IsMeta(uint64_t address) {
 	return found != m_surface_metas.end();
 }
 
+bool TextureCache::IsColorMeta(uint64_t address) {
+	std::scoped_lock lock {m_lock};
+	return m_color_metas.contains(address);
+}
+
+std::vector<std::pair<uint64_t, uint64_t>> TextureCache::PendingWriteBacks() const {
+	std::lock_guard lock(m_pending_writebacks->mutex);
+	return m_pending_writebacks->ranges;
+}
+
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
@@ -4909,6 +4979,8 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 			++metadata;
 		}
 	}
+	std::erase_if(m_color_metas,
+	              [&](uint64_t base) { return base >= address && base < address + size; });
 	auto images = FindImagesInRegion(address, size, false);
 	for (const auto id: images) {
 		auto owner = m_slot_images.try_get(id);

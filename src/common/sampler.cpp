@@ -86,6 +86,16 @@ std::vector<std::string> Patterns() {
 constexpr size_t MaxFrames      = 24;
 constexpr size_t StackCopyBytes = 16384;
 
+// The game's code (its modules and the instruction trampolines after them are mapped from
+// 0x8_0000_0000 up, below the emulator's own heaps): the samples there are reported with their
+// exact addresses, callers and code bytes ("Sample <thread> guest"), to be disassembled offline.
+constexpr uint64_t GuestCodeBegin = 0x8'0000'0000ull;
+constexpr uint64_t GuestCodeEnd   = 0x10'0000'0000ull;
+
+[[nodiscard]] bool IsGuestCode(uint64_t address) {
+	return address >= GuestCodeBegin && address < GuestCodeEnd;
+}
+
 struct Target {
 	uint32_t    tid = 0;
 	std::string name;
@@ -95,6 +105,9 @@ struct Target {
 	// Leaf addresses, and the emulator's addresses on the stack (once a sample), by samples.
 	std::unordered_map<uint64_t, uint32_t> self;
 	std::unordered_map<uint64_t, uint32_t> total;
+	// Samples whose leaf is in the game's code: by the leaf's 256-byte bucket, its callers (the
+	// return address of the frame-pointer chain's first frame).
+	std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint32_t>> guest_callers;
 };
 
 struct Image {
@@ -267,6 +280,9 @@ private:
 			target.in_image++;
 		}
 		target.self[frames[0]]++;
+		if (IsGuestCode(frames[0])) {
+			target.guest_callers[frames[0] & ~uint64_t {0xff}][count > 1 ? frames[1] : 0]++;
+		}
 		for (size_t i = 0; i < count; i++) {
 			// The emulator's own frames: the chain through the game's code is not reliable.
 			if (!m_image.Contains(frames[i]) ||
@@ -312,11 +328,93 @@ private:
 		return out;
 	}
 
+	// "48 8b 50 38 ..." for [address, address + size), or "?" where it cannot be read.
+	static std::string CodeBytes(uint64_t address, size_t size) {
+		std::array<uint8_t, 128> bytes {};
+		size        = std::min(size, bytes.size());
+		SIZE_T read = 0;
+		if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address),
+		                      bytes.data(), size, &read) == FALSE ||
+		    read != size) {
+			return "?";
+		}
+		std::string out;
+		for (size_t i = 0; i < size; i++) {
+			out += fmt::format("{}{:02x}", i == 0 ? "" : " ", bytes[i]);
+		}
+		return out;
+	}
+
+	// The game code a thread's samples fell in most: for each of the top buckets, its share, the
+	// exact addresses sampled most, the callers, and the code bytes around the hottest address and
+	// before the top caller's return address (its call).
+	void ReportGuest(const Target& target) {
+		if (target.guest_callers.empty()) {
+			return;
+		}
+		std::unordered_map<uint64_t, uint64_t> buckets;
+		for (const auto& [address, count]: target.self) {
+			if (IsGuestCode(address)) {
+				buckets[address & ~uint64_t {0xff}] += count;
+			}
+		}
+		std::vector<std::pair<uint64_t, uint64_t>> sorted(buckets.begin(), buckets.end());
+		std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.second > b.second; });
+		const auto share = [&](uint64_t count) {
+			return 100.0 * static_cast<double>(count) /
+			       static_cast<double>(std::max<uint64_t>(target.samples, 1));
+		};
+		for (size_t rank = 0; rank < std::min<size_t>(sorted.size(), 6); rank++) {
+			const auto [bucket, count] = sorted[rank];
+			if (share(count) < 1.0) {
+				break;
+			}
+			std::vector<std::pair<uint64_t, uint32_t>> exact;
+			for (const auto& [address, hits]: target.self) {
+				if ((address & ~uint64_t {0xff}) == bucket) {
+					exact.emplace_back(address, hits);
+				}
+			}
+			std::ranges::sort(exact,
+			                  [](const auto& a, const auto& b) { return a.second > b.second; });
+			std::string addresses;
+			for (size_t i = 0; i < std::min<size_t>(exact.size(), 4); i++) {
+				addresses += fmt::format("{}0x{:x} {:.1f}%", i == 0 ? "" : ", ", exact[i].first,
+				                         share(exact[i].second));
+			}
+			std::string callers;
+			uint64_t    top_caller = 0;
+			if (const auto it = target.guest_callers.find(bucket);
+			    it != target.guest_callers.end()) {
+				std::vector<std::pair<uint64_t, uint32_t>> by(it->second.begin(), it->second.end());
+				std::ranges::sort(by,
+				                  [](const auto& a, const auto& b) { return a.second > b.second; });
+				for (size_t i = 0; i < std::min<size_t>(by.size(), 3); i++) {
+					if (top_caller == 0 && by[i].first != 0) {
+						top_caller = by[i].first;
+					}
+					callers += fmt::format("{}{} {:.1f}%", i == 0 ? "" : ", ",
+					                       by[i].first == 0 ? std::string("(none)")
+					                                        : fmt::format("0x{:x}", by[i].first),
+					                       share(by[i].second));
+				}
+			}
+			const auto hottest = exact.empty() ? bucket : exact.front().first;
+			Log::WriteUnmuted(fmt::format(
+			    "Sample {} guest {}: {:.1f}% at 0x{:x}: {} | called from {} | code 0x{:x}: {} | "
+			    "call 0x{:x}: {}\n",
+			    target.name, rank + 1, share(count), bucket, addresses, callers, hottest - 32,
+			    CodeBytes(hottest - 32, 64), top_caller - 16,
+			    top_caller != 0 ? CodeBytes(top_caller - 16, 16) : std::string("?")));
+		}
+	}
+
 	void Report(double seconds) {
 		for (auto& target: m_targets) {
 			if (target->samples == 0) {
 				continue;
 			}
+			ReportGuest(*target);
 			Log::WriteUnmuted(fmt::format(
 			    "Sample {} (tid {}): {} samples in {:.0f} s, {:.0f}% in the emulator's code | "
 			    "self:{}\n",
@@ -330,6 +428,7 @@ private:
 			target->in_image = 0;
 			target->self.clear();
 			target->total.clear();
+			target->guest_callers.clear();
 		}
 		// The names stay: most addresses come back in the next report.
 		if (m_names.size() > 400'000) {

@@ -1436,14 +1436,21 @@ static void LogFrameGraphDraw(RenderContext& context, const CommandBuffer& buffe
 	if (state.depth_info.image_id) {
 		const auto& depth = state.depth_info;
 		const auto& info  = depth.desc.info;
+		// Its HTile, and whether a fill there left a clear for this draw to apply (round 64).
+		const bool htile = info.metadata.kind == ImageMetadataKind::Htile;
 		FrameGraph::Log(
 		    "  depth: 0x%012" PRIx64 "+0x%" PRIx64
-		    " %ux%u fmt %d samples %u test %d write %d op %d bounds %d stencil %d clear %d",
+		    " %ux%u fmt %d samples %u test %d write %d op %d bounds %d stencil %d clear %d"
+		    " htile 0x%012" PRIx64 " htile-clear %d",
 		    info.data.address, info.data.size, info.extent.width, info.extent.height,
 		    static_cast<int>(info.pixel_format), info.samples, depth.depth_test_enable ? 1 : 0,
 		    depth.depth_write_enable ? 1 : 0, static_cast<int>(depth.depth_compare_op),
 		    depth.depth_bounds_test_enable ? 1 : 0, depth.stencil_test_enable ? 1 : 0,
-		    depth.depth_clear_enable ? 1 : 0);
+		    depth.depth_clear_enable ? 1 : 0, htile ? info.metadata.range.address : 0,
+		    htile && textures.IsMetaCleared(info.metadata.range.address,
+		                                    depth.desc.view_info.base_layer)
+		        ? 1
+		        : 0);
 	}
 	const auto& shaders = buffer.GetShaders();
 	const auto  note    = [](const char* stage, uint64_t address) {
@@ -1930,6 +1937,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}
+	// The draw's writes are in this command buffer now, before a periodic flush submits it.
+	bool     address_writes = false;
+	uint64_t address_writer = 0;
+	for (const auto& stage: vertex_stages) {
+		if (!address_writes && stage.stage.program->has_address_writes) {
+			address_writes = true;
+			address_writer = stage.stage.program->shader_hash;
+		}
+	}
+	if (!address_writes && state.ps_active &&
+	    state.ps_input_info.stage.program->has_address_writes) {
+		address_writes = true;
+		address_writer = state.ps_input_info.stage.program->shader_hash;
+	}
+	m_context.GetBufferCache().WritesRecorded(address_writes, address_writer);
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
 }

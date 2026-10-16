@@ -84,6 +84,11 @@ struct Counters {
 	// Readahead downloads (BufferCache, KYTY_READAHEAD).
 	std::atomic<uint64_t> readaheads {0};
 	std::atomic<uint64_t> readahead_bytes {0};
+	// Reads copied on the readback queue (BufferCache::FastReadback).
+	std::atomic<uint64_t> fast_readbacks {0};
+	std::atomic<uint64_t> fast_readback_bytes {0};
+	std::atomic<uint64_t> fast_readback_wait_ns {0};
+	std::atomic<uint64_t> longest_fast_readback_ns {0};
 
 	// The host GPU's queue: submission to completion.
 	std::atomic<uint64_t> ticks_done {0};
@@ -288,6 +293,10 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 		const auto unsupported = take(c.unsupported_stores);
 		const auto aheads      = take(c.readaheads);
 		const auto ahead_bytes = take(c.readahead_bytes);
+		const auto fasts       = take(c.fast_readbacks);
+		const auto fast_bytes  = take(c.fast_readback_bytes);
+		const auto fast_wait   = take(c.fast_readback_wait_ns);
+		const auto fast_max    = take(c.longest_fast_readback_ns);
 		const auto stalls      = take(c.stalls);
 		const auto stall_max   = take(c.longest_stall_ns);
 		const auto acquire_max = take(c.longest_host_ns[static_cast<size_t>(Host::Acquire)]);
@@ -308,7 +317,8 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 		    "{:.2f} ms later (longest {:.1f}), {:.1f} steps, {:.1f} command buffers unfinished | "
 		    "stores to GPU-written pages done in place {:.0f}/s ({:.0f} us each), declined "
 		    "{:.0f}/s, "
-		    "not handled {:.0f}/s | readahead {:.0f}/s ({:.1f} MB/s) | stalls {} (longest {:.0f} "
+		    "not handled {:.0f}/s | readahead {:.0f}/s ({:.1f} MB/s) | fast readbacks {:.0f}/s "
+		    "({:.1f} MB/s, {:.0f} us each, longest {:.0f}) | stalls {} (longest {:.0f} "
 		    "ms) | longest swapchain acquire "
 		    "{:.1f} ms, present {:.1f} ms, queue lock wait {:.1f} ms{}\n",
 		    configuration, static_cast<double>(submitted) / seconds, per(latency, done, 1e6),
@@ -318,9 +328,11 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 		    per(behind, readbacks, 1.0), static_cast<double>(stores) / seconds,
 		    per(store_ns, stores, 1e3), static_cast<double>(declined) / seconds,
 		    static_cast<double>(unsupported) / seconds, static_cast<double>(aheads) / seconds,
-		    static_cast<double>(ahead_bytes) / 1e6 / seconds, stalls,
-		    static_cast<double>(stall_max) / 1e6, static_cast<double>(acquire_max) / 1e6,
-		    static_cast<double>(present_max) / 1e6, static_cast<double>(lock_max) / 1e6, extra));
+		    static_cast<double>(ahead_bytes) / 1e6 / seconds, static_cast<double>(fasts) / seconds,
+		    static_cast<double>(fast_bytes) / 1e6 / seconds, per(fast_wait, fasts, 1e3),
+		    static_cast<double>(fast_max) / 1e3, stalls, static_cast<double>(stall_max) / 1e6,
+		    static_cast<double>(acquire_max) / 1e6, static_cast<double>(present_max) / 1e6,
+		    static_cast<double>(lock_max) / 1e6, extra));
 	}
 
 	// The busiest threads, and those that spent longest in faults.
@@ -510,6 +522,13 @@ void AddReadaheadSlow(uint64_t bytes) {
 	g_counters.readahead_bytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
+void AddFastReadbackSlow(uint64_t wait_ns, uint64_t bytes) {
+	g_counters.fast_readbacks.fetch_add(1, std::memory_order_relaxed);
+	g_counters.fast_readback_bytes.fetch_add(bytes, std::memory_order_relaxed);
+	g_counters.fast_readback_wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+	StoreMax(g_counters.longest_fast_readback_ns, wait_ns);
+}
+
 } // namespace Detail
 
 void SetExtraReporter(ExtraReporter reporter) {
@@ -556,6 +575,11 @@ void NameThread(const char* name) {
 void SetConfiguration(std::string_view name) {
 	std::scoped_lock lock(g_configuration_mutex);
 	g_configuration = std::string(name);
+}
+
+std::string Configuration() {
+	std::scoped_lock lock(g_configuration_mutex);
+	return g_configuration;
 }
 
 void Start() {

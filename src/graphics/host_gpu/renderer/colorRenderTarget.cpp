@@ -8,6 +8,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -25,14 +26,14 @@
 
 namespace Libs::Graphics {
 
-// KYTY_MSAA_CMASK_CLEARS=0: a multisampled target's CMASK fast clears are left out, as before
-// round 63 (its image then keeps what earlier frames drew into it).
+// KYTY_MSAA_CMASK_CLEARS=0, or KYTY_BISECT's cmask:off: a multisampled target's CMASK fast clears
+// are left out, as before round 63 (its image then keeps what earlier frames drew into it).
 static bool MsaaCmaskClears() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_MSAA_CMASK_CLEARS");
 		return value == nullptr || value[0] != '0';
 	}();
-	return enabled;
+	return enabled && !Bisect::MsaaCmaskOff();
 }
 
 static bool DccAlphaOnMsb(const HW::ColorInfo& info) {

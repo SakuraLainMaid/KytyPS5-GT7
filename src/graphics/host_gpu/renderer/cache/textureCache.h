@@ -18,6 +18,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -83,6 +84,14 @@ public:
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
+	// Whether a color target's CMASK or DCC starts at this address (MaterializeColorClear notes
+	// them): a fill there that is also a depth target's HTile clear must still run.
+	[[nodiscard]] bool IsColorMeta(uint64_t address);
+	// Any thread: the ranges image write-backs to guest memory still have to land in
+	// (DownloadImageMemory), as (address, size), a copy. A fast readback leaves the bytes under
+	// them (BufferCache::FastReadback): such a write-back, on the priority thread, would put older
+	// bytes over its own.
+	[[nodiscard]] std::vector<std::pair<uint64_t, uint64_t>> PendingWriteBacks() const;
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	// Whether the GPU's writes to an image like this go back to guest memory after each
@@ -377,6 +386,16 @@ private:
 	std::unordered_set<ImageId>                       m_download_images;
 	std::unordered_set<ImageId>                       m_bindless_evictable;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	// The addresses color targets' CMASK and DCC start at (IsColorMeta).
+	std::unordered_set<uint64_t> m_color_metas;
+	// Image write-backs still to land, one entry each (PendingWriteBacks); shared with their
+	// publications on the priority thread, which remove their own.
+	struct PendingWriteBackList {
+		mutable std::mutex                         mutex;
+		std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	};
+	std::shared_ptr<PendingWriteBackList> m_pending_writebacks =
+	    std::make_shared<PendingWriteBackList>();
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

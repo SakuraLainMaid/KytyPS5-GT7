@@ -918,6 +918,34 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			report += "\n";
 		}
+		// The callers, through the frame-pointer chain (the game's code keeps rbp frames): each
+		// return address with the 32 code bytes before it, its call, to disassemble offline.
+		{
+			std::string frames;
+			uint64_t    rbp = info->rbp;
+			for (int depth = 0; depth < 12 && (rbp & 7u) == 0 && IsReadableRange(rbp, 16);
+			     depth++) {
+				const auto* frame = reinterpret_cast<const uint64_t*>(rbp);
+				const auto  next  = frame[0];
+				const auto  ret   = frame[1];
+				if (ret < 32 || !IsReadableRange(ret - 32, 32)) {
+					break;
+				}
+				const auto* code = reinterpret_cast<const uint8_t*>(ret - 32);
+				frames += fmt::format("\n {:016x} <-", ret);
+				for (int i = 0; i < 32; i++) {
+					frames += fmt::format(" {:02x}", code[i]);
+				}
+				if (next <= rbp) {
+					break;
+				}
+				rbp = next;
+			}
+			if (!frames.empty()) {
+				report +=
+				    "frames (each return address <- the 32 code bytes before it):" + frames + "\n";
+			}
+		}
 		std::fputs(report.c_str(), stdout);
 		LOGF("%s", report.c_str());
 		std::fflush(stdout);
