@@ -341,6 +341,19 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
+void RenderContext::PrepareGpuThreadWrite(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || !GuestRange {vaddr, size}.Valid() || Bisect::GpuWritesFault()) {
+		return;
+	}
+	for (uint64_t page = vaddr & ~(TRACKER_PAGE_SIZE - 1); page < vaddr + size;
+	     page += TRACKER_PAGE_SIZE) {
+		if (m_page_manager.IsWriteWatched(page)) {
+			(void)InvalidateMemory(vaddr, size);
+			return;
+		}
+	}
+}
+
 bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return false;

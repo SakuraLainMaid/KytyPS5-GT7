@@ -81,6 +81,13 @@
 //   texmemo:off  every texture binding is looked up in the texture cache again, as before round
 //                67, instead of reusing one the same command buffer resolved for the same
 //                descriptor (KYTY_TEXTURE_MEMO=0 for the whole run)
+// and (round 68):
+//   rebind2      a dispatch makes its image and buffer bindings twice, as before round 68
+//   drawprep:off the draw-prep scanner prepares nothing and the GPU thread walks every draw's and
+//                dispatch's descriptors itself (KYTY_DRAW_PREP=0 for the whole run)
+//   gpuwrites:fault the GPU thread's own stores to guest memory (labels, WRITE_DATA) fault on
+//                pages protected for tracking, as before round 68, instead of lifting the
+//                protection first
 namespace Libs::Graphics::Bisect {
 
 // The GPU thread, at its start: applies the start step's CPU set and log setting.
@@ -128,6 +135,10 @@ void                      ApplyPending();
 // Any thread: popwait; texmemo:off.
 [[nodiscard]] bool PopWait();
 [[nodiscard]] bool TextureMemoOff();
+// Any thread: rebind2; drawprep:off; gpuwrites:fault.
+[[nodiscard]] bool RebindTwice();
+[[nodiscard]] bool DrawPrepOff();
+[[nodiscard]] bool GpuWritesFault();
 
 } // namespace Libs::Graphics::Bisect
 

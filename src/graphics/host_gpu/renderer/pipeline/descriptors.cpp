@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/bisect.h"
@@ -35,20 +36,20 @@
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 
-#include <unordered_map>
-#include <unordered_set>
-#include <mutex>
-#include <set>
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
-#include <bit>
 #include <fmt/format.h>
 #include <limits>
+#include <mutex>
+#include <set>
 #include <span>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <xxhash.h>
 
@@ -3046,13 +3047,18 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			PrefaultDmaPointers(m_context.GetBufferCache(), *stage->runtime);
 		}
 	}
-	for (auto* stage: stages) {
-		FindBuffers(*stage);
-		uses_dma |= stage->runtime->program->info.uses_dma;
+	{
+		const GpuPhases::Scope phase(GpuPhases::Phase::DrawFind);
+		for (auto* stage: stages) {
+			FindBuffers(*stage);
+			uses_dma |= stage->runtime->program->info.uses_dma;
+		}
 	}
 	if (uses_dma) {
+		const GpuPhases::Scope phase(GpuPhases::Phase::DrawBda);
 		m_context.PrepareBda();
 	}
+	GpuPhases::Scope images_phase(GpuPhases::Phase::DrawImages);
 	for (auto* stage: stages) {
 		RebindImages(*stage);
 	}
@@ -3074,8 +3080,10 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			BindRenderTarget(target.image_id);
 		}
 	}
+	images_phase.End();
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
+	const GpuPhases::Scope buffers_phase(GpuPhases::Phase::DrawBuffers);
 	for (auto* stage: stages) {
 		RebindBuffers(*stage);
 	}

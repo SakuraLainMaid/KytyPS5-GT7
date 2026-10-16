@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/virtualMemory.h"
+#include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
 
@@ -191,6 +192,7 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
+		const GpuPhases::Scope phase(GpuPhases::Phase::Protect);
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));
@@ -297,6 +299,16 @@ bool PageManager::IsReadWatched(uint64_t vaddr) const noexcept {
 	}
 	const auto index = static_cast<size_t>((vaddr % REGION_SIZE) / PAGE_SIZE);
 	return region->pages[index].access_watchers != 0;
+}
+
+bool PageManager::IsWriteWatched(uint64_t vaddr) const noexcept {
+	const auto* region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		return false;
+	}
+	const auto  index = static_cast<size_t>((vaddr % REGION_SIZE) / PAGE_SIZE);
+	const auto& page  = region->pages[index];
+	return page.write_watchers != 0 || page.access_watchers != 0;
 }
 
 void PageManager::ResyncHostProtection(uint64_t vaddr, uint64_t size) {

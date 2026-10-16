@@ -7,37 +7,38 @@
 #include "common/profiler.h"
 #include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/cache/readbackQueue.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/stallWatch.h"
 #include "graphics/host_gpu/timeline.h"
-#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/host_gpu/vulkanCommon.h"
-#include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
-#include <fmt/format.h>
 #include <atomic>
 #include <bit>
 #include <chrono>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
+#include <map>
 #include <memory>
 #include <mutex>
-#include <map>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -1431,6 +1432,7 @@ void RecordSync(uint64_t size, bool is_written, bool uploaded, double walk_s) {
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
 	KYTY_PROFILER_FUNCTION();
+	const GpuPhases::Scope phase(GpuPhases::Phase::BufferSync);
 	// Timing every call cost ~2 % of the GPU thread (two performance-counter reads); SyncStats
 	// times the tracker walk only with KYTY_SYNC_STATS=1.
 	static const bool timed = std::getenv("KYTY_SYNC_STATS") != nullptr;

@@ -13,22 +13,23 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
-#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
-#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -47,6 +48,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -56,8 +58,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-
-#include <fmt/format.h>
 
 namespace Libs::Graphics {
 
@@ -1153,6 +1153,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
+	const GpuPhases::Scope phase(GpuPhases::Phase::DrawPrograms);
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
 	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
@@ -1331,19 +1332,22 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
 	}
-	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-		if ((mrt_mask & (1u << slot)) != 0) {
-			ResolveRenderColorTarget(buffer, state.color_info[state.color_count],
-			                         render_target_slice_offset, slot);
-			if (state.color_info[state.color_count].image_id) {
-				state.color_count++;
+	{
+		const GpuPhases::Scope phase(GpuPhases::Phase::DrawTargets);
+		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			if ((mrt_mask & (1u << slot)) != 0) {
+				ResolveRenderColorTarget(buffer, state.color_info[state.color_count],
+				                         render_target_slice_offset, slot);
+				if (state.color_info[state.color_count].image_id) {
+					state.color_count++;
+				}
 			}
 		}
+		if (draw.IsIndexed()) {
+			LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
+		}
+		ResolveRenderDepthTarget(buffer, state.depth_info);
 	}
-	if (draw.IsIndexed()) {
-		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
-	}
-	ResolveRenderDepthTarget(buffer, state.depth_info);
 
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
@@ -1691,20 +1695,24 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
-	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
-		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
-		descriptor_stages[stage_count++] = &bindings.vertex[i];
-	}
-	if (state.ps_active) {
-		if (!bindings.pixel) bindings.pixel.emplace();
-		PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
-		descriptor_stages[stage_count++] = &*bindings.pixel;
+	{
+		const GpuPhases::Scope phase(GpuPhases::Phase::DrawTextures);
+		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+			PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
+			descriptor_stages[stage_count++] = &bindings.vertex[i];
+		}
+		if (state.ps_active) {
+			if (!bindings.pixel) bindings.pixel.emplace();
+			PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
+			descriptor_stages[stage_count++] = &*bindings.pixel;
+		}
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
+		const GpuPhases::Scope phase(GpuPhases::Phase::DrawVertex);
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
@@ -1727,11 +1735,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		may_defer = may_defer && !writes_memory(stage.stage);
 	}
 	// Glyphs and cached layers: drawn once into small targets (SmallColorTargetDraw).
-	may_defer               = may_defer && !SmallColorTargetDraw(buffer.GetRegisters());
-	auto* deferred_pipeline = m_context.GetPipelineCache().TryGetGraphicsPipeline(
-	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
-	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs, may_defer);
+	may_defer = may_defer && !SmallColorTargetDraw(buffer.GetRegisters());
+	PipelineCache::Pipeline* deferred_pipeline = nullptr;
+	{
+		const GpuPhases::Scope phase(GpuPhases::Phase::DrawPipeline);
+		deferred_pipeline = m_context.GetPipelineCache().TryGetGraphicsPipeline(
+		    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages,
+		    buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
+		    primitive_restart_enable, state.programs, may_defer);
+	}
 	if (deferred_pipeline == nullptr) {
 		if (FrameGraph::Logging()) {
 			FrameGraph::Log("  skipped: its pipeline is still compiling");
@@ -1740,9 +1752,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	auto& pipeline = *deferred_pipeline;
 	vk::ImageAspectFlags feedback_aspects;
+	GpuPhases::Scope     rendering_phase(GpuPhases::Phase::DrawRendering);
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
+	rendering_phase.End();
 	if (FrameGraph::Logging() && state.depth_info.image_id) {
 		// What the depth attachment's rendering starts with (an HTile clear among them).
 		const auto& ds = rendering.depth_stencil_attachment;
@@ -1758,7 +1772,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory. Recorded through the recording thread when it runs.
-	const auto vk_buffer = buffer.Recorder();
+	GpuPhases::Scope emit_phase(GpuPhases::Phase::DrawEmit);
+	const auto       vk_buffer = buffer.Recorder();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	buffer.AnnotateDiagnosticCheckpoint(
 	    vertex_stages.front().stage.program->shader_hash,
@@ -1817,7 +1832,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	emit_phase.End();
+	{
+		const GpuPhases::Scope phase(GpuPhases::Phase::DrawCommit);
+		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	}
+	emit_phase.Restart();
 	if (mesh_active) {
 		// GPU arguments: dword 3 = 0xFFFFFFFF tells the fast-launch entry to read the start vertex
 		// at dwords 4-5's address + 8 (the shader's other draw dwords are unused then).
@@ -2120,6 +2140,7 @@ const char* RenderExecutor::ConsumeDrawAsOperation(CommandBuffer& buffer,
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& guest_args) {
 	KYTY_PROFILER_FUNCTION();
+	const GpuPhases::Scope draw_phase(GpuPhases::Phase::Draw);
 	DrawIndexArgs args = guest_args;
 	if (args.gpu_args_address != 0 &&
 	    !GpuIndexedArgsSupported(buffer, args.index_type_and_size)) {
@@ -2128,7 +2149,10 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
-	m_context.GetCommandScheduler().PopPendingOperations(false);
+	{
+		const GpuPhases::Scope phase(GpuPhases::Phase::DrawPending);
+		m_context.GetCommandScheduler().PopPendingOperations(false);
+	}
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -2148,6 +2172,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		FrameGraph::Log("draw %s count=%u instances=%u", "DrawIndex", args.index_count,
 		                args.instance_count);
 	}
+	GpuPhases::Scope consume_phase(GpuPhases::Phase::DrawConsume);
 	if (const char* consumed = ConsumeDrawAsOperation(buffer, args.render_target_slice_offset)) {
 		if (FrameGraph::Logging()) {
 			FrameGraph::Log("  consumed as %s", consumed);
@@ -2155,6 +2180,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return;
 	}
+	consume_phase.End();
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
 		if (FrameGraph::Logging()) {
@@ -2269,10 +2295,14 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	const GpuPhases::Scope draw_phase(GpuPhases::Phase::Draw);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
-	m_context.GetCommandScheduler().PopPendingOperations(false);
+	{
+		const GpuPhases::Scope phase(GpuPhases::Phase::DrawPending);
+		m_context.GetCommandScheduler().PopPendingOperations(false);
+	}
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -2294,6 +2324,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		FrameGraph::Log("draw %s count=%u instances=%u", "DrawIndexAuto", args.vertex_count,
 		                args.instance_count);
 	}
+	GpuPhases::Scope consume_phase(GpuPhases::Phase::DrawConsume);
 	if (const char* consumed = ConsumeDrawAsOperation(buffer, args.render_target_slice_offset)) {
 		if (FrameGraph::Logging()) {
 			FrameGraph::Log("  consumed as %s", consumed);
@@ -2301,6 +2332,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		ResetBindings();
 		return;
 	}
+	consume_phase.End();
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
 		if (FrameGraph::Logging()) {

@@ -63,6 +63,10 @@ public:
 	[[nodiscard]] bool TryWriteFaulting(uint64_t pc, uint64_t fault_vaddr, uint64_t vaddr,
 	                                    const void* data, uint64_t size) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// GPU thread, before it stores to guest memory itself (a label, WRITE_DATA): a page protected
+	// for tracking gets what its write fault would have done (InvalidateMemory), so the store
+	// does not fault. A fault on the GPU thread cost an exception dispatch each (round 68).
+	void               PrepareGpuThreadWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);

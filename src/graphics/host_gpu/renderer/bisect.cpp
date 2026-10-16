@@ -47,6 +47,9 @@ struct Step {
 	bool              faultblock_off = false;
 	bool              pop_wait       = false;
 	bool              texmemo_off    = false;
+	bool              rebind_twice    = false;
+	bool              drawprep_off    = false;
+	bool              gpuwrites_fault = false;
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
 	uint32_t          gpu_frames  = 0;    // gputime:<n>
@@ -162,6 +165,18 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "texmemo:off") {
 		step.texmemo_off = true;
+		return true;
+	}
+	if (action == "rebind2") {
+		step.rebind_twice = true;
+		return true;
+	}
+	if (action == "drawprep:off") {
+		step.drawprep_off = true;
+		return true;
+	}
+	if (action == "gpuwrites:fault") {
+		step.gpuwrites_fault = true;
 		return true;
 	}
 	if (action.starts_with("tess:max:")) {
@@ -555,6 +570,21 @@ bool PopWait() {
 bool TextureMemoOff() {
 	const auto* step = Current();
 	return step != nullptr && step->texmemo_off;
+}
+
+bool RebindTwice() {
+	const auto* step = Current();
+	return step != nullptr && step->rebind_twice;
+}
+
+bool DrawPrepOff() {
+	const auto* step = Current();
+	return step != nullptr && step->drawprep_off;
+}
+
+bool GpuWritesFault() {
+	const auto* step = Current();
+	return step != nullptr && step->gpuwrites_fault;
 }
 
 bool WholeUnnormalizedViews() {

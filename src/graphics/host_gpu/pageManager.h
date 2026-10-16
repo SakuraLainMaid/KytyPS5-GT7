@@ -28,6 +28,9 @@ public:
 	// Whether the page holding vaddr is read-protected for tracking. Unlocked: a hint that can
 	// be stale by the time the caller acts on it.
 	[[nodiscard]] bool IsReadWatched(uint64_t vaddr) const noexcept;
+	// Whether a write to the page holding vaddr faults for tracking (it is write- or
+	// read-protected). Unlocked: a hint as IsReadWatched.
+	[[nodiscard]] bool IsWriteWatched(uint64_t vaddr) const noexcept;
 
 	// The host protection of [vaddr, vaddr + size) was replaced behind the tracker (a view mapped
 	// again with its own access by a partial unmap, a guest mprotect that allows writes): the

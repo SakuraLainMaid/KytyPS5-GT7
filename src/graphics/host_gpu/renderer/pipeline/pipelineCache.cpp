@@ -10,7 +10,9 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -32,22 +34,22 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
-#include <deque>
-#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fmt/format.h>
 #include <limits>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <span>
-#include <string>
 #include <spirv-tools/libspirv.hpp>
 #include <spirv/unified1/spirv.hpp>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <unordered_set>
@@ -1188,8 +1190,17 @@ struct PipelineCache::ProgramCache {
 			PipelineKeyHash::Mix(hash, key.code_size);
 			PipelineKeyHash::Mix(hash, key.static_state.size());
 			PipelineKeyHash::Mix(hash, key.function_code.size());
-			// Bucket same-shape static variants by source. ProgramKey equality performs the one
-			// exact state comparison needed on a stable hit without hashing the full state first.
+			// The static state and expanded code too (round 68): with only the source's shape,
+			// every static variant of a shader (its vertex layouts, render target formats, ...)
+			// went into one bucket, and each draw's lookup compared its key with them in turn.
+			PipelineKeyHash::Mix(
+			    hash, static_cast<std::size_t>(XXH3_64bits(
+			              key.static_state.data(), key.static_state.size() * sizeof(uint32_t))));
+			if (!key.function_code.empty()) {
+				PipelineKeyHash::Mix(hash, static_cast<std::size_t>(XXH3_64bits(
+				                               key.function_code.data(),
+				                               key.function_code.size() * sizeof(uint32_t))));
+			}
 			return hash;
 		}
 	};
@@ -1416,6 +1427,7 @@ struct PipelineCache::ProgramCache {
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
+		const GpuPhases::Scope get_phase(GpuPhases::Phase::ProgramGet);
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -1433,6 +1445,7 @@ struct PipelineCache::ProgramCache {
 			return ShaderProgram {};
 		}
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
+		GpuPhases::Scope key_phase(GpuPhases::Phase::ProgramKey);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = params.user_data_count;
@@ -1451,6 +1464,7 @@ struct PipelineCache::ProgramCache {
 		}
 		KYTY_PROFILER_BLOCK("ProgramCache::Get");
 		auto                                         entry = programs.find(lookup_key);
+		key_phase.End();
 		// Scoped to this call only: see GuestPageReadCache.
 		GuestPageReadCache                           clean_read_cache;
 		ShaderRecompiler::IR::SrtRuntime             runtime {
@@ -1496,12 +1510,15 @@ struct PipelineCache::ProgramCache {
 					if (verify) {
 						VerifyPrepared(entry->second, runtime, stage, params.hash);
 					}
-				} else if (DrawPrep::Enabled() &&
-				           TakeScanned(entry->second, stage, runtime, params.hash)) {
+				} else if (DrawPrep::Enabled() && !Bisect::DrawPrepOff() && [&] {
+					           const GpuPhases::Scope phase(GpuPhases::Phase::ProgramScanned);
+					           return TakeScanned(entry->second, stage, runtime, params.hash);
+				           }()) {
 					// Prepared by the draw-prep scanner from the same inputs and bytes.
 					materialized = true;
 				} else {
-					std::lock_guard walk_lock(entry->second.walk_mutex);
+					const GpuPhases::Scope phase(GpuPhases::Phase::ProgramWalk);
+					std::lock_guard        walk_lock(entry->second.walk_mutex);
 					entry->second.prepared_serial = 0;
 					materialized = ShaderRecompiler::IR::MaterializeResources(
 					    entry->second.resource_plan, runtime, entry->second.resources,
@@ -2760,11 +2777,13 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
 	std::array<ShaderParams, 3> vertex_params;
 	ShaderParams                pixel_params;
+	GpuPhases::Scope            describe_phase(GpuPhases::Phase::Describe);
 	if (!DescribeGraphicsStages(vertex_regs, pixel_regs, sh, context, user_config,
 	                            target_export_mapping, pixel_active, vertex_info, pixel_info,
 	                            vertex_params, pixel_params)) {
 		return {};
 	}
+	describe_phase.End();
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	uint32_t          push_data_cursor =

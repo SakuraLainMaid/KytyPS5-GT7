@@ -494,6 +494,12 @@ list(REMOVE_DUPLICATES kyty_emulator_src)
 
 if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
+	# Release: line tables in the PDB, so every function has its name and source lines there (the
+	# sampler's reports, host stacks). Without them only the public symbols were there, and the
+	# time of a static or inlined function went to the public one before it. The code is the same.
+	set_property(SOURCE ${kyty_emulator_src} APPEND PROPERTY COMPILE_OPTIONS
+	             "$<$<CONFIG:Release>:-gline-tables-only>")
+	target_compile_options(common PRIVATE "$<$<CONFIG:Release>:-gline-tables-only>")
 endif()
 
 set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus)

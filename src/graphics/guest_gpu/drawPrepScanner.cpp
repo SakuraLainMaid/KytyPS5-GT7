@@ -1,17 +1,18 @@
 #include "graphics/guest_gpu/drawPrepScanner.h"
 
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
-#include "common/logging/log.h"
 #include "libs/agc.h"
 
 #include <algorithm>
@@ -224,6 +225,10 @@ bool DrawPrepScanner::ApplyRegisterIndirect(uint32_t header, const uint32_t* bod
 }
 
 void DrawPrepScanner::ScanDraw(uint64_t seq, uint32_t ordinal, const uint32_t* packet) {
+	// KYTY_BISECT's drawprep:off: the GPU thread walks every draw itself.
+	if (Bisect::DrawPrepOff()) {
+		return;
+	}
 	if (m_state->tainted) {
 		DrawPrep::Add(DrawPrep::Counter::Tainted);
 		return;
@@ -255,6 +260,9 @@ void DrawPrepScanner::ScanDraw(uint64_t seq, uint32_t ordinal, const uint32_t* p
 // A dispatch: the compute inputs RenderExecutor::DispatchDirect / DispatchIndirect build.
 void DrawPrepScanner::ScanDispatch(uint64_t seq, uint32_t ordinal, const uint32_t* packet,
                                    uint32_t opcode) {
+	if (Bisect::DrawPrepOff()) {
+		return;
+	}
 	if (m_state->tainted) {
 		DrawPrep::Add(DrawPrep::Counter::Tainted);
 		return;

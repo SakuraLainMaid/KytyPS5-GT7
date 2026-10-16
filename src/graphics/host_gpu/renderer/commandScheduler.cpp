@@ -7,6 +7,7 @@
 #include "common/profiler.h"
 #include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
@@ -270,6 +271,11 @@ void CommandScheduler::CompleteDraw() {
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
+	// Not again for a flush the before-flush hook makes.
+	GpuPhases::Scope phase(GpuPhases::Phase::Flush);
+	if (m_in_before_flush) {
+		phase.Cancel();
+	}
 	if (m_before_flush != nullptr && !m_in_before_flush && Active() && !m_command.IsInvalid()) {
 		// What it records can flush (a download ring that wraps): that flush skips the hook.
 		m_in_before_flush = true;

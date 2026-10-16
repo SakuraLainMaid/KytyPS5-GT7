@@ -714,9 +714,9 @@ private:
 			    "Sample {} (tid {}): {} samples in {:.0f} s, {:.0f}% in the emulator's code | "
 			    "self:{}\n",
 			    target->name, target->tid, target->samples, seconds,
-			    Share(target->in_image, target->samples), Top(target->self, target->samples)));
+			    Share(target->in_image, target->samples), Top(target->self, target->samples, 50)));
 			Log::WriteUnmuted(fmt::format("Sample {} (tid {}) total:{}\n", target->name,
-			                              target->tid, Top(target->total, target->samples, 40)));
+			                              target->tid, Top(target->total, target->samples, 70)));
 			Log::WriteUnmuted(fmt::format(
 			    "Sample {} (tid {}) depth: {:.1f} frames a sample, {:.0f}% walked 4 or more\n",
 			    target->name, target->tid,
@@ -728,9 +728,9 @@ private:
 			                              target->name, target->tid,
 			                              Share(waited, target->samples), waits));
 			Log::WriteUnmuted(fmt::format("Sample {} (tid {}) paths:{}\n", target->name,
-			                              target->tid, TopPaths(*target, 24)));
+			                              target->tid, TopPaths(*target, 40)));
 			Log::WriteUnmuted(fmt::format("Sample {} (tid {}) lines:{}\n", target->name,
-			                              target->tid, TopLines(*target, 14, 4)));
+			                              target->tid, TopLines(*target, 24, 6)));
 			target->samples  = 0;
 			target->in_image = 0;
 			target->frames   = 0;

@@ -11,11 +11,12 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/drawPrepScanner.h"
-#include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -273,6 +274,7 @@ void GuestGpu::DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size) 
 		(void)TrySendCommand([this, address, value, size, sequence] {
 			Timeline::Mark("label", address, value);
 			if (!m_renderer.GetBufferCache().WriteClean(address, &value, size)) {
+				m_renderer.PrepareGpuThreadWrite(address, size);
 				std::memcpy(reinterpret_cast<void*>(address), &value, size);
 			}
 			const auto pending = m_pending_labels.find(address);
@@ -581,6 +583,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		if (cache.WriteClean(reinterpret_cast<uint64_t>(dst), &src[dw_num - 1], sizeof(uint32_t))) {
 			return;
 		}
+		m_renderer.PrepareGpuThreadWrite(reinterpret_cast<uint64_t>(dst), sizeof(uint32_t));
 		for (uint32_t i = 0; i < dw_num; i++) {
 			dst[0] = src[i];
 		}
@@ -589,6 +592,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		if (cache.WriteClean(reinterpret_cast<uint64_t>(dst), src, bytes)) {
 			return;
 		}
+		m_renderer.PrepareGpuThreadWrite(reinterpret_cast<uint64_t>(dst), bytes);
 		memcpy(dst, src, bytes);
 	}
 }
@@ -702,6 +706,7 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_state  = gpu;
 	Common::PerfStats::Start();
 	Bisect::Start();
+	GpuPhases::Start();
 	// KYTY_PERF: how the GPU thread spends its time.
 	using PerfPhase      = Common::PerfStats::GpuThread;
 	const auto perf_time = [] {
@@ -711,6 +716,7 @@ void GuestGpu::ThreadRun(void* data) {
 	};
 
 	for (;;) {
+		GpuPhases::ReportIfDue(static_cast<uint64_t>(gpu->GetFrameNum()));
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
@@ -777,7 +783,10 @@ void GuestGpu::ThreadRun(void* data) {
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
 			const auto busy_from = perf_time();
-			command();
+			{
+				const GpuPhases::Scope phase(GpuPhases::Phase::Command);
+				command();
+			}
 			Common::PerfStats::AddGpuThread(PerfPhase::Busy, perf_time() - busy_from);
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
@@ -790,7 +799,11 @@ void GuestGpu::ThreadRun(void* data) {
 
 		EXIT_IF(!has_submission);
 		const auto busy_from = perf_time();
-		const bool complete  = gpu->Process(submission);
+		bool       complete  = false;
+		{
+			const GpuPhases::Scope phase(GpuPhases::Phase::Process);
+			complete = gpu->Process(submission);
+		}
 		Common::PerfStats::AddGpuThread(PerfPhase::Busy, perf_time() - busy_from);
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
@@ -1540,6 +1553,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			// both copies instead.
 			if (!m_renderer.GetBufferCache().WriteClean(reinterpret_cast<uint64_t>(dst), &data,
 			                                            sizeof(data))) {
+				m_renderer.PrepareGpuThreadWrite(reinterpret_cast<uint64_t>(dst), sizeof(data));
 				std::memcpy(dst, &data, sizeof(data));
 			}
 		}
@@ -1601,6 +1615,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 						                                    value, sizeof(value));
 					} else if (!m_renderer.GetBufferCache().WriteClean(
 					               reinterpret_cast<uint64_t>(dst), &value, sizeof(value))) {
+						m_renderer.PrepareGpuThreadWrite(reinterpret_cast<uint64_t>(dst),
+						                                 sizeof(value));
 						std::memcpy(dst, &value, sizeof(value));
 					}
 

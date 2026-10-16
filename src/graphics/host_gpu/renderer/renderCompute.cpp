@@ -11,23 +11,24 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
-#include "graphics/host_gpu/timeline.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/timeline.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
@@ -44,7 +45,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
-#include <string>
 #include <limits>
 #include <map>
 #include <memory>
@@ -52,6 +52,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <string>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -1430,8 +1431,12 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
+	const GpuPhases::Scope dispatch_phase(GpuPhases::Phase::Dispatch);
 	EXIT_IF(buffer.IsInvalid());
-	m_context.GetCommandScheduler().PopPendingOperations(false);
+	{
+		const GpuPhases::Scope phase(GpuPhases::Phase::DispatchPending);
+		m_context.GetCommandScheduler().PopPendingOperations(false);
+	}
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -1517,6 +1522,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderProgram compute_program;
 	{
 		KYTY_PROFILER_BLOCK("Dispatch::GetComputeProgram");
+		const GpuPhases::Scope phase(GpuPhases::Phase::DispatchProgram);
 		compute_program =
 		    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	}
@@ -1553,6 +1559,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	{
 		KYTY_PROFILER_BLOCK("Dispatch::TryConsumeClears");
+		const GpuPhases::Scope phase(GpuPhases::Phase::DispatchClears);
 		if (resources.specialization_reads.empty() &&
 		    (TryConsumeComputeMetaClear(input_info, buffer, cs_regs.cs_regs.data_addr,
 		                                thread_group_x, thread_group_y, thread_group_z, mode) ||
@@ -1577,6 +1584,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		uint32_t value   = 0;
 	} fill_note;
 	const char* fill_why = "its program is specialized on guest memory it reads";
+	GpuPhases::Scope fill_phase(GpuPhases::Phase::DispatchFill);
 	if (resources.specialization_reads.empty()) {
 		DispatchFill       fill_found;
 		constexpr uint64_t SmallestNoted = 64u * 1024u;
@@ -1616,6 +1624,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		const uint32_t groups[] = {thread_group_x, thread_group_y, thread_group_z};
 		ReportWritesOverHoles(input_info, fill_why, groups, 0, mode);
 	}
+	fill_phase.End();
 
 	if (use_thread_dimensions) {
 		const uint32_t old_x = thread_group_x;
@@ -1637,8 +1646,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	buffer.EndRendering();
+	GpuPhases::Scope pipeline_phase(GpuPhases::Phase::DispatchPipeline);
 	auto& pipeline =
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	pipeline_phase.End();
 	auto& bindings = m_compute_bindings;
 	if (FrameGraph::Logging()) {
 		FrameGraph::Log("  cs %016" PRIx64 " groups %ux%ux%u threads %ux%ux%u", program.shader_hash,
@@ -1649,7 +1660,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		FrameGraph::SetShowBuffers(true);
 	}
 	const TraceShaderScope trace_shader(program.shader_hash);
-	PrepareBindings(input_info.stage, bindings);
+	{
+		const GpuPhases::Scope phase(GpuPhases::Phase::DispatchTextures);
+		PrepareBindings(input_info.stage, bindings);
+	}
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
 		std::copy(std::begin(input_info.dispatch_threads_num), std::end(input_info.dispatch_threads_num),
 		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
@@ -1657,14 +1671,28 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_dma) {
 		PrefaultDmaPointers(m_context.GetBufferCache(), input_info.stage);
 	}
-	FindBuffers(bindings);
+	{
+		const GpuPhases::Scope phase(GpuPhases::Phase::DispatchFind);
+		FindBuffers(bindings);
+	}
 	if (program.info.uses_dma) {
 		KYTY_PROFILER_BLOCK("Dispatch::PrepareBda");
+		const GpuPhases::Scope phase(GpuPhases::Phase::DispatchBda);
 		m_context.PrepareBda();
 	}
-	RebindImages(bindings);
+	// Resolving one image binding can replace or free the image of an earlier one (an image
+	// expanded or merged into a larger one): the image set's generation then moves, and the
+	// bindings are made again below.
+	const auto image_generation = m_context.GetTextureCache().ImageSetGeneration();
+	{
+		const GpuPhases::Scope phase(GpuPhases::Phase::DispatchImages);
+		RebindImages(bindings);
+	}
 	BindSharedMemory(m_context, input_info, bindings);
-	RebindBuffers(bindings);
+	{
+		const GpuPhases::Scope phase(GpuPhases::Phase::DispatchBuffers);
+		RebindBuffers(bindings);
+	}
 
 	if (Config::GraphicsDebugDumpEnabled()) {
 		const auto sampled_images = std::count_if(
@@ -1727,13 +1755,30 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	DispatchBufferRecovery recovery(m_context, bindings, cs_regs.cs_regs.data_addr);
+	// The bindings made above are made again only when something may have changed them since: a
+	// dispatch that runs as a transaction (the recovery's copies and its drain may merge buffers),
+	// each retry, and the images when the image set changed while they were made. Before round 68
+	// every dispatch made them twice (KYTY_BISECT's rebind2).
+	bool rebind = recovery.Enabled() || Bisect::RebindTwice();
+	bool rebind_images =
+	    rebind || m_context.GetTextureCache().ImageSetGeneration() != image_generation;
 	do {
-		RebindImages(bindings);
-		RebindBuffers(bindings);
+		if (rebind_images) {
+			const GpuPhases::Scope phase(GpuPhases::Phase::DispatchImages);
+			RebindImages(bindings);
+		}
+		if (rebind) {
+			const GpuPhases::Scope phase(GpuPhases::Phase::DispatchBuffers);
+			RebindBuffers(bindings);
+		}
+		rebind                             = true;
+		rebind_images                      = true;
 		const auto        vk_buffer        = buffer.Recorder();
 		PreparedBindings* descriptor_stage = &bindings;
+		GpuPhases::Scope  commit_phase(GpuPhases::Phase::DispatchCommit);
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 		               std::span {&descriptor_stage, 1u});
+		commit_phase.End();
 		KYTY_PROFILER_BLOCK("Dispatch::Record");
 		bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
 		    HasShaderBufferWrites(input_info.stage);
@@ -1813,7 +1858,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	// shader bounds its threads by the counts it reads from the same memory.
 	const bool use_thread_dimensions =
 	    (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
-	m_context.GetCommandScheduler().PopPendingOperations(false);
+	const GpuPhases::Scope dispatch_phase(GpuPhases::Phase::Dispatch);
+	{
+		const GpuPhases::Scope phase(GpuPhases::Phase::DispatchPending);
+		m_context.GetCommandScheduler().PopPendingOperations(false);
+	}
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
@@ -1840,8 +1889,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	input_info.dispatch_thread_dimensions   = use_thread_dimensions;
 	input_info.dispatch_dimensions_indirect = use_thread_dimensions;
+	GpuPhases::Scope program_phase(GpuPhases::Phase::DispatchProgram);
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	program_phase.End();
 	if (!compute_program) {
 		LogSkippedDispatch(cs_regs, "indirect");
 		if (FrameGraph::Logging()) {
@@ -1867,7 +1918,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		    m_context.GetGraphics(), m_context.GetCommandScheduler());
 	}
 	buffer.EndRendering();
+	GpuPhases::Scope pipeline_phase(GpuPhases::Phase::DispatchPipeline);
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	pipeline_phase.End();
 	auto& bindings = m_compute_bindings;
 	if (FrameGraph::Logging()) {
 		FrameGraph::Log("  cs %016" PRIx64 " threads %ux%ux%u",
@@ -1877,24 +1930,40 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		                       cs_regs.cs_regs.data_addr, nullptr, 0);
 	}
 	const TraceShaderScope trace_shader(input_info.stage.program->shader_hash);
-	PrepareBindings(input_info.stage, bindings);
+	{
+		const GpuPhases::Scope phase(GpuPhases::Phase::DispatchTextures);
+		PrepareBindings(input_info.stage, bindings);
+	}
 	const auto& program = *input_info.stage.program;
 	ReportWritesOverHoles(input_info, "an indirect dispatch is not checked for a fill", nullptr,
 	                      args_addr, mode);
 	if (program.info.uses_dma) {
 		PrefaultDmaPointers(m_context.GetBufferCache(), input_info.stage);
 	}
-	FindBuffers(bindings);
+	{
+		const GpuPhases::Scope phase(GpuPhases::Phase::DispatchFind);
+		FindBuffers(bindings);
+	}
 	if (program.info.uses_dma) {
+		const GpuPhases::Scope phase(GpuPhases::Phase::DispatchBda);
 		m_context.PrepareBda();
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
-	RebindImages(bindings);
+	{
+		const GpuPhases::Scope phase(GpuPhases::Phase::DispatchImages);
+		RebindImages(bindings);
+	}
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
-	RebindBuffers(bindings);
+	{
+		const GpuPhases::Scope phase(GpuPhases::Phase::DispatchBuffers);
+		RebindBuffers(bindings);
+	}
 	DispatchBufferRecovery recovery(m_context, bindings, cs_regs.cs_regs.data_addr);
 	do {
+		GpuPhases::Scope images_phase(GpuPhases::Phase::DispatchImages);
 		RebindImages(bindings);
+		images_phase.End();
+		GpuPhases::Scope buffers_phase(GpuPhases::Phase::DispatchBuffers);
 		const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 		    args_addr, sizeof(vk::DispatchIndirectCommand), false, false, {},
 		    use_thread_dimensions);
@@ -1920,9 +1989,12 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			}
 		}
 		RebindBuffers(bindings);
+		buffers_phase.End();
 		PreparedBindings* descriptor_stage = &bindings;
+		GpuPhases::Scope  commit_phase(GpuPhases::Phase::DispatchCommit);
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 		               std::span {&descriptor_stage, 1u});
+		commit_phase.End();
 		const auto vk_buffer = buffer.Recorder();
 		const bool has_storage_writes =
 		    bindings.shared_memory.buffer != nullptr || HasShaderBufferWrites(input_info.stage) ||
