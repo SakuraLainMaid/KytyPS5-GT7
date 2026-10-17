@@ -598,7 +598,11 @@ add_executable(archive_file_tests EXCLUDE_FROM_ALL
 target_link_libraries(archive_file_tests common ZArchive::zarchive)
 target_include_directories(archive_file_tests PRIVATE ${inc_headers})
 
-add_executable(avplayer_file_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AvPlayerFileTests.cpp")
+add_executable(avplayer_file_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AvPlayerFileTests.cpp"
+	# Libs::PrintName (libs.h) reads the loader's timer, as upstream's test target has it.
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+)
 target_link_libraries(avplayer_file_tests common FFmpeg::ffmpeg ZArchive::zarchive)
 target_include_directories(avplayer_file_tests PRIVATE ${inc_headers})
 
