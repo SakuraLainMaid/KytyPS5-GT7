@@ -37,6 +37,13 @@ the game. The user profile, audio and notification settings don't matter.
 | | Printf output | File (`_kyty.txt`) |
 | | Tracy profiler | **Off** (it costs frame rate) |
 
+## In-game settings
+
+In the game's own graphics options, use the **performance (frame rate) mode, not the ray tracing
+(RT) mode**. The ray tracing mode isn't supported properly yet.
+
+## Notes
+
 No environment variables are needed to play. The `KYTY_*` variables mentioned in the commit
 history are for diagnostic runs only.
 

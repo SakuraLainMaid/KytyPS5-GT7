@@ -18,7 +18,8 @@ can change significantly between builds.
 
 > [!NOTE]
 > This branch carries work on Gran Turismo 7. See [docs/GT7.md](docs/GT7.md) for the launcher
-> settings it was tested with and its current state.
+> settings it was tested with and its current state. In the game, use the performance mode, not
+> the ray tracing (RT) mode.
 
 > [!IMPORTANT]
 > KytyPS5 is not affiliated with Sony Interactive Entertainment or PlayStation. The project does
