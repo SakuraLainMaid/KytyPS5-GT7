@@ -2769,13 +2769,29 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_b
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
-		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
-
-		for (const auto id: candidates) {
-			const auto& image = m_slot_images[id];
-			if (SameBacking(image.info, desc.info, exact_format)) {
-				result = id;
+		// An image with the same backing starts at the same address, so it is among the owners of
+		// the first page: those are looked at first, and the overlaps in the rest of the range only
+		// when none of them is. The images of a binding found again (nearly all of them) were
+		// otherwise looked up page by page over their whole size, a page table lookup each 16 KB
+		// (3 % of the GPU thread in a race, round 68).
+		ImageIds candidates;
+		if (const auto* owners =
+		        m_image_page_table.Find(desc.info.data.address >> ImagePageTable::kPageBits);
+		    owners != nullptr) {
+			owners->ForEach([&](ImageId id) {
+				const auto* image = m_slot_images.try_get(id);
+				if (image != nullptr && SameBacking(image->info, desc.info, exact_format)) {
+					result = id;
+				}
+			});
+		}
+		if (!result) {
+			candidates = FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+			for (const auto id: candidates) {
+				const auto& image = m_slot_images[id];
+				if (SameBacking(image.info, desc.info, exact_format)) {
+					result = id;
+				}
 			}
 		}
 		// Found with the same backing: the overlap loop below does not run.

@@ -81,6 +81,8 @@ public:
 	void            CompleteReleaseMemInterrupt();
 	// See CommandScheduler::CompleteDraw -- called after every DrawIndex/DrawAuto.
 	void            CompleteDraw();
+	// See CommandScheduler::CompleteDispatch -- called after every dispatch.
+	void            CompleteDispatch();
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
 	HW::Shader&     GetShCtx() { return m_sh_ctx; }

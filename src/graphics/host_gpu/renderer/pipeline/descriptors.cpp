@@ -3133,9 +3133,25 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		uint64_t                                descriptor_size    = 0;
 		bool                                    bounded  = false;
 	};
+	// One draw or dispatch in 64 is checked (every one with KYTY_SPEC_READ_CHECK=1 or KYTY_BISECT's
+	// speccheck:all): the check changes nothing, it reports (or stops on) what has never been
+	// seen to happen, and it cost ~1 us a draw, 3 % of the GPU thread (round 68's sampler: the
+	// read-by-read loop below was the hottest line of the whole thread).
+	static const bool check_every = [] {
+		const char* value = std::getenv("KYTY_SPEC_READ_CHECK");
+		return value != nullptr && value[0] == '1';
+	}();
+	thread_local uint32_t check_counter = 0;
+	const bool            check_spec_reads =
+	    check_every || Bisect::SpecCheckAll() || (++check_counter & 63u) == 0u;
+	GpuPhases::Scope spec_check_phase(GpuPhases::Phase::SpecCheck);
+	if (!check_spec_reads) {
+		spec_check_phase.Cancel();
+	}
 	std::vector<WrittenRange> written_ranges;
 	bool                      written_gathered = false;
-	for (const auto* reader: prepared_bindings) {
+	for (const auto* reader:
+	     check_spec_reads ? prepared_bindings : std::span<PreparedBindings* const> {}) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
 		if (!written_gathered) {
@@ -3225,6 +3241,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 	}
+	spec_check_phase.End();
 	m_descriptor_buffers.clear();
 	m_descriptor_images.clear();
 	m_descriptor_writes.clear();

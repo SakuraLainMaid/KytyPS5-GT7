@@ -93,6 +93,9 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
+		// The BDA walk synchronizes it (the CPU-dirty pages it covers may have none over them
+		// until now).
+		m_memory_tracker.MarkBdaPending(buffer.CpuAddress(), buffer.Size());
 		g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
 		buffer.lru_id = m_lru_cache.Insert(id, LruClock());
 		std::vector<vk::DeviceAddress> addresses;
@@ -2668,6 +2671,28 @@ void BufferCache::SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t siz
 	    vaddr, size, [this](uint64_t address, uint64_t bytes) {
 		    SynchronizeBuffersInRange(address, bytes);
 	    });
+}
+
+uint64_t BufferCache::SynchronizeBdaPending(const RangeSet& mapped) {
+	// Before round 69 each walk visited every tracker region of the mapped ranges with a CPU-dirty
+	// page anywhere, and synchronized every cached buffer of it: thousands of buffers a walk whose
+	// pages had not changed (the regions keep CPU-dirty the pages no buffer covers), ~30 us a
+	// dispatch that reads memory through addresses, 8 % of the GPU thread in a race. Now only the
+	// regions where pages became CPU-dirty or a buffer appeared since the last walk, and in them
+	// only the buffers over CPU-dirty pages: what a sync of the others found was nothing to do.
+	thread_local std::vector<std::pair<uint64_t, uint64_t>> runs;
+	uint64_t                                                regions = 0;
+	m_memory_tracker.TakeBdaPending([&](uint64_t region) {
+		regions++;
+		runs.clear();
+		mapped.ForEachInRange(region, TRACKER_REGION_SIZE, [&](uint64_t begin, uint64_t end) {
+			m_memory_tracker.CollectCpuDirtyRuns(begin, end - begin, runs);
+		});
+		for (const auto& [address, bytes]: runs) {
+			SynchronizeBuffersInRange(address, bytes);
+		}
+	});
+	return regions;
 }
 
 void BufferCache::VerifyWithGuest(uint64_t vaddr, uint64_t size, uint32_t op,

@@ -178,6 +178,7 @@ public:
 			bits.SetRange(start, end);
 			StoreSummary<source>(true);
 			if constexpr (source == DirtySource::Cpu) {
+				NoteBdaPending();
 				g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
 			}
 		} else {
@@ -222,6 +223,25 @@ public:
 	void SetCpuSummaryBit(std::atomic<uint64_t>* word, uint64_t bit) noexcept {
 		m_cpu_summary_word = word;
 		m_cpu_summary_bit  = bit;
+	}
+
+	// The tracker's bits of the regions the next BDA walk visits (MemoryTracker::TakeBdaPending):
+	// one in a word of regions and one in the word above it. Set before the region is published.
+	void SetBdaPendingBits(std::atomic<uint64_t>* word, uint64_t bit,
+	                       std::atomic<uint64_t>* top_word, uint64_t top_bit) noexcept {
+		m_bda_word     = word;
+		m_bda_bit      = bit;
+		m_bda_top_word = top_word;
+		m_bda_top_bit  = top_bit;
+	}
+
+	// Pages of this region became CPU-dirty: the next BDA walk visits it. The region's bit before
+	// the word's, so a walk that sees the word's bit finds the region's.
+	void NoteBdaPending() noexcept {
+		if (m_bda_word != nullptr) {
+			m_bda_word->fetch_or(m_bda_bit, std::memory_order_release);
+			m_bda_top_word->fetch_or(m_bda_top_bit, std::memory_order_release);
+		}
 	}
 
 	TrackingSpinLock lock;
@@ -310,6 +330,10 @@ private:
 	std::atomic<bool> m_gpu_maybe_dirty {false};
 	std::atomic<uint64_t>* m_cpu_summary_word = nullptr;
 	uint64_t               m_cpu_summary_bit  = 0;
+	std::atomic<uint64_t>* m_bda_word         = nullptr;
+	uint64_t               m_bda_bit          = 0;
+	std::atomic<uint64_t>* m_bda_top_word     = nullptr;
+	uint64_t               m_bda_top_bit      = 0;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
 };

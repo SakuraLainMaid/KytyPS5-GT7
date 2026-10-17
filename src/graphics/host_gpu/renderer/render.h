@@ -155,6 +155,10 @@ public:
 
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
+	// Whether commands record NVIDIA diagnostic checkpoints: the device has them and
+	// KYTY_GPU_CHECKPOINTS=1 (or KYTY_BISECT's checkpoints:on) asks for them. Off by default since
+	// round 69: three a draw, each a command the GPU executes, for a device-loss report only.
+	[[nodiscard]] bool RecordsCheckpoints() const;
 	// A checkpoint before a transfer (an upload, copy, clear, ...): the destination's guest
 	// address, the source's (if any) and three numbers. Leaves the running draw's debug info and
 	// annotations alone.

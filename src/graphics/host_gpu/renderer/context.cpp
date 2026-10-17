@@ -3,6 +3,7 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -15,6 +16,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 namespace Libs::Graphics {
 
@@ -64,6 +66,14 @@ void CommandBuffer::End() const {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 
+bool CommandBuffer::RecordsCheckpoints() const {
+	static const bool always = [] {
+		const char* value = std::getenv("KYTY_GPU_CHECKPOINTS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return m_graphics.diagnostic_checkpoints_enabled && (always || Bisect::CheckpointsOn());
+}
+
 void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0, uint32_t arg1,
                                  uint32_t arg2, uint32_t arg3, uint64_t arg4) {
 	m_debug_op        = op;
@@ -73,7 +83,8 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg2      = arg2;
 	m_debug_arg3      = arg3;
 	m_debug_arg4      = arg4;
-	if (m_graphics.diagnostic_checkpoints_enabled && !IsInvalid()) {
+	m_debug_marker    = nullptr;
+	if (RecordsCheckpoints() && !IsInvalid()) {
 		auto* marker = RecordDiagnosticCheckpoint({.op        = op,
 		                                                 .submit_id = submit_id,
 		                                                 .arg0      = arg0,
@@ -138,7 +149,7 @@ void CommandBuffer::MarkTransfer(CommandBufferDebugOp op, uint64_t destination, 
 		}
 		m_scheduler.NoteTransfer(kind, bytes);
 	}
-	if (!m_graphics.diagnostic_checkpoints_enabled || IsInvalid()) {
+	if (!RecordsCheckpoints() || IsInvalid()) {
 		return;
 	}
 	auto* marker = RecordDiagnosticCheckpoint({.op        = static_cast<uint32_t>(op),

@@ -81,6 +81,12 @@ public:
 	// too small reintroduces per-submit overhead, too large leaves the same idle bubbles this
 	// exists to remove.
 	void           CompleteDraw();
+	// The same after every dispatch, every KYTY_DISPATCH_FLUSH_INTERVAL dispatches (default 16; 0
+	// turns it off, as before round 69). Before, only draws sent command buffers on: a compute
+	// queue's hundreds of dispatches in a row (561 at the start of a race frame, 7 ms of the GPU
+	// thread) went to the GPU at once at the end, which then took 9 ms over them while every game
+	// thread waited for their results.
+	void           CompleteDispatch();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
@@ -250,6 +256,7 @@ private:
 	uint32_t                     m_recorded_release_mem_writes     = 0;
 	uint32_t                     m_recorded_release_mem_interrupts = 0;
 	uint32_t                     m_recorded_draws                  = 0;
+	uint32_t                     m_recorded_dispatches             = 0;
 	// m_operation_mutex held: a priority callback of `tick` or before is queued or running.
 	[[nodiscard]] bool PriorityPendingThrough(uint64_t tick) const;
 

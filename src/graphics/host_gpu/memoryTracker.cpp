@@ -11,6 +11,35 @@ MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_man
 	m_regions           = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
 	m_present_regions   = std::make_unique<std::atomic<uint64_t>[]>(REGION_COUNT / 64);
 	m_cpu_dirty_regions = std::make_unique<std::atomic<uint64_t>[]>(REGION_COUNT / 64);
+	m_bda_pending       = std::make_unique<std::atomic<uint64_t>[]>(REGION_COUNT / 64);
+	m_bda_pending_top   = std::make_unique<std::atomic<uint64_t>[]>(BDA_TOP_WORDS);
+}
+
+void MemoryTracker::MarkBdaPending(uint64_t vaddr, uint64_t size) noexcept {
+	if (size == 0 || vaddr >= TRACKER_ADDRESS_SIZE || size > TRACKER_ADDRESS_SIZE - vaddr) {
+		return;
+	}
+	const uint64_t first = vaddr / TRACKER_REGION_SIZE;
+	const uint64_t last  = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+	for (uint64_t index = first; index <= last; index++) {
+		m_bda_pending[index / 64].fetch_or(uint64_t {1} << (index % 64), std::memory_order_release);
+		m_bda_pending_top[index / 4096].fetch_or(uint64_t {1} << ((index / 64) % 64),
+		                                         std::memory_order_release);
+	}
+}
+
+void MemoryTracker::CollectCpuDirtyRuns(uint64_t vaddr, uint64_t size,
+                                        std::vector<std::pair<uint64_t, uint64_t>>& runs) {
+	CheckNotInUploadCallback();
+	Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		if (!manager->MaybeModified<DirtySource::Cpu>()) {
+			return;
+		}
+		std::scoped_lock lock(manager->lock);
+		manager->ForEachModifiedRange<DirtySource::Cpu, false>(
+		    manager->GetCpuAddr() + offset, bytes,
+		    [&](uint64_t address, uint64_t run_bytes) { runs.emplace_back(address, run_bytes); });
+	});
 }
 
 bool MemoryTracker::IsRangeCpuCleanHint(uint64_t vaddr, uint64_t size) const noexcept {
@@ -88,6 +117,10 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	const uint64_t bit = uint64_t {1} << (index % 64);
 	m_cpu_dirty_regions[index / 64].fetch_or(bit, std::memory_order_acq_rel);
 	ptr->SetCpuSummaryBit(&m_cpu_dirty_regions[index / 64], bit);
+	// And pending for the BDA walk, being all CPU-dirty.
+	ptr->SetBdaPendingBits(&m_bda_pending[index / 64], bit, &m_bda_pending_top[index / 4096],
+	                       uint64_t {1} << ((index / 64) % 64));
+	ptr->NoteBdaPending();
 	m_present_regions[index / 64].fetch_or(bit, std::memory_order_acq_rel);
 	m_regions[index].store(ptr, std::memory_order_release);
 	return ptr;

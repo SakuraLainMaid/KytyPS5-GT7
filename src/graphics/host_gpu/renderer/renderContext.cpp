@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/perfStats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/bisect.h"
@@ -18,11 +19,10 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
-#include <cstdlib>
-#include <cstring>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <mutex>
 #include <string>
@@ -433,11 +433,19 @@ void RenderContext::PrepareBda() {
 	}
 	if (epoch != m_bda_synced_epoch) {
 		// The guest writes somewhere nearly all the time, so the epoch moves between most
-		// dispatches; walk only the regions holding CPU-dirty pages, not every buffer.
-		std::shared_lock lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-			m_buffer_cache.SynchronizeCpuDirtyBuffersInRange(start, end - start);
-		});
+		// dispatches: walk only the regions where pages became CPU-dirty or a buffer appeared
+		// since the last walk (BufferCache::SynchronizeBdaPending). KYTY_BISECT's bdawalk:all
+		// walks every region holding a CPU-dirty page and every buffer in it, as before round 69.
+		const GpuPhases::Scope walk_phase(GpuPhases::Phase::BdaWalk);
+		std::shared_lock       lock(m_mapped_ranges_mutex);
+		if (Bisect::BdaWalkAll()) {
+			m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+				m_buffer_cache.SynchronizeCpuDirtyBuffersInRange(start, end - start);
+			});
+		} else {
+			GpuPhases::Count(GpuPhases::Phase::BdaRegions,
+			                 m_buffer_cache.SynchronizeBdaPending(m_mapped_ranges));
+		}
 		m_bda_synced_epoch = epoch;
 	}
 	m_fault_process_pending = true;

@@ -879,6 +879,81 @@ void TestDirtyRegionWalk() {
   Release(memory);
 }
 
+void TestBdaPendingRegions() {
+  // The BDA walk's pending regions (MemoryTracker::TakeBdaPending): a region is
+  // pending when it is created, when pages of it become CPU-dirty and when
+  // MarkBdaPending names it; a take empties them. CollectCpuDirtyRuns gives the
+  // dirty pages as runs.
+  constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = AllocateFixedGuestRange(region_size * 3, 0x800000);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  std::vector<uint64_t> taken;
+  const auto take = [&] {
+    taken.clear();
+    tracker.TakeBdaPending([&](uint64_t region) { taken.push_back(region); });
+  };
+  take();
+  Check(taken.empty(), "a new tracker had pending regions");
+
+  tracker.ForEachUploadRange(
+      address, region_size * 3, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  take();
+  Check(taken.size() == 3 && taken[0] == address &&
+            taken[1] == address + region_size &&
+            taken[2] == address + region_size * 2,
+        "the regions an upload created were not pending, in order");
+  take();
+  Check(taken.empty(), "a take left regions pending");
+
+  std::vector<std::pair<uint64_t, uint64_t>> runs;
+  tracker.CollectCpuDirtyRuns(address, region_size * 3, runs);
+  Check(runs.empty(), "clean regions had CPU-dirty runs");
+
+  tracker.MarkRegionAsCpuModified(address + region_size * 2 + page_size * 7,
+                                  16);
+  tracker.MarkRegionAsCpuModified(address + region_size * 2 + page_size * 8,
+                                  16);
+  tracker.MarkRegionAsCpuModified(address + region_size * 2 + page_size * 20,
+                                  16);
+  take();
+  Check(taken.size() == 1 && taken[0] == address + region_size * 2,
+        "a CPU-dirty page did not make its region (only) pending");
+  tracker.CollectCpuDirtyRuns(address, region_size * 3, runs);
+  Check(runs.size() == 2 &&
+            runs[0] ==
+                std::pair<uint64_t, uint64_t>(
+                    address + region_size * 2 + page_size * 7, page_size * 2) &&
+            runs[1] ==
+                std::pair<uint64_t, uint64_t>(
+                    address + region_size * 2 + page_size * 20, page_size),
+        "the CPU-dirty runs were not the dirty pages");
+  runs.clear();
+  tracker.CollectCpuDirtyRuns(address + region_size * 2 + page_size * 8,
+                              page_size, runs);
+  Check(runs.size() == 1 &&
+            runs[0].first == address + region_size * 2 + page_size * 8 &&
+            runs[0].second == page_size,
+        "a run was not clipped to the range asked for");
+
+  tracker.MarkBdaPending(address + region_size + 5, 1);
+  take();
+  Check(taken.size() == 1 && taken[0] == address + region_size,
+        "MarkBdaPending did not make its region pending");
+  tracker.MarkBdaPending(address + region_size - 1, 2);
+  take();
+  Check(taken.size() == 2 && taken[0] == address &&
+            taken[1] == address + region_size,
+        "MarkBdaPending across a region boundary did not make both pending");
+
+  tracker.MarkRegionAsCpuModified(address, region_size * 3);
+  tracker.UntrackMemory(address, region_size * 3);
+  Release(memory);
+}
+
 void TestUploadDoesNotSerializeDisjointRegion() {
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
@@ -1278,6 +1353,7 @@ int main(int argc, char **argv) {
   TestCrossRegionUpload();
   TestRegionBitmapHint();
   TestDirtyRegionWalk();
+  TestBdaPendingRegions();
   TestUploadDoesNotSerializeDisjointRegion();
   TestDownloadDoesNotSerializeDisjointRegion();
   TestGpuUnmarkUsesRegionMask();

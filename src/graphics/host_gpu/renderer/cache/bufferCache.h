@@ -209,6 +209,12 @@ public:
 	void TraceContents(uint64_t vaddr, uint64_t size, const std::string& prefix);
 	// Same, but visits only the tracker regions that may hold CPU-dirty pages.
 	void                            SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
+	// The BDA walk (RenderContext::PrepareBda): the cached buffers over the CPU-dirty pages of the
+	// tracker regions that are pending since the last walk (MemoryTracker::TakeBdaPending), in
+	// their parts inside `mapped`. What a walk of every buffer in every region with a CPU-dirty
+	// page synchronizes, without visiting the buffers of regions where nothing happened.
+	// Returns the regions visited.
+	uint64_t                        SynchronizeBdaPending(const RangeSet& mapped);
 	void                            RunGarbageCollector();
 	// Diagnostics, GPU thread: makes guest memory current for [vaddr, vaddr + size) by
 	// downloading what the GPU wrote there (drains the GPU).

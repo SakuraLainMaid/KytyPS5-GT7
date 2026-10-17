@@ -88,6 +88,18 @@
 //   gpuwrites:fault the GPU thread's own stores to guest memory (labels, WRITE_DATA) fault on
 //                pages protected for tracking, as before round 68, instead of lifting the
 //                protection first
+// and (round 69):
+//   bdawalk:all  a dispatch or draw that reads memory through shader addresses synchronizes every
+//                cached buffer of every tracker region holding a CPU-dirty page, as before round
+//                69, instead of the regions where something changed since the last walk
+//   checkpoints:on every draw, dispatch and transfer records an NVIDIA diagnostic checkpoint, as
+//                before round 69 (KYTY_GPU_CHECKPOINTS=1 for the whole run)
+//   speccheck:all every draw and dispatch checks its specialization reads against what it
+//                writes, as before round 69, instead of one in 64 (KYTY_SPEC_READ_CHECK=1 for the
+//                whole run)
+//   dflush:<n>   a command buffer goes to the GPU after n dispatches (KYTY_DISPATCH_FLUSH_INTERVAL
+//                for the whole run, default 16); dflush:0 only at the usual points, as before
+//                round 69
 namespace Libs::Graphics::Bisect {
 
 // The GPU thread, at its start: applies the start step's CPU set and log setting.
@@ -139,6 +151,12 @@ void                      ApplyPending();
 [[nodiscard]] bool RebindTwice();
 [[nodiscard]] bool DrawPrepOff();
 [[nodiscard]] bool GpuWritesFault();
+// Any thread: bdawalk:all; checkpoints:on; speccheck:all.
+[[nodiscard]] bool BdaWalkAll();
+[[nodiscard]] bool CheckpointsOn();
+[[nodiscard]] bool SpecCheckAll();
+// Any thread: dflush:'s dispatches (-1 for the usual).
+[[nodiscard]] int32_t DispatchFlushInterval();
 
 } // namespace Libs::Graphics::Bisect
 

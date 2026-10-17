@@ -68,6 +68,37 @@ public:
 			}
 		});
 	}
+	// The BDA walk (RenderContext::PrepareBda). A region is pending from its creation, and again
+	// whenever pages of it become CPU-dirty or a buffer is registered over it (MarkBdaPending): a
+	// walk that synchronized every buffer of a region leaves CPU-dirty only the pages no buffer
+	// covers, so until one of those happens the next walks have nothing to do there.
+	void MarkBdaPending(uint64_t vaddr, uint64_t size) noexcept;
+	// Calls func(region address) for each pending region, which is pending no more.
+	template <typename Func>
+	void TakeBdaPending(Func&& func) {
+		for (uint64_t top = 0; top < BDA_TOP_WORDS; top++) {
+			if (m_bda_pending_top[top].load(std::memory_order_relaxed) == 0) {
+				continue;
+			}
+			auto words = m_bda_pending_top[top].exchange(0, std::memory_order_acq_rel);
+			while (words != 0) {
+				const uint64_t word = top * 64 + static_cast<uint64_t>(std::countr_zero(words));
+				words &= words - 1;
+				auto regions = m_bda_pending[word].exchange(0, std::memory_order_acq_rel);
+				while (regions != 0) {
+					const uint64_t index =
+					    word * 64 + static_cast<uint64_t>(std::countr_zero(regions));
+					regions &= regions - 1;
+					func(index * TRACKER_REGION_SIZE);
+				}
+			}
+		}
+	}
+	// The CPU-dirty pages of the range, as runs of whole pages (appended to `runs`). Lock-free
+	// skip of a region whose summary is clean.
+	void CollectCpuDirtyRuns(uint64_t vaddr, uint64_t size,
+	                         std::vector<std::pair<uint64_t, uint64_t>>& runs);
+
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -185,7 +216,8 @@ public:
 	[[nodiscard]] bool InUploadCallback() const noexcept { return s_upload_owner == this; }
 
 private:
-	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+	static constexpr size_t REGION_COUNT  = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+	static constexpr size_t BDA_TOP_WORDS = REGION_COUNT / 64 / 64;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
 
 	void CheckNotInUploadCallback() const noexcept {
@@ -276,6 +308,9 @@ private:
 	// One bit per region: the region exists / its CPU summary is set (RegionManager::StoreSummary).
 	std::unique_ptr<std::atomic<uint64_t>[]> m_present_regions;
 	std::unique_ptr<std::atomic<uint64_t>[]> m_cpu_dirty_regions;
+	// The regions the next BDA walk visits (one bit each), and the words of those with a bit set.
+	std::unique_ptr<std::atomic<uint64_t>[]>       m_bda_pending;
+	std::unique_ptr<std::atomic<uint64_t>[]>       m_bda_pending_top;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;

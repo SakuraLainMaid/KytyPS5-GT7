@@ -50,8 +50,12 @@ struct Step {
 	bool              rebind_twice    = false;
 	bool              drawprep_off    = false;
 	bool              gpuwrites_fault = false;
+	bool              bdawalk_all     = false;
+	bool              checkpoints_on  = false;
+	bool              speccheck_all   = false;
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
+	int32_t           dflush          = -1;   // dflush:<n>; -1: the usual
 	uint32_t          gpu_frames  = 0;    // gputime:<n>
 	int64_t           readback_kb = -1; // -1: the usual window
 	std::string       cpu_set;          // empty: as at the start
@@ -179,6 +183,18 @@ bool ParseAction(std::string_view action, Step& step) {
 		step.gpuwrites_fault = true;
 		return true;
 	}
+	if (action == "bdawalk:all") {
+		step.bdawalk_all = true;
+		return true;
+	}
+	if (action == "checkpoints:on") {
+		step.checkpoints_on = true;
+		return true;
+	}
+	if (action == "speccheck:all") {
+		step.speccheck_all = true;
+		return true;
+	}
 	if (action.starts_with("tess:max:")) {
 		const auto text = std::string(action.substr(9));
 		if (text.empty() || text.size() > 8 ||
@@ -201,6 +217,16 @@ bool ParseAction(std::string_view action, Step& step) {
 		}
 		step.flush = static_cast<uint32_t>(std::strtoul(std::string(draws).c_str(), nullptr, 10));
 		return step.flush != 0;
+	}
+	if (action.starts_with("dflush:")) {
+		const auto dispatches = action.substr(7);
+		if (dispatches.empty() || dispatches.size() > 5 ||
+		    dispatches.find_first_not_of("0123456789") != std::string_view::npos) {
+			return false;
+		}
+		step.dflush =
+		    static_cast<int32_t>(std::strtoul(std::string(dispatches).c_str(), nullptr, 10));
+		return true;
 	}
 	if (action.starts_with("gputime:")) {
 		const auto frames = action.substr(8);
@@ -585,6 +611,26 @@ bool DrawPrepOff() {
 bool GpuWritesFault() {
 	const auto* step = Current();
 	return step != nullptr && step->gpuwrites_fault;
+}
+
+bool BdaWalkAll() {
+	const auto* step = Current();
+	return step != nullptr && step->bdawalk_all;
+}
+
+bool CheckpointsOn() {
+	const auto* step = Current();
+	return step != nullptr && step->checkpoints_on;
+}
+
+bool SpecCheckAll() {
+	const auto* step = Current();
+	return step != nullptr && step->speccheck_all;
+}
+
+int32_t DispatchFlushInterval() {
+	const auto* step = Current();
+	return step != nullptr ? step->dflush : -1;
 }
 
 bool WholeUnnormalizedViews() {

@@ -471,6 +471,10 @@ void CommandProcessor::CompleteDraw() {
 	GetScheduler().CompleteDraw();
 }
 
+void CommandProcessor::CompleteDispatch() {
+	GetScheduler().CompleteDispatch();
+}
+
 void CommandProcessor::BufferWait() {
 	BufferInit();
 	GetScheduler().Finish();
@@ -1440,6 +1444,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode);
 	}
+	CompleteDispatch();
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
@@ -1455,6 +1460,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode);
+	CompleteDispatch();
 }
 
 uint32_t CommandProcessor::NumInstances() {

@@ -41,6 +41,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <fmt/format.h>
 #include <limits>
 #include <mutex>
@@ -51,6 +52,7 @@
 #include <spirv/unified1/spirv.hpp>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -180,6 +182,36 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	auto message = fmt::format(format, std::forward<Args>(args)...);
 	message += '\n';
 	Log::WriteToConsoleAndLog(message);
+}
+
+// What the shader disk cache's folder holds at the start (where it is, its files and their size):
+// round 68's runs found it empty, every shader was translated again, and why could not be told.
+void LogShaderCacheFolder(const std::filesystem::path& directory) {
+	if (directory.empty()) {
+		return;
+	}
+	std::error_code error;
+	const auto      absolute = std::filesystem::absolute(directory, error);
+	const auto      shown    = (error ? directory : absolute).string();
+	if (!std::filesystem::is_directory(directory, error)) {
+		PipelineCacheLog("Shader disk cache folder: {} does not exist yet (every shader is "
+		                 "translated, and saved there)",
+		                 shown);
+		return;
+	}
+	uint64_t files = 0;
+	uint64_t bytes = 0;
+	for (std::filesystem::directory_iterator it(directory, error), end; !error && it != end;
+	     it.increment(error)) {
+		std::error_code entry_error;
+		if (it->is_regular_file(entry_error)) {
+			files++;
+			const auto size = it->file_size(entry_error);
+			bytes += entry_error ? 0 : size;
+		}
+	}
+	PipelineCacheLog("Shader disk cache folder: {}: {} files, {} MB{}", shown, files, bytes >> 20u,
+	                 error ? " (the listing stopped early)" : "");
 }
 
 // The backing bytes of the guest pages one resource evaluation (MaterializeResources, a function
@@ -1177,6 +1209,8 @@ struct PipelineCache::ProgramCache {
 		// Draw prep: the serial of the prepared result whose refresh `resources` holds now (0 after a
 		// walk here), so a later draw of the same packet can use it again.
 		uint64_t prepared_serial = 0;
+		// The permutation the last lookup found (at most one matches), compared first.
+		size_t last_permutation = 0;
 	};
 
 	struct ProgramKeyHash {
@@ -1559,17 +1593,26 @@ struct PipelineCache::ProgramCache {
 					return ShaderProgram {};
 				}
 			}
-			if (const auto permutation = std::ranges::find_if(
-			        entry->second.permutations, [&](const Permutation& candidate) {
-				        const auto& layout = candidate.program.bindings;
-				        return layout.push_data_start_dword ==
-				                   ShaderRecompiler::IR::PushData::StartFor(
-				                       push_data_cursor, layout.ShaderDataDwords()) &&
-				               candidate.specialization == entry->second.specialization;
-			        });
-			    permutation != entry->second.permutations.end()) {
+			auto&      source  = entry->second;
+			const auto matches = [&](const Permutation& candidate) {
+				const auto& layout = candidate.program.bindings;
+				return layout.push_data_start_dword ==
+				           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
+				                                                    layout.ShaderDataDwords()) &&
+				       candidate.specialization == source.specialization;
+			};
+			Permutation* permutation = nullptr;
+			if (source.last_permutation < source.permutations.size() &&
+			    matches(source.permutations[source.last_permutation])) {
+				permutation = &source.permutations[source.last_permutation];
+			} else if (const auto found = std::ranges::find_if(source.permutations, matches);
+			           found != source.permutations.end()) {
+				permutation             = &*found;
+				source.last_permutation = static_cast<size_t>(found - source.permutations.begin());
+			}
+			if (permutation != nullptr) {
 				input_info.stage = {.program   = &permutation->program,
-				                    .resources = &entry->second.resources};
+				                    .resources = &source.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
@@ -1867,6 +1910,7 @@ struct PipelineCache::ProgramCache {
 			// The dumps are written while translating: every shader has to be translated.
 			PipelineCacheLog("Shader disk cache: off (graphics debug dump)");
 		} else {
+			LogShaderCacheFolder(disk_directory);
 			disk = ShaderDiskCache::Store::Open(std::move(disk_directory));
 		}
 		if (g_async_translation) {

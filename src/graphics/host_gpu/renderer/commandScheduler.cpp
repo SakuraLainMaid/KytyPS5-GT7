@@ -57,6 +57,18 @@ uint32_t DrawFlushInterval() {
 	return interval;
 }
 
+// KYTY_DISPATCH_FLUSH_INTERVAL=N: CompleteDispatch()'s interval (default 16, 0 turns it off).
+uint32_t DispatchFlushInterval() {
+	static const uint32_t interval = [] {
+		const char* v = std::getenv("KYTY_DISPATCH_FLUSH_INTERVAL");
+		if (v == nullptr || *v == '\0') {
+			return 16u;
+		}
+		return static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+	}();
+	return interval;
+}
+
 } // namespace
 
 CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
@@ -264,6 +276,17 @@ void CommandScheduler::CompleteDraw() {
 	const auto step     = Bisect::FlushInterval();
 	const auto interval = step != 0 ? step : DrawFlushInterval();
 	if (interval == 0u || ++m_recorded_draws < interval) {
+		return;
+	}
+	CheckActive();
+	Flush();
+}
+
+void CommandScheduler::CompleteDispatch() {
+	// KYTY_BISECT's dflush:<n> (dflush:0: none, as before round 69).
+	const auto step     = Bisect::DispatchFlushInterval();
+	const auto interval = step >= 0 ? static_cast<uint32_t>(step) : DispatchFlushInterval();
+	if (interval == 0u || ++m_recorded_dispatches < interval) {
 		return;
 	}
 	CheckActive();
@@ -628,6 +651,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	m_recorded_release_mem_writes     = 0;
 	m_recorded_release_mem_interrupts = 0;
 	m_recorded_draws                  = 0;
+	m_recorded_dispatches             = 0;
 
 	if (m_threaded) {
 		// The tick is allocated now, in order; the recording thread ends the command buffer and

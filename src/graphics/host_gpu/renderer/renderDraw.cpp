@@ -1788,7 +1788,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	        (std::min(rendering.num_layers, 255u) << 8u) |
 	        (std::min(rendering.num_color_attachments, 255u) << 16u) |
 	        (rendering.depth_stencil_attachment.image_view ? 1u << 24u : 0u));
-	if (buffer.GetGraphics().diagnostic_checkpoints_enabled) {
+	if (buffer.RecordsCheckpoints()) {
 		DiagnosticTargets targets;
 		const auto        pack = [](uint32_t width, uint32_t height) {
 			return std::min(width, 0xffffu) | (std::min(height, 0xffffu) << 16u);

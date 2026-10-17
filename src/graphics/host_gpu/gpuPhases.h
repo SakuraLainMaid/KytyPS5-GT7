@@ -65,6 +65,9 @@ enum class Phase : uint32_t {
 	BufferSync,     // BufferCache::SynchronizeBuffer
 	Protect,        // page protection changes (PageManager)
 	Flush,          // a command buffer ended and a new one begun (CommandScheduler::Flush)
+	BdaWalk,        // PrepareBda's walk of CPU-dirty buffers (at most once a guest submission)
+	BdaRegions,     // (a count only) the tracker regions those walks visited
+	SpecCheck,      // CommitBindings' check of specialization reads against the draw's writes
 	Count
 };
 
@@ -90,6 +93,13 @@ inline void Add(Phase phase, uint64_t cycles) noexcept {
 	const auto index = static_cast<size_t>(phase);
 	Detail::g_totals.cycles[index] += cycles;
 	Detail::g_totals.count[index]++;
+}
+
+// Adds `n` to the count of `phase` without time (a count-only phase), on the GPU thread.
+inline void Count(Phase phase, uint64_t n) noexcept {
+	if (Detail::t_on) {
+		Detail::g_totals.count[static_cast<size_t>(phase)] += n;
+	}
 }
 
 // Times its block on the GPU thread.
