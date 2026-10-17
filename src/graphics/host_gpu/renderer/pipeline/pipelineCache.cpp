@@ -2424,12 +2424,15 @@ struct PipelineCache::ProgramCache {
 		if (const auto found = copies.find(&entry); found != copies.end()) {
 			return found->second.get();
 		}
-		// A bound on the memory the copies take (a plan is tens of KB): past it, new programs are
+		// A bound on the memory the copies take (a plan is tens of KB), over all the scanner's
+		// threads (round 73: its workers have copies of their own): past it, new programs are
 		// walked under the lock as before.
-		constexpr size_t MaxCopies = 8192;
-		if (copies.size() >= MaxCopies) {
+		constexpr size_t           MaxCopies = 12288;
+		static std::atomic<size_t> total {0};
+		if (total.load(std::memory_order_relaxed) >= MaxCopies) {
 			return nullptr;
 		}
+		total.fetch_add(1, std::memory_order_relaxed);
 		std::vector<uint8_t> bytes;
 		bool                 encoded = false;
 		{
@@ -2571,6 +2574,7 @@ struct PipelineCache::ProgramCache {
 		const bool again = result->consumed;
 		if (again && entry.prepared_serial != result->serial) {
 			DrawPrep::Add(DrawPrep::Counter::MissNone);
+			DrawPrep::Add(DrawPrep::Counter::MissAgain);
 			return false;
 		}
 		if (result->shader_base != runtime.shader_base ||
@@ -3102,12 +3106,11 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	return result;
 }
 
-bool PipelineCache::DrawPrepGraphics(
+bool PipelineCache::DrawPrepDescribeGraphics(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    DrawPrep::PacketResult& out) {
-	out.stage_count = 0;
+    DrawPrepInputs& inputs) {
 	if (user_config.GetPrimType() == Prospero::PrimitiveType::kPatch) {
 		DrawPrep::Add(DrawPrep::Counter::SkipUnsupported);
 		return false;
@@ -3118,21 +3121,53 @@ bool PipelineCache::DrawPrepGraphics(
 		return false;
 	}
 	std::array<ShaderVertexInputInfo, 3> vertex_info;
-	ShaderPixelInputInfo                 pixel_info;
 	std::array<ShaderParams, 3>          vertex_params;
-	ShaderParams                         pixel_params;
 	if (!DescribeGraphicsStages(vertex_regs, pixel_regs, sh, context, user_config,
-	                            target_export_mapping, pixel_active, vertex_info, pixel_info,
-	                            vertex_params, pixel_params)) {
+	                            target_export_mapping, pixel_active, vertex_info, inputs.pixel_info,
+	                            vertex_params, inputs.pixel_params)) {
 		DrawPrep::Add(DrawPrep::Counter::SkipUnsupported);
 		return false;
 	}
-	if (pixel_active &&
-	    m_program_cache->ScanStage(pixel_params, pixel_info, ShaderType::Pixel, out.stages[0])) {
+	inputs.compute       = false;
+	inputs.pixel         = pixel_active;
+	inputs.vertex_params = vertex_params[0];
+	inputs.vertex_info   = vertex_info[0];
+	return true;
+}
+
+bool PipelineCache::DrawPrepDescribeCompute(const HW::ComputeShaderInfo&  regs,
+                                            const HW::ShaderRegisters&    sh,
+                                            const ShaderComputeInputInfo& input_info,
+                                            DrawPrepInputs&               inputs) {
+	if (!DrawPrep::IsGoodPair(regs.cs_regs.data_addr, UINT64_MAX)) {
+		DrawPrep::Add(DrawPrep::Counter::SkipUnknownPair);
+		return false;
+	}
+	inputs.compute                         = true;
+	inputs.compute_info                    = input_info;
+	inputs.compute_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
+	inputs.compute_params                  = PrepareProgram(regs, sh, inputs.compute_info);
+	inputs.compute_info.lds_storage =
+	    inputs.compute_info.lds_size_dwords * 4u >
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	return true;
+}
+
+bool PipelineCache::DrawPrepWalk(const DrawPrepInputs& inputs, DrawPrep::PacketResult& out) {
+	out.stage_count = 0;
+	if (inputs.compute) {
+		if (m_program_cache->ScanStage(inputs.compute_params, inputs.compute_info,
+		                               ShaderType::Compute, out.stages[0])) {
+			out.stage_count = 1;
+		}
+		return out.stage_count != 0;
+	}
+	if (inputs.pixel && m_program_cache->ScanStage(inputs.pixel_params, inputs.pixel_info,
+	                                               ShaderType::Pixel, out.stages[0])) {
 		out.stage_count++;
 	}
-	if (m_program_cache->ScanStage(vertex_params[0], vertex_info[0], vertex_info[0].logical_stage,
-	                               out.stages[out.stage_count])) {
+	if (m_program_cache->ScanStage(inputs.vertex_params, inputs.vertex_info,
+	                               inputs.vertex_info.logical_stage, out.stages[out.stage_count])) {
 		out.stage_count++;
 	}
 	return out.stage_count != 0;
@@ -3156,23 +3191,6 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 		DrawPrep::NoteGoodPair(regs.cs_regs.data_addr, UINT64_MAX);
 	}
 	return program;
-}
-
-bool PipelineCache::DrawPrepCompute(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
-                                    ShaderComputeInputInfo& input_info, DrawPrep::PacketResult& out) {
-	out.stage_count = 0;
-	if (!DrawPrep::IsGoodPair(regs.cs_regs.data_addr, UINT64_MAX)) {
-		DrawPrep::Add(DrawPrep::Counter::SkipUnknownPair);
-		return false;
-	}
-	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
-	const auto params             = PrepareProgram(regs, sh, input_info);
-	input_info.lds_storage        = input_info.lds_size_dwords * 4u >
-	                         m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
-	if (m_program_cache->ScanStage(params, input_info, ShaderType::Compute, out.stages[0])) {
-		out.stage_count = 1;
-	}
-	return out.stage_count != 0;
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {

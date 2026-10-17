@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/shaderCompiler.h"
 
 #include <array>
 #include <cstddef>
@@ -216,16 +217,29 @@ public:
 	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
 	                    ShaderPixelInputInfo& pixel_info);
-	// Draw prep (KYTY_DRAW_PREP, drawPrep.h), scanner thread: the SRT refreshes GetGraphicsPrograms
-	// would run for these registers, into `out`. False when nothing was prepared.
-	bool DrawPrepGraphics(const HW::VertexShaderInfo& vertex_regs,
-	                      const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
-	                      const HW::Context& context, const HW::UserConfig& user_config,
-	                      std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-	                      bool pixel_active, DrawPrep::PacketResult& out);
-	// The same for a dispatch: the SRT refresh GetComputeProgram would run.
-	bool DrawPrepCompute(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
-	                     ShaderComputeInputInfo& input_info, DrawPrep::PacketResult& out);
+	// Draw prep (KYTY_DRAW_PREP, drawPrep.h): the SRT refreshes GetGraphicsPrograms or
+	// GetComputeProgram would run for a draw's or dispatch's registers, in two steps so that the
+	// walks can run on several threads (round 73): the stage inputs from the registers (the
+	// scanner thread, which follows them), then the walks (any of its workers), into `out`.
+	struct DrawPrepInputs {
+		bool                   compute = false;
+		bool                   pixel   = false;
+		ShaderParams           pixel_params;
+		ShaderPixelInputInfo   pixel_info;
+		ShaderParams           vertex_params;
+		ShaderVertexInputInfo  vertex_info;
+		ShaderParams           compute_params;
+		ShaderComputeInputInfo compute_info;
+	};
+	bool DrawPrepDescribeGraphics(const HW::VertexShaderInfo& vertex_regs,
+	                              const HW::PixelShaderInfo&  pixel_regs,
+	                              const HW::ShaderRegisters& sh, const HW::Context& context,
+	                              const HW::UserConfig&                               user_config,
+	                              std::span<const Prospero::ColorComponentMapping, 8> mapping,
+	                              bool pixel_active, DrawPrepInputs& inputs);
+	bool DrawPrepDescribeCompute(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
+	                             const ShaderComputeInputInfo& input_info, DrawPrepInputs& inputs);
+	bool DrawPrepWalk(const DrawPrepInputs& inputs, DrawPrep::PacketResult& out);
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
@@ -254,7 +268,7 @@ public:
 private:
 	struct ProgramCache;
 
-	// GetGraphicsPrograms' stage inputs from the registers (shared with DrawPrepGraphics).
+	// GetGraphicsPrograms' stage inputs from the registers (shared with DrawPrepDescribeGraphics).
 	bool DescribeGraphicsStages(const HW::VertexShaderInfo& vertex_regs,
 	                            const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
 	                            const HW::Context& context, const HW::UserConfig& user_config,

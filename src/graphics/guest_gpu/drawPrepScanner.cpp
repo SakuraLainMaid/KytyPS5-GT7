@@ -19,6 +19,7 @@
 #include <array>
 #include <atomic>
 #include <cinttypes>
+#include <cstdlib>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -69,6 +70,20 @@ bool RegisterPacketIsSane(uint32_t opcode, uint32_t header, const uint32_t* body
 	}
 }
 
+// KYTY_DRAW_PREP_WORKERS (default 2, at most 8): the threads that run the scanner's walks; 0 runs
+// them on the scanner thread, as before round 73.
+uint32_t WorkerCount() {
+	static const uint32_t count = [] {
+		const char* value = std::getenv("KYTY_DRAW_PREP_WORKERS");
+		const long  n     = value != nullptr ? std::strtol(value, nullptr, 10) : 2l;
+		return static_cast<uint32_t>(std::clamp(n, 0l, 8l));
+	}();
+	return count;
+}
+
+// Jobs waiting for a worker, at most: past it the scanner waits (it is far enough ahead).
+constexpr size_t MaxJobs = 128;
+
 void LogScanStopped(const char* what, uint32_t header, uint64_t value) {
 	static std::atomic<uint32_t> reports {0};
 	const auto                   report = reports.fetch_add(1, std::memory_order_relaxed);
@@ -82,6 +97,12 @@ void LogScanStopped(const char* what, uint32_t header, uint64_t value) {
 } // namespace
 
 DrawPrepScanner::DrawPrepScanner(RenderContext& renderer): m_renderer(renderer) {
+	const auto workers = WorkerCount();
+	LOGF("DrawPrep: the scanner's walks run on %u worker thread%s (KYTY_DRAW_PREP_WORKERS)\n",
+	     workers, workers == 1 ? "" : "s");
+	for (uint32_t i = 0; i < workers; i++) {
+		m_workers.emplace_back([this] { WorkerRun(); });
+	}
 	m_thread = std::thread([this] { Run(); });
 }
 
@@ -104,9 +125,102 @@ DrawPrepScanner::~DrawPrepScanner() {
 		std::lock_guard lock(m_mutex);
 		m_stop = true;
 	}
+	{
+		std::lock_guard lock(m_job_mutex);
+		m_job_stop = true;
+	}
+	m_stopping.store(true, std::memory_order_relaxed);
 	m_work.notify_one();
+	m_job_ready.notify_all();
+	m_job_space.notify_all();
 	if (m_thread.joinable()) {
 		m_thread.join();
+	}
+	for (auto& worker: m_workers) {
+		if (worker.joinable()) {
+			worker.join();
+		}
+	}
+}
+
+void DrawPrepScanner::WorkerRun() {
+	KYTY_PROFILER_THREAD("Thread_DrawPrepWalk");
+	// As the scanner thread: clean-backing reads that check the GPU-dirty ranges themselves.
+	LibKernel::Memory::SetGpuReadDelegate(true);
+	for (;;) {
+		Job job;
+		{
+			std::unique_lock lock(m_job_mutex);
+			m_job_ready.wait(lock, [this] { return m_job_stop || !m_jobs.empty(); });
+			if (m_job_stop) {
+				return;
+			}
+			job = std::move(m_jobs.front());
+			m_jobs.pop_front();
+		}
+		m_job_space.notify_one();
+		Walk(job);
+	}
+}
+
+void DrawPrepScanner::Dispatch(const DrawPrep::Key&                 key,
+                               const PipelineCache::DrawPrepInputs& inputs) {
+	Job job;
+	job.index  = m_next_index++;
+	job.key    = key;
+	job.inputs = inputs;
+	if (m_workers.empty() || Bisect::ScanOneThread()) {
+		Walk(job);
+		return;
+	}
+	{
+		std::unique_lock lock(m_job_mutex);
+		m_job_space.wait(lock, [this] { return m_job_stop || m_jobs.size() < MaxJobs; });
+		if (m_job_stop) {
+			return;
+		}
+		m_jobs.push_back(std::move(job));
+	}
+	m_job_ready.notify_one();
+}
+
+void DrawPrepScanner::Walk(Job& job) {
+	// The GPU thread may have passed the packet while the job waited.
+	if (!DrawPrep::GpuProgress(job.key.queue).Before(job.key)) {
+		DrawPrep::Add(DrawPrep::Counter::SkipBehind);
+		Finish(job.index, nullptr);
+		return;
+	}
+	DrawPrep::PacketResult result;
+	DrawPrep::Recycle(result);
+	result.key = job.key;
+	if (m_renderer.GetPipelineCache().DrawPrepWalk(job.inputs, result)) {
+		Finish(job.index, &result);
+	} else {
+		Finish(job.index, nullptr);
+	}
+}
+
+void DrawPrepScanner::Finish(uint64_t index, DrawPrep::PacketResult* result) {
+	// Going away: nothing more is published (Publish can wait while the GPU thread is gone).
+	if (m_stopping.load(std::memory_order_relaxed)) {
+		return;
+	}
+	std::lock_guard lock(m_order_mutex);
+	if (index != m_next_publish) {
+		m_done.emplace(index, result != nullptr ? std::optional(std::move(*result)) : std::nullopt);
+		return;
+	}
+	if (result != nullptr) {
+		DrawPrep::Publish(std::move(*result));
+	}
+	m_next_publish++;
+	for (auto next = m_done.begin(); next != m_done.end() && next->first == m_next_publish;
+	     next      = m_done.erase(next)) {
+		if (next->second.has_value()) {
+			DrawPrep::Publish(std::move(*next->second));
+		}
+		m_next_publish++;
 	}
 }
 
@@ -247,13 +361,11 @@ void DrawPrepScanner::ScanDraw(uint64_t seq, uint32_t ordinal, const uint32_t* p
 	}
 	std::array<Prospero::ColorComponentMapping, 8> mapping {};
 	const bool ps_active = DrawPrepPixelState(ctx, sh, mapping);
-	DrawPrep::PacketResult result;
-	DrawPrep::Recycle(result);
-	result.key = key;
-	if (m_renderer.GetPipelineCache().DrawPrepGraphics(sh.GetVs(), sh.GetPs(),
-	                                                   ctx.GetShaderRegisters(), ctx, ucfg, mapping,
-	                                                   ps_active, result)) {
-		DrawPrep::Publish(std::move(result));
+	thread_local PipelineCache::DrawPrepInputs     inputs;
+	if (m_renderer.GetPipelineCache().DrawPrepDescribeGraphics(sh.GetVs(), sh.GetPs(),
+	                                                           ctx.GetShaderRegisters(), ctx, ucfg,
+	                                                           mapping, ps_active, inputs)) {
+		Dispatch(key, inputs);
 	}
 }
 
@@ -308,12 +420,10 @@ void DrawPrepScanner::ScanDispatch(uint64_t seq, uint32_t ordinal, const uint32_
 		input_info.dispatch_thread_dimensions   = use_thread_dimensions;
 		input_info.dispatch_dimensions_indirect = use_thread_dimensions;
 	}
-	DrawPrep::PacketResult result;
-	DrawPrep::Recycle(result);
-	result.key = key;
-	if (m_renderer.GetPipelineCache().DrawPrepCompute(cs, m_state->cp->GetCtx().GetShaderRegisters(),
-	                                                  input_info, result)) {
-		DrawPrep::Publish(std::move(result));
+	thread_local PipelineCache::DrawPrepInputs inputs;
+	if (m_renderer.GetPipelineCache().DrawPrepDescribeCompute(
+	        cs, m_state->cp->GetCtx().GetShaderRegisters(), input_info, inputs)) {
+		Dispatch(key, inputs);
 	}
 }
 
@@ -326,6 +436,7 @@ void DrawPrepScanner::Scan(const Item& item) {
 	};
 	std::vector<Cursor> stack {{item.commands}};
 	uint32_t            ordinal = 0;
+	bool                prepare = true; // false after a COND_EXEC it could not follow
 	while (!stack.empty()) {
 		auto& cursor = stack.back();
 		if (cursor.offset >= cursor.commands.size()) {
@@ -359,7 +470,10 @@ void DrawPrepScanner::Scan(const Item& item) {
 		if (DrawPrep::CountsAsDrawOrDispatch(opcode)) {
 			const auto this_ordinal = ordinal++;
 			DrawPrep::Add(DrawPrep::Counter::Scanned);
-			if (IsGraphicsDraw(opcode)) {
+			if (!prepare) {
+				// After a COND_EXEC the scanner could not follow (its packet numbers may no
+				// longer be the GPU thread's).
+			} else if (IsGraphicsDraw(opcode)) {
 				ScanDraw(item.seq, this_ordinal, packet);
 			} else {
 				ScanDispatch(item.seq, this_ordinal, packet, opcode);
@@ -402,6 +516,41 @@ void DrawPrepScanner::Scan(const Item& item) {
 					DrawPrep::Add(DrawPrep::Counter::TaintIndirect);
 				}
 				break;
+			case Pm4::IT_COND_EXEC: {
+				// As CpOpCondExec: the next exec_count dwords run only when the word at the
+				// address is not zero. The draws in them were counted here and not on the GPU
+				// thread, whose packet numbers then fell behind the scanner's for the rest of the
+				// submission: none of its draws found its result after a COND_EXEC that skipped
+				// (round 73). The word is read as the GPU thread will read it, when no GPU work
+				// wrote it. When it cannot be read so, or the packet is predicated (the GPU thread
+				// may step over it and run the dwords anyway), which packets the GPU thread meets
+				// is unknown here: nothing more of the submission is prepared, and its register
+				// writes are followed as if the dwords ran.
+				DrawPrep::Add(DrawPrep::Counter::ScanCondExec);
+				if (length < 5u) {
+					DrawPrep::Add(DrawPrep::Counter::ScanCondStop);
+					return;
+				}
+				const uint64_t address =
+				    (static_cast<uint64_t>(packet[2]) << 32u) | (packet[1] & 0xfffffffcu);
+				const uint32_t exec_count = packet[4] & 0x3fffu;
+				uint32_t       value      = 0;
+				if ((header & 1u) != 0 || (packet[1] & 0x3u) != 0 || packet[3] != 0 ||
+				    address == 0 || exec_count > remaining - length ||
+				    !LibKernel::Memory::TryReadGpuCleanBacking(address, &value, sizeof(value))) {
+					DrawPrep::Add(DrawPrep::Counter::ScanCondStop);
+					prepare = false;
+					cursor.offset += length;
+					continue;
+				}
+				if (value == 0) {
+					DrawPrep::Add(DrawPrep::Counter::ScanCondSkip);
+					cursor.offset += length + exec_count;
+				} else {
+					cursor.offset += length;
+				}
+				continue;
+			}
 			case Pm4::IT_CLEAR_STATE: m_state->cp->GetCtx().Reset(); break;
 			case Pm4::IT_INDIRECT_BUFFER: {
 				if (length != 4u) {

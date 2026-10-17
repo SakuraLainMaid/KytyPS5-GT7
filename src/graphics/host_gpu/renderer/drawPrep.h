@@ -113,23 +113,35 @@ void Recycle(PacketResult& result);
 
 // Counters (always counted; logged every 10 s while enabled).
 enum class Counter : uint32_t {
-	Scanned,          // draw/dispatch packets the scanner saw
-	Prepared,         // stage refreshes prepared
-	SkipBehind,       // packets the GPU thread had already passed
-	SkipUnknownPair,  // shader pair the GPU thread has not prepared yet
-	SkipUnsupported,  // tessellation, no vertex shader, a skip-listed compute shader, ...
-	SkipNoEntry,      // program not translated yet
-	FailWalk,         // walk failed (unclean or unreadable bytes)
-	Tainted,          // packets scanned while the register copy was unreliable
-	TaintIndirect,    // register-indirect pairs that could not be read cleanly
-	TaintContext,     // context-state pushes and pops the scanner could not follow
-	Takes,            // GPU thread asked
-	Used,             // results used
-	Reused,           // results used again by a later draw of the same packet (multi-draw, retry)
-	MissNone,         // no result for the current packet
-	MissEntry,        // different program
-	MissInputs,       // user data or shader base differ
-	MissReads,        // recorded bytes changed or are no longer clean
+	Scanned,         // draw/dispatch packets the scanner saw
+	Prepared,        // stage refreshes prepared
+	SkipBehind,      // packets the GPU thread had already passed
+	SkipUnknownPair, // shader pair the GPU thread has not prepared yet
+	SkipUnsupported, // tessellation, no vertex shader, a skip-listed compute shader, ...
+	SkipNoEntry,     // program not translated yet
+	FailWalk,        // walk failed (unclean or unreadable bytes)
+	Tainted,         // packets scanned while the register copy was unreliable
+	TaintIndirect,   // register-indirect pairs that could not be read cleanly
+	TaintContext,    // context-state pushes and pops the scanner could not follow
+	Takes,           // GPU thread asked
+	Used,            // results used
+	Reused,          // results used again by a later draw of the same packet (multi-draw, retry)
+	MissNone,        // no result for the current packet (the next six say why)
+	MissNoKey,       // no draw or dispatch packet is being run (the emulator's own programs)
+	MissEmpty,       // nothing prepared waits: the scanner is behind, or stopped scanning
+	MissLater,       // the next one waiting is for a later packet: this one was not prepared
+	MissPacket,      // the next one has this packet's number but another packet (the counts
+	                 // of the two sides went apart)
+	MissStage,       // the packet was prepared, but not this stage
+	MissAgain,       // used by an earlier draw of the packet, and the program has moved on
+	ScanCondExec,    // COND_EXEC packets the scanner met (round 73)
+	ScanCondSkip,    // ... whose packets it stepped over (its word read zero)
+	ScanCondStop,    // ... where it stopped: the word could not be read cleanly
+	GpuCondExec,     // COND_EXEC packets the GPU thread ran
+	GpuCondSkip,     // ... whose packets it stepped over
+	MissEntry,       // different program
+	MissInputs,      // user data or shader base differ
+	MissReads,       // recorded bytes changed or are no longer clean
 	VerifyChecks,
 	VerifyMismatches,
 	Count,

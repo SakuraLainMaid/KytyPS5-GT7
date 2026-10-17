@@ -47,6 +47,7 @@ void AddReadaheadSlow(uint64_t bytes);
 void AddFastReadbackSlow(uint64_t wait_ns, uint64_t bytes);
 void AddLockWaitSlow(uint32_t lock, uint64_t nanoseconds);
 void AddLightGridSlow(uint32_t garbage_cells);
+void AddLightGridViewSlow(uint32_t garbage_cells);
 inline std::atomic<bool> g_spin_locks {false};
 } // namespace Detail
 
@@ -157,6 +158,13 @@ inline void AddFastReadback(uint64_t wait_ns, uint64_t bytes) {
 inline void AddLightGrid(uint32_t garbage_cells) {
 	if (Active()) {
 		Detail::AddLightGridSlow(garbage_cells);
+	}
+}
+// A light-grid binding of a pixel shader checked (RenderExecutor::CheckLightGridView, once a
+// submission for each place), and the cells it reads that ask for more than 1024 lights.
+inline void AddLightGridView(uint32_t garbage_cells) {
+	if (Active()) {
+		Detail::AddLightGridViewSlow(garbage_cells);
 	}
 }
 // The graphics caches' spin locks (graphics/host_gpu/regionManager.h): a thread found one held by

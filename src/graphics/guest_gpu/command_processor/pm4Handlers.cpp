@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/videoOut.h"
@@ -1453,7 +1454,9 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
+	DrawPrep::Add(DrawPrep::Counter::GpuCondExec);
 	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
+		DrawPrep::Add(DrawPrep::Counter::GpuCondSkip);
 		return payload_dw + exec_count;
 	}
 

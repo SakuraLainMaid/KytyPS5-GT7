@@ -118,6 +118,9 @@
 //   grids:raw    a light grid's cells that ask for more than 1024 lights are uploaded as they are,
 //                as before round 72, instead of as empty cells (they are still counted and
 //                logged: the "LightGrid:" lines)
+// and (round 73):
+//   scan:one     the draw-prep scanner walks every draw on its own thread, as before round 73,
+//                instead of on its workers (KYTY_DRAW_PREP_WORKERS=0 for the whole run)
 namespace Libs::Graphics::Bisect {
 
 // The GPU thread, at its start: applies the start step's CPU set and log setting.
@@ -183,6 +186,8 @@ void                      ApplyPending();
 [[nodiscard]] bool OldViewBase();
 [[nodiscard]] bool LightGridsOff();
 [[nodiscard]] bool LightGridsRaw();
+// Any thread: scan:one.
+[[nodiscard]] bool ScanOneThread();
 
 } // namespace Libs::Graphics::Bisect
 

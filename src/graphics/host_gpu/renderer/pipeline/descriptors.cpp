@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -16,11 +17,13 @@
 #include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
+#include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/image/imageDump.h"
@@ -2520,6 +2523,172 @@ void RenderExecutor::DescribeLightGrid(const PreparedBindings& pixel,
 	}
 }
 
+void RenderExecutor::CheckLightGridView(const ShaderStageRuntime& runtime, uint32_t index,
+                                        const TextureBinding& binding) {
+	auto&       textures = m_context.GetTextureCache();
+	const auto* image    = textures.m_slot_images.try_get(binding.image_id);
+	if (image == nullptr || image->info.pixel_format != vk::Format::eR32G32Uint ||
+	    image->info.data.Empty() || image->info.resources.layers == 0 ||
+	    image->info.tile_mode != Prospero::TileMode::kLinear) {
+		return;
+	}
+	const auto&    info        = image->info;
+	const uint64_t layer_bytes = info.data.size / info.resources.layers;
+	const uint32_t row         = std::max(info.pitch, info.extent.width);
+	const uint32_t base        = binding.desc.view_info.base_layer;
+	// The small grids only (the reflection cube faces' 8x8 cells): the screen's own grid never
+	// held such cells, and its 70 KB a frame are not worth reading.
+	if (info.extent.width * info.extent.height > 256u) {
+		return;
+	}
+	if (layer_bytes == 0 || base >= info.resources.layers ||
+	    binding.desc.view_info.layer_count == 0 ||
+	    static_cast<uint64_t>(row) * info.extent.height * 8u > layer_bytes) {
+		return;
+	}
+	const uint32_t layers =
+	    std::min(binding.desc.view_info.layer_count, info.resources.layers - base);
+	const uint64_t start = info.data.address + layer_bytes * base;
+	const uint64_t size  = layer_bytes * layers;
+	if (size > 0x40000u) {
+		return;
+	}
+	// Once a guest submission for each place a view starts at (GPU thread only).
+	struct View {
+		uint32_t draw    = 0;
+		uint64_t tsharp  = 0; // the T#'s address
+		int64_t  first   = 0; // the view's first layer, counted from the T#'s address
+		uint32_t layers  = 0;
+		uint32_t garbage = 0;
+	};
+	struct Submission {
+		uint64_t                     seq = 0;
+		std::unordered_set<uint64_t> starts;
+		std::vector<View>            views;
+	};
+	thread_local Submission seen;
+	const auto              seq = g_guest_submission_seq.load(std::memory_order_relaxed);
+	if (seen.seq != seq) {
+		seen.seq = seq;
+		seen.starts.clear();
+		seen.views.clear();
+	}
+	if (!seen.starts.insert(start).second) {
+		return;
+	}
+	// Not where the GPU wrote (the guest bytes there are older than the GPU's).
+	thread_local std::vector<uint8_t> bytes;
+	bytes.resize(static_cast<size_t>(size));
+	if (!LibKernel::Memory::TryReadGpuCleanBacking(start, bytes.data(), size)) {
+		return;
+	}
+	uint32_t garbage = 0;
+	uint32_t most    = 0;
+	for (uint32_t layer = 0; layer < layers; layer++) {
+		for (uint32_t y = 0; y < info.extent.height; y++) {
+			for (uint32_t x = 0; x < info.extent.width; x++) {
+				uint32_t packed = 0;
+				std::memcpy(&packed,
+				            bytes.data() + layer * layer_bytes +
+				                (static_cast<uint64_t>(y) * row + x) * 8u + 4u,
+				            sizeof(packed));
+				most = std::max(most, packed & 0xffffu);
+				garbage += (packed & 0xffffu) > 1024u ? 1u : 0u;
+			}
+		}
+	}
+	Common::PerfStats::AddLightGridView(garbage);
+	const auto* current = DrawPrep::Current();
+	const auto  tsharp  = binding.desc.info.data.address;
+	View        view;
+	view.draw   = current != nullptr ? current->ordinal : 0u;
+	view.tsharp = tsharp;
+	view.first  = (static_cast<int64_t>(start) - static_cast<int64_t>(tsharp)) /
+	             static_cast<int64_t>(layer_bytes);
+	view.layers  = layers;
+	view.garbage = garbage;
+	if (seen.views.size() < 48) {
+		seen.views.push_back(view);
+	}
+	if (garbage == 0) {
+		return;
+	}
+	static std::atomic<uint64_t> found {0};
+	const auto                   n = found.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (n > 32 && n % 64 != 0) {
+		return;
+	}
+	const auto& program  = *runtime.program;
+	const auto& snapshot = *runtime.resources;
+	std::string words;
+	if (index < snapshot.images.size()) {
+		const auto& descriptor = snapshot.images[index];
+		for (uint32_t w = 0; w < descriptor.dword_count && w < 8u; w++) {
+			words += fmt::format(" {:08x}", descriptor.dwords[w]);
+		}
+	}
+	std::string user;
+	for (size_t u = 0; u < snapshot.user_data.size() && u < 16u; u++) {
+		user += fmt::format(" {:08x}", snapshot.user_data[u]);
+	}
+	// Where the T# came from: the first 8 KB behind each user-data pointer (an aligned pair of
+	// user-data words that reads as a guest address), searched for its first four words; and who
+	// wrote it there, when.
+	std::string source;
+	uint64_t    source_address = 0;
+	if (index < snapshot.images.size() && snapshot.images[index].dword_count >= 4u) {
+		const auto&                        d = snapshot.images[index].dwords;
+		thread_local std::vector<uint32_t> window;
+		window.resize(2048);
+		for (size_t u = 0; u + 1 < snapshot.user_data.size() && source_address == 0; u += 2) {
+			const uint64_t pointer =
+			    snapshot.user_data[u] | (static_cast<uint64_t>(snapshot.user_data[u + 1]) << 32u);
+			if (pointer < 0x100000u || (pointer & 3u) != 0 || pointer >= (uint64_t {1} << 40u) ||
+			    !LibKernel::Memory::TryReadBacking(pointer, window.data(),
+			                                       window.size() * sizeof(uint32_t))) {
+				continue;
+			}
+			for (size_t w = 0; w + 4 <= window.size(); w++) {
+				if (window[w] == d[0] && window[w + 1] == d[1] && window[w + 2] == d[2] &&
+				    window[w + 3] == d[3]) {
+					source_address = pointer + w * 4u;
+					source = fmt::format("s[{}:{}] -> 0x{:x} +0x{:x}", program.user_data_base + u,
+					                     program.user_data_base + u + 1, pointer, w * 4u);
+					break;
+				}
+			}
+		}
+	}
+	if (source_address == 0) {
+		source = "not within 8 KB of a user-data pointer";
+	}
+	std::string others;
+	for (const auto& other: seen.views) {
+		others += fmt::format(" [{}: 0x{:x} {}+{}: {}]", other.draw, other.tsharp, other.first,
+		                      other.layers, other.garbage);
+	}
+	LOGF("LightGrid view: submission %" PRIu64 ", draw %u, ps %016" PRIx64
+	     " tex[%u]: T# 0x%012" PRIx64 " (%ux%u, %u layers) viewed at its layers %" PRId64
+	     "+%u, in image 0x%012" PRIx64 " (%u layers): %u cells over 1024 lights (most %u; %" PRIu64
+	     " so far) | T#:%s (read from %s) | user data:%s | the submission's light-grid views so "
+	     "far (draw: T#, layers from the T#, cells over 1024):%s\n",
+	     seq, view.draw, program.shader_hash, index, tsharp, binding.desc.info.extent.width,
+	     binding.desc.info.extent.height, binding.desc.info.resources.layers, view.first, layers,
+	     info.data.address, info.resources.layers, garbage, most, n, words.c_str(), source.c_str(),
+	     user.c_str(), others.c_str());
+	if (n <= 16) {
+		LOGF("LightGrid view: 0x%012" PRIx64 "+0x%" PRIx64 " writes there in the last second, "
+		     "newest first: %s\n",
+		     start, size, LibKernel::Memory::DescribeJournal(start, size, 1000, 24).c_str());
+		if (source_address != 0) {
+			LOGF("LightGrid view: its T# at 0x%012" PRIx64 ": writes there in the last second, "
+			     "newest first: %s\n",
+			     source_address,
+			     LibKernel::Memory::DescribeJournal(source_address, 32, 1000, 16).c_str());
+		}
+	}
+}
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
@@ -2647,8 +2816,10 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i], true);
 		const bool grid    = pixel && IsLightGridBinding(program.info.images[i], binding);
 		if (grid) {
-			// Its later uploads are checked (TextureCache::CheckLightGridUpload).
+			// Its later uploads are checked (TextureCache::CheckLightGridUpload), and what this
+			// binding reads (CheckLightGridView).
 			TextureCache::NoteLightGridShape(binding.desc.info);
+			CheckLightGridView(runtime, i, binding);
 		}
 		if (grids_off && grid) {
 			// KYTY_BISECT's grids:off: a null texture, whose cells read as zero lights.

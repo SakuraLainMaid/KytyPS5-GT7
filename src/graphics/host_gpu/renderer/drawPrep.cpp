@@ -226,6 +226,7 @@ StageResult* Take(uint32_t stage) {
 	Add(Counter::Takes);
 	if (key == nullptr) {
 		Add(Counter::MissNone);
+		Add(Counter::MissNoKey);
 		return nullptr;
 	}
 	auto&           store   = GetStore();
@@ -244,12 +245,18 @@ StageResult* Take(uint32_t stage) {
 	}
 	if (pending.empty()) {
 		Add(Counter::MissNone);
+		Add(Counter::MissEmpty);
 		return nullptr;
 	}
 	auto& front = pending.front();
-	if (front.key.seq != key->seq || front.key.ordinal != key->ordinal ||
-	    front.key.packet != key->packet) {
+	if (front.key.seq != key->seq || front.key.ordinal != key->ordinal) {
 		Add(Counter::MissNone);
+		Add(Counter::MissLater);
+		return nullptr;
+	}
+	if (front.key.packet != key->packet) {
+		Add(Counter::MissNone);
+		Add(Counter::MissPacket);
 		return nullptr;
 	}
 	for (uint32_t i = 0; i < front.stage_count; i++) {
@@ -261,6 +268,7 @@ StageResult* Take(uint32_t stage) {
 		}
 	}
 	Add(Counter::MissNone);
+	Add(Counter::MissStage);
 	return nullptr;
 }
 
@@ -290,15 +298,20 @@ void LogCountersIfDue() {
 	LOGF("DrawPrep (10 s): scanned %llu, prepared %llu stages, skipped behind %llu / unknown pair "
 	     "%llu / unsupported %llu / no entry %llu, walk failed %llu, tainted %llu (indirect %llu, "
 	     "context %llu); GPU takes %llu, "
-	     "used %llu (again %llu), miss none %llu / entry %llu / inputs %llu / reads %llu; verify "
-	     "%llu checks, "
-	     "%llu mismatches\n",
+	     "used %llu (again %llu), miss none %llu (no packet %llu, nothing waiting %llu, a later "
+	     "packet waiting %llu, another packet %llu, not this stage %llu, used before %llu) / entry "
+	     "%llu / inputs "
+	     "%llu / reads %llu; COND_EXEC: scanner %llu (stepped over %llu, stopped %llu), GPU "
+	     "thread %llu (stepped over %llu); verify %llu checks, %llu mismatches\n",
 	     c(Counter::Scanned), c(Counter::Prepared), c(Counter::SkipBehind),
 	     c(Counter::SkipUnknownPair), c(Counter::SkipUnsupported), c(Counter::SkipNoEntry),
 	     c(Counter::FailWalk), c(Counter::Tainted), c(Counter::TaintIndirect),
 	     c(Counter::TaintContext), c(Counter::Takes), c(Counter::Used) + c(Counter::Reused),
-	     c(Counter::Reused), c(Counter::MissNone), c(Counter::MissEntry), c(Counter::MissInputs),
-	     c(Counter::MissReads),
+	     c(Counter::Reused), c(Counter::MissNone), c(Counter::MissNoKey), c(Counter::MissEmpty),
+	     c(Counter::MissLater), c(Counter::MissPacket), c(Counter::MissStage),
+	     c(Counter::MissAgain), c(Counter::MissEntry), c(Counter::MissInputs),
+	     c(Counter::MissReads), c(Counter::ScanCondExec), c(Counter::ScanCondSkip),
+	     c(Counter::ScanCondStop), c(Counter::GpuCondExec), c(Counter::GpuCondSkip),
 	     c(Counter::VerifyChecks), c(Counter::VerifyMismatches));
 }
 

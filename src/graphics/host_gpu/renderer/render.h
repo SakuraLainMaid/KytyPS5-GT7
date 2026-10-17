@@ -271,6 +271,12 @@ public:
 	// Watch mode (GpuTiming): the pixel stage's first light grid as this draw reads it, and its
 	// user-data buffer's words, into `detail.grid` (round 71).
 	void DescribeLightGrid(const PreparedBindings& pixel, GpuTiming::DrawDetail& detail);
+	// Diagnostics (round 73): a pixel shader's light-grid binding as the shader reads it (the
+	// guest bytes of the layers it views), once a guest submission for each place: one with
+	// cells of more than 1024 lights is counted and logged with its draw, its T# and the other
+	// light-grid views of the submission ("LightGrid view:" lines).
+	void CheckLightGridView(const ShaderStageRuntime& runtime, uint32_t index,
+	                        const TextureBinding& binding);
 
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
