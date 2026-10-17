@@ -105,6 +105,15 @@
 //                it meets register pairs it cannot read (the GPU wrote them), as before round 70
 //   bdaspan:off  the BDA walk synchronizes each CPU-dirty run of pages on its own, as in round 69,
 //                instead of each cached buffer once over the span of its CPU-dirty runs
+// and (round 71):
+//   scanplan:shared the draw-prep scanner walks the program's own resource plan under its lock,
+//                as before round 71, instead of a copy of its own (the GPU thread then waits
+//                whenever the scanner is walking a program it needs)
+//   views:old    a texture or target found inside a larger cached image is viewed from the layer
+//                where its memory starts, as before round 71, dropping its descriptor's first
+//                layer (BASE_ARRAY / SLICE_START)
+//   grids:off    a pixel shader's light grids (two-channel uint array textures of up to 256 KB)
+//                are bound as null textures: every light count reads as zero
 namespace Libs::Graphics::Bisect {
 
 // The GPU thread, at its start: applies the start step's CPU set and log setting.
@@ -165,6 +174,10 @@ void                      ApplyPending();
 // Any thread: drawprep:taint; bdaspan:off.
 [[nodiscard]] bool DrawPrepTaint();
 [[nodiscard]] bool BdaSpanOff();
+// Any thread: scanplan:shared; views:old; grids:off.
+[[nodiscard]] bool ScanPlanShared();
+[[nodiscard]] bool OldViewBase();
+[[nodiscard]] bool LightGridsOff();
 
 } // namespace Libs::Graphics::Bisect
 

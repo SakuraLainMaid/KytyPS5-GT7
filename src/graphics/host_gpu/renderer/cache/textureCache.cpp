@@ -2834,11 +2834,45 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_b
 			}
 		}
 		auto& image = m_slot_images[result];
+		// A binding found inside a larger image starts at its mip view_mip, layer view_layer (where
+		// the binding's memory starts); the binding's view starts there plus its own first mip and
+		// layer (the T#'s BASE_LEVEL and BASE_ARRAY, a target's SLICE_START). Before round 71 its
+		// own were dropped: GT7's reflection cube faces read their light grids through T#s of one
+		// 48-layer grid with BASE_ARRAY 0, 8, ... 40, and a face whose grid lay inside an older,
+		// larger image read the first face's layers, or other data there (light counts of 65535 a
+		// pixel). KYTY_BISECT's views:old drops them again.
+		const bool old_views = Bisect::OldViewBase();
 		if (view_mip >= 0) {
-			desc.view_info.base_level = static_cast<uint32_t>(view_mip);
+			const auto own   = desc.view_info.base_level;
+			auto       level = static_cast<uint32_t>(view_mip) + (old_views ? 0u : own);
+			if (level + desc.view_info.level_count > image.info.resources.levels) {
+				level = static_cast<uint32_t>(view_mip);
+			}
+			desc.view_info.base_level = level;
 		}
 		if (view_layer >= 0) {
-			desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
+			const auto own   = desc.view_info.base_layer;
+			auto       layer = static_cast<uint32_t>(view_layer) + (old_views ? 0u : own);
+			const bool fits  = layer + desc.view_info.layer_count <= image.info.resources.layers;
+			if (!fits) {
+				layer = static_cast<uint32_t>(view_layer);
+			}
+			if (own != 0 && !old_views) {
+				static std::atomic<uint64_t> moved {0};
+				const auto                   count = ++moved;
+				if (count <= 12u || (count & (count - 1u)) == 0u) {
+					LOGF("TextureCache: 0x%012" PRIx64
+					     " (%ux%u, layers %u, view %u+%u) lies at layer "
+					     "%d of 0x%012" PRIx64 " (%u layers): viewed from layer %u%s (%" PRIu64
+					     " so far; before round 71 from layer %d)\n",
+					     desc.info.data.address, desc.info.extent.width, desc.info.extent.height,
+					     desc.info.resources.layers, own, desc.view_info.layer_count, view_layer,
+					     image.info.data.address, image.info.resources.layers, layer,
+					     fits ? "" : " (its own first layer does not fit: left out)", count,
+					     view_layer);
+				}
+			}
+			desc.view_info.base_layer = layer;
 		}
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);

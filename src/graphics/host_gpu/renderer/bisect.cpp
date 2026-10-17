@@ -55,6 +55,9 @@ struct Step {
 	bool              speccheck_all   = false;
 	bool              drawprep_taint  = false;
 	bool              bdaspan_off     = false;
+	bool              scanplan_shared = false;
+	bool              views_old       = false;
+	bool              grids_off       = false;
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
 	int32_t           dflush          = -1;   // dflush:<n>; -1: the usual
@@ -203,6 +206,18 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "bdaspan:off") {
 		step.bdaspan_off = true;
+		return true;
+	}
+	if (action == "scanplan:shared") {
+		step.scanplan_shared = true;
+		return true;
+	}
+	if (action == "views:old") {
+		step.views_old = true;
+		return true;
+	}
+	if (action == "grids:off") {
+		step.grids_off = true;
 		return true;
 	}
 	if (action.starts_with("tess:max:")) {
@@ -651,6 +666,21 @@ bool DrawPrepTaint() {
 bool BdaSpanOff() {
 	const auto* step = Current();
 	return step != nullptr && step->bdaspan_off;
+}
+
+bool ScanPlanShared() {
+	const auto* step = Current();
+	return step != nullptr && step->scanplan_shared;
+}
+
+bool OldViewBase() {
+	const auto* step = Current();
+	return step != nullptr && step->views_old;
+}
+
+bool LightGridsOff() {
+	const auto* step = Current();
+	return step != nullptr && step->grids_off;
 }
 
 bool WholeUnnormalizedViews() {

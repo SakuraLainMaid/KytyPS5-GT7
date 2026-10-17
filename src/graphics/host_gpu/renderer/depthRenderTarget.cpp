@@ -306,7 +306,8 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	     z.stencil_write_base_addr != z.stencil_read_base_addr)) {
 		DepthFatal("unsupported depth register state");
 	}
-	r.desc = MakeDepthTargetDesc(buffer, z);
+	r.desc                    = MakeDepthTargetDesc(buffer, z);
+	r.guest_array_layer       = r.desc.view_info.base_layer;
 	r.depth_clear_enable      = rc.depth_clear_enable;
 	r.depth_load_clear_enable = r.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();

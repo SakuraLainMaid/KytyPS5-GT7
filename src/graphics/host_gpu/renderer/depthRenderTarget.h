@@ -37,6 +37,9 @@ struct RenderDepthInfo {
 	vk::StencilOpState          stencil_front;
 	vk::StencilOpState          stencil_back;
 	ImageId                     image_id;
+	// The target's own first slice (DB_DEPTH_VIEW's), which its HTile's per-layer clear state is
+	// kept by: desc.view_info.base_layer counts from the cache image it was found in.
+	uint32_t guest_array_layer = 0;
 
 	[[nodiscard]] vk::ImageAspectFlags AttachmentWriteAspects() const;
 };

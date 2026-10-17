@@ -235,7 +235,8 @@ void PruneShaderCache(std::stop_token stop, std::filesystem::path directory,
                       ShaderCachePrefix prefix) {
 	constexpr size_t HeaderBytes = 32;
 	std::error_code  error;
-	const auto marker = directory / fmt::format("pruned_{:016x}", ShaderDiskCache::SourceVersion());
+	const auto       version = ShaderDiskCache::SourceVersion();
+	const auto       marker  = directory / fmt::format("pruned_{:016x}", version);
 	if (std::filesystem::exists(marker, error)) {
 		return;
 	}
@@ -248,56 +249,109 @@ void PruneShaderCache(std::stop_token stop, std::filesystem::path directory,
 	if (!std::filesystem::is_directory(directory, error)) {
 		return;
 	}
+	// Round 71: a run that stops before the end (the game closed) leaves the name of the last file
+	// it kept in pruning_<version>, and the next run goes on after it instead of opening every
+	// file again from the first (round 70 got through a fifth of 344,000 files in a run).
+	const auto  progress = directory / fmt::format("pruning_{:016x}", version);
+	std::string resume;
+	{
+		std::ifstream file(progress);
+		std::getline(file, resume);
+	}
 	uint64_t                           removed       = 0;
 	uint64_t                           removed_bytes = 0;
 	uint64_t                           kept          = 0;
 	uint64_t                           examined      = 0;
+	uint64_t                           skipped       = 0;
+	std::string                        last_kept;
 	std::vector<std::filesystem::path> old_markers;
-	for (std::filesystem::directory_iterator it(directory, error), end; !error && it != end;
-	     it.increment(error)) {
-		if (stop.stop_requested()) {
-			return;
-		}
-		const auto& path = it->path();
-		const auto  name = path.filename().string();
-		if (name.starts_with("pruned_")) {
-			if (path.filename() != marker.filename()) {
-				old_markers.push_back(path);
+	const auto                         save_progress = [&] {
+        if (!last_kept.empty()) {
+            std::ofstream(progress, std::ios::trunc) << last_kept << "\n";
+        }
+	};
+	// Two passes at most: the first skips up to the resume point; when the resume file is not
+	// found (removed by hand), the second goes through everything.
+	for (int pass = 0; pass < 2; pass++) {
+		bool skipping = !resume.empty() && pass == 0;
+		bool found    = false;
+		for (std::filesystem::directory_iterator it(directory, error), end; !error && it != end;
+		     it.increment(error)) {
+			if (stop.stop_requested()) {
+				save_progress();
+				PipelineCacheLog("Shader disk cache: removing old entries paused at the end of the "
+				                 "run: {} files ({} MB) removed, {} kept; the next run goes on",
+				                 removed, removed_bytes >> 20u, kept);
+				return;
 			}
-			continue;
-		}
-		std::error_code entry_error;
-		if (path.extension() != ".bin" || !it->is_regular_file(entry_error)) {
-			continue;
-		}
-		const auto size = it->file_size(entry_error);
-		if (entry_error) {
-			continue;
-		}
-		std::array<uint8_t, HeaderBytes + 16> head {};
-		{
-			std::ifstream file(path, std::ios::binary);
-			if (!file) {
+			const auto& path = it->path();
+			const auto  name = path.filename().string();
+			if (name.starts_with("pruned_") || name.starts_with("pruning_")) {
+				if (path.filename() != marker.filename() &&
+				    path.filename() != progress.filename()) {
+					old_markers.push_back(path);
+				}
 				continue;
 			}
-			file.read(reinterpret_cast<char*>(head.data()),
-			          static_cast<std::streamsize>(head.size()));
+			if (skipping) {
+				skipped++;
+				if (name == resume) {
+					skipping = false;
+					found    = true;
+				}
+				continue;
+			}
+			std::error_code entry_error;
+			if (path.extension() != ".bin" || !it->is_regular_file(entry_error)) {
+				continue;
+			}
+			const auto size = it->file_size(entry_error);
+			if (entry_error) {
+				continue;
+			}
+			std::array<uint8_t, HeaderBytes + 16> head {};
+			{
+				std::ifstream file(path, std::ios::binary);
+				if (!file) {
+					continue;
+				}
+				file.read(reinterpret_cast<char*>(head.data()),
+				          static_cast<std::streamsize>(head.size()));
+			}
+			const bool current =
+			    size >= head.size() && std::memcmp(head.data(), prefix.data(), 8) == 0 &&
+			    std::memcmp(head.data() + HeaderBytes, prefix.data(), prefix.size()) == 0;
+			if (current) {
+				kept++;
+				last_kept = name;
+			} else if (std::filesystem::remove(path, entry_error)) {
+				removed++;
+				removed_bytes += size;
+			}
+			// Gently: a pause every 64 files; the resume point every 4096; a line every 32768.
+			if ((++examined & 63u) == 0) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			}
+			if ((examined & 4095u) == 0) {
+				save_progress();
+			}
+			if ((examined & 32767u) == 0) {
+				PipelineCacheLog("Shader disk cache: removing old entries: {} files examined, {} "
+				                 "({} MB) removed so far",
+				                 examined, removed, removed_bytes >> 20u);
+			}
 		}
-		const bool current =
-		    size >= head.size() && std::memcmp(head.data(), prefix.data(), 8) == 0 &&
-		    std::memcmp(head.data() + HeaderBytes, prefix.data(), prefix.size()) == 0;
-		if (current) {
-			kept++;
-		} else if (std::filesystem::remove(path, entry_error)) {
-			removed++;
-			removed_bytes += size;
+		if (error || pass == 1 || resume.empty() || found) {
+			break;
 		}
-		// Gently: a pause every 64 files.
-		if ((++examined & 63u) == 0) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
-		}
+		// The resume point was not there: everything again, from the first file.
+		PipelineCacheLog("Shader disk cache: the resume point of removing old entries is gone; "
+		                 "starting over");
+		old_markers.clear();
+		skipped = 0;
 	}
 	if (error) {
+		save_progress();
 		PipelineCacheLog("Shader disk cache: removing old entries stopped early ({}): {} files "
 		                 "({} MB) removed, {} kept",
 		                 error.message(), removed, removed_bytes >> 20u, kept);
@@ -306,10 +360,11 @@ void PruneShaderCache(std::stop_token stop, std::filesystem::path directory,
 	for (const auto& old_marker: old_markers) {
 		std::filesystem::remove(old_marker, error);
 	}
+	std::filesystem::remove(progress, error);
 	std::ofstream(marker) << "entries of other recompilers removed\n";
-	PipelineCacheLog("Shader disk cache: {} files ({} MB) of other recompilers removed, {} kept "
-	                 "(KYTY_SHADER_CACHE_PRUNE=0 keeps them)",
-	                 removed, removed_bytes >> 20u, kept);
+	PipelineCacheLog("Shader disk cache: {} files ({} MB) of other recompilers removed, {} kept, "
+	                 "{} gone through in earlier runs (KYTY_SHADER_CACHE_PRUNE=0 keeps them)",
+	                 removed, removed_bytes >> 20u, kept, skipped);
 }
 
 // The backing bytes of the guest pages one resource evaluation (MaterializeResources, a function
@@ -2351,6 +2406,62 @@ struct PipelineCache::ProgramCache {
 		return true;
 	}
 
+	// The draw-prep scanner's own copy of an entry's resource plan (round 71), or null to walk the
+	// entry's plan under its lock as before (KYTY_BISECT's scanplan:shared, or a plan that cannot
+	// be encoded). A plan's memo and replay state are mutable, so the scanner and the GPU thread
+	// took turns on its walk lock: once the GPU thread was as fast as the scanner (round 69), it
+	// waited for the scanner's walk of the very program it needed, ~17 % of its time at Tokyo in
+	// round 70 (Mtx_lock in ProgramCache::Get), and then walked it again itself. The copy is the
+	// plan decoded from its disk cache encoding (which round-trips exactly before anything is
+	// stored): the same values, with a memo of its own. One per entry and scanner thread.
+	ShaderRecompiler::IR::ResourcePlan* ScannerPlan(SourceEntry& entry) {
+		if (Bisect::ScanPlanShared()) {
+			return nullptr;
+		}
+		thread_local std::unordered_map<const SourceEntry*,
+		                                std::unique_ptr<ShaderRecompiler::IR::ResourcePlan>>
+		    copies;
+		if (const auto found = copies.find(&entry); found != copies.end()) {
+			return found->second.get();
+		}
+		// A bound on the memory the copies take (a plan is tens of KB): past it, new programs are
+		// walked under the lock as before.
+		constexpr size_t MaxCopies = 8192;
+		if (copies.size() >= MaxCopies) {
+			return nullptr;
+		}
+		std::vector<uint8_t> bytes;
+		bool                 encoded = false;
+		{
+			std::lock_guard walk_lock(entry.walk_mutex);
+			encoded =
+			    ShaderDiskCache::EncodeSourceRecord(false, false, &entry.resource_plan, bytes);
+		}
+		std::unique_ptr<ShaderRecompiler::IR::ResourcePlan> plan;
+		// As the disk cache stores nothing that does not decode to the same encoding again.
+		if (encoded && ShaderDiskCache::SourceRecordRoundTrips(bytes)) {
+			ShaderDiskCache::SourceRecord record;
+			if (ShaderDiskCache::DecodeSourceRecord(bytes, record) && !record.unsupported) {
+				plan = std::make_unique<ShaderRecompiler::IR::ResourcePlan>(std::move(record.plan));
+			}
+		}
+		static std::atomic<uint64_t> made {0};
+		static std::atomic<uint64_t> shared {0};
+		static std::atomic<uint64_t> encoded_bytes {0};
+		if (plan) {
+			encoded_bytes += bytes.size();
+		}
+		const auto count = plan ? ++made : ++shared;
+		if ((count & (count - 1u)) == 0u && count >= 64u) {
+			LOGF("DrawPrep: the scanner walks %" PRIu64 " plans of its own (%" PRIu64
+			     " KB encoded), %" PRIu64 " shared with the GPU thread (not encodable)\n",
+			     made.load(), encoded_bytes.load() >> 10u, shared.load());
+		}
+		auto* result = plan.get();
+		copies.emplace(&entry, std::move(plan));
+		return result;
+	}
+
 	// Scanner thread: the SRT refresh Get would run for these inputs, into `result`.
 	template <typename InputInfo>
 	bool ScanStage(const ShaderParams& params, const InputInfo& input_info, ShaderType stage,
@@ -2397,7 +2508,10 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		bool ok = false;
-		{
+		if (auto* own = ScannerPlan(*entry); own != nullptr) {
+			ok = ShaderRecompiler::IR::MaterializeResources(*own, runtime, result.resources,
+			                                                result.specialization);
+		} else {
 			std::lock_guard walk_lock(entry->walk_mutex);
 			ok = ShaderRecompiler::IR::MaterializeResources(entry->resource_plan, runtime,
 			                                                result.resources, result.specialization);

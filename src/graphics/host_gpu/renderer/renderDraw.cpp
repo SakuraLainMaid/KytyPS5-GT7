@@ -717,7 +717,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		const bool meta_clear =
 		    metadata.kind == ImageMetadataKind::Htile &&
-		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
+		    cache.IsMetaCleared(metadata.range.address, depth.guest_array_layer);
 		depth.depth_load_clear_enable = depth.depth_clear_enable || meta_clear;
 		if (meta_clear && depth.desc.info.HasStencil()) {
 			// The fill's value says whether it cleared the stencil too (HtileSMem).
@@ -730,7 +730,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			LogHtileClear(depth, fill, clears_stencil);
 		}
 		if (meta_clear &&
-		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
+		    !cache.TouchMeta(metadata.range.address, depth.guest_array_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");
 		}
 		auto& image = cache.GetImage(depth.image_id);
@@ -1532,8 +1532,7 @@ static void LogFrameGraphDraw(RenderContext& context, const CommandBuffer& buffe
 		    depth.depth_write_enable ? 1 : 0, static_cast<int>(depth.depth_compare_op),
 		    depth.depth_bounds_test_enable ? 1 : 0, depth.stencil_test_enable ? 1 : 0,
 		    depth.depth_clear_enable ? 1 : 0, htile ? info.metadata.range.address : 0,
-		    htile && textures.IsMetaCleared(info.metadata.range.address,
-		                                    depth.desc.view_info.base_layer)
+		    htile && textures.IsMetaCleared(info.metadata.range.address, depth.guest_array_layer)
 		        ? 1
 		        : 0);
 		// The values a clear of it takes, and the stencil test (round 65: the course maps' track,
@@ -2041,6 +2040,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                        ? GpuTiming::DrawDetail::GpuArguments
 		                        : 0u) |
 		                   (mesh_active ? GpuTiming::DrawDetail::Mesh : 0u);
+		    if (state.ps_active && bindings.pixel) {
+			    DescribeLightGrid(*bindings.pixel, detail);
+		    }
 		    if (vertex_stages.size() == 3) {
 			    const auto& tess    = state.vertex_info[0].tess;
 			    detail.flags       |= GpuTiming::DrawDetail::Tessellated;

@@ -40,6 +40,9 @@ class RenderContext;
 class CommandScheduler;
 class CommandRecorder;
 struct RenderExecutorTestAccess;
+namespace GpuTiming {
+struct DrawDetail;
+} // namespace GpuTiming
 
 enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
@@ -265,6 +268,9 @@ public:
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
+	// Watch mode (GpuTiming): the pixel stage's first light grid as this draw reads it, and its
+	// user-data buffer's words, into `detail.grid` (round 71).
+	void DescribeLightGrid(const PreparedBindings& pixel, GpuTiming::DrawDetail& detail);
 
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);

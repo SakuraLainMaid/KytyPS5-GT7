@@ -111,6 +111,17 @@ std::string Describe(const DrawDetail& detail) {
 	if (detail.depth_samples != 0) {
 		text += fmt::format(", depth {}x", detail.depth_samples);
 	}
+	if (const auto& grid = detail.grid; grid.address != 0) {
+		text += fmt::format("; grid 0x{:x} {}x{}x{} view {}+{}", grid.address, grid.width,
+		                    grid.height, grid.layers, grid.base, grid.count);
+		text += grid.read ? fmt::format(" most {}/{}/{} lights, {} cells over 256", grid.most_low,
+		                                grid.most_mid, grid.most_top, grid.over)
+		                  : std::string(" (unread)");
+	}
+	if (detail.grid.words_read) {
+		text += fmt::format("; cb 528={:08x} 53c={:08x} 6a4={:08x}", detail.grid.words[0],
+		                    detail.grid.words[1], detail.grid.words[2]);
+	}
 	return "[" + text + "]";
 }
 

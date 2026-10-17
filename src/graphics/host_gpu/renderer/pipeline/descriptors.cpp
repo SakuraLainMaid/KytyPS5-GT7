@@ -2436,6 +2436,90 @@ static void ProbeSlowShaderGrids(RenderContext& context, const ShaderStageRuntim
 	}
 }
 
+// A pixel shader's light grid as GT7's lit shaders read them: a two-channel uint 2D array texture
+// of up to 256 KB, sampled, not stored (cells: a light-list offset, packed light counts).
+static bool IsLightGridBinding(const ShaderRecompiler::IR::ImageResource& resource,
+                               const TextureBinding&                      binding) {
+	const auto& info = binding.desc.info;
+	return !resource.written && binding.image_id && info.pixel_format == vk::Format::eR32G32Uint &&
+	       info.resources.layers > 1 && !info.data.Empty() && info.data.size <= 0x40000u &&
+	       (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray ||
+	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D);
+}
+
+void RenderExecutor::DescribeLightGrid(const PreparedBindings& pixel,
+                                       GpuTiming::DrawDetail&  detail) {
+	auto& grid = detail.grid;
+	grid       = {};
+	if (pixel.runtime == nullptr || !*pixel.runtime) {
+		return;
+	}
+	const auto& program  = *pixel.runtime->program;
+	const auto& snapshot = *pixel.runtime->resources;
+	// The user-data buffer: s[0:1], when the stage's user data start at s0.
+	if (program.user_data_base == 0 && snapshot.user_data.size() >= 2) {
+		const uint64_t pointer =
+		    snapshot.user_data[0] | (static_cast<uint64_t>(snapshot.user_data[1]) << 32u);
+		constexpr std::array<uint32_t, 3> Offsets {0x528u, 0x53cu, 0x6a4u};
+		grid.words_read = pointer != 0;
+		for (size_t i = 0; i < Offsets.size() && grid.words_read; i++) {
+			grid.words_read = LibKernel::Memory::TryReadBacking(pointer + Offsets[i],
+			                                                    &grid.words[i], sizeof(uint32_t));
+		}
+	}
+	auto& textures = m_context.GetTextureCache();
+	for (size_t i = 0; i < pixel.images.size() && i < program.info.images.size(); i++) {
+		const auto& binding = pixel.images[i];
+		if (!IsLightGridBinding(program.info.images[i], binding)) {
+			continue;
+		}
+		// The image the view is of: the grid's own, or a larger one it lies in.
+		const auto* image = textures.m_slot_images.try_get(binding.image_id);
+		if (image == nullptr || image->info.pixel_format != vk::Format::eR32G32Uint ||
+		    image->info.data.Empty() || image->info.resources.layers == 0 ||
+		    image->info.tile_mode != Prospero::TileMode::kLinear) {
+			continue;
+		}
+		const auto& info           = image->info;
+		grid.address               = info.data.address;
+		grid.width                 = info.extent.width;
+		grid.height                = info.extent.height;
+		grid.layers                = info.resources.layers;
+		grid.base                  = binding.desc.view_info.base_layer;
+		grid.count                 = binding.desc.view_info.layer_count;
+		const uint64_t layer_bytes = info.data.size / info.resources.layers;
+		const uint64_t row_texels  = std::max(info.pitch, info.extent.width);
+		if (grid.base >= grid.layers || row_texels * info.extent.height * 8u > layer_bytes) {
+			return;
+		}
+		const uint32_t layers = std::min(grid.count, grid.layers - grid.base);
+		if (layer_bytes * layers > 0x100000u) {
+			return;
+		}
+		thread_local std::vector<uint32_t> words;
+		words.resize(static_cast<size_t>(layer_bytes * layers / sizeof(uint32_t)));
+		if (words.empty() ||
+		    !LibKernel::Memory::TryReadBacking(info.data.address + layer_bytes * grid.base,
+		                                       words.data(), words.size() * sizeof(uint32_t))) {
+			return;
+		}
+		grid.read = true;
+		for (uint32_t layer = 0; layer < layers; layer++) {
+			for (uint32_t y = 0; y < info.extent.height; y++) {
+				for (uint32_t x = 0; x < info.extent.width; x++) {
+					const uint64_t at = (layer * layer_bytes + (y * row_texels + x) * 8u) / 4u + 1u;
+					const uint32_t packed = words[at];
+					grid.most_low         = std::max(grid.most_low, packed & 0xffffu);
+					grid.most_mid         = std::max(grid.most_mid, (packed >> 16u) & 0xffu);
+					grid.most_top         = std::max(grid.most_top, packed >> 24u);
+					grid.over += (packed & 0xffffu) > 256u ? 1u : 0u;
+				}
+			}
+		}
+		return;
+	}
+}
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
@@ -2557,8 +2641,15 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
+	const bool grids_off = program.stage == ShaderType::Pixel && Bisect::LightGridsOff();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i], true);
+		if (grids_off && IsLightGridBinding(program.info.images[i], binding)) {
+			// KYTY_BISECT's grids:off: a null texture, whose cells read as zero lights.
+			auto desc = NullTextureDesc(program.info.images[i], TextureCache::BindingType::Texture);
+			const auto id = m_context.GetTextureCache().FindImage(desc);
+			binding       = {id, nullptr, std::move(desc)};
+		}
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();

@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_GPUTIMING_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_GPUTIMING_H_
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 
@@ -59,6 +60,27 @@ struct DrawDetail {
 	float    tess_min      = 0.0f; // the factor range it is made for (0: no clamp)
 	float    tess_max      = 0.0f;
 	uint32_t flags         = 0;
+	// The pixel shader's first light grid (a two-channel uint array texture of up to 256 KB: the
+	// light lists GT7's lit shaders loop over, as many times a pixel as a cell's count), as this
+	// draw reads it (round 71): the image, the layers of the view, the most lights a cell of those
+	// layers holds in its guest bytes (counts in bits 0-15, 16-23, 24-31), and the words of the
+	// shader's user-data buffer (s[0:1]) at 0x528, 0x53c and 0x6a4 (in the cube-map shaders: the
+	// grid layer offset, and the cascade count of two shader families).
+	struct Grid {
+		uint64_t                address  = 0; // 0: none
+		uint32_t                width    = 0;
+		uint32_t                height   = 0;
+		uint32_t                layers   = 0;
+		uint32_t                base     = 0; // the view's first layer and layer count
+		uint32_t                count    = 0;
+		uint32_t                most_low = 0;
+		uint32_t                most_mid = 0;
+		uint32_t                most_top = 0;
+		uint32_t                over     = 0; // cells of more than 256 lights
+		std::array<uint32_t, 3> words {};
+		bool                    read       = false; // the grid's guest bytes were read
+		bool                    words_read = false;
+	} grid;
 };
 
 namespace Detail {
