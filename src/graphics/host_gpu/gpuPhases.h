@@ -84,6 +84,17 @@ namespace Detail {
 inline thread_local bool t_on = false;
 // Written by the GPU thread only.
 inline Totals g_totals;
+// The step a page protection change is charged to: the innermost open scope of a whole
+// operation (a slice, a command, a draw, a dispatch, a BDA walk) or of a draw's or a dispatch's
+// steps; Count outside them. And the protection changes by that step (GPU thread only).
+inline thread_local Phase                                          t_step = Phase::Count;
+inline std::array<uint64_t, static_cast<size_t>(Phase::Count) + 1> g_protect_cycles {};
+inline std::array<uint64_t, static_cast<size_t>(Phase::Count) + 1> g_protect_count {};
+[[nodiscard]] constexpr bool ChargesProtects(Phase phase) noexcept {
+	return phase == Phase::Process || phase == Phase::Command || phase == Phase::Draw ||
+	       phase == Phase::Dispatch || phase == Phase::BdaWalk ||
+	       (phase >= Phase::DrawPending && phase <= Phase::DispatchCommit);
+}
 } // namespace Detail
 
 [[nodiscard]] inline uint64_t Now() noexcept {
@@ -111,28 +122,61 @@ inline void Count(Phase phase, uint64_t n) noexcept {
 // Times its block on the GPU thread.
 class Scope {
 public:
-	explicit Scope(Phase phase) noexcept: m_phase(phase), m_start(Detail::t_on ? Now() : 0) {}
-	~Scope() { End(); }
-	// Ends the timing before the block does.
-	void End() noexcept {
+	explicit Scope(Phase phase) noexcept: m_phase(phase), m_start(Detail::t_on ? Now() : 0) {
 		if (m_start != 0) {
-			Add(m_phase, Now() - m_start);
-			m_start = 0;
+			m_step = Detail::t_step;
+			if (Detail::ChargesProtects(phase)) {
+				Detail::t_step = phase;
+				m_set_step     = true;
+			}
 		}
 	}
+	~Scope() { End(); }
+	// Ends the timing before the block does (and its charge of protection changes).
+	void End() noexcept {
+		if (m_start != 0) {
+			const auto cycles = Now() - m_start;
+			Add(m_phase, cycles);
+			if (m_phase == Phase::Protect) {
+				Detail::g_protect_cycles[static_cast<size_t>(m_step)] += cycles;
+				Detail::g_protect_count[static_cast<size_t>(m_step)]++;
+			}
+			m_start = 0;
+		}
+		RestoreStep();
+	}
 	// Drops the timing: the block is not counted.
-	void Cancel() noexcept { m_start = 0; }
+	void Cancel() noexcept {
+		m_start = 0;
+		RestoreStep();
+	}
 	// Times the same phase again from here (after an End); a second count.
 	void Restart() noexcept {
 		End();
 		m_start = Detail::t_on ? Now() : 0;
+		if (m_start != 0) {
+			m_step = Detail::t_step;
+			if (Detail::ChargesProtects(m_phase)) {
+				Detail::t_step = m_phase;
+				m_set_step     = true;
+			}
+		}
 	}
 	Scope(const Scope&)            = delete;
 	Scope& operator=(const Scope&) = delete;
 
 private:
+	void RestoreStep() noexcept {
+		if (m_set_step) {
+			Detail::t_step = m_step;
+			m_set_step     = false;
+		}
+	}
+
 	Phase    m_phase;
 	uint64_t m_start;
+	Phase    m_step     = Phase::Count; // t_step when it began
+	bool     m_set_step = false;        // it set t_step (to restore when it ends)
 };
 
 // GPU thread, at its start: turns the phases on there (KYTY_GPU_PHASES=0 leaves them off).

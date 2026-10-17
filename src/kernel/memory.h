@@ -119,6 +119,46 @@ int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+
+// Diagnostics: who wrote guest memory. The emulator's own writes into it (TryWriteBacking, and the
+// GPU thread's stores, fills and copies done on the CPU) and game threads' write faults, the last
+// 16384 and 65536 of them, so a check that finds bytes it did not expect there (the texture
+// cache's light grids) can name the writes that touched them, and when.
+enum class WriteSource : uint8_t {
+	Other,          // TryWriteBacking from a caller that does not name itself
+	Download,       // a buffer download put into guest memory (BufferCache)
+	FastReadback,   // a fast readback put into guest memory (BufferCache)
+	StoreInPlace,   // a store to GPU-written bytes done on both copies (BufferCache::WriteClean)
+	ImageWriteBack, // an image written back to guest memory (TextureCache)
+	MetadataClear,  // color metadata rewritten as expanded keys (TextureCache)
+	GpuThreadStore, // WRITE_DATA done on the CPU
+	Fill,           // a DMA fill done on the CPU
+	Copy,           // a DMA copy done on the CPU
+	FileRead,       // an AMPR file read
+	CpuWriteFault,  // a game thread's store faulted there (the faulting byte's page)
+	Count
+};
+[[nodiscard]] const char* WriteSourceName(WriteSource source) noexcept;
+void                      JournalWrite(uint64_t vaddr, uint64_t size, WriteSource source) noexcept;
+// The source TryWriteBacking journals this thread's writes as now (WriteSourceScope).
+[[nodiscard]] WriteSource CurrentWriteSource() noexcept;
+// The source TryWriteBacking journals this thread's writes as, while it lives.
+class WriteSourceScope final {
+public:
+	explicit WriteSourceScope(WriteSource source) noexcept;
+	~WriteSourceScope();
+	WriteSourceScope(const WriteSourceScope&)            = delete;
+	WriteSourceScope& operator=(const WriteSourceScope&) = delete;
+
+private:
+	WriteSource m_previous;
+};
+// The journaled writes that touched [vaddr, vaddr + size) in the last `ms` milliseconds, newest
+// first, at most `max` of them: "<source> <address>+<size> <age> ms ago (<thread>)", joined by
+// "; ", or "none".
+[[nodiscard]] std::string DescribeJournal(uint64_t vaddr, uint64_t size, uint64_t ms, size_t max);
+// The steady-clock time the journal stamps its entries with, in nanoseconds.
+[[nodiscard]] uint64_t JournalNowNs() noexcept;
 // GPU thread: some byte of [vaddr, vaddr + size) was written by GPU work into a buffer, so the
 // GPU holds it and a host read would wait for the GPU.
 [[nodiscard]] bool     IsGpuBufferWritten(uint64_t vaddr, uint64_t size);

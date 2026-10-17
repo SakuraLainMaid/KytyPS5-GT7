@@ -3,6 +3,8 @@
 #include "common/logging/log.h"
 #include "common/perfStats.h"
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <fmt/format.h>
@@ -22,7 +24,46 @@ struct Reporter {
 	uint64_t                              last_frames = 0;
 	uint64_t                              next_check  = 0;
 	Totals                                last {};
+	std::array<uint64_t, PhaseCount + 1>  last_protect_cycles {};
+	std::array<uint64_t, PhaseCount + 1>  last_protect_count {};
 };
+
+// The names of the steps page protection changes are charged to (Detail::ChargesProtects).
+const char* StepName(size_t index) {
+	switch (static_cast<Phase>(index)) {
+		case Phase::Process: return "a slice";
+		case Phase::Command: return "commands";
+		case Phase::Draw: return "draws";
+		case Phase::Dispatch: return "dispatches";
+		case Phase::BdaWalk: return "bda walks";
+		case Phase::DrawPending: return "draw pending";
+		case Phase::DrawConsume: return "draw consume";
+		case Phase::DrawPrograms: return "draw programs";
+		case Phase::DrawTargets: return "draw targets";
+		case Phase::DrawTextures: return "draw textures";
+		case Phase::DrawFind: return "draw find";
+		case Phase::DrawBda: return "draw bda";
+		case Phase::DrawImages: return "draw images";
+		case Phase::DrawBuffers: return "draw buffers";
+		case Phase::DrawVertex: return "draw vertex";
+		case Phase::DrawPipeline: return "draw pipeline";
+		case Phase::DrawRendering: return "draw rendering";
+		case Phase::DrawCommit: return "draw commit";
+		case Phase::DrawEmit: return "draw emit";
+		case Phase::DispatchPending: return "dispatch pending";
+		case Phase::DispatchProgram: return "dispatch program";
+		case Phase::DispatchClears: return "dispatch clears";
+		case Phase::DispatchFill: return "dispatch fill";
+		case Phase::DispatchPipeline: return "dispatch pipeline";
+		case Phase::DispatchTextures: return "dispatch textures";
+		case Phase::DispatchFind: return "dispatch find";
+		case Phase::DispatchBda: return "dispatch bda";
+		case Phase::DispatchImages: return "dispatch images";
+		case Phase::DispatchBuffers: return "dispatch buffers";
+		case Phase::DispatchCommit: return "dispatch commit";
+		default: return "elsewhere";
+	}
+}
 
 Reporter g_reporter;
 
@@ -68,6 +109,14 @@ void ReportIfDue(uint64_t frames) {
 		delta.cycles[i] = totals.cycles[i] - g_reporter.last.cycles[i];
 		delta.count[i]  = totals.count[i] - g_reporter.last.count[i];
 	}
+	std::array<uint64_t, PhaseCount + 1> protect_cycles {};
+	std::array<uint64_t, PhaseCount + 1> protect_count {};
+	for (size_t i = 0; i <= PhaseCount; i++) {
+		protect_cycles[i] = Detail::g_protect_cycles[i] - g_reporter.last_protect_cycles[i];
+		protect_count[i]  = Detail::g_protect_count[i] - g_reporter.last_protect_count[i];
+	}
+	g_reporter.last_protect_cycles = Detail::g_protect_cycles;
+	g_reporter.last_protect_count  = Detail::g_protect_count;
 	g_reporter.last        = totals;
 	g_reporter.last_time   = now;
 	g_reporter.last_tsc    = tsc;
@@ -154,6 +203,29 @@ void ReportIfDue(uint64_t frames) {
 	line += fmt::format(" | {} ({:.1f} regions, {:.1f} protects each), {}",
 	                    counted("bda walks", Phase::BdaWalk), per_walk(Phase::BdaRegions),
 	                    per_walk(Phase::BdaProtects), counted("spec checks", Phase::SpecCheck));
+	{
+		// The protection changes by the step they were made in, the costliest first (round 72).
+		std::array<size_t, PhaseCount + 1> order {};
+		for (size_t i = 0; i < order.size(); i++) {
+			order[i] = i;
+		}
+		std::sort(order.begin(), order.end(),
+		          [&](size_t a, size_t b) { return protect_cycles[a] > protect_cycles[b]; });
+		std::string by_step;
+		for (size_t k = 0; k < order.size() && k < 8; k++) {
+			const auto i = order[k];
+			if (protect_count[i] == 0) {
+				break;
+			}
+			by_step += fmt::format("{}{} {} x {:.2f} us", by_step.empty() ? "" : ", ", StepName(i),
+			                       protect_count[i],
+			                       static_cast<double>(protect_cycles[i]) / cycles_per_us /
+			                           static_cast<double>(protect_count[i]));
+		}
+		if (!by_step.empty()) {
+			line += " | protects by step: " + by_step;
+		}
+	}
 
 	if (new_frames != 0) {
 		const auto frame = [&](Phase phase) {

@@ -269,8 +269,10 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	auto publish = [this, mapped, offset, total_size, buffer_address,
-	                copies = std::move(copies), owner = std::move(temporary)] {
+	auto publish = [this, mapped, offset, total_size, buffer_address, copies = std::move(copies),
+	                owner = std::move(temporary)] {
+		const Libs::LibKernel::Memory::WriteSourceScope source(
+		    Libs::LibKernel::Memory::WriteSource::Download);
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
 			const auto  address = buffer_address + copy.srcOffset;
@@ -602,6 +604,11 @@ bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 	}
 
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	// A caller that names its writes (a metadata clear) keeps its name.
+	using Libs::LibKernel::Memory::WriteSource;
+	const auto outer = Libs::LibKernel::Memory::CurrentWriteSource();
+	const Libs::LibKernel::Memory::WriteSourceScope source(
+	    outer == WriteSource::Other ? WriteSource::StoreInPlace : outer);
 	if (owner == nullptr || !*owner || !m_slot_buffers[*owner].IsInBounds(vaddr, size) ||
 	    !Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
 		return false;
@@ -993,6 +1000,8 @@ bool BufferCache::FastReadback(Buffer& buffer, uint64_t vaddr, uint64_t size, ui
 		return false;
 	}
 	// Into guest memory, as a download's publication puts them (DownloadBufferCopies).
+	const Libs::LibKernel::Memory::WriteSourceScope source(
+	    Libs::LibKernel::Memory::WriteSource::FastReadback);
 	for (const auto& copy: copies) {
 		const auto  address = buffer_address + copy.srcOffset;
 		const auto* source  = bytes + copy.dstOffset;
@@ -2313,6 +2322,8 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
+		Libs::LibKernel::Memory::JournalWrite(vaddr, size,
+		                                      Libs::LibKernel::Memory::WriteSource::Fill);
 		return;
 	}
 
@@ -2408,6 +2419,8 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		ForgetFillsUnder(dst_vaddr, size);
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
+		Libs::LibKernel::Memory::JournalWrite(dst_vaddr, size,
+		                                      Libs::LibKernel::Memory::WriteSource::Copy);
 		return;
 	}
 

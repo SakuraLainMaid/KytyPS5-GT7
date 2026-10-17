@@ -209,10 +209,15 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			}
 			NoteWriteFault(released, now);
 			if (released) {
+				LibKernel::Memory::JournalWrite(block, block_bytes,
+				                                LibKernel::Memory::WriteSource::CpuWriteFault);
 				m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
 				return true;
 			}
 		}
+		LibKernel::Memory::JournalWrite(Common::AlignDown(fault_vaddr, TRACKER_PAGE_SIZE),
+		                                TRACKER_PAGE_SIZE,
+		                                LibKernel::Memory::WriteSource::CpuWriteFault);
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		if (!texture_done) {
 			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);

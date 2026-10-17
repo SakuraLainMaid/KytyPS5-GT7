@@ -114,6 +114,10 @@
 //                layer (BASE_ARRAY / SLICE_START)
 //   grids:off    a pixel shader's light grids (two-channel uint array textures of up to 256 KB)
 //                are bound as null textures: every light count reads as zero
+// and (round 72):
+//   grids:raw    a light grid's cells that ask for more than 1024 lights are uploaded as they are,
+//                as before round 72, instead of as empty cells (they are still counted and
+//                logged: the "LightGrid:" lines)
 namespace Libs::Graphics::Bisect {
 
 // The GPU thread, at its start: applies the start step's CPU set and log setting.
@@ -174,10 +178,11 @@ void                      ApplyPending();
 // Any thread: drawprep:taint; bdaspan:off.
 [[nodiscard]] bool DrawPrepTaint();
 [[nodiscard]] bool BdaSpanOff();
-// Any thread: scanplan:shared; views:old; grids:off.
+// Any thread: scanplan:shared; views:old; grids:off; grids:raw.
 [[nodiscard]] bool ScanPlanShared();
 [[nodiscard]] bool OldViewBase();
 [[nodiscard]] bool LightGridsOff();
+[[nodiscard]] bool LightGridsRaw();
 
 } // namespace Libs::Graphics::Bisect
 

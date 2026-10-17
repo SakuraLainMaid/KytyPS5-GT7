@@ -4,12 +4,14 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/image/imageDump.h"
@@ -18,7 +20,6 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
-#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/stallWatch.h"
 #include "kernel/memory.h"
 
@@ -27,22 +28,27 @@
 #include <atomic>
 #include <bit>
 #include <cctype>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fmt/format.h>
 #include <limits>
-#include <memory>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
-#include <unordered_set>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <vulkan/vulkan_format_traits.hpp>
@@ -834,7 +840,13 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	m_nan_check = NanCheck::FromEnvironment();
 }
 
+namespace {
+// The light grid finds' background thread is stopped (CheckLightGridUpload).
+void StopLightGridRechecks();
+} // namespace
+
 TextureCache::~TextureCache() {
+	StopLightGridRechecks();
 	m_slot_images.ForEach([&](ImageId id, const Image& image) {
 		if (image.registered) {
 			UnregisterImage(id);
@@ -2034,6 +2046,7 @@ void TextureCache::InitializeImage(ImageId id) {
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
+		CheckLightGridUpload(image, *source, source_offset);
 		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();
 		image.gpu_pixels = false;
@@ -2265,6 +2278,378 @@ static void DescribeLightGrid(const ImageInfo& info, uint64_t shader) {
 	     "256 lights, max offset %u\n",
 	     info.data.address, info.extent.width, info.extent.height, info.resources.layers,
 	     info.pitch, shader, n, cells, max_low, max_mid, max_high, over, max_offset);
+}
+
+namespace {
+
+// The shapes pixel shaders bind light grids with (NoteLightGridShape): width, height, row pitch
+// and layers, packed under the top bit; 0 is a free slot.
+std::array<std::atomic<uint64_t>, 16> g_light_grid_shapes {};
+
+uint64_t LightGridShapeKey(const ImageInfo& info) {
+	return (uint64_t {1} << 63u) | (info.extent.width & 0xffffu) |
+	       (static_cast<uint64_t>(info.extent.height & 0xffffu) << 16u) |
+	       (static_cast<uint64_t>(info.pitch & 0xffffu) << 32u) |
+	       (static_cast<uint64_t>(info.resources.layers & 0x7fffu) << 48u);
+}
+
+bool LightGridFormat(const ImageInfo& info) {
+	return info.pixel_format == vk::Format::eR32G32Uint && !info.IsTiled() && !info.IsVolume() &&
+	       info.resources.levels == 1 && info.resources.layers >= 2 && info.samples == 1 &&
+	       !info.data.Empty() && info.data.size <= 0x40000u;
+}
+
+bool IsLightGridShape(const ImageInfo& info) {
+	if (!LightGridFormat(info)) {
+		return false;
+	}
+	const auto key = LightGridShapeKey(info);
+	for (const auto& shape: g_light_grid_shapes) {
+		const auto value = shape.load(std::memory_order_relaxed);
+		if (value == key) {
+			return true;
+		}
+		if (value == 0) {
+			return false;
+		}
+	}
+	return false;
+}
+
+// No light grid cell of GT7's asks for this many lights (the counts seen are below 64); the
+// garbage ones ask for up to 65535.
+constexpr uint32_t LightGridMostLights = 1024;
+
+struct LightGridScan {
+	uint32_t    cells   = 0;
+	uint32_t    garbage = 0;
+	uint64_t    first   = UINT64_MAX; // byte offsets of the first and the last such cell
+	uint64_t    last    = 0;
+	std::string layers; // " <layer>:<cells>" for each layer holding such cells (`describe`)
+};
+
+// A light grid's bytes: cell (x, y) of layer l is two words at l * layer bytes + (y * row + x) * 8,
+// a light-list offset and packed counts (the low 16 bits one of them). Each cell that asks for
+// more than LightGridMostLights lights is emptied in `repair` (`bytes` itself, or a copy), when
+// given.
+LightGridScan ScanLightGrid(const uint8_t* bytes, uint64_t size, uint32_t width, uint32_t height,
+                            uint32_t layers, uint32_t row, uint8_t* repair, bool describe) {
+	LightGridScan scan;
+	if (layers == 0 || size % layers != 0) {
+		return scan;
+	}
+	const uint64_t layer_bytes = size / layers;
+	if (static_cast<uint64_t>(row) * height * 8u > layer_bytes || width > row) {
+		return scan;
+	}
+	for (uint32_t layer = 0; layer < layers; layer++) {
+		uint32_t in_layer = 0;
+		for (uint32_t y = 0; y < height; y++) {
+			for (uint32_t x = 0; x < width; x++) {
+				const uint64_t at = layer * layer_bytes + (static_cast<uint64_t>(y) * row + x) * 8u;
+				uint32_t       packed = 0;
+				std::memcpy(&packed, bytes + at + 4u, sizeof(packed));
+				scan.cells++;
+				if ((packed & 0xffffu) <= LightGridMostLights) {
+					continue;
+				}
+				in_layer++;
+				scan.garbage++;
+				scan.first = std::min(scan.first, at);
+				scan.last  = std::max(scan.last, at);
+				if (repair != nullptr) {
+					std::memset(repair + at, 0, 8u);
+				}
+			}
+		}
+		if (describe && in_layer != 0) {
+			scan.layers += fmt::format(" {}:{}", layer, in_layer);
+		}
+	}
+	return scan;
+}
+
+std::string HexWords(const uint8_t* bytes, uint64_t size, uint64_t offset, uint32_t words) {
+	std::string text;
+	for (uint32_t i = 0; i < words && offset + (i + 1u) * 4u <= size; i++) {
+		uint32_t word = 0;
+		std::memcpy(&word, bytes + offset + i * 4u, sizeof(word));
+		text += fmt::format(" {:08x}", word);
+	}
+	return text;
+}
+
+// A light grid found with such cells, for the background thread (LightGridRechecker): its words
+// and the guest memory journal's writes there are logged off the GPU thread, and, for the first
+// few, what guest memory holds there is read again 1, 4, 16, 64, 256 and 1000 ms after it was
+// found: does the game still write it, or does something write over it later?
+struct LightGridFind {
+	uint64_t             address  = 0;
+	uint32_t             width    = 0;
+	uint32_t             height   = 0;
+	uint32_t             layers   = 0;
+	uint32_t             row      = 0;
+	uint64_t             first    = 0; // the first and the last such cell
+	uint64_t             last     = 0;
+	uint64_t             found_ns = 0; // the journal's clock
+	bool                 recheck  = false;
+	std::vector<uint8_t> found; // the bytes the check found (before any repair)
+	// The rechecks done so far, and their results.
+	size_t      step = 0;
+	std::string text;
+};
+
+class LightGridRechecker final {
+public:
+	LightGridRechecker(): m_thread([this](const std::stop_token& stop) { Run(stop); }) {}
+	~LightGridRechecker() = default;
+	KYTY_CLASS_NO_COPY(LightGridRechecker);
+
+	void Queue(LightGridFind find) {
+		{
+			std::lock_guard lock(m_mutex);
+			if (m_queue.size() >= 32) {
+				return;
+			}
+			m_queue.push_back(std::move(find));
+		}
+		m_ready.notify_one();
+	}
+
+private:
+	static constexpr std::array<uint32_t, 6> StepsMs {1u, 4u, 16u, 64u, 256u, 1000u};
+
+	static uint64_t Due(const LightGridFind& find) {
+		return find.found_ns + uint64_t {StepsMs[find.step]} * 1000000u;
+	}
+
+	static void LogDetails(const LightGridFind& find) {
+		const auto* bytes     = find.found.data();
+		const auto  size      = static_cast<uint64_t>(find.found.size());
+		const auto  first_row = Common::AlignDown(find.first, static_cast<uint64_t>(find.row) * 8u);
+		LOGF("LightGrid: 0x%012" PRIx64 " words: at +0 (the grid's start):%s | the row of the "
+		     "first such cell, +0x%" PRIx64 ":%s | the last such cell, +0x%" PRIx64 ":%s\n",
+		     find.address, HexWords(bytes, size, 0, 16).c_str(), first_row,
+		     HexWords(bytes, size, first_row, std::min(find.row, 16u) * 2u).c_str(), find.last,
+		     HexWords(bytes, size, find.last, 8).c_str());
+		const auto age_ms = (LibKernel::Memory::JournalNowNs() - find.found_ns) / 1000000u;
+		LOGF("LightGrid: 0x%012" PRIx64 " writes there in the second before it was found (and the "
+		     "%" PRIu64 " ms since), newest first: %s\n",
+		     find.address, age_ms,
+		     LibKernel::Memory::DescribeJournal(find.address, size, 1000u + age_ms + 1u, 40)
+		         .c_str());
+	}
+
+	// Reads the grid's guest memory once more; true when that was its last recheck.
+	static bool Recheck(LightGridFind& find, std::vector<uint8_t>& now) {
+		const auto size = static_cast<uint64_t>(find.found.size());
+		now.resize(find.found.size());
+		const auto age =
+		    static_cast<double>(LibKernel::Memory::JournalNowNs() - find.found_ns) / 1e6;
+		find.step++;
+		if (!LibKernel::Memory::TryReadBacking(find.address, now.data(), size)) {
+			find.text += fmt::format(" +{:.1f} ms: unreadable", age);
+			return true;
+		}
+		size_t differ = 0;
+		for (uint64_t at = 0; at + 4u <= size; at += 4u) {
+			differ += std::memcmp(now.data() + at, find.found.data() + at, 4u) != 0 ? 1u : 0u;
+		}
+		const auto scan = ScanLightGrid(now.data(), size, find.width, find.height, find.layers,
+		                                find.row, nullptr, false);
+		find.text += fmt::format(" +{:.1f} ms: {} such cells, {}", age, scan.garbage,
+		                         differ == 0 ? std::string("bytes as found")
+		                                     : fmt::format("{} words changed", differ));
+		return find.step >= StepsMs.size();
+	}
+
+	void Run(const std::stop_token& stop) {
+		std::vector<LightGridFind> active; // this thread's only
+		std::vector<uint8_t>       now;
+		std::unique_lock           lock(m_mutex);
+		for (;;) {
+			while (!m_queue.empty()) {
+				auto find = std::move(m_queue.front());
+				m_queue.pop_front();
+				lock.unlock();
+				LogDetails(find);
+				if (find.recheck) {
+					active.push_back(std::move(find));
+				}
+				lock.lock();
+			}
+			if (active.empty()) {
+				if (!m_ready.wait(lock, stop, [this] { return !m_queue.empty(); })) {
+					return;
+				}
+				continue;
+			}
+			// The recheck due first, across the finds.
+			size_t next = 0;
+			for (size_t i = 1; i < active.size(); i++) {
+				if (Due(active[i]) < Due(active[next])) {
+					next = i;
+				}
+			}
+			const auto due     = Due(active[next]);
+			const auto current = LibKernel::Memory::JournalNowNs();
+			if (due > current) {
+				(void)m_ready.wait_for(lock, stop, std::chrono::nanoseconds(due - current),
+				                       [this] { return !m_queue.empty(); });
+				if (stop.stop_requested()) {
+					return;
+				}
+				continue;
+			}
+			lock.unlock();
+			auto& find = active[next];
+			if (Recheck(find, now)) {
+				const auto since_ms =
+				    (LibKernel::Memory::JournalNowNs() - find.found_ns) / 1000000u + 1u;
+				LOGF("LightGrid: 0x%012" PRIx64 " in guest memory after it was found:%s; writes "
+				     "there since: %s\n",
+				     find.address, find.text.c_str(),
+				     LibKernel::Memory::DescribeJournal(find.address, find.found.size(), since_ms,
+				                                        16)
+				         .c_str());
+				active.erase(active.begin() + static_cast<std::ptrdiff_t>(next));
+			}
+			lock.lock();
+		}
+	}
+
+	std::mutex                  m_mutex;
+	std::condition_variable_any m_ready;
+	std::deque<LightGridFind>   m_queue;
+	std::jthread                m_thread; // last: it starts with the others in place
+};
+
+// Made on the first find; stopped (joined) with the texture cache, before guest memory goes.
+std::mutex                          g_rechecker_mutex;
+std::unique_ptr<LightGridRechecker> g_rechecker;
+bool                                g_rechecker_stopped = false;
+
+void QueueLightGridFind(LightGridFind find) {
+	std::lock_guard lock(g_rechecker_mutex);
+	if (g_rechecker_stopped) {
+		return;
+	}
+	if (g_rechecker == nullptr) {
+		g_rechecker = std::make_unique<LightGridRechecker>();
+	}
+	g_rechecker->Queue(std::move(find));
+}
+
+void StopLightGridRechecks() {
+	std::unique_ptr<LightGridRechecker> rechecker;
+	{
+		std::lock_guard lock(g_rechecker_mutex);
+		g_rechecker_stopped = true;
+		rechecker           = std::move(g_rechecker);
+	}
+	rechecker.reset();
+}
+
+} // namespace
+
+void TextureCache::NoteLightGridShape(const ImageInfo& info) {
+	if (!LightGridFormat(info)) {
+		return;
+	}
+	const auto key = LightGridShapeKey(info);
+	for (auto& shape: g_light_grid_shapes) {
+		auto value = shape.load(std::memory_order_relaxed);
+		if (value == key) {
+			return;
+		}
+		if (value == 0) {
+			if (shape.compare_exchange_strong(value, key, std::memory_order_relaxed)) {
+				LOGF("LightGrid: pixel shaders read light grids of %ux%u cells, %u layers (row "
+				     "pitch "
+				     "%u): their uploads are checked\n",
+				     info.extent.width, info.extent.height, info.resources.layers, info.pitch);
+				return;
+			}
+			if (value == key) {
+				return;
+			}
+		}
+	}
+}
+
+void TextureCache::CheckLightGridUpload(const Image& image, Buffer& source,
+                                        uint64_t source_offset) {
+	const auto& info = image.info;
+	if (!IsLightGridShape(info)) {
+		return;
+	}
+	const auto range  = info.data;
+	const bool staged = &source == &m_buffer_cache.GetUtilityBuffer(MemoryUsage::Upload) &&
+	                    source.Mapped().size() >= source_offset &&
+	                    source.Mapped().size() - source_offset >= range.size;
+	// The guest bytes, read again into cached memory (the staging copy is write-combined, slow to
+	// read). When they hold such cells, they are what is uploaded, repaired: the staging copy is
+	// overwritten with them, so the cells checked are the cells uploaded even when the game
+	// wrote the grid in between. Uploaded from a cached buffer (its bytes GPU-written), the guest
+	// bytes are only counted: nothing is repaired.
+	thread_local std::vector<uint8_t> guest;
+	guest.resize(static_cast<size_t>(range.size));
+	if (!LibKernel::Memory::TryReadBacking(range.address, guest.data(), range.size)) {
+		return;
+	}
+	const auto width  = info.extent.width;
+	const auto height = info.extent.height;
+	const auto layers = info.resources.layers;
+	const auto row    = std::max(info.pitch, width);
+	const auto scan =
+	    ScanLightGrid(guest.data(), range.size, width, height, layers, row, nullptr, true);
+	Common::PerfStats::AddLightGrid(scan.garbage);
+	if (scan.garbage == 0) {
+		return;
+	}
+	static std::atomic<uint64_t> found {0};
+	const auto                   n      = found.fetch_add(1, std::memory_order_relaxed) + 1;
+	const bool                   log    = n <= 24 || n % 64 == 0;
+	const bool                   repair = staged && !Bisect::LightGridsRaw();
+	if (log) {
+		const auto writebacks = PendingWriteBacks();
+		const auto under = std::count_if(writebacks.begin(), writebacks.end(), [&](const auto& w) {
+			return w.first < range.address + range.size && range.address < w.first + w.second;
+		});
+		LOGF("LightGrid: 0x%012" PRIx64 "+0x%" PRIx64 " (%ux%u, %u layers, pitch %u), %s, from %s: "
+		     "%u of %u cells ask for more than %u lights, from +0x%" PRIx64 " to +0x%" PRIx64
+		     " (per layer:%s); %s (%" PRIu64 " so far) | GPU-written bytes there: %s, image "
+		     "write-backs on their way over it: %zu\n",
+		     range.address, range.size, width, height, layers, info.pitch,
+		     image.initialized ? "uploaded again" : "a new image",
+		     staged ? "its guest bytes" : "a cached buffer (GPU-written)", scan.garbage, scan.cells,
+		     LightGridMostLights, scan.first, scan.last, scan.layers.c_str(),
+		     repair   ? "uploaded as empty cells"
+		     : staged ? "uploaded as they are (grids:raw)"
+		              : "uploaded as they are (not repairable)",
+		     n, m_buffer_cache.IsRegionGpuModified(range.address, range.size) ? "yes" : "no",
+		     static_cast<size_t>(under));
+		static std::atomic<uint32_t> rechecks {0};
+		LightGridFind                find;
+		find.address  = range.address;
+		find.width    = width;
+		find.height   = height;
+		find.layers   = layers;
+		find.row      = row;
+		find.first    = scan.first;
+		find.last     = scan.last;
+		find.found_ns = LibKernel::Memory::JournalNowNs();
+		find.recheck  = rechecks.fetch_add(1, std::memory_order_relaxed) < 12;
+		find.found    = guest;
+		QueueLightGridFind(std::move(find));
+	}
+	if (repair) {
+		(void)ScanLightGrid(guest.data(), range.size, width, height, layers, row, guest.data(),
+		                    false);
+		std::memcpy(source.Mapped().data() + source_offset, guest.data(),
+		            static_cast<size_t>(range.size));
+		source.Flush(source_offset, range.size);
+	}
 }
 
 void TextureCache::DescribeUintArrayImage(ImageId id, const ImageDesc& desc) {
@@ -2560,6 +2945,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
 			// Still GPU-written (a known fill): both copies, without the download a CPU store
 			// to GPU-written bytes needs.
+			const LibKernel::Memory::WriteSourceScope source(
+			    LibKernel::Memory::WriteSource::MetadataClear);
 			if (!known_fill || !m_buffer_cache.WriteClean(address, bytes.data(), bytes.size())) {
 				m_buffer_cache.InvalidateMemory(address, slice_size);
 				LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
@@ -3759,6 +4146,8 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 			}
 			return;
 		}
+		const LibKernel::Memory::WriteSourceScope source(
+		    LibKernel::Memory::WriteSource::ImageWriteBack);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
 		if (readback_guard) {
 			NoteLandedReadback(range.address, mapped, range.size);

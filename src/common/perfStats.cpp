@@ -99,6 +99,10 @@ struct Counters {
 	// Waits of KYTY_STALL_MS or more for the host GPU, and the longest host-side sections.
 	std::atomic<uint64_t>                                               stalls {0};
 	std::atomic<uint64_t>                                               longest_stall_ns {0};
+	// Light grid uploads checked, those holding cells of more than 1024 lights, and such cells.
+	std::atomic<uint64_t>                                               light_grids {0};
+	std::atomic<uint64_t>                                               light_grids_garbage {0};
+	std::atomic<uint64_t>                                               light_grid_cells {0};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(Host::Count)> longest_host_ns {};
 
 	// Waits for the graphics caches' spin locks, by lock.
@@ -304,6 +308,9 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 		const auto fast_max    = take(c.longest_fast_readback_ns);
 		const auto stalls      = take(c.stalls);
 		const auto stall_max   = take(c.longest_stall_ns);
+		const auto grids       = take(c.light_grids);
+		const auto bad_grids   = take(c.light_grids_garbage);
+		const auto grid_cells  = take(c.light_grid_cells);
 		const auto acquire_max = take(c.longest_host_ns[static_cast<size_t>(Host::Acquire)]);
 		const auto present_max = take(c.longest_host_ns[static_cast<size_t>(Host::Present)]);
 		const auto lock_max    = take(c.longest_host_ns[static_cast<size_t>(Host::QueueLock)]);
@@ -324,7 +331,7 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 		    "{:.0f}/s, "
 		    "not handled {:.0f}/s | readahead {:.0f}/s ({:.1f} MB/s) | fast readbacks {:.0f}/s "
 		    "({:.1f} MB/s, {:.0f} us each, longest {:.0f}) | stalls {} (longest {:.0f} "
-		    "ms) | longest swapchain acquire "
+		    "ms) | light grids {} checked, {} with garbage ({} cells) | longest swapchain acquire "
 		    "{:.1f} ms, present {:.1f} ms, queue lock wait {:.1f} ms{}\n",
 		    configuration, static_cast<double>(submitted) / seconds, per(latency, done, 1e6),
 		    static_cast<double>(latency_max) / 1e6, static_cast<double>(readbacks) / seconds,
@@ -336,8 +343,8 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 		    static_cast<double>(ahead_bytes) / 1e6 / seconds, static_cast<double>(fasts) / seconds,
 		    static_cast<double>(fast_bytes) / 1e6 / seconds, per(fast_wait, fasts, 1e3),
 		    static_cast<double>(fast_max) / 1e3, stalls, static_cast<double>(stall_max) / 1e6,
-		    static_cast<double>(acquire_max) / 1e6, static_cast<double>(present_max) / 1e6,
-		    static_cast<double>(lock_max) / 1e6, extra));
+		    grids, bad_grids, grid_cells, static_cast<double>(acquire_max) / 1e6,
+		    static_cast<double>(present_max) / 1e6, static_cast<double>(lock_max) / 1e6, extra));
 	}
 
 	// The graphics caches' locks: how often a thread found one held, and how long it waited.
@@ -550,6 +557,14 @@ void AddFastReadbackSlow(uint64_t wait_ns, uint64_t bytes) {
 	g_counters.fast_readback_bytes.fetch_add(bytes, std::memory_order_relaxed);
 	g_counters.fast_readback_wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
 	StoreMax(g_counters.longest_fast_readback_ns, wait_ns);
+}
+
+void AddLightGridSlow(uint32_t garbage_cells) {
+	g_counters.light_grids.fetch_add(1, std::memory_order_relaxed);
+	if (garbage_cells != 0) {
+		g_counters.light_grids_garbage.fetch_add(1, std::memory_order_relaxed);
+		g_counters.light_grid_cells.fetch_add(garbage_cells, std::memory_order_relaxed);
+	}
 }
 
 void AddLockWaitSlow(uint32_t lock, uint64_t nanoseconds) {

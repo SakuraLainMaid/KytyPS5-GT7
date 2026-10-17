@@ -591,6 +591,8 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		for (uint32_t i = 0; i < dw_num; i++) {
 			dst[0] = src[i];
 		}
+		LibKernel::Memory::JournalWrite(reinterpret_cast<uint64_t>(dst), sizeof(uint32_t),
+		                                LibKernel::Memory::WriteSource::GpuThreadStore);
 	} else {
 		const auto bytes = static_cast<size_t>(dw_num) * sizeof(uint32_t);
 		if (cache.WriteClean(reinterpret_cast<uint64_t>(dst), src, bytes)) {
@@ -598,6 +600,8 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		}
 		m_renderer.PrepareGpuThreadWrite(reinterpret_cast<uint64_t>(dst), bytes);
 		memcpy(dst, src, bytes);
+		LibKernel::Memory::JournalWrite(reinterpret_cast<uint64_t>(dst), bytes,
+		                                LibKernel::Memory::WriteSource::GpuThreadStore);
 	}
 }
 

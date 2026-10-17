@@ -46,6 +46,7 @@ void AddHostSlow(uint32_t which, uint64_t nanoseconds);
 void AddReadaheadSlow(uint64_t bytes);
 void AddFastReadbackSlow(uint64_t wait_ns, uint64_t bytes);
 void AddLockWaitSlow(uint32_t lock, uint64_t nanoseconds);
+void AddLightGridSlow(uint32_t garbage_cells);
 inline std::atomic<bool> g_spin_locks {false};
 } // namespace Detail
 
@@ -149,6 +150,13 @@ inline void AddReadahead(uint64_t bytes) {
 inline void AddFastReadback(uint64_t wait_ns, uint64_t bytes) {
 	if (Active()) {
 		Detail::AddFastReadbackSlow(wait_ns, bytes);
+	}
+}
+// A light grid's upload checked (TextureCache::CheckLightGridUpload), and its cells that asked for
+// more lights than any game data does.
+inline void AddLightGrid(uint32_t garbage_cells) {
+	if (Active()) {
+		Detail::AddLightGridSlow(garbage_cells);
 	}
 }
 // The graphics caches' spin locks (graphics/host_gpu/regionManager.h): a thread found one held by

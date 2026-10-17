@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -14,12 +15,14 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
 #include <functional>
 #include <magic_enum.hpp>
 #include <map>
@@ -1154,9 +1157,182 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	return addr;
 }
 
+namespace {
+
+// The write journal (JournalWrite): two rings, the emulator's writes and the game threads' write
+// faults (tens of thousands a second in races, which would push the others out). An entry is
+// published by its sequence number, stored last; a reader skips one being rewritten.
+struct JournalEntry {
+	std::atomic<uint64_t> sequence {0}; // the entry's index in its ring + 1, once written
+	std::atomic<uint64_t> vaddr {0};
+	std::atomic<uint64_t> size_source {0}; // size << 8 | source
+	std::atomic<uint64_t> time_ns {0};
+	std::atomic<uint32_t> tid {0};
+};
+
+template <size_t N>
+struct JournalRing {
+	static_assert(std::has_single_bit(N));
+	std::atomic<uint64_t>       next {0};
+	std::array<JournalEntry, N> entries {};
+};
+
+// Made by Initialize, before any thread could append (a write fault's handler among them).
+JournalRing<16384>* g_emulator_journal = nullptr;
+JournalRing<65536>* g_fault_journal    = nullptr;
+
+void InitializeJournal() {
+	if (g_emulator_journal == nullptr) {
+		g_emulator_journal = new JournalRing<16384>();
+		g_fault_journal    = new JournalRing<65536>();
+	}
+}
+
+thread_local WriteSource t_write_source = WriteSource::Other;
+
+template <size_t N>
+void Append(JournalRing<N>& ring, uint64_t vaddr, uint64_t size, WriteSource source,
+            uint64_t now) noexcept {
+	const auto index = ring.next.fetch_add(1, std::memory_order_relaxed);
+	auto&      entry = ring.entries[index & (N - 1)];
+	entry.sequence.store(0, std::memory_order_relaxed);
+	std::atomic_thread_fence(std::memory_order_release);
+	entry.vaddr.store(vaddr, std::memory_order_relaxed);
+	entry.size_source.store((std::min<uint64_t>(size, uint64_t {1} << 55u) << 8u) |
+	                            static_cast<uint8_t>(source),
+	                        std::memory_order_relaxed);
+	entry.time_ns.store(now, std::memory_order_relaxed);
+	entry.tid.store(Common::PerfStats::CurrentOsThreadId(), std::memory_order_relaxed);
+	entry.sequence.store(index + 1, std::memory_order_release);
+}
+
+struct JournalHit {
+	uint64_t    vaddr  = 0;
+	uint64_t    size   = 0;
+	uint64_t    time   = 0;
+	uint32_t    tid    = 0;
+	WriteSource source = WriteSource::Other;
+};
+
+template <size_t N>
+void Collect(const JournalRing<N>& ring, uint64_t vaddr, uint64_t size, uint64_t since,
+             std::vector<JournalHit>& hits) {
+	const auto next = ring.next.load(std::memory_order_acquire);
+	for (uint64_t back = 0; back < std::min<uint64_t>(next, N); back++) {
+		const auto  index    = next - 1 - back;
+		const auto& entry    = ring.entries[index & (N - 1)];
+		const auto  sequence = entry.sequence.load(std::memory_order_acquire);
+		if (sequence != index + 1) {
+			continue;
+		}
+		JournalHit hit;
+		hit.vaddr              = entry.vaddr.load(std::memory_order_relaxed);
+		const auto size_source = entry.size_source.load(std::memory_order_relaxed);
+		hit.time               = entry.time_ns.load(std::memory_order_relaxed);
+		hit.tid                = entry.tid.load(std::memory_order_relaxed);
+		hit.size               = size_source >> 8u;
+		hit.source             = static_cast<WriteSource>(size_source & 0xffu);
+		std::atomic_thread_fence(std::memory_order_acquire);
+		if (entry.sequence.load(std::memory_order_relaxed) != sequence) {
+			continue;
+		}
+		if (hit.time < since) {
+			continue; // older (stamped just before its slot was taken, a newer one may follow)
+		}
+		if (hit.vaddr < vaddr + size && vaddr < hit.vaddr + hit.size) {
+			hits.push_back(hit);
+		}
+	}
+}
+
+} // namespace
+
+const char* WriteSourceName(WriteSource source) noexcept {
+	switch (source) {
+		case WriteSource::Other: return "backing write";
+		case WriteSource::Download: return "download";
+		case WriteSource::FastReadback: return "fast readback";
+		case WriteSource::StoreInPlace: return "store in place";
+		case WriteSource::ImageWriteBack: return "image write-back";
+		case WriteSource::MetadataClear: return "metadata clear";
+		case WriteSource::GpuThreadStore: return "WRITE_DATA";
+		case WriteSource::Fill: return "DMA fill";
+		case WriteSource::Copy: return "DMA copy";
+		case WriteSource::FileRead: return "file read";
+		case WriteSource::CpuWriteFault: return "game write fault";
+		case WriteSource::Count: break;
+	}
+	return "?";
+}
+
+uint64_t JournalNowNs() noexcept {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+void JournalWrite(uint64_t vaddr, uint64_t size, WriteSource source) noexcept {
+	if (size == 0) {
+		return;
+	}
+	const auto now = JournalNowNs();
+	if (source == WriteSource::CpuWriteFault) {
+		if (auto* ring = g_fault_journal; ring != nullptr) {
+			Append(*ring, vaddr, size, source, now);
+		}
+	} else if (auto* ring = g_emulator_journal; ring != nullptr) {
+		Append(*ring, vaddr, size, source, now);
+	}
+}
+
+WriteSource CurrentWriteSource() noexcept {
+	return t_write_source;
+}
+
+WriteSourceScope::WriteSourceScope(WriteSource source) noexcept: m_previous(t_write_source) {
+	t_write_source = source;
+}
+
+WriteSourceScope::~WriteSourceScope() {
+	t_write_source = m_previous;
+}
+
+std::string DescribeJournal(uint64_t vaddr, uint64_t size, uint64_t ms, size_t max) {
+	const auto              now   = JournalNowNs();
+	const auto              since = now > ms * 1000000u ? now - ms * 1000000u : 0;
+	std::vector<JournalHit> hits;
+	if (const auto* ring = g_emulator_journal; ring != nullptr) {
+		Collect(*ring, vaddr, size, since, hits);
+	}
+	if (const auto* ring = g_fault_journal; ring != nullptr) {
+		Collect(*ring, vaddr, size, since, hits);
+	}
+	if (hits.empty()) {
+		return "none";
+	}
+	std::sort(hits.begin(), hits.end(),
+	          [](const JournalHit& a, const JournalHit& b) { return a.time > b.time; });
+	std::string text;
+	for (size_t i = 0; i < hits.size() && i < max; i++) {
+		const auto& hit = hits[i];
+		const auto  age = static_cast<double>(now - std::min(now, hit.time)) / 1e6;
+		text += fmt::format("{}{} 0x{:012x}+0x{:x} {:.1f} ms ago ({})", i == 0 ? "" : "; ",
+		                    WriteSourceName(hit.source), hit.vaddr, hit.size, age,
+		                    Common::PerfStats::ThreadNameOf(hit.tid));
+	}
+	if (hits.size() > max) {
+		text += fmt::format("; {} more", hits.size() - max);
+	}
+	return text;
+}
+
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-	return g_guest_address_space != nullptr &&
-	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	const bool written = g_guest_address_space != nullptr &&
+	                     g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	if (written) {
+		JournalWrite(vaddr, size, t_write_source);
+	}
+	return written;
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -1415,6 +1591,7 @@ static bool SelfTestSub64SharedPlaceholderAlias() {
 static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
 
 void Initialize() {
+	InitializeJournal();
 	g_flexible_memory_size_frozen = true;
 	VirtualMemory::Init();
 	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize());

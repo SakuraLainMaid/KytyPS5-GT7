@@ -2641,10 +2641,16 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
-	const bool grids_off = program.stage == ShaderType::Pixel && Bisect::LightGridsOff();
+	const bool pixel     = program.stage == ShaderType::Pixel;
+	const bool grids_off = pixel && Bisect::LightGridsOff();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i], true);
-		if (grids_off && IsLightGridBinding(program.info.images[i], binding)) {
+		const bool grid    = pixel && IsLightGridBinding(program.info.images[i], binding);
+		if (grid) {
+			// Its later uploads are checked (TextureCache::CheckLightGridUpload).
+			TextureCache::NoteLightGridShape(binding.desc.info);
+		}
+		if (grids_off && grid) {
 			// KYTY_BISECT's grids:off: a null texture, whose cells read as zero lights.
 			auto desc = NullTextureDesc(program.info.images[i], TextureCache::BindingType::Texture);
 			const auto id = m_context.GetTextureCache().FindImage(desc);

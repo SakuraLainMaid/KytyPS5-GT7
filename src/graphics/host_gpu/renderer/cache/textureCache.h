@@ -184,6 +184,13 @@ public:
 	// before submitting). A light grid (R32G32_UINT cells: a light-list offset and packed light
 	// counts) also gets its lit cells per layer on both sides. Logs "FG 0 grid ...".
 	void CompareWithGuest(ImageId id, uint32_t op);
+	// A pixel shader's light grid (descriptors.cpp, IsLightGridBinding): its shape (width, height,
+	// row pitch) is remembered, and the uploads of R32G32_UINT linear arrays of a shape seen are
+	// checked for cells that ask for more than 1024 lights, which game data never does: the
+	// shader loops over every one of them, for tens of milliseconds a pixel (GT7's reflection
+	// freezes). Such cells are uploaded as empty, unless KYTY_BISECT's grids:raw is on, and logged
+	// ("LightGrid:" lines) with the writes the guest memory journal saw there.
+	static void NoteLightGridShape(const ImageInfo& info);
 	// Diagnostics (the frame graph's verification, FrameGraph::ClaimVerify): an image a shader
 	// reads, refreshed as its binding will refresh it, against its guest bytes when the GPU did
 	// not write it ("FG <op> stale ..." when they differ), and for an array of six or more layers
@@ -424,6 +431,9 @@ private:
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
+	// InitializeImage: a light grid's upload source before the copy is recorded
+	// (NoteLightGridShape).
+	void CheckLightGridUpload(const Image& image, Buffer& source, uint64_t source_offset);
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
 	[[nodiscard]] ImageDownload BuildDownload(const Image& image) const;

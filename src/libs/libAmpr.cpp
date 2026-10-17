@@ -102,6 +102,8 @@ static bool WriteGuestBytes(uint64_t addr, const void* in, uint64_t size) {
 		return false;
 	}
 	std::memcpy(reinterpret_cast<void*>(addr), in, static_cast<size_t>(size));
+	Libs::LibKernel::Memory::JournalWrite(addr, size,
+	                                      Libs::LibKernel::Memory::WriteSource::FileRead);
 	return true;
 }
 
@@ -1873,6 +1875,8 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 					*error_offset     = static_cast<uint32_t>(command.record_offset);
 					return OK;
 				}
+				LibKernel::Memory::JournalWrite(command.destination, bytes_read,
+				                                LibKernel::Memory::WriteSource::FileRead);
 			} break;
 			case CommandKind::KernelEvent: {
 				const auto& command = state.kernel_event_commands[entry.index];

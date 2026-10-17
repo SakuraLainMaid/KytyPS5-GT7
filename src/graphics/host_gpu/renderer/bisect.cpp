@@ -58,6 +58,7 @@ struct Step {
 	bool              scanplan_shared = false;
 	bool              views_old       = false;
 	bool              grids_off       = false;
+	bool              grids_raw       = false;
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
 	int32_t           dflush          = -1;   // dflush:<n>; -1: the usual
@@ -218,6 +219,10 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "grids:off") {
 		step.grids_off = true;
+		return true;
+	}
+	if (action == "grids:raw") {
+		step.grids_raw = true;
 		return true;
 	}
 	if (action.starts_with("tess:max:")) {
@@ -681,6 +686,11 @@ bool OldViewBase() {
 bool LightGridsOff() {
 	const auto* step = Current();
 	return step != nullptr && step->grids_off;
+}
+
+bool LightGridsRaw() {
+	const auto* step = Current();
+	return step != nullptr && step->grids_raw;
 }
 
 bool WholeUnnormalizedViews() {
