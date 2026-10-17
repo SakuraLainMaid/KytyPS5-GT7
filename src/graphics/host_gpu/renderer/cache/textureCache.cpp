@@ -3138,6 +3138,35 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	return association;
 }
 
+namespace {
+
+// A binding the overlap loop found inside an image that starts elsewhere, where it has no place
+// its view fits in (TextureCache::FindImage): it gets an image of its own. Logged, the first 16
+// and then at each power of two.
+void NoteUnplacedBinding(const TextureCache::ImageDesc& desc, const ImageInfo& found, int32_t mip,
+                         int32_t layer) {
+	static std::atomic<uint64_t> unplaced {0};
+	const auto                   count = unplaced.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (count > 16u && (count & (count - 1u)) != 0u) {
+		return;
+	}
+	LOGF("TextureCache: 0x%012" PRIx64 " (%ux%u, mips %u, layers %u, view mips %u+%u layers %u+%u, "
+	     "format %u) lies in 0x%012" PRIx64
+	     " (%ux%u, mips %u, layers %u) %s: given an image of its "
+	     "own (%" PRIu64 " so far)\n",
+	     desc.info.data.address, desc.info.extent.width, desc.info.extent.height,
+	     desc.info.resources.levels, desc.info.resources.layers, desc.view_info.base_level,
+	     desc.view_info.level_count, desc.view_info.base_layer, desc.view_info.layer_count,
+	     static_cast<uint32_t>(desc.info.pixel_format), found.data.address, found.extent.width,
+	     found.extent.height, found.resources.levels, found.resources.layers,
+	     mip < 0 || layer < 0
+	         ? "at no mip and layer"
+	         : fmt::format("at mip {} layer {}, where its view does not fit", mip, layer).c_str(),
+	     count);
+}
+
+} // namespace
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_backing) {
 	if (same_backing != nullptr) {
 		*same_backing = false;
@@ -3187,15 +3216,73 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_b
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
 		if (!result) {
+			// Where the binding lies in the image the loop ends with. Each overlap places the
+			// image it was given (the binding, or the image merged so far) in the candidate it
+			// returns; before round 74 the last overlap's place was used as the binding's, and a
+			// later candidate that returned the image found without a place (or the place of the
+			// merged image instead of the binding's) left the binding viewed from its own first
+			// layer of an image that starts elsewhere: GT7's reflection faces read their light
+			// grids layers before their T#s, in a 48-layer grid of an earlier frame (the light
+			// counts of 65535). KYTY_BISECT's views:old places it as before.
+			const bool old_views  = Bisect::OldViewBase();
+			ImageId    placed_in  = {};
+			bool       placed_raw = false; // placed against the binding's own address
 			for (const auto candidate: candidates) {
-				view_mip                = -1;
-				view_layer              = -1;
+				if (old_views) {
+					view_mip   = -1;
+					view_layer = -1;
+				}
+				// The overlap places the binding itself when it is given the binding, or an image
+				// that starts where the binding does (an alias of another format, a depth image).
 				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
+				const bool  direct      = merged_info.data.address == desc.info.data.address;
 				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
 				if (overlap.image) {
-					result     = overlap.image;
-					view_mip   = overlap.mip;
-					view_layer = overlap.layer;
+					result = overlap.image;
+					if (old_views || overlap.mip >= 0 || overlap.layer >= 0) {
+						view_mip   = overlap.mip;
+						view_layer = overlap.layer;
+					}
+					placed_in = overlap.mip >= 0 || overlap.layer >= 0 ? overlap.image : ImageId {};
+					placed_raw = direct;
+				}
+			}
+			if (result && !old_views) {
+				const auto& found      = m_slot_images[result].info;
+				const auto  loop_mip   = view_mip;
+				const auto  loop_layer = view_layer;
+				const bool  loop_own   = placed_in == result && placed_raw;
+				view_mip               = -1;
+				view_layer             = -1;
+				if (found.data.address != desc.info.data.address) {
+					// The binding's own place in the image found, else the overlap's if it placed
+					// the binding itself there. With neither, or a place its view does not fit
+					// in, the binding gets an image of its own instead of a view that starts
+					// elsewhere.
+					if (const auto mip = desc.info.MipOf(found); mip >= 0) {
+						view_mip   = mip;
+						view_layer = desc.info.SliceOf(found, mip);
+					} else if (loop_own) {
+						view_mip   = loop_mip;
+						view_layer = loop_layer;
+					}
+					const bool fits = view_mip >= 0 && view_layer >= 0 &&
+					                  static_cast<uint64_t>(view_mip) + desc.view_info.base_level +
+					                          desc.view_info.level_count <=
+					                      found.resources.levels &&
+					                  static_cast<uint64_t>(view_layer) +
+					                          desc.view_info.base_layer +
+					                          desc.view_info.layer_count <=
+					                      found.resources.layers;
+					if (!fits) {
+						NoteUnplacedBinding(desc, found, view_mip, view_layer);
+						view_mip   = -1;
+						view_layer = -1;
+						result     = {};
+					}
+				} else if (loop_own) {
+					view_mip   = loop_mip;
+					view_layer = loop_layer;
 				}
 			}
 		}

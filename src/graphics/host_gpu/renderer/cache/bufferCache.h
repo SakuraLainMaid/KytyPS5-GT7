@@ -150,6 +150,19 @@ public:
 	// fault takes its own page). The known fills over it are forgotten, as the CPU's later stores
 	// there do not fault.
 	[[nodiscard]] bool ReleaseBlockForCpuWrite(uint64_t block, uint64_t size);
+	// Hot pages (MemoryTracker::MarkHot, RenderContext::HandleFault): the pages of the range that
+	// hold no GPU-written bytes stay writable, and are uploaded again after each RedirtyHotPages
+	// whether the CPU wrote them or not; how many became hot. The known fills over them are
+	// forgotten, as the CPU's later stores there do not fault.
+	size_t               MarkHotPages(uint64_t vaddr, uint64_t size);
+	size_t               RedirtyHotPages() { return m_memory_tracker.RedirtyHot(); }
+	// A store to guest memory that does not go through a fault (the GPU thread's own): the hot
+	// pages of the range become CPU-dirty, as their write fault would have made them.
+	void DirtyHotPagesIn(uint64_t vaddr, uint64_t size) {
+		m_memory_tracker.DirtyHotIn(vaddr, size);
+	}
+	void                 ClearHotPages() { m_memory_tracker.ClearHot(); }
+	[[nodiscard]] size_t HotPages() const noexcept { return m_memory_tracker.HotPages(); }
 	// Whether a shader has stored through shader addresses: those stores mark no range, so no
 	// block can be proven free of GPU-written bytes.
 	[[nodiscard]] bool AddressWritesSeen() const noexcept {

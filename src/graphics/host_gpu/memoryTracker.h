@@ -99,6 +99,21 @@ public:
 	void CollectCpuDirtyRuns(uint64_t vaddr, uint64_t size,
 	                         std::vector<std::pair<uint64_t, uint64_t>>& runs);
 
+	// Hot pages (RegionManager::MarkHot): the pages of the range that hold no GPU-written bytes
+	// stay writable from now on; how many became hot. Only regions that exist.
+	size_t MarkHot(uint64_t vaddr, uint64_t size);
+	// Every hot page becomes CPU-dirty again (RegionManager::RedirtyHot); how many did.
+	size_t RedirtyHot();
+	// The hot pages of the range become CPU-dirty (RegionManager::DirtyHotIn): a store to them
+	// that did not fault (the GPU thread's own). Lock-free return while no page is hot.
+	void DirtyHotIn(uint64_t vaddr, uint64_t size);
+	// No page is hot any more.
+	void ClearHot();
+	// The pages that are hot now.
+	[[nodiscard]] size_t HotPages() const noexcept {
+		return m_hot_pages.load(std::memory_order_relaxed);
+	}
+
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -192,6 +207,11 @@ public:
 					     " bytes=0x%" PRIx64 " written=%d\n",
 					     manager->GetCpuAddr(), offset, bytes, static_cast<int>(is_written));
 				}
+			}
+			if (is_written) {
+				// Hot pages the CPU may have written since their last upload, unseen: uploaded
+				// now, before the GPU's writes take the range (RegionManager::DropHotIn).
+				manager->DropHotIn(manager->GetCpuAddr() + offset, bytes);
 			}
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
 			                                                      bytes, range_func);
@@ -312,6 +332,11 @@ private:
 	std::unique_ptr<std::atomic<uint64_t>[]>       m_bda_pending;
 	std::unique_ptr<std::atomic<uint64_t>[]>       m_bda_pending_top;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
+	// The regions holding hot pages (RegionManager::in_hot_list), and how many pages are hot. The
+	// mutex is taken before a region's lock.
+	std::mutex                                     m_hot_mutex;
+	std::vector<RegionManager*>                    m_hot_regions;
+	std::atomic<size_t>                            m_hot_pages {0};
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
 };

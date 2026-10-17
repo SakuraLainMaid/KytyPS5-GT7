@@ -164,6 +164,64 @@ bool MemoryTracker::ReleaseForCpuWrite(uint64_t vaddr, uint64_t size) {
 	    });
 }
 
+size_t MemoryTracker::MarkHot(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	size_t           marked = 0;
+	std::scoped_lock hot_lock(m_hot_mutex);
+	Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		const auto       pages = manager->MarkHot(manager->GetCpuAddr() + offset, bytes);
+		if (pages != 0 && !manager->in_hot_list) {
+			manager->in_hot_list = true;
+			m_hot_regions.push_back(manager);
+		}
+		marked += pages;
+	});
+	m_hot_pages.fetch_add(marked, std::memory_order_relaxed);
+	return marked;
+}
+
+size_t MemoryTracker::RedirtyHot() {
+	CheckNotInUploadCallback();
+	size_t           pages = 0;
+	size_t           hot   = 0;
+	std::scoped_lock hot_lock(m_hot_mutex);
+	if (m_hot_regions.empty()) {
+		return 0;
+	}
+	for (auto* manager: m_hot_regions) {
+		std::scoped_lock lock(manager->lock);
+		pages += manager->RedirtyHot();
+		hot += manager->HotCount();
+	}
+	// Pages the GPU wrote since left the hot set on their own (RegionManager::ChangeState).
+	m_hot_pages.store(hot, std::memory_order_relaxed);
+	return pages;
+}
+
+void MemoryTracker::DirtyHotIn(uint64_t vaddr, uint64_t size) {
+	if (m_hot_pages.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
+	CheckNotInUploadCallback();
+	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		(void)manager->DirtyHotIn(manager->GetCpuAddr() + offset, bytes);
+	});
+}
+
+void MemoryTracker::ClearHot() {
+	CheckNotInUploadCallback();
+	std::scoped_lock hot_lock(m_hot_mutex);
+	for (auto* manager: m_hot_regions) {
+		std::scoped_lock lock(manager->lock);
+		manager->ClearHot();
+		manager->in_hot_list = false;
+	}
+	m_hot_regions.clear();
+	m_hot_pages.store(0, std::memory_order_relaxed);
+}
+
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {

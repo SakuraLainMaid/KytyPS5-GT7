@@ -566,6 +566,18 @@ bool BufferCache::ReleaseBlockForCpuWrite(uint64_t block, uint64_t size) {
 	return true;
 }
 
+size_t BufferCache::MarkHotPages(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return 0;
+	}
+	const auto pages = m_memory_tracker.MarkHot(vaddr, size);
+	if (pages != 0 && m_known_fill_count.load(std::memory_order_relaxed) != 0) {
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		ForgetFills(vaddr, size);
+	}
+	return pages;
+}
+
 void BufferCache::ForgetUnmapped(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return;
@@ -2319,6 +2331,8 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 	if (!IsRegionGpuModified(vaddr, size)) {
 		ForgetFillsUnder(vaddr, size);
+		// Hot pages do not fault (MemoryTracker::DirtyHotIn).
+		m_memory_tracker.DirtyHotIn(vaddr, size);
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
@@ -2417,6 +2431,8 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	}
 	if (cpu_copy) {
 		ForgetFillsUnder(dst_vaddr, size);
+		// Hot pages do not fault (MemoryTracker::DirtyHotIn).
+		m_memory_tracker.DirtyHotIn(dst_vaddr, size);
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
 		Libs::LibKernel::Memory::JournalWrite(dst_vaddr, size,

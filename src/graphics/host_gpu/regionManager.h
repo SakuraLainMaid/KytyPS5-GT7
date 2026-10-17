@@ -188,8 +188,16 @@ public:
 			}
 		}
 		if constexpr (source == DirtySource::Cpu) {
-			UpdateProtection<!enable, false>();
+			UpdateCpuProtection();
 		} else {
+			if constexpr (enable) {
+				// Written by the GPU: no longer kept writable for the CPU (hot pages, below).
+				if (m_hot_count != 0 && RegionBits(m_hot, start, end).Any()) {
+					m_hot.UnsetRange(start, end);
+					m_hot_count = m_hot.Count();
+					UpdateCpuProtection();
+				}
+			}
 			UpdateProtection<enable, true>();
 		}
 	}
@@ -208,7 +216,7 @@ public:
 				StoreSummary<source>(false);
 			}
 			if constexpr (source == DirtySource::Cpu) {
-				UpdateProtection<true, false>();
+				UpdateCpuProtection();
 			} else {
 				UpdateProtection<false, true>();
 			}
@@ -244,7 +252,78 @@ public:
 		}
 	}
 
+	// Hot pages (KYTY_BISECT's "hotpages"): pages the CPU writes over and over, kept writable
+	// instead of write-protected again after each upload, so that the CPU's next write does not
+	// fault. Without a fault the tracker cannot see that write, so they are marked CPU-dirty again
+	// wholesale (RedirtyHot) at the points where the GPU thread may next read what the CPU wrote
+	// since: a new slice of a submission, a wait on memory. A page the GPU writes stops being hot.
+	// All with the lock held.
+	//
+	// The pages of [vaddr, vaddr + size) that hold no GPU-written bytes become hot; how many did.
+	size_t MarkHot(uint64_t vaddr, uint64_t size) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		RegionBits pages;
+		pages.SetRange(start, end);
+		pages &= ~m_hot;
+		pages &= ~m_gpu_dirty;
+		if (pages.None()) {
+			return 0;
+		}
+		m_hot |= pages;
+		m_hot_count = m_hot.Count();
+		UpdateCpuProtection();
+		return pages.Count();
+	}
+	// The hot pages become CPU-dirty again (they are writable already); how many.
+	size_t RedirtyHot() {
+		if (m_hot_count == 0) {
+			return 0;
+		}
+		return DirtyHot(m_hot);
+	}
+	// The hot pages of [vaddr, vaddr + size) become CPU-dirty: something wrote them without a
+	// fault (the GPU thread's own stores to guest memory); how many.
+	size_t DirtyHotIn(uint64_t vaddr, uint64_t size) {
+		if (m_hot_count == 0) {
+			return 0;
+		}
+		const auto [start, end] = GetPageRange(vaddr, size);
+		return DirtyHot(RegionBits(m_hot, start, end));
+	}
+	// The hot pages of [vaddr, vaddr + size) stop being hot, as CPU-dirty pages: the CPU may have
+	// written them since their last upload, unseen, so their next upload takes those writes (and
+	// write-protects them, so the writes after it fault again). Before a sync that hands the
+	// range to the GPU's writes (MemoryTracker::ForEachUploadRange).
+	void DropHotIn(uint64_t vaddr, uint64_t size) {
+		if (m_hot_count == 0) {
+			return;
+		}
+		const auto [start, end] = GetPageRange(vaddr, size);
+		const RegionBits pages(m_hot, start, end);
+		if (pages.None()) {
+			return;
+		}
+		(void)DirtyHot(pages);
+		m_hot.UnsetRange(start, end);
+		m_hot_count = m_hot.Count();
+		UpdateCpuProtection();
+	}
+	// No page is hot any more. They become CPU-dirty first (unseen writes since their last
+	// upload are uploaded with them), then write-protected at that upload as any page.
+	void ClearHot() {
+		if (m_hot_count == 0) {
+			return;
+		}
+		(void)DirtyHot(m_hot);
+		m_hot.Clear();
+		m_hot_count = 0;
+		UpdateCpuProtection();
+	}
+	[[nodiscard]] size_t HotCount() const noexcept { return m_hot_count; }
+
 	TrackingSpinLock lock;
+	// Whether the tracker lists this region as holding hot pages (MemoryTracker's hot mutex).
+	bool in_hot_list = false;
 
 private:
 	// Every summary change goes through here; the CPU one is mirrored in the tracker's bitmap at
@@ -273,6 +352,41 @@ private:
 		}
 		previous = protection;
 		m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, mask);
+	}
+
+	// `pages` (hot ones) that are neither GPU-written nor CPU-dirty become CPU-dirty; how many.
+	size_t DirtyHot(const RegionBits& pages) {
+		auto dirty = pages & ~m_gpu_dirty;
+		dirty &= ~m_cpu_dirty;
+		if (dirty.None()) {
+			return 0;
+		}
+		m_cpu_dirty |= dirty;
+		StoreSummary<DirtySource::Cpu>(true);
+		NoteBdaPending();
+		g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+		return dirty.Count();
+	}
+
+	// The CPU write protection: a page is writable while CPU-dirty or hot. Pages can go both
+	// ways in one call (hot pages cleared while others become dirty).
+	void UpdateCpuProtection() {
+		auto writable = m_cpu_dirty;
+		if (m_hot_count != 0) {
+			writable |= m_hot;
+		}
+		auto now_writable  = writable & ~m_writable;
+		auto now_protected = m_writable & ~writable;
+		if (now_writable.None() && now_protected.None()) {
+			return;
+		}
+		m_writable = writable;
+		if (now_protected.Any()) {
+			m_page_manager.UpdatePageWatchersForRegion<true, false>(m_cpu_addr, now_protected);
+		}
+		if (now_writable.Any()) {
+			m_page_manager.UpdatePageWatchersForRegion<false, false>(m_cpu_addr, now_writable);
+		}
 	}
 
 	template <DirtySource source>
@@ -336,6 +450,8 @@ private:
 	uint64_t               m_bda_top_bit      = 0;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	RegionBits             m_hot;
+	size_t                 m_hot_count = 0;
 };
 
 } // namespace Libs::Graphics

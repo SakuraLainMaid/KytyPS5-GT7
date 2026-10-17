@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cinttypes>
 #include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <mutex>
 #include <optional>
@@ -60,6 +61,7 @@ struct Step {
 	bool              grids_off       = false;
 	bool              grids_raw       = false;
 	bool              scan_one        = false;
+	bool              hot_pages       = false;
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
 	int32_t           dflush          = -1;   // dflush:<n>; -1: the usual
@@ -228,6 +230,10 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "scan:one") {
 		step.scan_one = true;
+		return true;
+	}
+	if (action == "hotpages") {
+		step.hot_pages = true;
 		return true;
 	}
 	if (action.starts_with("tess:max:")) {
@@ -701,6 +707,15 @@ bool LightGridsRaw() {
 bool ScanOneThread() {
 	const auto* step = Current();
 	return step != nullptr && step->scan_one;
+}
+
+bool HotPages() {
+	static const bool always = [] {
+		const char* value = std::getenv("KYTY_HOT_PAGES");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	const auto* step = Current();
+	return always || (step != nullptr && step->hot_pages);
 }
 
 bool WholeUnnormalizedViews() {

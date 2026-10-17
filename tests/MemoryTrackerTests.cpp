@@ -572,6 +572,102 @@ void TestReleaseForCpuWrite() {
   Release(memory);
 }
 
+void TestHotPages() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  constexpr uint64_t pages = 16;
+  auto *memory = Allocate(page_manager, pages);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto size = page_size * pages;
+  const auto hot = address + page_size * 2;
+  std::vector<std::pair<uint64_t, uint64_t>> uploaded;
+  const auto upload = [&](uint64_t vaddr, uint64_t bytes, bool written) {
+    uploaded.clear();
+    tracker.ForEachUploadRange(
+        vaddr, bytes, written,
+        [&](uint64_t range, uint64_t range_bytes) noexcept {
+          uploaded.emplace_back(range, range_bytes);
+        },
+        []() noexcept {});
+  };
+
+  upload(address, size, false);
+  Check(!IsWritable(memory + page_size * 2),
+        "hot page setup did not arm write tracking");
+  // A write fault on the page, which then becomes hot: it stays writable after
+  // its upload.
+  tracker.MarkRegionAsCpuModified(hot, page_size);
+  Check(tracker.MarkHot(hot, page_size) == 1 && tracker.HotPages() == 1,
+        "a CPU-dirty page did not become hot");
+  upload(address, size, false);
+  Check(uploaded.size() == 1 && uploaded[0].first == hot &&
+            !tracker.IsRegionCpuModified(hot, page_size) &&
+            IsWritable(memory + page_size * 2) &&
+            !IsWritable(memory + page_size * 3),
+        "a hot page was write-protected after its upload");
+  // Each refresh makes it CPU-dirty again, without a protection change.
+  ResetProtectionLog();
+  Check(tracker.RedirtyHot() == 1 &&
+            tracker.IsRegionCpuModified(hot, page_size) &&
+            !tracker.IsRegionCpuModified(address, page_size) &&
+            g_protection_calls == 0,
+        "a refresh did not make the hot page CPU-dirty again on its own");
+  Check(tracker.RedirtyHot() == 0,
+        "a refresh counted a page that was CPU-dirty already");
+  upload(address, size, false);
+  Check(uploaded.size() == 1 && uploaded[0].first == hot &&
+            IsWritable(memory + page_size * 2),
+        "a refreshed hot page was not uploaded again");
+  // Written by the GPU: the CPU may have written the clean hot page since its
+  // upload, unseen, so it is uploaded first; then it is no longer hot, and
+  // protected as GPU-written pages are.
+  upload(hot, page_size, true);
+  Check(uploaded.size() == 1 && uploaded[0].first == hot,
+        "a GPU-written sync did not upload the clean hot page first");
+  Check(tracker.IsRegionGpuModified(hot, page_size) &&
+            !IsWritable(memory + page_size * 2) && tracker.RedirtyHot() == 0 &&
+            tracker.HotPages() == 0,
+        "a page the GPU wrote stayed hot");
+  tracker.UnmarkRegionAsGpuModified(hot, page_size);
+  Check(!IsWritable(memory + page_size * 2),
+        "a page that stopped being hot became writable");
+  // Cleared: the page may hold unseen writes, so it is CPU-dirty (uploaded
+  // next) and write-protected by that upload.
+  const auto other = address + page_size * 7;
+  tracker.MarkRegionAsCpuModified(other, page_size);
+  Check(tracker.MarkHot(other, page_size) == 1,
+        "a second page did not become hot");
+  upload(address, size, false);
+  Check(IsWritable(memory + page_size * 7),
+        "the second hot page was protected");
+  tracker.ClearHot();
+  Check(tracker.HotPages() == 0 &&
+            tracker.IsRegionCpuModified(other, page_size) &&
+            IsWritable(memory + page_size * 7) && tracker.RedirtyHot() == 0,
+        "a cleared hot page was not left CPU-dirty");
+  upload(address, size, false);
+  Check(uploaded.size() == 1 && uploaded[0].first == other &&
+            !IsWritable(memory + page_size * 7),
+        "a cleared hot page was not uploaded and protected");
+  // A store that does not fault (the GPU thread's own) makes a clean hot page
+  // CPU-dirty.
+  tracker.MarkRegionAsCpuModified(other, page_size);
+  Check(tracker.MarkHot(other, page_size) == 1,
+        "the page did not become hot again");
+  upload(address, size, false);
+  tracker.DirtyHotIn(address, size);
+  Check(tracker.IsRegionCpuModified(other, page_size) &&
+            !tracker.IsRegionCpuModified(address, page_size),
+        "a store to a hot page did not make it CPU-dirty");
+  tracker.ClearHot();
+
+  tracker.MarkRegionAsCpuModified(address, size);
+  tracker.UntrackMemory(address, size);
+  Release(memory);
+}
+
 void TestGpuReacquisitionAfterInvalidation() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1346,6 +1442,7 @@ int main(int argc, char **argv) {
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestReleaseForCpuWrite();
+  TestHotPages();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();
   TestExactDirtyIntervalsSharingTrackerPage();

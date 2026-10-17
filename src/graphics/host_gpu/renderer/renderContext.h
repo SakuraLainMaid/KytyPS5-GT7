@@ -67,6 +67,11 @@ public:
 	// for tracking gets what its write fault would have done (InvalidateMemory), so the store
 	// does not fault. A fault on the GPU thread cost an exception dispatch each (round 68).
 	void               PrepareGpuThreadWrite(uint64_t vaddr, uint64_t size);
+	// GPU thread, where it may next read what the CPU wrote since it last looked (a new slice of
+	// a submission, a wait on memory that passes): the hot pages (Bisect::HotPages) become
+	// CPU-dirty again, as their writes do not fault. Every few seconds no page is hot any more
+	// (each has to fault its way back in), and none is while hot pages are off.
+	void               RefreshHotPages();
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
@@ -107,6 +112,7 @@ private:
 	bool                      m_bda_logged = false;
 	uint64_t                  m_bda_synced_epoch      = 0;
 	uint64_t                  m_bda_synced_submission = 0;
+	uint64_t                  m_hot_cleared_ms        = 0;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

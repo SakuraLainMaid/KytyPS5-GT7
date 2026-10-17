@@ -111,7 +111,8 @@
 //                whenever the scanner is walking a program it needs)
 //   views:old    a texture or target found inside a larger cached image is viewed from the layer
 //                where its memory starts, as before round 71, dropping its descriptor's first
-//                layer (BASE_ARRAY / SLICE_START)
+//                layer (BASE_ARRAY / SLICE_START); and placed where the last overlap left it, as
+//                before round 74 (TextureCache::FindImage)
 //   grids:off    a pixel shader's light grids (two-channel uint array textures of up to 256 KB)
 //                are bound as null textures: every light count reads as zero
 // and (round 72):
@@ -121,6 +122,11 @@
 // and (round 73):
 //   scan:one     the draw-prep scanner walks every draw on its own thread, as before round 73,
 //                instead of on its workers (KYTY_DRAW_PREP_WORKERS=0 for the whole run)
+// and (round 74):
+//   hotpages     pages the CPU writes again within 250 ms, three times running, stay writable
+//                instead of being write-protected after each upload (RenderContext::HandleFault);
+//                they are uploaded again at each new slice and each wait on memory, written or
+//                not (KYTY_HOT_PAGES=1 for the whole run)
 namespace Libs::Graphics::Bisect {
 
 // The GPU thread, at its start: applies the start step's CPU set and log setting.
@@ -188,6 +194,8 @@ void                      ApplyPending();
 [[nodiscard]] bool LightGridsRaw();
 // Any thread: scan:one.
 [[nodiscard]] bool ScanOneThread();
+// Any thread: hotpages, or KYTY_HOT_PAGES=1.
+[[nodiscard]] bool HotPages();
 
 } // namespace Libs::Graphics::Bisect
 

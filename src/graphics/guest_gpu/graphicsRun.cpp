@@ -555,7 +555,11 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	(void)poll;
 	if (!TestWaitRegMemValue(ReadLabel(addr), ref, mask, func)) {
 		SuspendPm4();
+		return;
 	}
+	// The wait passed: what the CPU wrote to its hot pages before it let the GPU go on (the
+	// next slice does this for a wait that suspends).
+	m_renderer.RefreshHotPages();
 }
 
 template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, uint32_t, uint32_t,
@@ -851,6 +855,8 @@ bool GuestGpu::Process(Submission& submission) {
 		// submission's draws, as on the console.
 		m_renderer.GetRenderExecutor().SyncBindlessHeaps();
 	}
+	// What the CPU wrote to its hot pages since the last slice (their writes do not fault).
+	m_renderer.RefreshHotPages();
 
 	if (first_slice) {
 		submission.started = true;

@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/bisect.h"
+#include "graphics/host_gpu/renderer/faultPages.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/timeline.h"
 #include "graphics/presentation/videoOut.h"
@@ -105,6 +106,33 @@ void NoteWriteFault(bool released, uint64_t now_ms) {
 	     static_cast<double>(now_ms - last) / 1000.0, blocks, pages);
 }
 
+// Hot pages (Bisect::HotPages): whether the page (or block) faulted within 250 ms of its fault
+// before, three times running; notes this fault. A hint, as BlockFaultedRecently: a key that shares
+// a slot with another may be missed.
+bool FaultRecurs(uint64_t key, uint64_t now_ms) {
+	constexpr uint64_t                              WindowMs  = 250;
+	constexpr uint64_t                              CountBits = 8;
+	constexpr uint64_t                              TimeBits  = 20;
+	constexpr uint64_t                              KeyBits   = 64 - CountBits - TimeBits;
+	constexpr uint64_t                              TimeMask  = (uint64_t {1} << TimeBits) - 1;
+	constexpr uint64_t                              CountMask = (uint64_t {1} << CountBits) - 1;
+	constexpr uint64_t                              KeyMask   = (uint64_t {1} << KeyBits) - 1;
+	constexpr uint64_t                              Needed    = 3;
+	static std::array<std::atomic<uint64_t>, 16384> slots {};
+	auto&          slot     = slots[(key ^ (key >> 14u) ^ (key >> 28u)) % slots.size()];
+	const uint64_t previous = slot.load(std::memory_order_relaxed);
+	const uint64_t time     = (previous >> CountBits) & TimeMask;
+	uint64_t       count    = 1;
+	if (previous != 0 && (previous >> (CountBits + TimeBits)) == (key & KeyMask) &&
+	    ((now_ms - time) & TimeMask) < WindowMs) {
+		count = std::min(CountMask, (previous & CountMask) + 1u);
+	}
+	slot.store(((key & KeyMask) << (CountBits + TimeBits)) | ((now_ms & TimeMask) << CountBits) |
+	               count,
+	           std::memory_order_relaxed);
+	return count >= Needed;
+}
+
 } // namespace
 
 RenderContext::RenderContext(GraphicContext& graphics)
@@ -149,6 +177,7 @@ RenderContext::RenderContext(GraphicContext& graphics)
 }
 
 RenderContext::~RenderContext() {
+	FaultPages::Stop();
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
 }
@@ -194,38 +223,66 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
-		bool texture_done = false;
+		using FaultPages::Outcome;
+		const auto frame        = m_graphics.presented_frames.load(std::memory_order_relaxed);
+		const bool hot_pages    = Bisect::HotPages() && !m_buffer_cache.AddressWritesSeen();
+		bool       texture_done = false;
+		auto       outcome      = Outcome::BlocksOff;
 		if (const auto block_bytes = FaultBlockBytes(); block_bytes != 0) {
 			const auto now      = NowMs();
 			const auto block    = Common::AlignDown(fault_vaddr, block_bytes);
 			bool       released = false;
-			if (BlockFaultedRecently(block / block_bytes, now) &&
-			    !m_buffer_cache.AddressWritesSeen() && IsMapped(block, block_bytes)) {
+			if (!BlockFaultedRecently(block / block_bytes, now)) {
+				outcome = Outcome::NotRecent;
+			} else if (m_buffer_cache.AddressWritesSeen()) {
+				outcome = Outcome::AddressWrites;
+			} else if (!IsMapped(block, block_bytes)) {
+				outcome = Outcome::BlockUnmapped;
+			} else {
 				// The texture cache first: an image in the block keeps it to the faulting page.
 				texture_done = true;
-				released     = !m_texture_cache.InvalidateMemoryNear(fault_vaddr, fault_size, block,
-				                                                     block_bytes) &&
-				           m_buffer_cache.ReleaseBlockForCpuWrite(block, block_bytes);
+				if (m_texture_cache.InvalidateMemoryNear(fault_vaddr, fault_size, block,
+				                                         block_bytes)) {
+					outcome = Outcome::ImageInBlock;
+				} else if (!m_buffer_cache.ReleaseBlockForCpuWrite(block, block_bytes)) {
+					outcome = Outcome::GpuBytes;
+				} else {
+					outcome  = Outcome::Released;
+					released = true;
+				}
 			}
 			NoteWriteFault(released, now);
+			FaultPages::Note(fault_vaddr, frame, outcome);
 			if (released) {
 				LibKernel::Memory::JournalWrite(block, block_bytes,
 				                                LibKernel::Memory::WriteSource::CpuWriteFault);
 				m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
+				// A block released again and again stays writable (hot pages).
+				if (hot_pages && FaultRecurs((block / block_bytes) | (uint64_t {1} << 35u), now)) {
+					FaultPages::NoteHotMarked(m_buffer_cache.MarkHotPages(block, block_bytes));
+				}
 				return true;
 			}
+		} else {
+			FaultPages::Note(fault_vaddr, frame, outcome);
 		}
-		LibKernel::Memory::JournalWrite(Common::AlignDown(fault_vaddr, TRACKER_PAGE_SIZE),
-		                                TRACKER_PAGE_SIZE,
+		const auto page = Common::AlignDown(fault_vaddr, TRACKER_PAGE_SIZE);
+		LibKernel::Memory::JournalWrite(page, TRACKER_PAGE_SIZE,
 		                                LibKernel::Memory::WriteSource::CpuWriteFault);
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		if (!texture_done) {
 			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		}
 		m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
+		// A page written again and again stays writable (hot pages).
+		if (hot_pages && FaultRecurs(page / TRACKER_PAGE_SIZE, NowMs())) {
+			FaultPages::NoteHotMarked(m_buffer_cache.MarkHotPages(page, TRACKER_PAGE_SIZE));
+		}
 	} else {
 		// KYTY_TIMELINE / F6: a game thread's read of GPU-written memory, and when it went on.
 		Timeline::Mark("fault-read", fault_vaddr);
+		FaultPages::Note(fault_vaddr, m_graphics.presented_frames.load(std::memory_order_relaxed),
+		                 FaultPages::Outcome::Read);
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 		Timeline::Mark("fault-read-end", fault_vaddr);
 	}
@@ -347,7 +404,12 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::PrepareGpuThreadWrite(uint64_t vaddr, uint64_t size) {
-	if (size == 0 || !GuestRange {vaddr, size}.Valid() || Bisect::GpuWritesFault()) {
+	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	// A hot page is writable without a fault, and nothing else would tell the tracker.
+	m_buffer_cache.DirtyHotPagesIn(vaddr, size);
+	if (Bisect::GpuWritesFault()) {
 		return;
 	}
 	for (uint64_t page = vaddr & ~(TRACKER_PAGE_SIZE - 1); page < vaddr + size;
@@ -457,6 +519,34 @@ void RenderContext::PrepareBda() {
 		m_bda_synced_epoch = epoch;
 	}
 	m_fault_process_pending = true;
+}
+
+void RenderContext::RefreshHotPages() {
+	FaultPages::StartIfActive();
+	// Hot pages stay writable to the CPU and are uploaded again after each refresh, so a shader
+	// store through an address (which marks no range) there would be overwritten: none once one
+	// was seen.
+	if (!Bisect::HotPages() || m_buffer_cache.AddressWritesSeen()) {
+		if (m_buffer_cache.HotPages() != 0) {
+			m_buffer_cache.ClearHotPages();
+			FaultPages::NoteHotCleared();
+		}
+		return;
+	}
+	// A page the game stopped writing would be uploaded at each refresh for nothing: every 4 s
+	// none is hot, and the pages still written fault their way back in (three faults each).
+	constexpr uint64_t DecayMs = 4000;
+	const auto         now     = NowMs();
+	if (now - m_hot_cleared_ms >= DecayMs) {
+		m_hot_cleared_ms = now;
+		if (m_buffer_cache.HotPages() != 0) {
+			m_buffer_cache.ClearHotPages();
+			FaultPages::NoteHotCleared();
+		}
+		return;
+	}
+	const auto pages = m_buffer_cache.RedirtyHotPages();
+	FaultPages::NoteHotRefresh(pages, m_buffer_cache.HotPages());
 }
 
 // Diagnostics: KYTY_DUMP_GUEST=<frame>:<address>+<size>[,<address>+<size>...] (frame decimal,
