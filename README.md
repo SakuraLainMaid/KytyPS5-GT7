@@ -16,6 +16,10 @@ with experimental macOS support. It is based on a heavily modified version of
 [Kyty](https://github.com/InoriRus/Kyty). The project is in active development, and behavior
 can change significantly between builds.
 
+> [!NOTE]
+> This branch carries work on Gran Turismo 7. See [docs/GT7.md](docs/GT7.md) for the launcher
+> settings it was tested with and its current state.
+
 > [!IMPORTANT]
 > KytyPS5 is not affiliated with Sony Interactive Entertainment or PlayStation. The project does
 > not distribute games or copyrighted system software. Use only game files that you have obtained
