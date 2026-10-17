@@ -3,7 +3,7 @@ name: Build and Release KytyPS5
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master, wolverine ]
+    branches: [ main, master, wolverine, gt7-eqaa ]
   pull_request:
 
 concurrency:
@@ -434,9 +434,11 @@ jobs:
     name: Release KytyPS5
     if: >-
       always() &&
-      github.event_name == 'push' &&
-      (github.repository == 'KytyPS5/KytyPS5' ||
-       (github.repository == 'Senaxx/KytyPS5' && github.ref == 'refs/heads/wolverine')) &&
+      ((github.event_name == 'push' &&
+        (github.repository == 'KytyPS5/KytyPS5' ||
+         (github.repository == 'Senaxx/KytyPS5' && github.ref == 'refs/heads/wolverine'))) ||
+       (github.repository == 'usa-ratt/KytyPS5-GT7' && github.ref == 'refs/heads/gt7-eqaa' &&
+        (github.event_name == 'push' || github.event_name == 'workflow_dispatch'))) &&
       (needs.windows.result == 'success' ||
        needs.macos.result == 'success' ||
        needs.linux.result == 'success')
