@@ -388,7 +388,17 @@ void DrawPrepScanner::Scan(const Item& item) {
 			case Pm4::IT_SET_SH_REG_INDIRECT:
 			case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
 				if (!ApplyRegisterIndirect(command, packet + 1)) {
-					m_state->tainted = true;
+					// Register pairs the GPU wrote: the registers they set keep their old values
+					// here. The draws after them are prepared anyway: the GPU thread uses a result
+					// only when its program entry (the static state), shader address, user data,
+					// compute sizes and every byte its walk read are the same as its own
+					// (TakeScanned), which is all a walk depends on; one prepared from a stale
+					// register is not used, as before. Before round 70 the rest of the queue up to
+					// the next suspend point went unprepared (~90 draws a frame at Tokyo, round
+					// 69); KYTY_BISECT's drawprep:taint does that again.
+					if (Bisect::DrawPrepTaint()) {
+						m_state->tainted = true;
+					}
 					DrawPrep::Add(DrawPrep::Counter::TaintIndirect);
 				}
 				break;

@@ -100,6 +100,11 @@
 //   dflush:<n>   a command buffer goes to the GPU after n dispatches (KYTY_DISPATCH_FLUSH_INTERVAL
 //                for the whole run, default 16); dflush:0 only at the usual points, as before
 //                round 69
+// and (round 70):
+//   drawprep:taint the draw-prep scanner prepares nothing more up to the next suspend point once
+//                it meets register pairs it cannot read (the GPU wrote them), as before round 70
+//   bdaspan:off  the BDA walk synchronizes each CPU-dirty run of pages on its own, as in round 69,
+//                instead of each cached buffer once over the span of its CPU-dirty runs
 namespace Libs::Graphics::Bisect {
 
 // The GPU thread, at its start: applies the start step's CPU set and log setting.
@@ -157,6 +162,9 @@ void                      ApplyPending();
 [[nodiscard]] bool SpecCheckAll();
 // Any thread: dflush:'s dispatches (-1 for the usual).
 [[nodiscard]] int32_t DispatchFlushInterval();
+// Any thread: drawprep:taint; bdaspan:off.
+[[nodiscard]] bool DrawPrepTaint();
+[[nodiscard]] bool BdaSpanOff();
 
 } // namespace Libs::Graphics::Bisect
 

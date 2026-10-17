@@ -148,11 +148,12 @@ void ReportIfDue(uint64_t frames) {
 	                    counted("buffer syncs", Phase::BufferSync),
 	                    counted("protects", Phase::Protect), counted("flushes", Phase::Flush));
 	const auto walks = count(Phase::BdaWalk);
-	line += fmt::format(" | {} ({:.1f} regions each), {}", counted("bda walks", Phase::BdaWalk),
-	                    walks != 0 ? static_cast<double>(count(Phase::BdaRegions)) /
-	                                     static_cast<double>(walks)
-	                               : 0.0,
-	                    counted("spec checks", Phase::SpecCheck));
+	const auto per_walk = [&](Phase phase) {
+		return walks != 0 ? static_cast<double>(count(phase)) / static_cast<double>(walks) : 0.0;
+	};
+	line += fmt::format(" | {} ({:.1f} regions, {:.1f} protects each), {}",
+	                    counted("bda walks", Phase::BdaWalk), per_walk(Phase::BdaRegions),
+	                    per_walk(Phase::BdaProtects), counted("spec checks", Phase::SpecCheck));
 
 	if (new_frames != 0) {
 		const auto frame = [&](Phase phase) {

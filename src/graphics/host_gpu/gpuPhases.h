@@ -67,6 +67,7 @@ enum class Phase : uint32_t {
 	Flush,          // a command buffer ended and a new one begun (CommandScheduler::Flush)
 	BdaWalk,        // PrepareBda's walk of CPU-dirty buffers (at most once a guest submission)
 	BdaRegions,     // (a count only) the tracker regions those walks visited
+	BdaProtects,    // (a count only) the page protection changes those walks made
 	SpecCheck,      // CommitBindings' check of specialization reads against the draw's writes
 	Count
 };
@@ -100,6 +101,11 @@ inline void Count(Phase phase, uint64_t n) noexcept {
 	if (Detail::t_on) {
 		Detail::g_totals.count[static_cast<size_t>(phase)] += n;
 	}
+}
+
+// The count of `phase` so far (GPU thread).
+[[nodiscard]] inline uint64_t CountOf(Phase phase) noexcept {
+	return Detail::g_totals.count[static_cast<size_t>(phase)];
 }
 
 // Times its block on the GPU thread.

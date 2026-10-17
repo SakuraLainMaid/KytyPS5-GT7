@@ -2680,17 +2680,66 @@ uint64_t BufferCache::SynchronizeBdaPending(const RangeSet& mapped) {
 	// dispatch that reads memory through addresses, 8 % of the GPU thread in a race. Now only the
 	// regions where pages became CPU-dirty or a buffer appeared since the last walk, and in them
 	// only the buffers over CPU-dirty pages: what a sync of the others found was nothing to do.
+	//
+	// Each cached buffer over the runs synchronizes once, over the span from its first CPU-dirty
+	// byte to its last in the region (round 70): its sync uploads only the CPU-dirty pages of the
+	// span and changes their protection in one call, where one sync a run made one protection
+	// call a run (~3.7 us each; 216,000 protection changes in 10 s of a race in round 69, 8 % of
+	// the GPU thread). KYTY_BISECT's bdaspan:off synchronizes each run on its own again.
 	thread_local std::vector<std::pair<uint64_t, uint64_t>> runs;
 	uint64_t                                                regions = 0;
+	const bool                                              by_run  = Bisect::BdaSpanOff();
+	// A buffer's runs in one mapped part of the region: the buffers do not overlap and the runs
+	// ascend, so they come one after another.
+	const auto sync_runs = [&] {
+		if (by_run) {
+			for (const auto& [address, bytes]: runs) {
+				SynchronizeBuffersInRange(address, bytes);
+			}
+			return;
+		}
+		BufferId   current {};
+		uint64_t   span_begin = 0;
+		uint64_t   span_end   = 0;
+		const auto flush      = [&] {
+            if (current) {
+                (void)SynchronizeBuffer(m_slot_buffers[current], span_begin, span_end - span_begin,
+				                             false, false);
+                current = {};
+            }
+		};
+		for (const auto& [address, bytes]: runs) {
+			const auto end = address + bytes;
+			auto       it  = m_buffers.upper_bound(address);
+			if (it != m_buffers.begin()) {
+				--it;
+			}
+			for (; it != m_buffers.end() && it->first < end; ++it) {
+				const auto& buffer = m_slot_buffers[it->second];
+				const auto  start  = std::max(buffer.CpuAddress(), address);
+				const auto  finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+				if (start >= finish) {
+					continue;
+				}
+				if (current == it->second) {
+					span_end = finish;
+					continue;
+				}
+				flush();
+				current    = it->second;
+				span_begin = start;
+				span_end   = finish;
+			}
+		}
+		flush();
+	};
 	m_memory_tracker.TakeBdaPending([&](uint64_t region) {
 		regions++;
-		runs.clear();
 		mapped.ForEachInRange(region, TRACKER_REGION_SIZE, [&](uint64_t begin, uint64_t end) {
+			runs.clear();
 			m_memory_tracker.CollectCpuDirtyRuns(begin, end - begin, runs);
+			sync_runs();
 		});
-		for (const auto& [address, bytes]: runs) {
-			SynchronizeBuffersInRange(address, bytes);
-		}
 	});
 	return regions;
 }

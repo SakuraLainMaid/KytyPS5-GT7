@@ -53,6 +53,8 @@ struct Step {
 	bool              bdawalk_all     = false;
 	bool              checkpoints_on  = false;
 	bool              speccheck_all   = false;
+	bool              drawprep_taint  = false;
+	bool              bdaspan_off     = false;
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
 	int32_t           dflush          = -1;   // dflush:<n>; -1: the usual
@@ -193,6 +195,14 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "speccheck:all") {
 		step.speccheck_all = true;
+		return true;
+	}
+	if (action == "drawprep:taint") {
+		step.drawprep_taint = true;
+		return true;
+	}
+	if (action == "bdaspan:off") {
+		step.bdaspan_off = true;
 		return true;
 	}
 	if (action.starts_with("tess:max:")) {
@@ -631,6 +641,16 @@ bool SpecCheckAll() {
 int32_t DispatchFlushInterval() {
 	const auto* step = Current();
 	return step != nullptr ? step->dflush : -1;
+}
+
+bool DrawPrepTaint() {
+	const auto* step = Current();
+	return step != nullptr && step->drawprep_taint;
+}
+
+bool BdaSpanOff() {
+	const auto* step = Current();
+	return step != nullptr && step->bdaspan_off;
 }
 
 bool WholeUnnormalizedViews() {

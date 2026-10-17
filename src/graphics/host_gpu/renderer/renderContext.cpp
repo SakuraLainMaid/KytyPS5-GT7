@@ -437,6 +437,7 @@ void RenderContext::PrepareBda() {
 		// since the last walk (BufferCache::SynchronizeBdaPending). KYTY_BISECT's bdawalk:all
 		// walks every region holding a CPU-dirty page and every buffer in it, as before round 69.
 		const GpuPhases::Scope walk_phase(GpuPhases::Phase::BdaWalk);
+		const auto             protects = GpuPhases::CountOf(GpuPhases::Phase::Protect);
 		std::shared_lock       lock(m_mapped_ranges_mutex);
 		if (Bisect::BdaWalkAll()) {
 			m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
@@ -446,6 +447,8 @@ void RenderContext::PrepareBda() {
 			GpuPhases::Count(GpuPhases::Phase::BdaRegions,
 			                 m_buffer_cache.SynchronizeBdaPending(m_mapped_ranges));
 		}
+		GpuPhases::Count(GpuPhases::Phase::BdaProtects,
+		                 GpuPhases::CountOf(GpuPhases::Phase::Protect) - protects);
 		m_bda_synced_epoch = epoch;
 	}
 	m_fault_process_pending = true;

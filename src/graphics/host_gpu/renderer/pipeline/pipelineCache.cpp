@@ -43,6 +43,7 @@
 #include <deque>
 #include <filesystem>
 #include <fmt/format.h>
+#include <fstream>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -212,6 +213,103 @@ void LogShaderCacheFolder(const std::filesystem::path& directory) {
 	}
 	PipelineCacheLog("Shader disk cache folder: {}: {} files, {} MB{}", shown, files, bytes >> 20u,
 	                 error ? " (the listing stopped early)" : "");
+}
+
+// The shader disk cache keeps every entry it ever wrote, and each build whose recompiler differs
+// writes a new set: the folder held 342,000 files and 102 GB in round 69, nearly all of them for
+// recompilers long gone. An entry file starts with a header (magic, format, sizes, hash: 32 bytes)
+// and then its key, whose first 16 bytes are the magic, the format and the recompiler's version
+// (ShaderDiskCache::SessionKey). A file whose first bytes differ from this build's can never be a
+// hit for it (Store::Load rejects it), and is removed, in the background, 30 s after the start,
+// once per recompiler version (a "pruned_<version>" file marks it done). Files with this
+// recompiler's version are kept whatever else their key holds (another GPU, other switches).
+// KYTY_SHADER_CACHE_PRUNE=0 keeps everything.
+using ShaderCachePrefix = std::array<uint8_t, 16>;
+
+bool ShaderCachePruneEnabled() {
+	const char* value = std::getenv("KYTY_SHADER_CACHE_PRUNE");
+	return value == nullptr || value[0] != '0';
+}
+
+void PruneShaderCache(std::stop_token stop, std::filesystem::path directory,
+                      ShaderCachePrefix prefix) {
+	constexpr size_t HeaderBytes = 32;
+	std::error_code  error;
+	const auto marker = directory / fmt::format("pruned_{:016x}", ShaderDiskCache::SourceVersion());
+	if (std::filesystem::exists(marker, error)) {
+		return;
+	}
+	for (int i = 0; i < 300; i++) {
+		if (stop.stop_requested()) {
+			return;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	}
+	if (!std::filesystem::is_directory(directory, error)) {
+		return;
+	}
+	uint64_t                           removed       = 0;
+	uint64_t                           removed_bytes = 0;
+	uint64_t                           kept          = 0;
+	uint64_t                           examined      = 0;
+	std::vector<std::filesystem::path> old_markers;
+	for (std::filesystem::directory_iterator it(directory, error), end; !error && it != end;
+	     it.increment(error)) {
+		if (stop.stop_requested()) {
+			return;
+		}
+		const auto& path = it->path();
+		const auto  name = path.filename().string();
+		if (name.starts_with("pruned_")) {
+			if (path.filename() != marker.filename()) {
+				old_markers.push_back(path);
+			}
+			continue;
+		}
+		std::error_code entry_error;
+		if (path.extension() != ".bin" || !it->is_regular_file(entry_error)) {
+			continue;
+		}
+		const auto size = it->file_size(entry_error);
+		if (entry_error) {
+			continue;
+		}
+		std::array<uint8_t, HeaderBytes + 16> head {};
+		{
+			std::ifstream file(path, std::ios::binary);
+			if (!file) {
+				continue;
+			}
+			file.read(reinterpret_cast<char*>(head.data()),
+			          static_cast<std::streamsize>(head.size()));
+		}
+		const bool current =
+		    size >= head.size() && std::memcmp(head.data(), prefix.data(), 8) == 0 &&
+		    std::memcmp(head.data() + HeaderBytes, prefix.data(), prefix.size()) == 0;
+		if (current) {
+			kept++;
+		} else if (std::filesystem::remove(path, entry_error)) {
+			removed++;
+			removed_bytes += size;
+		}
+		// Gently: a pause every 64 files.
+		if ((++examined & 63u) == 0) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+	}
+	if (error) {
+		PipelineCacheLog("Shader disk cache: removing old entries stopped early ({}): {} files "
+		                 "({} MB) removed, {} kept",
+		                 error.message(), removed, removed_bytes >> 20u, kept);
+		return;
+	}
+	for (const auto& old_marker: old_markers) {
+		std::filesystem::remove(old_marker, error);
+	}
+	std::ofstream(marker) << "entries of other recompilers removed\n";
+	PipelineCacheLog("Shader disk cache: {} files ({} MB) of other recompilers removed, {} kept "
+	                 "(KYTY_SHADER_CACHE_PRUNE=0 keeps them)",
+	                 removed, removed_bytes >> 20u, kept);
 }
 
 // The backing bytes of the guest pages one resource evaluation (MaterializeResources, a function
@@ -1912,12 +2010,25 @@ struct PipelineCache::ProgramCache {
 		} else {
 			LogShaderCacheFolder(disk_directory);
 			disk = ShaderDiskCache::Store::Open(std::move(disk_directory));
+			if (disk != nullptr && ShaderCachePruneEnabled()) {
+				// Only the key's first 16 bytes are compared (its format and the recompiler's
+				// version), which nothing at run time changes.
+				const auto key = ShaderDiskCache::SessionKey(disk_session);
+				if (key.size() >= ShaderCachePrefix {}.size()) {
+					ShaderCachePrefix prefix {};
+					std::copy_n(key.begin(), prefix.size(), prefix.begin());
+					disk_pruner = std::jthread(PruneShaderCache, disk->Directory(), prefix);
+				}
+			}
 		}
 		if (g_async_translation) {
-			// KYTY_TRANSLATION_THREADS=<n> (default 2).
+			// KYTY_TRANSLATION_THREADS=<n> (default an eighth of the processors, 2 to 4; 2 before
+			// round 70).
 			const char* value   = std::getenv("KYTY_TRANSLATION_THREADS");
 			const auto  threads = std::max<uint32_t>(
-			    value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 2u, 1u);
+                value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10))
+                                 : std::clamp(std::thread::hardware_concurrency() / 8u, 2u, 4u),
+			    1u);
 			translators = std::make_unique<TranslationWorkers>(threads);
 			PipelineCacheLog("Shader translation: graphics shaders of 3D draws on {} worker threads",
 			                 threads);
@@ -2055,6 +2166,8 @@ struct PipelineCache::ProgramCache {
 	bool                                                        disk_verify  = false;
 	uint64_t                                                    disk_lookups = 0;
 	std::unique_ptr<ShaderDiskCache::Store>                     disk;
+	// Removes the disk cache's entries no build of this recompiler can read (PruneShaderCache).
+	std::jthread disk_pruner;
 	// Graphics translations in progress on the workers (KYTY_ASYNC_TRANSLATION), by program.
 	std::unordered_map<ProgramKey, std::shared_ptr<TranslationJob>, ProgramKeyHash> translating;
 	uint64_t                                                    translation_skips = 0;
@@ -2452,8 +2565,18 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	    !EqaaPerSampleShading();
 	InitializeDriverCache();
 	if (g_async_pipelines) {
-		const auto threads = std::clamp(std::thread::hardware_concurrency() / 4u, 1u, 4u);
-		m_compiler         = std::make_unique<PipelineCompiler>(threads);
+		// KYTY_PIPELINE_THREADS=<n>; by default a third of the processors, 2 to 10 (4 at most
+		// before round 70). A race brings hundreds of new pipelines at once (other cars, lap 2),
+		// each pixel shader of 150,000-230,000 SPIR-V words taking the driver about a second, and
+		// their draws are skipped until they are done: with 4 threads the track and the cars
+		// vanished for ten seconds while the process used 4 of 32 processors.
+		const char* value = std::getenv("KYTY_PIPELINE_THREADS");
+		const auto  threads =
+            value != nullptr && *value != '\0'
+		         ? std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u,
+		                                32u)
+		         : std::clamp(std::thread::hardware_concurrency() / 3u, 2u, 10u);
+		m_compiler = std::make_unique<PipelineCompiler>(threads);
 		PipelineCacheLog("Vulkan pipelines: compiled on {} worker threads (wait {} ms)", threads,
 		                 g_pipeline_wait.count());
 	}
