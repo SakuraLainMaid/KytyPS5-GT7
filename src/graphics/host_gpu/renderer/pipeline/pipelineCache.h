@@ -132,6 +132,17 @@ struct ShaderProgram {
 // sample index as they are, per-sample shading included, which NVIDIA does not allow there.
 [[nodiscard]] bool EqaaPerSampleShading();
 
+// The SPIR-V of a stage before the rasterizer with every float add, subtract, multiply, divide
+// and dot product decorated NoContraction, and its Position output Invariant; empty when there
+// is nothing to add. The guest GPU rounds a multiply before the add that follows it unless the
+// shader asks for a fused one, and a driver free to fuse them may do so in one shader and not in
+// another computing the same position: a depth prepass and the pass that tests EQUAL against it
+// then disagree in the last bits.
+[[nodiscard]] std::vector<uint32_t> SpirvExactFloat(std::span<const uint32_t> spirv);
+// KYTY_EXACT_FLOAT=1 (round 75, a test): every vertex, geometry and tessellation shader's module is
+// made from SpirvExactFloat's copy. The shader cache is unchanged; the driver compiles again.
+[[nodiscard]] bool ExactFloatPositions();
+
 // Everything vkCreateGraphicsPipelines reads for one graphics pipeline, owned in one place so the
 // driver compile can run on a worker thread (the structures point into each other: it stays
 // where it was allocated).

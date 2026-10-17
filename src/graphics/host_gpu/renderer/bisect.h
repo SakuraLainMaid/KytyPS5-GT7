@@ -127,6 +127,12 @@
 //                instead of being write-protected after each upload (RenderContext::HandleFault);
 //                they are uploaded again at each new slice and each wait on memory, written or
 //                not (KYTY_HOT_PAGES=1 for the whole run)
+// and (round 75):
+//   depth:equal-relaxed[:<units>]  a draw that tests depth for EQUAL (GT7's G-buffer pass of
+//                cars, after their depth prepass) tests it for "as close or closer" instead,
+//                biased towards the camera by <units> (default 256) of the primitive's depth
+//                precision and by its depth slope, without writing depth: a pixel whose depth the
+//                two passes compute that close is drawn too (SetGraphicsDynamicParams)
 namespace Libs::Graphics::Bisect {
 
 // The GPU thread, at its start: applies the start step's CPU set and log setting.
@@ -196,6 +202,8 @@ void                      ApplyPending();
 [[nodiscard]] bool ScanOneThread();
 // Any thread: hotpages, or KYTY_HOT_PAGES=1.
 [[nodiscard]] bool HotPages();
+// Any thread: depth:equal-relaxed's bias in units of depth precision; 0 when off.
+[[nodiscard]] float DepthEqualRelaxed();
 
 } // namespace Libs::Graphics::Bisect
 

@@ -62,6 +62,7 @@ struct Step {
 	bool              grids_raw       = false;
 	bool              scan_one        = false;
 	bool              hot_pages       = false;
+	float             equal_relaxed   = 0.0f; // depth:equal-relaxed[:<units>]; 0: off
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
 	int32_t           dflush          = -1;   // dflush:<n>; -1: the usual
@@ -234,6 +235,23 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "hotpages") {
 		step.hot_pages = true;
+		return true;
+	}
+	if (action == "depth:equal-relaxed") {
+		step.equal_relaxed = 256.0f;
+		return true;
+	}
+	if (action.starts_with("depth:equal-relaxed:")) {
+		const auto text = std::string(action.substr(20));
+		if (text.empty() || text.size() > 7 ||
+		    text.find_first_not_of("0123456789") != std::string::npos) {
+			return false;
+		}
+		const auto units = std::strtof(text.c_str(), nullptr);
+		if (!(units >= 1.0f && units <= 1000000.0f)) {
+			return false;
+		}
+		step.equal_relaxed = units;
 		return true;
 	}
 	if (action.starts_with("tess:max:")) {
@@ -716,6 +734,11 @@ bool HotPages() {
 	}();
 	const auto* step = Current();
 	return always || (step != nullptr && step->hot_pages);
+}
+
+float DepthEqualRelaxed() {
+	const auto* step = Current();
+	return step != nullptr ? step->equal_relaxed : 0.0f;
 }
 
 bool WholeUnnormalizedViews() {

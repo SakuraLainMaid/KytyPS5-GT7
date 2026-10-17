@@ -377,6 +377,25 @@ static void LogBigDepthDraw(const CommandBuffer& buffer, const ShaderVertexInput
 	     static_cast<double>(vp.zoffset), clip.clip_disable ? 1 : 0, clip.IsZClipEnabled() ? 1 : 0);
 }
 
+// depth:equal-relaxed: whether a larger depth is closer on this depth target (reversed Z), from
+// the last draw that tested it for GREATER or LESS (or equal) while the step was on; before one,
+// from the depth clear value (0: reversed Z).
+static bool ReversedDepth(const RenderDepthInfo& depth) {
+	static std::mutex                         mutex;
+	static std::unordered_map<uint64_t, bool> reversed;
+	const uint64_t                            address = depth.desc.info.data.address;
+	const std::lock_guard                     lock(mutex);
+	switch (depth.depth_compare_op) {
+		case vk::CompareOp::eGreater:
+		case vk::CompareOp::eGreaterOrEqual: reversed[address] = true; return true;
+		case vk::CompareOp::eLess:
+		case vk::CompareOp::eLessOrEqual: reversed[address] = false; return false;
+		default: break;
+	}
+	const auto found = reversed.find(address);
+	return found != reversed.end() ? found->second : depth.depth_clear_value == 0.0f;
+}
+
 static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandRecorder& vk_buffer,
                                      const ShaderVertexInputInfo& vs_input_info,
                                      const RenderDepthInfo& depth, const RenderState& rendering) {
@@ -441,9 +460,19 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandR
 	const auto&      blend = ctx.GetBlendColor();
 	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
 	vk_buffer.setBlendConstants(blend_constants.data());
+	// KYTY_BISECT's depth:equal-relaxed: a test for EQUAL passes "as close or closer" with a small
+	// bias towards the camera, without writing depth (ReversedDepth says which way is closer; GT7
+	// uses reversed Z). A pixel the depth prepass and this pass compute a little apart is drawn
+	// then; one truly behind something is not.
+	const float relax_units = depth.depth_test_enable ? Bisect::DepthEqualRelaxed() : 0.0f;
+	const bool  relax_step  = relax_units > 0.0f;
+	const bool  reversed_z  = relax_step && ReversedDepth(depth);
+	const bool  relax_equal = relax_step && depth.depth_compare_op == vk::CompareOp::eEqual;
 	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+	vk_buffer.setDepthWriteEnable(depth.depth_write_enable && !relax_equal ? VK_TRUE : VK_FALSE);
+	vk_buffer.setDepthCompareOp(!relax_equal ? depth.depth_compare_op
+	                            : reversed_z ? vk::CompareOp::eGreaterOrEqual
+	                                         : vk::CompareOp::eLessOrEqual);
 
 	const auto& mode              = ctx.GetModeControl();
 	const auto& poly_offset       = ctx.GetPolyOffset();
@@ -452,8 +481,19 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandR
 	const bool  depth_bias_enable = use_front || use_back;
 	float       constant_factor   = 0.0f;
 	float       slope_factor      = 0.0f;
-	vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
-	if (depth_bias_enable) {
+	if (relax_equal) {
+		// <units> of the primitive's depth precision (a float depth's is 2^-23 of its value, so
+		// 256 units are 0.003%, 16384 are 0.2%), and its depth slope over a pixel (four pixels
+		// from 4096 units): a position the two passes compute that much apart still matches.
+		const float slope = relax_units >= 4096.0f ? 4.0f : 1.0f;
+		constant_factor   = reversed_z ? relax_units : -relax_units;
+		slope_factor      = reversed_z ? slope : -slope;
+		vk_buffer.setDepthBiasEnable(VK_TRUE);
+		vk_buffer.setDepthBias(constant_factor, 0.0f, slope_factor);
+	} else {
+		vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
+	}
+	if (depth_bias_enable && !relax_equal) {
 		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
 		const float guest_constant_factor =
 		    use_front ? poly_offset.front_offset : poly_offset.back_offset;
@@ -462,7 +502,9 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandR
 		slope_factor    = (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
 		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
 	}
-	LogBigDepthDraw(buffer, vs_input_info, depth, depth_bias_enable, constant_factor, slope_factor);
+	// The bias set (a relaxed EQUAL's too); the compare op and write logged are the game's.
+	LogBigDepthDraw(buffer, vs_input_info, depth, depth_bias_enable || relax_equal, constant_factor,
+	                slope_factor);
 
 	vk_buffer.setStencilTestEnable(depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
 	if (depth.stencil_test_enable) {

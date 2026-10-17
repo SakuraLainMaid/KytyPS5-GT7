@@ -908,6 +908,181 @@ std::vector<uint32_t> SpirvWithoutSampleId(std::span<const uint32_t> spirv) {
 	return out;
 }
 
+bool ExactFloatPositions() {
+	static const bool value = [] {
+		const char* text = std::getenv("KYTY_EXACT_FLOAT");
+		return text != nullptr && text[0] == '1';
+	}();
+	return value;
+}
+
+std::vector<uint32_t> SpirvExactFloat(std::span<const uint32_t> spirv) {
+	constexpr uint32_t HeaderWords = 5;
+	if (spirv.size() < HeaderWords || spirv[0] != spv::MagicNumber) {
+		return {};
+	}
+	// One walk: what is decorated already, the Position built-ins, the Output variables and
+	// types, the float arithmetic results and where the annotations end.
+	std::unordered_set<uint32_t>               no_contraction;
+	std::unordered_set<uint32_t>               invariant;
+	std::unordered_set<uint64_t>               invariant_members;
+	std::vector<uint32_t>                      position_variables;
+	std::vector<std::pair<uint32_t, uint32_t>> position_members;
+	std::unordered_set<uint32_t>               output_variables;
+	std::vector<uint32_t>                      output_pointees;
+	std::unordered_map<uint32_t, uint32_t>     array_elements;
+	std::vector<uint32_t>                      arithmetic;
+	size_t                                     annotations_end = 0;
+	// Without annotations, the new ones go after the debug instructions (the end of the
+	// instructions that precede the annotation section).
+	size_t     preamble_end = 0;
+	bool       in_preamble  = true;
+	const auto member_key = [](uint32_t structure, uint32_t member) {
+		return (static_cast<uint64_t>(structure) << 32u) | member;
+	};
+	for (size_t offset = HeaderWords; offset < spirv.size();) {
+		const uint32_t count = spirv[offset] >> spv::WordCountShift;
+		if (count == 0 || offset + count > spirv.size()) {
+			return {};
+		}
+		const auto w      = spirv.subspan(offset, count);
+		const auto opcode = static_cast<spv::Op>(spirv[offset] & spv::OpCodeMask);
+		switch (opcode) {
+			case spv::OpCapability:
+			case spv::OpExtension:
+			case spv::OpExtInstImport:
+			case spv::OpMemoryModel:
+			case spv::OpEntryPoint:
+			case spv::OpExecutionMode:
+			case spv::OpExecutionModeId:
+			case spv::OpString:
+			case spv::OpSourceExtension:
+			case spv::OpSource:
+			case spv::OpSourceContinued:
+			case spv::OpName:
+			case spv::OpMemberName:
+			case spv::OpModuleProcessed:
+				if (in_preamble) {
+					preamble_end = offset + count;
+				}
+				break;
+			default: in_preamble = false; break;
+		}
+		switch (opcode) {
+			case spv::OpDecorate:
+				if (count >= 3 && w[2] == spv::DecorationNoContraction) {
+					no_contraction.insert(w[1]);
+				} else if (count >= 3 && w[2] == spv::DecorationInvariant) {
+					invariant.insert(w[1]);
+				} else if (count >= 4 && w[2] == spv::DecorationBuiltIn &&
+				           w[3] == spv::BuiltInPosition) {
+					position_variables.push_back(w[1]);
+				}
+				annotations_end = offset + count;
+				break;
+			case spv::OpMemberDecorate:
+				if (count >= 4 && w[3] == spv::DecorationInvariant) {
+					invariant_members.insert(member_key(w[1], w[2]));
+				} else if (count >= 5 && w[3] == spv::DecorationBuiltIn &&
+				           w[4] == spv::BuiltInPosition) {
+					position_members.emplace_back(w[1], w[2]);
+				}
+				annotations_end = offset + count;
+				break;
+			case spv::OpDecorationGroup:
+			case spv::OpGroupDecorate:
+			case spv::OpGroupMemberDecorate:
+			case spv::OpDecorateId:
+			case spv::OpDecorateString:
+			case spv::OpMemberDecorateString: annotations_end = offset + count; break;
+			// Only outputs are made Invariant: a tessellation or geometry stage's Position input
+			// is the stage before's output.
+			case spv::OpVariable:
+				if (count >= 4 && w[3] == spv::StorageClassOutput) {
+					output_variables.insert(w[2]);
+				}
+				break;
+			case spv::OpTypePointer:
+				if (count >= 4 && w[2] == spv::StorageClassOutput) {
+					output_pointees.push_back(w[3]);
+				}
+				break;
+			case spv::OpTypeArray:
+			case spv::OpTypeRuntimeArray:
+				if (count >= 3) {
+					array_elements[w[1]] = w[2];
+				}
+				break;
+			// The arithmetic a driver may fuse into one operation (a multiply and an add into an
+			// FMA) where the guest GPU ran them one after the other, rounding in between.
+			case spv::OpFAdd:
+			case spv::OpFSub:
+			case spv::OpFMul:
+			case spv::OpFDiv:
+			case spv::OpVectorTimesScalar:
+			case spv::OpMatrixTimesScalar:
+			case spv::OpVectorTimesMatrix:
+			case spv::OpMatrixTimesVector:
+			case spv::OpMatrixTimesMatrix:
+			case spv::OpDot:
+				if (count >= 3) {
+					arithmetic.push_back(w[2]);
+				}
+				break;
+			default: break;
+		}
+		offset += count;
+	}
+	if (annotations_end == 0) {
+		annotations_end = preamble_end;
+	}
+	if (annotations_end == 0) {
+		return {};
+	}
+	// The types an Output variable holds: a pointee, and the elements of a pointee that is an
+	// array (a mesh or tessellation control stage's per-vertex outputs).
+	std::unordered_set<uint32_t> output_types;
+	for (auto type: output_pointees) {
+		for (size_t depth = 0; depth < 4 && output_types.insert(type).second; depth++) {
+			const auto element = array_elements.find(type);
+			if (element == array_elements.end()) {
+				break;
+			}
+			type = element->second;
+		}
+	}
+
+	std::vector<uint32_t> added;
+	for (const auto variable: position_variables) {
+		if (output_variables.contains(variable) && invariant.insert(variable).second) {
+			added.insert(added.end(), {(3u << spv::WordCountShift) | spv::OpDecorate, variable,
+			                           spv::DecorationInvariant});
+		}
+	}
+	for (const auto& [structure, member]: position_members) {
+		if (output_types.contains(structure) &&
+		    invariant_members.insert(member_key(structure, member)).second) {
+			added.insert(added.end(), {(4u << spv::WordCountShift) | spv::OpMemberDecorate,
+			                           structure, member, spv::DecorationInvariant});
+		}
+	}
+	for (const auto result: arithmetic) {
+		if (no_contraction.insert(result).second) {
+			added.insert(added.end(), {(3u << spv::WordCountShift) | spv::OpDecorate, result,
+			                           spv::DecorationNoContraction});
+		}
+	}
+	if (added.empty()) {
+		return {};
+	}
+	std::vector<uint32_t> out;
+	out.reserve(spirv.size() + added.size());
+	out.insert(out.end(), spirv.begin(), spirv.begin() + static_cast<ptrdiff_t>(annotations_end));
+	out.insert(out.end(), added.begin(), added.end());
+	out.insert(out.end(), spirv.begin() + static_cast<ptrdiff_t>(annotations_end), spirv.end());
+	return out;
+}
+
 // A/B switch for background pipeline compiles (KYTY_ASYNC_PIPELINES=0 compiles every graphics
 // pipeline on the GPU thread, as before) and how long a draw waits for a new one
 // (KYTY_PIPELINE_WAIT_MS, default 20) before it is skipped.
@@ -1432,7 +1607,12 @@ struct PipelineCache::ProgramCache {
 		DumpShaderSpirv(stage_name, options.shader_hash, spirv);
 
 		KYTY_PROFILER_PHASE(phases, "Shader: module create", profiler::colors::Blue300);
-		const auto module = CompileSPV(spirv, device);
+		std::vector<uint32_t> exact;
+		if (options.stage != ShaderType::Pixel && options.stage != ShaderType::Compute &&
+		    ExactFloatPositions()) {
+			exact = ExactFloatVariant(options, spirv);
+		}
+		const auto module = CompileSPV(exact.empty() ? spirv : exact, device);
 		EXIT_IF(module == nullptr);
 		vk::ShaderModule pixel_rate_module = nullptr;
 		if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
@@ -2148,6 +2328,52 @@ struct PipelineCache::ProgramCache {
 		return variant_module;
 	}
 
+	// KYTY_EXACT_FLOAT=1: the copy of a stage before the rasterizer whose float arithmetic the
+	// driver may not fuse and whose position is invariant (SpirvExactFloat), or empty for the
+	// shader as it is. The first copies are validated, and every copy after one that fails; a copy
+	// that fails is not used (that shader alone runs as it is), and the log says whether the
+	// shader itself was valid. After eight failures (each logs both modules) no more copies.
+	std::vector<uint32_t> ExactFloatVariant(const ShaderRecompiler::CompileOptions& options,
+	                                        const std::vector<uint32_t>&            spirv) {
+		constexpr uint32_t MaxFailures = 8;
+		if (exact_float_failures >= MaxFailures) {
+			return {};
+		}
+		if (!exact_float_logged) {
+			exact_float_logged = true;
+			LOGF("Pipeline: KYTY_EXACT_FLOAT: vertex-stage shaders keep every float multiply and "
+			     "add apart, and their positions are invariant\n");
+		}
+		auto variant = SpirvExactFloat(spirv);
+		if (variant.empty()) {
+			return {};
+		}
+		constexpr uint32_t CheckedCopies = 32;
+		if (exact_float_rewritten < CheckedCopies || exact_float_failures > 0 ||
+		    Config::ShaderValidationEnabled()) {
+			if (!ValidateShaderSpirvNow(options.dump_label, options.shader_hash, variant)) {
+				exact_float_failures++;
+				const bool original_valid =
+				    ValidateShaderSpirvNow(options.dump_label, options.shader_hash, spirv);
+				LOGF("Pipeline: KYTY_EXACT_FLOAT: the copy of shader 0x%016" PRIx64
+				     " is not valid SPIR-V (%s); the shader runs as it is (%u such so far)\n",
+				     options.shader_hash,
+				     original_valid ? "the shader itself is: the copy is wrong"
+				                    : "nor is the shader itself",
+				     exact_float_failures);
+				if (exact_float_failures == MaxFailures) {
+					LOGF("Pipeline: KYTY_EXACT_FLOAT: off from now on (%u copies failed); %u "
+					     "shaders "
+					     "keep their copies\n",
+					     exact_float_failures, exact_float_rewritten);
+				}
+				return {};
+			}
+		}
+		exact_float_rewritten++;
+		return variant;
+	}
+
 	// Shader function expansion decodes the shader and every callee, and a shader with table
 	// calls can be dispatched hundreds of times a frame; the expander keeps what it can reuse.
 	void ExpandShaderFunctions(const ShaderParams& params, std::span<const uint32_t> user_data,
@@ -2212,6 +2438,10 @@ struct PipelineCache::ProgramCache {
 	bool                                                        pixel_rate_variants = false;
 	uint32_t                                                    pixel_rate_checked  = 0;
 	bool                                                        pixel_rate_failed   = false;
+	// KYTY_EXACT_FLOAT's copies (ExactFloatVariant): how many, and how many failed validation.
+	uint32_t                                                    exact_float_rewritten = 0;
+	uint32_t                                                    exact_float_failures  = 0;
+	bool                                                        exact_float_logged    = false;
 	uint64_t                                                    next_shader_id = 0;
 	// SPIR-V size of the last permutation compiled (for the profiler).
 	size_t                                                      last_spirv_words = 0;

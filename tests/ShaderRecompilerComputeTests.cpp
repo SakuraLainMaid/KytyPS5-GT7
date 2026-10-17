@@ -38955,6 +38955,314 @@ OpFunctionEnd
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// KYTY_EXACT_FLOAT's copy of a stage before the rasterizer (SpirvExactFloat):
+// valid SPIR-V whose float multiplies and adds are NoContraction and whose
+// Position output is Invariant: the emitter's vertex shader and a hand-written
+// one (a gl_PerVertex member), a tessellation control stage (an arrayed block
+// member), a geometry stage (variables, as the mesh stage declares them) and a
+// module without annotations; Position inputs stay as they are, a second
+// rewrite gives nothing, and so does a module with nothing to add.
+void CheckExactFloatVariant() {
+  constexpr const char *name = "ExactFloatVariant";
+  const auto disassemble = [&](const std::vector<u32> &spirv) {
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string text;
+    Require(name, "SPIR-V disassembly", tools.Disassemble(spirv, &text),
+            "failed to disassemble SPIR-V");
+    return text;
+  };
+  const auto count = [](const std::string &text, const std::string &what) {
+    size_t found = 0;
+    for (auto at = text.find(what); at != std::string::npos;
+         at = text.find(what, at + what.size())) {
+      found++;
+    }
+    return found;
+  };
+
+  // position = (id * 3 + id, 1, 0, 1) from the vertex index: a multiply and
+  // an add the recompiler cannot fold.
+  std::vector<u32> vertex_code;
+  vertex_code.push_back(EncodeVop1(0x06, 1, Vgpr(0))); // v_cvt_f32_u32
+  AppendVMovLiteral(&vertex_code, 2, std::bit_cast<u32>(3.0f));
+  vertex_code.push_back(EncodeVop2(0x08, 3, Vgpr(1), 2)); // v_mul_f32
+  vertex_code.push_back(EncodeVop2(0x03, 4, Vgpr(3), 1)); // v_add_f32
+  AppendVMovLiteral(&vertex_code, 5, std::bit_cast<u32>(1.0f));
+  AppendVMovLiteral(&vertex_code, 6, 0);
+  vertex_code.push_back(EncodeExp0(0x0c, 0xf));
+  vertex_code.push_back(EncodeExp1(4, 5, 6, 5));
+  AppendEnd(&vertex_code);
+  ShaderVertexInputInfo vertex{};
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Vertex;
+  options.input_info.vertex = &vertex;
+  auto translated = ShaderRecompiler::TranslateProgram(vertex_code, options);
+  const auto spirv =
+      ShaderRecompiler::CompileProgram(std::move(translated), options, {})
+          .spirv;
+  ValidateSpirv(name, spirv);
+  const auto before = disassemble(spirv);
+  Require(name, "vertex shader",
+          before.find("OpFMul") != std::string::npos &&
+              before.find("OpFAdd") != std::string::npos &&
+              before.find("BuiltIn Position") != std::string::npos,
+          "the vertex case has no float multiply and add, or no position");
+  const auto variant = Libs::Graphics::SpirvExactFloat(spirv);
+  Require(name, "vertex shader", !variant.empty(),
+          "a vertex shader with float arithmetic was not rewritten");
+  ValidateSpirv(name, variant);
+  const auto after = disassemble(variant);
+  Require(name, "vertex shader",
+          count(after, "Invariant") == 1 &&
+              count(after, "NoContraction") >=
+                  count(before, "NoContraction") + 2,
+          "the copy's position is not Invariant once, or its multiply and "
+          "add are not NoContraction");
+  Require(name, "vertex shader",
+          Libs::Graphics::SpirvExactFloat(variant).empty(),
+          "the copy was rewritten again");
+
+  const auto assemble = [&](const char *what, const std::string &source) {
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_1);
+    std::vector<u32> module;
+    Require(name, what, tools.Assemble(source, &module),
+            "the hand-written module did not assemble");
+    ValidateSpirv(name, module);
+    return module;
+  };
+  const std::string member_source = R"(OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Vertex %main "main" %per_vertex %scale
+OpDecorate %block Block
+OpMemberDecorate %block 0 BuiltIn Position
+OpDecorate %scale Location 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%v4float = OpTypeVector %float 4
+%block = OpTypeStruct %v4float
+%ptr_out_block = OpTypePointer Output %block
+%per_vertex = OpVariable %ptr_out_block Output
+%ptr_in_float = OpTypePointer Input %float
+%scale = OpVariable %ptr_in_float Input
+%ptr_out_v4 = OpTypePointer Output %v4float
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%one = OpConstant %float 1
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%value = OpLoad %float %scale
+%product = OpFMul %float %value %value
+%sum = OpFAdd %float %product %one
+%vec = OpCompositeConstruct %v4float %sum %sum %sum %one
+%scaled = OpVectorTimesScalar %v4float %vec %value
+%position = OpAccessChain %ptr_out_v4 %per_vertex %int_0
+OpStore %position %scaled
+OpReturn
+OpFunctionEnd
+)";
+  const auto member = Libs::Graphics::SpirvExactFloat(
+      assemble("Position member", member_source));
+  Require(name, "Position member", !member.empty(),
+          "a block with a Position member was not rewritten");
+  ValidateSpirv(name, member);
+  const auto member_text = disassemble(member);
+  Require(name, "Position member",
+          count(member_text, "OpMemberDecorate") == 2 &&
+              count(member_text, " 0 Invariant") == 1 &&
+              count(member_text, "NoContraction") == 3,
+          "the Position member is not Invariant, or the multiply, add and "
+          "vector scale are not each NoContraction once");
+
+  // A tessellation control stage: its Position input (the vertex shader's
+  // output) stays as it is, its arrayed Position output becomes Invariant.
+  const std::string arrayed_source = R"(OpCapability Tessellation
+OpMemoryModel Logical GLSL450
+OpEntryPoint TessellationControl %main "main" %in %out
+OpExecutionMode %main OutputVertices 3
+OpDecorate %in_block Block
+OpMemberDecorate %in_block 0 BuiltIn Position
+OpDecorate %out_block Block
+OpMemberDecorate %out_block 0 BuiltIn Position
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%v4float = OpTypeVector %float 4
+%uint = OpTypeInt 32 0
+%uint_3 = OpConstant %uint 3
+%uint_32 = OpConstant %uint 32
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%two = OpConstant %float 2
+%in_block = OpTypeStruct %v4float
+%in_array = OpTypeArray %in_block %uint_32
+%ptr_in = OpTypePointer Input %in_array
+%in = OpVariable %ptr_in Input
+%out_block = OpTypeStruct %v4float
+%out_array = OpTypeArray %out_block %uint_3
+%ptr_out = OpTypePointer Output %out_array
+%out = OpVariable %ptr_out Output
+%ptr_in_v4 = OpTypePointer Input %v4float
+%ptr_out_v4 = OpTypePointer Output %v4float
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%read = OpAccessChain %ptr_in_v4 %in %int_0 %int_0
+%value = OpLoad %v4float %read
+%scaled = OpVectorTimesScalar %v4float %value %two
+%write = OpAccessChain %ptr_out_v4 %out %int_0 %int_0
+OpStore %write %scaled
+OpReturn
+OpFunctionEnd
+)";
+  const auto arrayed = Libs::Graphics::SpirvExactFloat(
+      assemble("arrayed Position", arrayed_source));
+  Require(name, "arrayed Position", !arrayed.empty(),
+          "a tessellation control stage was not rewritten");
+  ValidateSpirv(name, arrayed);
+  const auto arrayed_text = disassemble(arrayed);
+  Require(name, "arrayed Position",
+          count(arrayed_text, "OpMemberDecorate") == 3 &&
+              count(arrayed_text, " 0 Invariant") == 1 &&
+              count(arrayed_text, "NoContraction") == 1,
+          "the Position output (and not the input) is not Invariant, or the "
+          "vector scale is not NoContraction");
+  // The decorated block is the element of the 3-vertex output array (the
+  // input array has 32).
+  const auto invariant_at = arrayed_text.find(" 0 Invariant");
+  const auto line_begin = arrayed_text.rfind("OpMemberDecorate ", invariant_at);
+  const auto structure = arrayed_text.substr(
+      line_begin + std::strlen("OpMemberDecorate "),
+      invariant_at - line_begin - std::strlen("OpMemberDecorate "));
+  Require(name, "arrayed Position",
+          arrayed_text.find("OpTypeArray " + structure + " %uint_3\n") !=
+              std::string::npos,
+          "the Position input became Invariant, not the output");
+
+  // A geometry stage with Position as variables: the arrayed input stays as
+  // it is, the output becomes Invariant.
+  const std::string variable_source = R"(OpCapability Geometry
+OpMemoryModel Logical GLSL450
+OpEntryPoint Geometry %main "main" %in_position %out_position
+OpExecutionMode %main Triangles
+OpExecutionMode %main Invocations 1
+OpExecutionMode %main OutputTriangleStrip
+OpExecutionMode %main OutputVertices 3
+OpDecorate %in_position BuiltIn Position
+OpDecorate %out_position BuiltIn Position
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%v4float = OpTypeVector %float 4
+%uint = OpTypeInt 32 0
+%uint_3 = OpConstant %uint 3
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%two = OpConstant %float 2
+%in_array = OpTypeArray %v4float %uint_3
+%ptr_in = OpTypePointer Input %in_array
+%in_position = OpVariable %ptr_in Input
+%ptr_out = OpTypePointer Output %v4float
+%out_position = OpVariable %ptr_out Output
+%ptr_in_v4 = OpTypePointer Input %v4float
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%read = OpAccessChain %ptr_in_v4 %in_position %int_0
+%value = OpLoad %v4float %read
+%scaled = OpVectorTimesScalar %v4float %value %two
+OpStore %out_position %scaled
+OpEmitVertex
+OpEndPrimitive
+OpReturn
+OpFunctionEnd
+)";
+  const auto variable = Libs::Graphics::SpirvExactFloat(
+      assemble("Position variable", variable_source));
+  Require(name, "Position variable", !variable.empty(),
+          "a geometry stage was not rewritten");
+  ValidateSpirv(name, variable);
+  const auto variable_text = disassemble(variable);
+  {
+    // The disassembler names the variables after their BuiltIn: the one
+    // decorated Invariant must be the Output.
+    size_t invariants = 0;
+    bool output_invariant = false;
+    for (size_t at = variable_text.find(" Invariant"); at != std::string::npos;
+         at = variable_text.find(" Invariant", at + 1)) {
+      invariants++;
+      const auto line_begin = variable_text.rfind("OpDecorate ", at);
+      const auto target =
+          variable_text.substr(line_begin + std::strlen("OpDecorate "),
+                               at - line_begin - std::strlen("OpDecorate "));
+      output_invariant =
+          variable_text.find(target + " = OpVariable %_ptr_Output") !=
+          std::string::npos;
+    }
+    Require(name, "Position variable",
+            invariants == 1 && output_invariant &&
+                count(variable_text, "NoContraction") == 1,
+            "the Position output variable (and not the input) is not "
+            "Invariant, or the vector scale is not NoContraction");
+  }
+
+  // A module without annotations: the decorations go after its debug names.
+  const std::string bare_source = R"(OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Vertex %main "main"
+OpName %main "main"
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%ptr_function = OpTypePointer Function %float
+%one = OpConstant %float 1
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%local = OpVariable %ptr_function Function
+%product = OpFMul %float %one %one
+%sum = OpFAdd %float %product %one
+OpStore %local %sum
+OpReturn
+OpFunctionEnd
+)";
+  const auto bare =
+      Libs::Graphics::SpirvExactFloat(assemble("no annotations", bare_source));
+  Require(name, "no annotations", !bare.empty(),
+          "a module without annotations was not rewritten");
+  ValidateSpirv(name, bare);
+  Require(name, "no annotations",
+          count(disassemble(bare), "NoContraction") == 2,
+          "the multiply and add of a module without annotations are not "
+          "NoContraction");
+
+  for (const auto *copy : {&member, &arrayed, &variable, &bare}) {
+    Require(name, "second rewrite",
+            Libs::Graphics::SpirvExactFloat(*copy).empty(),
+            "a copy was rewritten again");
+  }
+
+  const std::string nothing_source = R"(OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Vertex %main "main" %out
+OpDecorate %out Location 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%ptr_out = OpTypePointer Output %float
+%out = OpVariable %ptr_out Output
+%one = OpConstant %float 1
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpStore %out %one
+OpReturn
+OpFunctionEnd
+)";
+  Require(name, "nothing to add",
+          Libs::Graphics::SpirvExactFloat(
+              assemble("nothing to add", nothing_source))
+              .empty(),
+          "a module with no position and no float arithmetic was rewritten");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckFloatStoreClamp() {
   constexpr const char *name = "FloatStoreClamp";
   using O = ShaderOpcode;
@@ -41394,6 +41702,7 @@ int main(int argc, char **argv) {
   CheckTenBitRenderTargetFormat();
   CheckDeadImageViewScrub();
   CheckPixelRateSampleIdVariant();
+  CheckExactFloatVariant();
   CheckFloatStoreClamp();
   CheckPackedExportFormats();
   CheckShaderProbe();
