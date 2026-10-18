@@ -55,8 +55,15 @@ compiled. They are cached, so later runs through the same area are smoother.
 As of October 2026:
 
 - The game reaches its menus and runs races.
-- Frame rate at 3840x2160 on the PC above: about 27 to 30 fps standing still at Tokyo, and about
-  13 to 16 fps in a race against AI cars there.
+- Frame rate at 3840x2160 on the PC above: about 18 to 22 fps in a race against AI cars at Tokyo.
+- On a Ryzen with 3D V-Cache on one of its two dies (such as the 7950X3D), the emulator's
+  graphics threads start on the V-Cache cores by themselves (about 2 fps in a race). Starting the
+  emulator with an affinity of your own (Process Lasso, for example) keeps yours, and
+  `KYTY_CPU_SET=off` turns it off.
+- Texture descriptors no texture can be, which ended the emulator in some races and in the
+  cockpit view ("unsupported texture mip view changes physical layout"), are drawn as empty
+  textures. A race whose loading needs more than the game's 12.5 GB of memory no longer crashes:
+  the emulator gives it room past that (the log says "did not fit" when it does).
 - The cars' bodies, the AI cars' and the player's, are drawn right in the cockpit and chase views.
   The game skips the parts of a car it finds hidden by testing them against a small depth picture
   of the scene, and that test used to read the picture at the wrong place, so parts went missing or
