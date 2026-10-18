@@ -55,10 +55,16 @@ compiled. They are cached, so later runs through the same area are smoother.
 As of October 2026:
 
 - The game reaches its menus and runs races.
-- Frame rate at 3840x2160 on the PC above: about 27 fps standing still at Tokyo, and about 16 fps
-  in a race against AI cars there.
-- Known graphics problems: AI cars are drawn black; parts of the player's cockpit are missing; in
-  the exterior (chase) view, black squares and white flickers appear on the player's car.
+- Frame rate at 3840x2160 on the PC above: about 27 to 30 fps standing still at Tokyo, and about
+  13 to 16 fps in a race against AI cars there.
+- The cars' bodies, the AI cars' and the player's, are drawn right in the cockpit and chase views.
+  The game skips the parts of a car it finds hidden by testing them against a small depth picture
+  of the scene, and that test used to read the picture at the wrong place, so parts went missing or
+  black. The first time you race after updating, expect a short stutter while the fixed shaders are
+  compiled.
+- Known graphics problems: a thin spike sticks out of the roof of the player's car in the chase
+  view; lines show on the player's car's glass during the race countdown and in replays (it looks
+  right while driving); the FINISH and retry screens are drawn wrong.
 - The reflections' light lists sometimes hold corrupt cells (cells asking for thousands of lights).
   Those cells are emptied before they reach the graphics card; without that, they caused freezes of
   tens of milliseconds. Their cause is still being investigated.
