@@ -86,6 +86,8 @@ struct Step {
 	bool              backing_locked  = false;
 	// Round 84.
 	bool              buflen_old      = false;
+	// Round 85.
+	uint32_t          cube_every      = 0;    // cube:<n>; 0: KYTY_CUBE_EVERY
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
 	int32_t           dflush          = -1;   // dflush:<n>; -1: the usual
@@ -347,6 +349,14 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "buflen:old") {
 		step.buflen_old = true;
+		return true;
+	}
+	if (action.starts_with("cube:")) {
+		const auto text = action.substr(5);
+		if (text.size() != 1 || text[0] < '1' || text[0] > '8') {
+			return false;
+		}
+		step.cube_every = static_cast<uint32_t>(text[0] - '0');
 		return true;
 	}
 	if (action.starts_with("depth:equal-relaxed:")) {
@@ -989,6 +999,11 @@ bool ExpandOld() {
 bool BufferLengthOld() {
 	const auto* step = Current();
 	return step != nullptr && step->buflen_old;
+}
+
+uint32_t CubeEvery() {
+	const auto* step = Current();
+	return step != nullptr ? step->cube_every : 0u;
 }
 
 float DepthEqualRelaxed() {

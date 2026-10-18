@@ -1276,6 +1276,75 @@ static void NoteDrawTarget(const DrawRenderState& state) {
 	GpuPhases::SetOpKey(info->data.address | (depth ? uint64_t {1} << 63u : 0u), extent);
 }
 
+// KYTY_CUBE_EVERY=<n> (round 85; KYTY_BISECT's cube:<n>): the draws into a reflection cube run
+// every nth frame only (n from 1, every frame, the default, to 8). The game draws the scene into
+// a 512x512 cube of six layers every frame for its cars' reflections: 550 to 750 draws a frame,
+// 30 to 40 % of the GPU thread's draw time (round 84's KYTY_OP_STATS). On the other frames the
+// cube keeps the last frame's pictures. A cube is a color target of six square layers of at most
+// 2048 pixels; its address is learned at its first draw, and a draw is left out while that
+// address is its first color target and the draw writes it. GPU thread only.
+namespace {
+std::array<uint64_t, 4> g_cube_targets {};
+uint32_t                g_cube_target_count = 0;
+uint64_t                g_cube_draws_left   = 0;
+} // namespace
+
+static uint32_t CubeEvery() {
+	if (const auto step = Bisect::CubeEvery(); step != 0) {
+		return step;
+	}
+	static const uint32_t every = [] {
+		const char* value = std::getenv("KYTY_CUBE_EVERY");
+		const auto  n     = value != nullptr ? std::strtoul(value, nullptr, 10) : 1ul;
+		return static_cast<uint32_t>(std::clamp(n, 1ul, 8ul));
+	}();
+	return every;
+}
+
+static void LearnCubeTarget(CommandBuffer& buffer, const DrawRenderState& state) {
+	if (state.color_count == 0 || g_cube_target_count >= g_cube_targets.size()) {
+		return;
+	}
+	const auto& color = state.color_info[0];
+	const auto& info  = color.desc.info;
+	if (color.target_slot != 0 || info.resources.layers != 6 ||
+	    info.extent.width != info.extent.height || info.extent.width > 2048u) {
+		return;
+	}
+	const auto address = buffer.GetRegisters().GetRenderTarget(0).base.addr;
+	const auto known   = std::span(g_cube_targets.data(), g_cube_target_count);
+	if (address == 0 || std::ranges::find(known, address) != known.end()) {
+		return;
+	}
+	g_cube_targets[g_cube_target_count++] = address;
+	LOGF("Reflection cube: color target 0x%" PRIx64 ", %ux%u, 6 layers: its draws run every "
+	     "frame, or every nth with KYTY_CUBE_EVERY=<n> (now %u)\n",
+	     address, info.extent.width, info.extent.height, CubeEvery());
+}
+
+static bool SkipCubeDraw(CommandBuffer& buffer) {
+	if (g_cube_target_count == 0) {
+		return false;
+	}
+	const auto every = CubeEvery();
+	if (every <= 1 || FrameGraph::GpuThreadFrames() % every == 0) {
+		return false;
+	}
+	const auto& regs    = buffer.GetRegisters();
+	const auto  address = regs.GetRenderTarget(0).base.addr;
+	const auto  known   = std::span(g_cube_targets.data(), g_cube_target_count);
+	if (address == 0 || std::ranges::find(known, address) == known.end() ||
+	    (DrawColorOutputMask(regs) & 1u) == 0) {
+		return false;
+	}
+	const auto left = ++g_cube_draws_left;
+	if ((left & (left - 1u)) == 0 && left >= 1024u) {
+		LOGF("Reflection cube: %" PRIu64 " draws left out so far (KYTY_CUBE_EVERY=%u)\n", left,
+		     every);
+	}
+	return true;
+}
+
 // KYTY_DUMP_TESS_DRAWS="<hash>[,<hash>...]" (round 82, the roof spike): the inputs of the first
 // tessellated draws (up to 4 distinct index buffers per hash) whose stages include one of these
 // shaders, as guest memory holds them: the index buffer, each vertex buffer the first stage
@@ -2212,6 +2281,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
 	NoteDrawRepeat(draw, state, index_source, vertex_stages.size());
 	NoteDrawTarget(state);
+	LearnCubeTarget(buffer, state);
 	uint32_t   mesh_groups = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
@@ -2866,6 +2936,9 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		                  -1);
 		return;
 	}
+	if (SkipCubeDraw(buffer)) {
+		return;
+	}
 
 	if (FrameGraph::Logging()) {
 		FrameGraph::BeginOp();
@@ -3047,6 +3120,9 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	     (args.instance_count == 0 && args.gpu_instance_count_address == 0))) {
 		LogDrawCensusLine(buffer, "DrawIndexAuto-empty", args.vertex_count, args.instance_count, -1,
 		                  -1, -1);
+		return;
+	}
+	if (SkipCubeDraw(buffer)) {
 		return;
 	}
 

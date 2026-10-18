@@ -201,6 +201,9 @@
 //   cpu:gpucore   as cpu:gpuvcache (the placement a run starts with on a Ryzen X3D), with the GPU
 //                thread alone on one core of the V-Cache die, whose SMT sibling no thread of the
 //                process is given (Common::SetProcessCpuSet)
+// and, round 85:
+//   cube:<n>      the draws into a reflection cube (a color target of six square layers) run every
+//                nth frame only, n from 1 to 8 (KYTY_CUBE_EVERY for the whole run)
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -304,6 +307,8 @@ void                      ApplyPending();
 [[nodiscard]] bool ExpandOld();
 // Any thread: buflen:old.
 [[nodiscard]] bool BufferLengthOld();
+// Any thread: cube:<n>'s n; 0 when no step sets it.
+[[nodiscard]] uint32_t CubeEvery();
 // Any thread: depth:equal-relaxed's bias in units of depth precision; 0 when off.
 [[nodiscard]] float DepthEqualRelaxed();
 

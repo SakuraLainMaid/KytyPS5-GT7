@@ -69,9 +69,10 @@ As of October 2026:
   of the scene, and that test used to read the picture at the wrong place, so parts went missing or
   black. The first time you race after updating, expect a short stutter while the fixed shaders are
   compiled.
-- Known graphics problems: a thin spike sticks out of the roof of the player's car in the chase
-  view; lines show on the player's car's glass during the race countdown and in replays (it looks
-  right while driving); the FINISH and retry screens are drawn wrong.
+- The thin spike that stuck out of the roof of the cars in the chase view is gone: the last bytes
+  of a table the cars' glass reads were read as zero.
+- Known graphics problems: lines show on the player's car's glass during the race countdown and in
+  replays (it looks right while driving); the FINISH and retry screens are drawn wrong.
 - The reflections' light lists sometimes hold corrupt cells (cells asking for thousands of lights).
   Those cells are emptied before they reach the graphics card; without that, they caused freezes of
   tens of milliseconds. Their cause is still being investigated.
