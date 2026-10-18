@@ -56,9 +56,11 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -1140,6 +1142,238 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	return prepared;
 }
 
+// KYTY_DRAW_REPEATS=1 (round 83): how many of each frame's draws the frame before had too, by two
+// keys: the inputs (the stages' shaders and user data) and everything resolved from them (the
+// descriptors the shaders read, the flattened tables, the render and depth targets, the index and
+// vertex buffers). A draw whose resolved key the frame before had could reuse that draw's work
+// (bindings, targets, pipeline): the share of such draws says what a draw memo would save.
+// "Draw repeats" lines every 10 s (GPU thread).
+static bool DrawRepeatsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_REPEATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+static void NoteDrawRepeat(const DrawCallInfo& draw, const DrawRenderState& state,
+                           const DrawIndexBufferSource& index, size_t vertex_stage_count) {
+	if (!DrawRepeatsEnabled()) {
+		return;
+	}
+	struct Stats {
+		std::unordered_set<uint64_t>          inputs[2];
+		std::unordered_set<uint64_t>          resolved[2];
+		uint64_t                              frame         = UINT64_MAX;
+		uint64_t                              draws         = 0;
+		uint64_t                              input_hits    = 0;
+		uint64_t                              resolved_hits = 0;
+		uint64_t                              same_frame    = 0;
+		uint64_t                              frames        = 0;
+		std::chrono::steady_clock::time_point last          = std::chrono::steady_clock::now();
+	};
+	static Stats stats;
+	const auto   frame = FrameGraph::GpuThreadFrames();
+	if (frame != stats.frame) {
+		stats.frame = frame;
+		std::swap(stats.inputs[0], stats.inputs[1]);
+		std::swap(stats.resolved[0], stats.resolved[1]);
+		stats.inputs[0].clear();
+		stats.resolved[0].clear();
+		stats.frames++;
+	}
+	const auto mix = [](uint64_t seed, const void* data, size_t size) {
+		return size == 0 ? seed : XXH3_64bits_withSeed(data, size, seed);
+	};
+	uint64_t   inputs   = 0x5eed;
+	uint64_t   resolved = 0;
+	const auto stage    = [&](const ShaderStageRuntime& runtime) {
+        if (!runtime) {
+            return;
+        }
+        const auto  hash = runtime.program->shader_hash;
+        const auto& snap = *runtime.resources;
+        inputs           = mix(inputs, &hash, sizeof(hash));
+        inputs   = mix(inputs, snap.user_data.data(), snap.user_data.size() * sizeof(uint32_t));
+        resolved = mix(resolved, snap.buffers.data(),
+		                  snap.buffers.size() * sizeof(ShaderRecompiler::IR::DescriptorValue));
+        resolved = mix(resolved, snap.images.data(),
+		                  snap.images.size() * sizeof(ShaderRecompiler::IR::DescriptorValue));
+        resolved = mix(resolved, snap.samplers.data(),
+		                  snap.samplers.size() * sizeof(ShaderRecompiler::IR::DescriptorValue));
+        resolved =
+            mix(resolved, snap.flattened_srt.data(), snap.flattened_srt.size() * sizeof(uint32_t));
+	};
+	for (size_t i = 0; i < vertex_stage_count; i++) {
+		stage(state.vertex_info[i].stage);
+	}
+	if (state.ps_active) {
+		stage(state.ps_input_info.stage);
+	}
+	std::array<uint64_t, 8> targets {};
+	for (uint32_t i = 0; i < state.color_count && i < 6u; i++) {
+		targets[i] = state.color_info[i].desc.info.data.address;
+	}
+	targets[6]     = state.depth_info.image_id ? state.depth_info.desc.info.data.address : 0u;
+	targets[7]     = (static_cast<uint64_t>(draw.index_count) << 32u) | draw.instance_count;
+	resolved       = mix(resolved, targets.data(), sizeof(targets));
+	resolved       = mix(resolved, &index.address, sizeof(index.address));
+	const auto& vs = state.vertex_info[0];
+	for (int b = 0; b < vs.buffers_num; b++) {
+		const std::array<uint64_t, 2> vb {vs.buffers[b].addr,
+		                                  (static_cast<uint64_t>(vs.buffers[b].stride) << 32u) |
+		                                      vs.buffers[b].num_records};
+		resolved = mix(resolved, vb.data(), sizeof(vb));
+	}
+	resolved ^= inputs * 0x9e3779b97f4a7c15ull;
+	stats.draws++;
+	stats.input_hits += stats.inputs[1].contains(inputs) ? 1u : 0u;
+	stats.resolved_hits += stats.resolved[1].contains(resolved) ? 1u : 0u;
+	stats.same_frame += stats.resolved[0].insert(resolved).second ? 0u : 1u;
+	stats.inputs[0].insert(inputs);
+	const auto now = std::chrono::steady_clock::now();
+	if (now - stats.last >= std::chrono::seconds(10)) {
+		const auto percent = [&](uint64_t n) {
+			return stats.draws != 0
+			           ? 100.0 * static_cast<double>(n) / static_cast<double>(stats.draws)
+			           : 0.0;
+		};
+		LOGF("Draw repeats (%.0f s): %" PRIu64 " draws in %" PRIu64 " frames; the frame before had "
+		     "the same inputs (shaders, user data) for %.1f%%, the same resolved descriptors, "
+		     "targets and index/vertex buffers for %.1f%%; %.1f%% repeat one earlier in their "
+		     "frame\n",
+		     std::chrono::duration<double>(now - stats.last).count(), stats.draws, stats.frames,
+		     percent(stats.input_hits), percent(stats.resolved_hits), percent(stats.same_frame));
+		stats.last          = now;
+		stats.draws         = 0;
+		stats.input_hits    = 0;
+		stats.resolved_hits = 0;
+		stats.same_frame    = 0;
+		stats.frames        = 0;
+	}
+}
+
+// KYTY_DUMP_TESS_DRAWS="<hash>[,<hash>...]" (round 82, the roof spike): the inputs of the first
+// tessellated draws (up to 4 distinct index buffers per hash) whose stages include one of these
+// shaders, as guest memory holds them: the index buffer, each vertex buffer the first stage
+// fetches from (with its V#s), and each buffer every vertex stage binds, into dump_tess_*.bin
+// next to the log, with "TessDump:" lines naming them (and whether the GPU wrote the bytes, in
+// which case guest memory may be older than what the GPU reads).
+static void DumpTessellatedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
+                                const DrawRenderState& state, const DrawIndexBufferSource& index,
+                                std::span<PreparedBindings> stage_bindings) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> list;
+		if (const char* value = std::getenv("KYTY_DUMP_TESS_DRAWS"); value != nullptr) {
+			for (const char* cursor = value; *cursor != '\0';) {
+				char*      end  = nullptr;
+				const auto hash = std::strtoull(cursor, &end, 16);
+				if (end == cursor) {
+					break;
+				}
+				list.push_back(hash);
+				cursor = *end == ',' ? end + 1 : end;
+			}
+		}
+		return list;
+	}();
+	if (hashes.empty()) {
+		return;
+	}
+	const auto stage_count = state.programs.VertexStageCount();
+	uint64_t   matched     = 0;
+	for (uint32_t i = 0; i < stage_count && matched == 0; i++) {
+		const auto hash = state.vertex_info[i].stage.program->shader_hash;
+		if (std::find(hashes.begin(), hashes.end(), hash) != hashes.end()) {
+			matched = hash;
+		}
+	}
+	if (matched == 0) {
+		return;
+	}
+	// GPU thread only: the (hash, index buffer, count) dumped so far.
+	static std::vector<std::tuple<uint64_t, uint64_t, uint32_t>> dumped;
+	const auto key = std::make_tuple(matched, index.address, draw.index_count);
+	if (std::find(dumped.begin(), dumped.end(), key) != dumped.end() ||
+	    std::count_if(dumped.begin(), dumped.end(),
+	                  [&](const auto& entry) { return std::get<0>(entry) == matched; }) >= 4) {
+		return;
+	}
+	dumped.push_back(key);
+	const auto           number = dumped.size();
+	auto&                cache  = buffer.GetContext().GetBufferCache();
+	const auto           frame  = FrameGraph::GpuThreadFrames();
+	std::vector<uint8_t> bytes;
+	const auto           write = [&](const std::string& name, uint64_t address, uint64_t size,
+                           const void* host) -> std::string {
+        constexpr uint64_t MaxBytes = 32ull << 20u;
+        size                        = std::min(size, MaxBytes);
+        if (size == 0) {
+            return "(empty)";
+        }
+        bytes.resize(size);
+        if (host != nullptr) {
+            std::memcpy(bytes.data(), host, size);
+        } else if (!Libs::LibKernel::Memory::TryReadBacking(address, bytes.data(), size)) {
+            return "(not readable)";
+        }
+        const auto path = fmt::format("dump_tess_{:016x}_{}_{}.bin", matched, number, name);
+        if (FILE* file = std::fopen(path.c_str(), "wb"); file != nullptr) {
+            std::fwrite(bytes.data(), 1, bytes.size(), file);
+            std::fclose(file);
+        }
+        const bool gpu_written = host == nullptr && cache.IsRegionGpuModified(address, size);
+        return fmt::format("{} ({} bytes{})", path, size, gpu_written ? ", GPU-written" : "");
+	};
+	const auto& ucfg = buffer.GetUserConfig();
+	LOGF("TessDump: draw %zu of shader %016" PRIx64 " (frame %" PRIu64 "): %u indices x %u, index "
+	     "offset %u, %u control points, primitive type %u\n",
+	     number, matched, frame, draw.index_count, draw.instance_count, ucfg.GetIndexOffset(),
+	     (buffer.GetRegisters().GetShaderRegisters().m_vgtLsHsConfig >> 8u) & 0x3fu,
+	     static_cast<uint32_t>(ucfg.GetPrimType()));
+	LOGF("TessDump:   vgt_ls_hs_config 0x%08x, vgt_tf_param 0x%08x\n",
+	     buffer.GetRegisters().GetShaderRegisters().m_vgtLsHsConfig,
+	     buffer.GetRegisters().GetShaderRegisters().m_vgtTfParam);
+	const auto index_size =
+	    static_cast<uint64_t>(draw.index_count) * std::max(index.guest_element_size, 1u);
+	LOGF("TessDump:   indices at 0x%016" PRIx64 ", %u bytes each%s: %s\n", index.address,
+	     index.guest_element_size, index.host_data != nullptr ? " (expanded on the host)" : "",
+	     write("indices", index.address, index_size, index.host_data).c_str());
+	for (uint32_t i = 0; i < stage_count; i++) {
+		const auto& info    = state.vertex_info[i];
+		const auto* program = info.stage.program;
+		// (Each stage's user data is in its shader-dumps/<stage>_<hash>.txt.)
+		LOGF("TessDump:   stage %u: type %d, shader %016" PRIx64 "\n", i,
+		     static_cast<int>(program->stage), program->shader_hash);
+		for (int b = 0; b < info.buffers_num; b++) {
+			const auto& vb = info.buffers[b];
+			LOGF("TessDump:     vertex buffer %d: 0x%016" PRIx64 ", stride %u, %u records: %s\n", b,
+			     vb.addr, vb.stride, vb.num_records,
+			     write(fmt::format("s{}_vb{}", i, b), vb.addr,
+			           static_cast<uint64_t>(vb.stride) * vb.num_records, nullptr)
+			         .c_str());
+		}
+		for (int r = 0; r < info.resources_num; r++) {
+			const auto& v = info.resources[r];
+			LOGF("TessDump:     fetch %d (buffer %d, registers %d+%d, attribute %d): V# "
+			     "%08x %08x %08x %08x\n",
+			     r, info.resources_dst[r].buffer_index, info.resources_dst[r].register_start,
+			     info.resources_dst[r].registers_num, info.resources_dst[r].attr_id, v.fields[0],
+			     v.fields[1], v.fields[2], v.fields[3]);
+		}
+		if (i < stage_bindings.size()) {
+			const auto& sources = stage_bindings[i].buffer_sources;
+			for (size_t b = 0; b < sources.size(); b++) {
+				LOGF("TessDump:     bound buffer %zu: 0x%016" PRIx64 ", 0x%" PRIx64 " bytes: %s\n",
+				     b, sources[b].address, sources[b].size,
+				     write(fmt::format("s{}_buf{}", i, b), sources[b].address, sources[b].size,
+				           nullptr)
+				         .c_str());
+			}
+		}
+	}
+}
+
 static void SetDrawDebugPhase(CommandBuffer& buffer, uint64_t submit_id, const DrawCallInfo& draw,
                               uint32_t phase) {
 	buffer.SetDebugInfo(static_cast<uint32_t>(draw.debug_op), submit_id, phase, draw.index_count, 0,
@@ -1953,6 +2187,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
+	NoteDrawRepeat(draw, state, index_source, vertex_stages.size());
 	uint32_t   mesh_groups = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
@@ -2138,6 +2373,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	if (ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch) {
+		DumpTessellatedDraw(buffer, draw, state, index_source, bindings.vertex);
+	}
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
