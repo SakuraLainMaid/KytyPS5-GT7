@@ -2812,8 +2812,33 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.shader_data.clear();
 	const bool pixel     = program.stage == ShaderType::Pixel;
 	const bool grids_off = pixel && Bisect::LightGridsOff();
+	// KYTY_BISECT's hiz:off: a hull shader's texture sampled with unnormalized coordinates (GT7's
+	// depth pyramid, against which it culls hidden patches) reads as zero, the far plane.
+	const bool hiz_off = program.stage == ShaderType::TessellationControl && Bisect::HiZOff();
+	const auto sampled_unnormalized = [&](uint32_t image) {
+		for (const auto& pair: program.info.sampled_pairs) {
+			if (pair.image != image || pair.sampler >= program.info.samplers.size()) {
+				continue;
+			}
+			const auto index = program.info.samplers[pair.sampler].snapshot_index;
+			if (index < snapshot.samplers.size() &&
+			    DecodeNativeDescriptor<ShaderSamplerResource>(snapshot.samplers[index])
+			        .ForceUnormCoords()) {
+				return true;
+			}
+		}
+		return false;
+	};
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i], true);
+		if (hiz_off &&
+		    program.info.images[i].resource_class !=
+		        ShaderRecompiler::IR::ImageResourceClass::Storage &&
+		    sampled_unnormalized(i)) {
+			auto desc = NullTextureDesc(program.info.images[i], TextureCache::BindingType::Texture);
+			const auto id = m_context.GetTextureCache().FindImage(desc);
+			binding       = {id, nullptr, std::move(desc)};
+		}
 		const bool grid    = pixel && IsLightGridBinding(program.info.images[i], binding);
 		if (grid) {
 			// Its later uploads are checked (TextureCache::CheckLightGridUpload), and what this

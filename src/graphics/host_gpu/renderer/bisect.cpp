@@ -63,6 +63,8 @@ struct Step {
 	bool              scan_one        = false;
 	bool              hot_pages       = false;
 	float             equal_relaxed   = 0.0f; // depth:equal-relaxed[:<units>]; 0: off
+	bool              hiz_off         = false;
+	bool              unorm_lod       = false;
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
 	int32_t           dflush          = -1;   // dflush:<n>; -1: the usual
@@ -239,6 +241,14 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "depth:equal-relaxed") {
 		step.equal_relaxed = 256.0f;
+		return true;
+	}
+	if (action == "hiz:off") {
+		step.hiz_off = true;
+		return true;
+	}
+	if (action == "unorm:lod") {
+		step.unorm_lod = true;
 		return true;
 	}
 	if (action.starts_with("depth:equal-relaxed:")) {
@@ -734,6 +744,16 @@ bool HotPages() {
 	}();
 	const auto* step = Current();
 	return always || (step != nullptr && step->hot_pages);
+}
+
+bool HiZOff() {
+	const auto* step = Current();
+	return step != nullptr && step->hiz_off;
+}
+
+bool UnnormalizedLod() {
+	const auto* step = Current();
+	return step != nullptr && step->unorm_lod;
 }
 
 float DepthEqualRelaxed() {

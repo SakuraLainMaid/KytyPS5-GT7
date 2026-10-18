@@ -27,7 +27,9 @@ public:
 	vk::Sampler GetSampler(const ShaderSamplerResource& r, bool integer_border);
 
 private:
-	using SamplerKey = std::array<uint32_t, 5>;
+	// The S# words, the integer border variant, and whether an unnormalized sampler keeps its LOD
+	// range (UnnormalizedLodEnabled).
+	using SamplerKey = std::array<uint32_t, 6>;
 
 	struct SamplerKeyHash {
 		std::size_t operator()(const SamplerKey& key) const {

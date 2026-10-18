@@ -133,6 +133,14 @@
 //                biased towards the camera by <units> (default 256) of the primitive's depth
 //                precision and by its depth slope, without writing depth: a pixel whose depth the
 //                two passes compute that close is drawn too (SetGraphicsDynamicParams)
+// and (round 76):
+//   hiz:off      a hull shader's texture sampled through a sampler with unnormalized coordinates
+//                (GT7's depth pyramid, which culls the patches of car bodies another object hides)
+//                is bound as a null texture: no patch is culled that way
+//   unorm:lod    a sampler with unnormalized coordinates keeps the guest's LOD range instead of
+//                0 to 0 (KYTY_UNNORMALIZED_LOD=1 for the whole run): an explicit LOD past 0 then
+//                reaches the mip it names, as on the console, where Vulkan's rule for such a
+//                sampler (one mip, LOD 0) clamps it to the first
 namespace Libs::Graphics::Bisect {
 
 // The GPU thread, at its start: applies the start step's CPU set and log setting.
@@ -202,6 +210,10 @@ void                      ApplyPending();
 [[nodiscard]] bool ScanOneThread();
 // Any thread: hotpages, or KYTY_HOT_PAGES=1.
 [[nodiscard]] bool HotPages();
+// Any thread: hiz:off.
+[[nodiscard]] bool HiZOff();
+// Any thread: unorm:lod.
+[[nodiscard]] bool UnnormalizedLod();
 // Any thread: depth:equal-relaxed's bias in units of depth precision; 0 when off.
 [[nodiscard]] float DepthEqualRelaxed();
 

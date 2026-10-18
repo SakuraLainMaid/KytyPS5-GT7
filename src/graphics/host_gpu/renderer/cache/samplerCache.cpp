@@ -3,7 +3,11 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+
+#include <algorithm>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -14,10 +18,26 @@ SamplerCache::~SamplerCache() {
 	}
 }
 
+// KYTY_UNNORMALIZED_LOD=1, or KYTY_BISECT's unorm:lod (round 76): a sampler with unnormalized
+// coordinates keeps the guest's LOD range. Vulkan allows such a sampler only LOD 0 (and a view of
+// one mip), so it was made with 0 to 0, which clamps every explicit LOD to the first mip. The
+// guest GPU samples the mip the shader names, at coordinates in that mip's texels: GT7's hull
+// shaders read their depth pyramid that way, a level picked from each patch's size on screen,
+// and the patches of car bodies close to the camera read the wrong level and were culled.
+static bool UnnormalizedLodEnabled() {
+	static const bool always = [] {
+		const char* value = std::getenv("KYTY_UNNORMALIZED_LOD");
+		return value != nullptr && value[0] == '1';
+	}();
+	return always || Bisect::UnnormalizedLod();
+}
+
 vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool integer_border) {
 	Common::LockGuard lock(m_mutex);
 
-	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3], integer_border};
+	const bool       keep_lod = r.ForceUnormCoords() && UnnormalizedLodEnabled();
+	const SamplerKey key {r.fields[0], r.fields[1],    r.fields[2],
+	                      r.fields[3], integer_border, keep_lod};
 	if (auto iter = m_samplers.find(key); iter != m_samplers.end()) {
 		return iter->second;
 	}
@@ -142,8 +162,8 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool intege
 		sampler_info.addressModeV     = vk::SamplerAddressMode::eClampToEdge;
 		sampler_info.addressModeW     = vk::SamplerAddressMode::eClampToEdge;
 		sampler_info.mipmapMode       = vk::SamplerMipmapMode::eNearest;
-		sampler_info.minLod           = 0.0f;
-		sampler_info.maxLod           = 0.0f;
+		sampler_info.minLod           = keep_lod ? min_lod : 0.0f;
+		sampler_info.maxLod           = keep_lod ? std::max(max_lod, min_lod) : 0.0f;
 		sampler_info.anisotropyEnable = VK_FALSE;
 		sampler_info.maxAnisotropy    = 1.0f;
 		sampler_info.compareEnable    = VK_FALSE;
