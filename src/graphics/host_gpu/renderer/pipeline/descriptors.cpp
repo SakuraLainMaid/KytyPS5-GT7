@@ -1245,9 +1245,14 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 static vk::Sampler NativeSampler(RenderContext&                                  context,
                                  const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                  uint32_t index, const ShaderRecompiler::IR::DescriptorValue& value,
-                                 bool big_depth_image) {
+                                 bool big_depth_image, bool normalize_unnormalized) {
 	auto        descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
 	const auto& sampler = program.info.samplers[index];
+	if (normalize_unnormalized) {
+		// The stage's copy divides its coordinates by the mip's size (SpirvNormalizedExplicitLod):
+		// FORCE_UNNORMALIZED off, the guest's LOD range and clamps as they are.
+		descriptor.fields[0] &= ~(1u << 15u);
+	}
 	if (!sampler.depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
 	} else if (Bisect::PassesDepthCompare(big_depth_image)) {
@@ -2893,7 +2898,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 		prepared.samplers.push_back(NativeSampler(
 		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index],
-		    samples_big_depth(i)));
+		    samples_big_depth(i), prepared.normalize_unnormalized));
 	}
 	for (const auto& use: snapshot.bindless_heaps) {
 		if (m_bindless_surveyed.insert(use.base ^ (static_cast<uint64_t>(use.table_offset) << 48u))

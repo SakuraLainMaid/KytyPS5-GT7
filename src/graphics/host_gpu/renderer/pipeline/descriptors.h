@@ -45,6 +45,9 @@ struct PreparedBindings {
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
 	const ShaderStageRuntime* runtime = nullptr;
+	// The stage runs its copy that turns unnormalized coordinates into normalized ones
+	// (ShaderProgram::normalized_samplers): its samplers are made normalized.
+	bool normalize_unnormalized = false;
 	// Keep the resolved guest range through cache preparation; only the host buffer ID may
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;

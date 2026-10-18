@@ -1739,6 +1739,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	{
 		const GpuPhases::Scope phase(GpuPhases::Phase::DrawTextures);
 		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+			bindings.vertex[i].normalize_unnormalized =
+			    state.programs.vertex[i].normalized_samplers;
 			PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
 			descriptor_stages[stage_count++] = &bindings.vertex[i];
 		}

@@ -141,6 +141,11 @@
 //                0 to 0 (KYTY_UNNORMALIZED_LOD=1 for the whole run): an explicit LOD past 0 then
 //                reaches the mip it names, as on the console, where Vulkan's rule for such a
 //                sampler (one mip, LOD 0) clamps it to the first
+// and (round 77):
+//   unorm:old    a hull shader samples through a sampler with unnormalized coordinates as before
+//                round 77 (KYTY_UNNORMALIZED_FIX=0 for the whole run), instead of running its copy
+//                that turns them into normalized ones at the LOD it names
+//                (SpirvNormalizedExplicitLod)
 namespace Libs::Graphics::Bisect {
 
 // The GPU thread, at its start: applies the start step's CPU set and log setting.
@@ -214,6 +219,8 @@ void                      ApplyPending();
 [[nodiscard]] bool HiZOff();
 // Any thread: unorm:lod.
 [[nodiscard]] bool UnnormalizedLod();
+// Any thread: unorm:old.
+[[nodiscard]] bool UnnormalizedOld();
 // Any thread: depth:equal-relaxed's bias in units of depth precision; 0 when off.
 [[nodiscard]] float DepthEqualRelaxed();
 

@@ -118,6 +118,13 @@ struct ShaderProgram {
 	// A pixel shader that reads its sample index, as one that runs once per pixel with the index
 	// reading 0 (SpirvWithoutSampleId); null otherwise. For NV mixed-sample draws.
 	vk::ShaderModule pixel_rate_module = nullptr;
+	// A hull shader that samples at an explicit LOD, as one that turns its coordinates into
+	// normalized ones at that LOD (SpirvNormalizedExplicitLod), with an id of its own; null
+	// otherwise. A draw whose samplers there all have unnormalized coordinates runs it (with them
+	// made normalized), and sets normalized_samplers on its copy of the program.
+	vk::ShaderModule normalized_module   = nullptr;
+	uint64_t         normalized_id       = 0;
+	bool             normalized_samplers = false;
 
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
@@ -139,6 +146,19 @@ struct ShaderProgram {
 // another computing the same position: a depth prepass and the pass that tests EQUAL against it
 // then disagree in the last bits.
 [[nodiscard]] std::vector<uint32_t> SpirvExactFloat(std::span<const uint32_t> spirv);
+// The SPIR-V of a stage whose explicit-LOD samples (OpImageSampleExplicitLod with a Lod and
+// nothing but offsets) take their coordinates divided by the size of the mip the LOD names, the
+// nearest within the image (an array layer as it is); empty when it has none it can rewrite. Run
+// with a normalized sampler, it samples as the guest GPU does with FORCE_UNNORMALIZED: at
+// coordinates in that mip's texels. Vulkan allows unnormalized coordinates only on a view of one
+// mip at LOD 0, and GT7's hull shaders cull hidden patches against a depth pyramid sampled this
+// way at a level each picks from the patch's size on screen.
+[[nodiscard]] std::vector<uint32_t> SpirvNormalizedExplicitLod(std::span<const uint32_t> spirv);
+// KYTY_UNNORMALIZED_FIX (default on; =0, or KYTY_BISECT's unorm:old, off): hull shaders get the
+// SpirvNormalizedExplicitLod copy, used by draws whose samplers there are all unnormalized.
+[[nodiscard]] bool UnnormalizedSamplingFix();
+// Whether every sampler a stage samples through has unnormalized coordinates (this draw's).
+[[nodiscard]] bool StageSamplersAllUnnormalized(const ShaderStageRuntime& stage);
 // KYTY_EXACT_FLOAT=1 (round 75, a test): every vertex, geometry and tessellation shader's module is
 // made from SpirvExactFloat's copy. The shader cache is unchanged; the driver compiles again.
 [[nodiscard]] bool ExactFloatPositions();
