@@ -617,6 +617,70 @@ struct DrawRenderState {
 	PipelineCache::GraphicsPrograms programs;
 };
 
+// Round 82 (from the GTA V fork, 12bb591a's AcquireDrawRenderState): a draw state is ~36 KB, most
+// of it the input infos of the three vertex stages, and value-initializing one on the stack for
+// each draw cost ~0.6 us there. Each thread's draws reuse one state, value-initialized member by
+// member as `DrawRenderState state {}` would be, except the input infos of the second and third
+// vertex stages, which only tessellated draws write (DescribeGraphicsStages): those are cleared
+// only after a tessellated draw. A draw made while another is being made on the same thread gets
+// a state of its own. KYTY_BISECT's drawstate:old value-initializes a whole state per draw.
+template <typename T>
+static void ValueInitialize(T& object) {
+	if constexpr (!std::is_trivially_destructible_v<T>) {
+		object.~T();
+	}
+	::new (static_cast<void*>(std::addressof(object))) T {};
+}
+
+class DrawStateLease {
+public:
+	explicit DrawStateLease(bool tessellated) {
+		thread_local Slot slot;
+		if (slot.in_use || Bisect::DrawStateOld()) {
+			m_own.emplace();
+			m_state = &*m_own;
+			return;
+		}
+		slot.in_use = true;
+		m_slot      = &slot;
+		auto& state = slot.state;
+		ValueInitialize(state.depth_info);
+		for (auto& color: state.color_info) {
+			ValueInitialize(color);
+		}
+		state.color_count = 0;
+		state.ps_active   = true;
+		ValueInitialize(state.vertex_info[0]);
+		if (slot.tessellated) {
+			ValueInitialize(state.vertex_info[1]);
+			ValueInitialize(state.vertex_info[2]);
+		}
+		ValueInitialize(state.ps_input_info);
+		ValueInitialize(state.programs);
+		slot.tessellated = tessellated;
+		m_state          = &state;
+	}
+	~DrawStateLease() {
+		if (m_slot != nullptr) {
+			m_slot->in_use = false;
+		}
+	}
+	KYTY_CLASS_NO_COPY(DrawStateLease);
+
+	[[nodiscard]] DrawRenderState& Get() { return *m_state; }
+
+private:
+	struct Slot {
+		DrawRenderState state {};
+		// The last draw was tessellated: it may have written the second and third stages.
+		bool tessellated = false;
+		bool in_use      = false;
+	};
+	Slot*                          m_slot  = nullptr;
+	DrawRenderState*               m_state = nullptr;
+	std::optional<DrawRenderState> m_own;
+};
+
 struct DrawCallInfo {
 	CommandBufferDebugOp debug_op       = CommandBufferDebugOp::DrawIndex;
 	uint32_t             index_count    = 0;
@@ -1945,6 +2009,59 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (FrameGraph::Logging()) {
 		LogFrameGraphDraw(m_context, buffer, draw, state, vertex_stages, topology);
 	}
+	// KYTY_BISECT's tess:bit:<k> (round 82): the tessellated draws are numbered in their frame
+	// (the GPU thread's: between the suspend points it processes), and a step leaves out those
+	// whose number has bit k set. The first whole frame of each step lists them (once a step),
+	// so that the pictures' answer (a draw's number) names its shaders.
+	if (ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch && Bisect::TessBitsConfigured()) {
+		// GPU thread only.
+		static uint64_t tess_frame       = UINT64_MAX;
+		static uint32_t tess_number      = 0;
+		static uint64_t listed_steps     = 0;
+		static uint64_t listing_frame    = UINT64_MAX;
+		static uint32_t step_first_frame = UINT32_MAX;
+		const auto      frame            = FrameGraph::GpuThreadFrames();
+		const auto      step             = Bisect::StepNumber();
+		const auto      step_bit         = step < 64u ? uint64_t {1} << step : 0u;
+		if (frame != tess_frame) {
+			tess_frame  = frame;
+			tess_number = 0;
+			// A frame that starts after the step turned on is a whole frame of it.
+			if ((listed_steps & step_bit) == 0 && step_bit != 0) {
+				if (step_first_frame != step) {
+					step_first_frame = step;
+				} else {
+					listed_steps |= step_bit;
+					listing_frame = frame;
+				}
+			}
+		}
+		const auto number = tess_number++;
+		if (frame == listing_frame) {
+			std::string stages;
+			for (const auto& stage: vertex_stages) {
+				stages += fmt::format(" {}:{:016x}", static_cast<int>(stage.stage.program->stage),
+				                      stage.stage.program->shader_hash);
+			}
+			LOGF("Bisect: tess draw %u (frame %" PRIu64 ", step %u):%s ps %016" PRIx64
+			     ", %u indices x %u, %u control points, indices at 0x%" PRIx64 ", color 0x%" PRIx64
+			     ", depth 0x%" PRIx64 "\n",
+			     number, frame, step, stages.c_str(),
+			     state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0ull,
+			     draw.index_count, draw.instance_count,
+			     (buffer.GetRegisters().GetShaderRegisters().m_vgtLsHsConfig >> 8u) & 0x3fu,
+			     index_source.address,
+			     state.color_count != 0 ? state.color_info[0].desc.info.data.address : 0ull,
+			     state.depth_info.image_id ? state.depth_info.desc.info.data.address : 0ull);
+		}
+		if (const auto bit = Bisect::TessSkipBit(); bit >= 0 && ((number >> bit) & 1u) != 0) {
+			if (FrameGraph::Logging()) {
+				FrameGraph::Log("  not drawn: KYTY_BISECT's tess:bit:%d (tessellated draw %u)", bit,
+				                number);
+			}
+			return;
+		}
+	}
 	// KYTY_BISECT (bisect.h): a step that leaves out the draws of one of these shaders.
 	if (Bisect::Active()) {
 		uint64_t skipped = 0;
@@ -2572,7 +2689,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count, args.instance_count,
 	                   args.first_instance};
-	DrawRenderState state {};
+	DrawStateLease   state_lease(ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch);
+	DrawRenderState& state = state_lease.Get();
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return;
@@ -2719,7 +2837,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		ResetBindings();
 		return;
 	}
-	DrawRenderState state {};
+	DrawStateLease   state_lease(ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch);
+	DrawRenderState& state = state_lease.Get();
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return;
@@ -2825,8 +2944,13 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_
 	cache.MarkGpuWritten(dst.image_id);
 	auto& source      = cache.GetImage(src.image_id);
 	auto& destination = cache.GetImage(dst.image_id);
-	destination.Resolve(source, {src.guest_mip_level, 1, src.guest_array_layer, 1},
-	                    {dst.guest_mip_level, 1, dst.guest_array_layer, 1});
+	// A target can lie inside a larger image (a face of a cube or a slice of an array that the
+	// guest points a color target at): FindImage then moved the view to that level and layer,
+	// which is where the resolve has to read and write. It resolved into the register view's
+	// layer (always 0), so every face landed in the first (from the GTA V fork, 6bb0811e).
+	destination.Resolve(source,
+	                    {src.desc.view_info.base_level, 1, src.desc.view_info.base_layer, 1},
+	                    {dst.desc.view_info.base_level, 1, dst.desc.view_info.base_layer, 1});
 	return true;
 }
 

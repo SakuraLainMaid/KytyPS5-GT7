@@ -169,6 +169,9 @@ struct DirectMemoryUse {
 	uint64_t overflow = 0;
 };
 [[nodiscard]] DirectMemoryUse GetDirectMemoryUse();
+// KYTY_BISECT's backing:locked (round 82): copies to and from guest memory hold the backing
+// store's lock while they copy, as before round 82.
+void SetBackingCopyLocked(bool locked);
 // GPU thread: some byte of [vaddr, vaddr + size) was written by GPU work into a buffer, so the
 // GPU holds it and a host read would wait for the GPU.
 [[nodiscard]] bool     IsGpuBufferWritten(uint64_t vaddr, uint64_t size);

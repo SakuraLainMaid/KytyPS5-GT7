@@ -23,6 +23,8 @@ namespace Libs::Graphics::FrameGraph {
 void RequestCapture();
 // GPU thread, at each guest frame end (a suspend point): starts and ends captures.
 void OnFrameBoundary(BufferCache& cache);
+// GPU thread: the guest frames it has ended (suspend points it has processed).
+[[nodiscard]] uint64_t GpuThreadFrames();
 
 extern std::atomic<bool> g_active;
 extern std::atomic<bool> g_logging;

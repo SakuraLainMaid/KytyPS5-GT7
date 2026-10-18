@@ -2810,6 +2810,19 @@ struct PipelineCache::ProgramCache {
 			expanded.clear();
 			return;
 		}
+		// Round 82 (from the Frank fork, 1165e585 / 76e4833d): a shader the expander found to make
+		// no calls is not expanded again while the shader map's hash of its code is the same (the
+		// program lookup trusts that hash too): the expander compared the whole code at every
+		// dispatch to see that it had not changed. KYTY_BISECT's expand:old expands it each time.
+		const auto code_key = reinterpret_cast<uint64_t>(params.code.data());
+		if (params.hash != 0 && !Bisect::ExpandOld()) {
+			if (const auto it = call_free.find(code_key); it != call_free.end() &&
+			                                              it->second.hash == params.hash &&
+			                                              it->second.words == params.code.size()) {
+				expanded.clear();
+				return;
+			}
+		}
 		std::string reason;
 		std::string summary;
 		const bool  ok = function_expander.Expand(
@@ -2818,6 +2831,12 @@ struct PipelineCache::ProgramCache {
                 return ReadShaderGuestMemoryRaw(nullptr, address, words);
             },
             expanded, reason, wave_size, params.hash, &summary);
+		if (ok && expanded.empty() && summary.empty() && params.hash != 0) {
+			if (call_free.size() >= 65536) {
+				call_free.clear();
+			}
+			call_free[code_key] = {params.hash, params.code.size()};
+		}
 		if (!summary.empty()) {
 			// A table call left targets out: they take the miss trap, and the GPU reports the
 			// ones that run (ReportShaderCallMiss) for the next expansion. Logged once per
@@ -2849,6 +2868,13 @@ struct PipelineCache::ProgramCache {
 	std::shared_mutex                                              programs_mutex;
 	std::unordered_set<ProgramKey, ProgramKeyHash>                 unsupported;
 	ShaderRecompiler::Decoder::ShaderFunctionExpander             function_expander;
+	// Shaders the expander found to make no calls, by code address: the hash and size of the code
+	// it saw (round 82).
+	struct CallFreeCode {
+		uint64_t hash  = 0;
+		size_t   words = 0;
+	};
+	std::unordered_map<uint64_t, CallFreeCode>                     call_free;
 	std::unordered_set<std::string>                               partial_logged;
 	std::unordered_set<std::string>                               failure_logged;
 	ProgramKey                                                     lookup_key;

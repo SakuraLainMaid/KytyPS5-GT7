@@ -85,12 +85,14 @@ static bool                          g_flexible_memory_size_frozen = false;
 // the race did without, its next allocations failed, and it crashed on the null pointer one of
 // them returned (round 79 and 80 logs, the files it read the same in both). Such an allocation
 // is given room here instead, logged; the size the game is told does not change, so nothing it
-// plans by grows. KYTY_DMEM_OVERFLOW_MB (default 4096; 0: none, as before) sets the room. The
+// plans by grows. KYTY_DMEM_OVERFLOW_MB (default 8192; 0: none, as before) sets the room. The
 // backing behind it is reserved, not committed, until it is used; with KYTY_LAZY_COMMIT=0
 // (Windows commits the whole backing at boot) there is none unless KYTY_DMEM_OVERFLOW_MB asks.
 static uint64_t DirectMemoryOverflowSize() {
 	static const uint64_t size = [] {
-		uint64_t mb = 4096;
+		// 8 GB (round 82; 4 GB in round 81): the race's 5.3 GB pool did not fit in 4 GB when the
+		// game held a 2.3 GB block or two more than usual, and the game froze at the track menu.
+		uint64_t mb = 8192;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (const char* eager = std::getenv("KYTY_LAZY_COMMIT");
 		    eager != nullptr && eager[0] == '0') {
@@ -108,6 +110,8 @@ static uint64_t DirectMemoryOverflowSize() {
 	}();
 	return size;
 }
+// The guest code of the direct allocation this thread is making (round 82), for its log lines.
+static thread_local uint64_t          t_direct_memory_caller        = 0;
 static Graphics::RenderContext*       g_gpu_resources               = nullptr;
 
 static Graphics::RenderContext& GetGpuResources() {
@@ -234,6 +238,18 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 static uint32_t        g_test_backing_store_unmaps_before_failure = UINT32_MAX;
 static callback_func_t g_test_before_backing_map                   = nullptr;
 #endif
+
+// KYTY_BISECT's backing:locked (round 82; KYTY_BACKING_COPY_LOCKED=1 for the whole run): copies
+// to and from guest memory hold the backing store's lock while they copy, as before.
+static std::atomic<bool> g_backing_copy_locked_step {false};
+
+static bool BackingCopyLocked() {
+	static const bool always = [] {
+		const char* value = std::getenv("KYTY_BACKING_COPY_LOCKED");
+		return value != nullptr && value[0] == '1';
+	}();
+	return always || g_backing_copy_locked_step.load(std::memory_order_relaxed);
+}
 
 #include "memoryAddressSpace.inc"
 
@@ -3290,6 +3306,10 @@ DirectMemoryUse GetDirectMemoryUse() {
 	return use;
 }
 
+void SetBackingCopyLocked(bool locked) {
+	g_backing_copy_locked_step.store(locked, std::memory_order_relaxed);
+}
+
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {
 	PRINT_NAME();
 
@@ -3393,11 +3413,12 @@ static void ReportDirectMemoryFailure(uint64_t len, uint64_t alignment, int memo
 	     "%" PRIu64 " failures so far. %" PRIu64 " of %" PRIu64 " MiB allocated in %" PRIu64
 	     " blocks (direct %" PRIu64 ", pooled %" PRIu64 ", automatic %" PRIu64 " MiB; %s), %" PRIu64
 	     " MiB mapped; the largest free range 0x%" PRIx64 "+0x%" PRIx64 "; the largest blocks %s; "
-	     "%" PRIu64 " releases of ranges that were not one allocation freed %" PRIu64 " MiB\n",
+	     "%" PRIu64 " releases of ranges that were not one allocation freed %" PRIu64
+	     " MiB; asked from 0x%016" PRIx64 "\n",
 	     len, alignment, memory_type, failures, total >> 20u, PhysicalMemory::Size() >> 20u, blocks,
 	     allocated[0] >> 20u, allocated[1] >> 20u, allocated[2] >> 20u, types.c_str(),
 	     mapped >> 20u, free_at, largest_free, biggest.c_str(), pressure.partial_releases,
-	     pressure.partial_freed >> 20u);
+	     pressure.partial_freed >> 20u, t_direct_memory_caller);
 }
 
 // Whether this AvailableDirectMemorySize query's lines are left out (see ZeroLengthRequest).
@@ -3623,6 +3644,34 @@ int KYTY_SYSV_ABI KernelDirectMemoryQuery(int64_t offset, int flags, void* info,
 	return OK;
 }
 
+// Round 82: every direct allocation and release of 256 MB or more, with the guest code that asked
+// and the memory in use after it, logged however quiet the allocation lines are. The race's pool
+// (5.3 GB) failed in some runs because the game held one or two 2.3 GB blocks other runs did not
+// have at that point: these lines show where those come from and whether they are released.
+static void NoteBigDirectMemoryChange(bool allocated, uint64_t start, uint64_t len, int memory_type,
+                                      uint64_t caller) {
+	constexpr uint64_t Big = 256ull << 20u;
+	if (len < Big) {
+		return;
+	}
+	uint64_t in_use = 0;
+	uint64_t blocks = 0;
+	{
+		Common::LockGuard lock(g_physical_memory->GetMutex());
+		for (const auto& [block_start, block]: g_physical_memory->GetPhysicalBlocks()) {
+			(void)block_start;
+			in_use += block.size;
+			blocks++;
+		}
+	}
+	LOGF("Direct memory: %s 0x%" PRIx64 " bytes (%" PRIu64 " MiB) at 0x%" PRIx64
+	     "%s, from 0x%016" PRIx64 " on %s: %" PRIu64 " MiB in use in %" PRIu64 " blocks\n",
+	     allocated ? "allocated" : "released", len, len >> 20u, start,
+	     allocated ? fmt::format(" (type {})", memory_type).c_str() : "", caller,
+	     Common::PerfStats::ThreadNameOf(Common::PerfStats::CurrentOsThreadId()).c_str(),
+	     in_use >> 20u, blocks);
+}
+
 int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, size_t alignment,
                          int memory_type, int64_t* phys_addr_out, bool automatic) {
 
@@ -3666,6 +3715,7 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, s
 	if (!quiet) {
 		LOGF_COLOR(Log::Color::Green, "\tphys_addr    = %016" PRIx64 "\n\t[Ok]\n", addr);
 	}
+	NoteBigDirectMemoryChange(true, addr, len, memory_type, t_direct_memory_caller);
 
 	return OK;
 }
@@ -3678,8 +3728,17 @@ int KYTY_SYSV_ABI KernelAllocateDirectMemory(int64_t search_start, int64_t searc
 		NoteZeroLengthRequest(search_start, search_end, alignment, memory_type,
 		                      reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	}
-	return AllocateDirectMemory(search_start, search_end, len, alignment, memory_type,
-	                            phys_addr_out);
+	// The caller of KernelAllocateMainDirectMemory when it is the one calling.
+	const bool outer = t_direct_memory_caller == 0;
+	if (outer) {
+		t_direct_memory_caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+	}
+	const auto result =
+	    AllocateDirectMemory(search_start, search_end, len, alignment, memory_type, phys_addr_out);
+	if (outer) {
+		t_direct_memory_caller = 0;
+	}
+	return result;
 }
 
 int KYTY_SYSV_ABI KernelAllocateMainDirectMemory(size_t len, size_t alignment, int memory_type,
@@ -3693,8 +3752,11 @@ int KYTY_SYSV_ABI KernelAllocateMainDirectMemory(size_t len, size_t alignment, i
 	     "\t memory_type  = %d\n",
 	     len, alignment, memory_type);
 
-	return KernelAllocateDirectMemory(0, static_cast<int64_t>(PhysicalMemory::Size()), len,
-	                                  alignment, memory_type, phys_addr_out);
+	t_direct_memory_caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+	const int result = KernelAllocateDirectMemory(0, static_cast<int64_t>(PhysicalMemory::Size()),
+	                                              len, alignment, memory_type, phys_addr_out);
+	t_direct_memory_caller = 0;
+	return result;
 }
 
 // `not_one_span`: set when the range is not one allocated span (nothing was released).
@@ -3842,8 +3904,25 @@ int KYTY_SYSV_ABI KernelReleaseDirectMemory(int64_t start, size_t len) {
 	if (validation != OK) {
 		return validation;
 	}
-	bool not_one_span = false;
-	if (len != 0 && ReleaseDirectMemoryInternal(start, len, &not_one_span) != OK && not_one_span) {
+	bool       not_one_span = false;
+	const auto caller       = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+	const int  released = len != 0 ? ReleaseDirectMemoryInternal(start, len, &not_one_span) : OK;
+	if (len != 0 && released == OK) {
+		NoteBigDirectMemoryChange(false, static_cast<uint64_t>(start), len, 0, caller);
+	}
+	if (len != 0 && released != OK && !not_one_span) {
+		// Round 82: the release failed (its mappings could not be undone): the guest is told it
+		// worked, as before, but the memory stays allocated, so it is logged.
+		static std::atomic<uint32_t> failures {0};
+		const auto                   failure = failures.fetch_add(1, std::memory_order_relaxed);
+		if (failure < 16u || std::has_single_bit(failure + 1u)) {
+			LOGF("ReleaseDirectMemory: 0x%016" PRIx64 "+0x%" PRIx64 " was not released (error "
+			     "0x%08x), from 0x%016" PRIx64 ": it stays allocated (%u such releases so far)\n",
+			     start, static_cast<uint64_t>(len), static_cast<uint32_t>(released), caller,
+			     failure + 1u);
+		}
+	}
+	if (len != 0 && released != OK && not_one_span) {
 		// Not one allocated span (a gap, or a part already released): the unchecked release
 		// frees the allocated parts of the range and passes over the rest, where this used to
 		// free nothing at all and keep the whole range allocated.
@@ -3855,6 +3934,7 @@ int KYTY_SYSV_ABI KernelReleaseDirectMemory(int64_t start, size_t len) {
 				parts++;
 			}
 		}
+		NoteBigDirectMemoryChange(false, static_cast<uint64_t>(start), freed, 0, caller);
 		auto& pressure = g_direct_memory_pressure;
 		pressure.partial_releases++;
 		pressure.partial_freed += freed;
@@ -3882,6 +3962,10 @@ int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 	}
 
 	const int result = ReleaseDirectMemoryInternal(start, len);
+	if (result == OK) {
+		NoteBigDirectMemoryChange(false, static_cast<uint64_t>(start), len, 0,
+		                          reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+	}
 	return result == KERNEL_ERROR_EACCES ? KERNEL_ERROR_ENOENT : result;
 }
 

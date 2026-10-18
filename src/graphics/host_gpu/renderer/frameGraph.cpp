@@ -195,6 +195,10 @@ void RequestCapture() {
 	}
 }
 
+uint64_t GpuThreadFrames() {
+	return g_frame_ends;
+}
+
 void OnFrameBoundary(BufferCache& cache) {
 	g_frame_ends++;
 	if (g_active.load(std::memory_order_relaxed)) {

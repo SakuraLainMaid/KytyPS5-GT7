@@ -5,6 +5,7 @@
 #include "common/perfStats.h"
 #include "graphics/host_gpu/renderer/cache/pagedRangeSet.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <atomic>
@@ -38,6 +39,7 @@ struct Step {
 	bool              gc_off      = false;
 	bool              gpu_watch   = false;
 	bool              tess_off    = false;
+	int32_t           tess_bit        = -1; // tess:bit:<k> (round 82); -1: none
 	bool              readahead   = false;
 	bool              cmask_off    = false;
 	bool              fastread_off = false;
@@ -76,6 +78,12 @@ struct Step {
 	bool              flipcheck_old   = false;
 	bool              bdaprotect_old  = false;
 	bool              listreset_off   = false;
+	// Round 82.
+	bool              scanwave_old    = false;
+	bool              drawstate_old   = false;
+	bool              refresh_old     = false;
+	bool              expand_old      = false;
+	bool              backing_locked  = false;
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
 	int32_t           dflush          = -1;   // dflush:<n>; -1: the usual
@@ -148,6 +156,19 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "tess:off") {
 		step.tess_off = true;
+		return true;
+	}
+	if (action.starts_with("tess:bit:")) {
+		const auto text = action.substr(9);
+		if (text.empty() || text.size() > 2 ||
+		    text.find_first_not_of("0123456789") != std::string_view::npos) {
+			return false;
+		}
+		const auto bit = std::strtoul(std::string(text).c_str(), nullptr, 10);
+		if (bit > 15) {
+			return false;
+		}
+		step.tess_bit = static_cast<int32_t>(bit);
 		return true;
 	}
 	if (action == "readahead") {
@@ -300,6 +321,26 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "listreset:off") {
 		step.listreset_off = true;
+		return true;
+	}
+	if (action == "scanwave:old") {
+		step.scanwave_old = true;
+		return true;
+	}
+	if (action == "drawstate:old") {
+		step.drawstate_old = true;
+		return true;
+	}
+	if (action == "refresh:old") {
+		step.refresh_old = true;
+		return true;
+	}
+	if (action == "expand:old") {
+		step.expand_old = true;
+		return true;
+	}
+	if (action == "backing:locked") {
+		step.backing_locked = true;
 		return true;
 	}
 	if (action.starts_with("depth:equal-relaxed:")) {
@@ -518,6 +559,7 @@ void ApplyEffects(bool toggled = false) {
 	}
 	GpuTiming::SetWatch(step != nullptr && step->gpu_watch);
 	PagedRangeSet::SetIndexOff(step != nullptr && step->dirtyindex_off);
+	LibKernel::Memory::SetBackingCopyLocked(step != nullptr && step->backing_locked);
 	Common::PerfStats::SetSpinLocks(Common::PerfStats::SpinLocksFromEnvironment() ||
 	                                (step != nullptr && step->locks_spin));
 	static std::string applied = StartCpuSet();
@@ -619,6 +661,25 @@ void ApplyPending() {
 
 bool Active() {
 	return Current() != nullptr;
+}
+
+bool TessBitsConfigured() {
+	static const bool configured = [] {
+		const auto& steps = Steps();
+		return std::any_of(steps.begin(), steps.end(),
+		                   [](const Step& step) { return step.tess_bit >= 0; });
+	}();
+	return configured;
+}
+
+int32_t TessSkipBit() {
+	const auto* step = Current();
+	return step != nullptr ? step->tess_bit : -1;
+}
+
+uint32_t StepNumber() {
+	return g_ab_base.load(std::memory_order_acquire) ? 0u
+	                                                 : g_current.load(std::memory_order_acquire);
 }
 
 bool SkipsShader(uint64_t hash) {
@@ -897,6 +958,26 @@ bool BdaProtectOld() {
 bool ListResetOff() {
 	const auto* step = Current();
 	return step != nullptr && step->listreset_off;
+}
+
+bool ScanWaveOld() {
+	const auto* step = Current();
+	return step != nullptr && step->scanwave_old;
+}
+
+bool DrawStateOld() {
+	const auto* step = Current();
+	return step != nullptr && step->drawstate_old;
+}
+
+bool RefreshOld() {
+	const auto* step = Current();
+	return step != nullptr && step->refresh_old;
+}
+
+bool ExpandOld() {
+	const auto* step = Current();
+	return step != nullptr && step->expand_old;
 }
 
 float DepthEqualRelaxed() {

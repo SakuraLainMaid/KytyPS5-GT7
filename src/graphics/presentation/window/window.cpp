@@ -311,7 +311,15 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 }
 
 static void GameEventController([[maybe_unused]] const EventController& f) {
-	EXIT_NOT_IMPLEMENTED(f.remapped);
+	// A controller's new mapping (from the GTA V fork, ecc071be): it ended the emulator. SDL
+	// sends no release or neutral axis events for the old mapping, so the input held on the
+	// active controller is let go; buttons and axes stay logical under the new one.
+	if (f.remapped) {
+		if (Controller::GetActiveControllerId() == f.id) {
+			Controller::ResetInputState();
+		}
+		return;
+	}
 
 #ifdef KYTY_DBG_INPUT
 	if (f.added || f.removed) {

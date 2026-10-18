@@ -45,6 +45,10 @@
 //   tess:max:<f> the tessellator draws factors up to f at most: a larger VGT_HOS_MAX_TESS_LEVEL
 //                (or none) is lowered to f, so the tessellation shaders are made again for it on
 //                their next draws
+//   tess:bit:<k> the tessellated draws whose number in their frame (0 for the first) has bit k
+//                set are not run (round 82): with a step for each bit, the pictures in which a
+//                picture fault is gone spell the number of the draw that makes it. The first
+//                whole frame of each step lists its tessellated draws ("Bisect: tess draw" lines).
 //   flush:<n>    a command buffer goes to the GPU after n draws (KYTY_DRAW_FLUSH_INTERVAL for the
 //                whole run, default 16)
 //   readahead    what game threads read back is downloaded as soon as the GPU writes it again,
@@ -179,6 +183,17 @@
 //   listreset:off an indexed list draw whose indices hold the guest's primitive reset index draws
 //                it as a vertex, as before round 80, instead of dropping the primitive it falls in
 //                (KYTY_LIST_RESET=0 for the whole run)
+// and, round 82 (the A/B of its GPU thread and fault changes):
+//   scanwave:old  the draw-prep scanner prepares dispatches with the default wave size, as before
+//                (a wave32 dispatch then finds nothing prepared)
+//   drawstate:old each draw value-initializes a whole draw state (36 KB) on the stack, instead of
+//                reusing one and clearing the tessellation stages only after a tessellated draw
+//   refresh:old   every draw and dispatch reads the GPU's timeline semaphore, instead of every
+//                eighth one when nothing waits on it
+//   expand:old    a compute shader known to make no calls is still run through the function
+//                expander (which compares its whole code) at every dispatch
+//   backing:locked copies to and from guest memory hold the backing store's lock while they copy,
+//                as before (game threads' reads waited for the GPU thread's uploads)
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -198,6 +213,11 @@ void                      ApplyPending();
 
 // GPU thread: what the step that is on asks for.
 [[nodiscard]] bool Active();
+// GPU thread: whether some step has tess:bit; that bit of the step that is on (-1 for none); the
+// number of the step that is on (0: normal, or KYTY_BISECT_AB's base lines).
+[[nodiscard]] bool     TessBitsConfigured();
+[[nodiscard]] int32_t  TessSkipBit();
+[[nodiscard]] uint32_t StepNumber();
 [[nodiscard]] bool SkipsShader(uint64_t hash);
 [[nodiscard]] bool PassesDepthCompare(bool big_depth_image);
 // Whether a compute shader's sampler with unnormalized coordinates keeps the T#'s whole view.
@@ -269,6 +289,12 @@ void                      ApplyPending();
 [[nodiscard]] bool FlipCheckOld();
 [[nodiscard]] bool BdaProtectOld();
 [[nodiscard]] bool ListResetOff();
+// Any thread: scanwave:old; drawstate:old; refresh:old; expand:old (backing:locked is applied to
+// the kernel's memory, LibKernel::Memory::SetBackingCopyLocked).
+[[nodiscard]] bool ScanWaveOld();
+[[nodiscard]] bool DrawStateOld();
+[[nodiscard]] bool RefreshOld();
+[[nodiscard]] bool ExpandOld();
 // Any thread: depth:equal-relaxed's bias in units of depth precision; 0 when off.
 [[nodiscard]] float DepthEqualRelaxed();
 

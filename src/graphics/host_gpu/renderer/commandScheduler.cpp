@@ -423,7 +423,14 @@ void CommandScheduler::PopPendingOperations(bool wait) {
 	// callbacks of a finished tick are all queued already (DeferPriorityOperation queues the tick
 	// being recorded, which no finished tick reaches), so none can arrive after the check.
 	wait = wait || PopWaitAlways();
-	m_master.Refresh();
+	// Round 82 (from the GTA V fork, 12bb591a): a draw's or a dispatch's call reads the GPU's
+	// timeline semaphore (a driver call) only every eighth time; the pending operations only
+	// release what finished work used, so finding them a few calls later costs nothing, while a
+	// read per draw was a driver call per draw. KYTY_BISECT's refresh:old reads it every time.
+	thread_local uint32_t calls = 0;
+	if (wait || (++calls & 7u) == 0 || Bisect::RefreshOld()) {
+		m_master.Refresh();
+	}
 	for (;;) {
 		PendingOperation operation;
 		{

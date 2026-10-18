@@ -214,10 +214,14 @@ public:
 			return false;
 		}
 		const auto* source = static_cast<const uint8_t*>(data);
-		return TryTransferBacking(vaddr, size,
-		                          [source](uint8_t* backing, uint64_t data_offset, size_t bytes) {
-			                          std::memcpy(backing, source + data_offset, bytes);
-		                          });
+		// Writes copy under the lock (round 82): a write racing an unmap could otherwise land in
+		// backing that was released, zeroed and given to a new owner meanwhile.
+		return TryTransferBacking(
+		    vaddr, size,
+		    [source](uint8_t* backing, uint64_t data_offset, size_t bytes) {
+			    std::memcpy(backing, source + data_offset, bytes);
+		    },
+		    true);
 	}
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -564,34 +568,62 @@ public:
 
 private:
 	template <typename Transfer>
-	bool TryTransferBacking(uint64_t vaddr, uint64_t size, Transfer transfer) {
+	bool TryTransferBacking(uint64_t vaddr, uint64_t size, Transfer transfer,
+	                        bool locked_copy = false) {
 		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
-		const auto      end     = vaddr + size;
-		auto            current = vaddr;
-		while (current < end) {
-			MapEntry entry {};
-			if (!FindContainingUnlocked(current, 1, &entry)) {
-				return false;
+		// Round 82: a read's backing pieces are found under the lock and copied after it (from
+		// the Frank fork, cecbeebb). Copying under it made game threads' reads of guest memory
+		// (the clean-read emulation of their page faults) wait for the GPU thread's uploads,
+		// ~30 MB a frame in a race. The backing's writable alias stays mapped for the whole run,
+		// so a read that races an unmap of the range reads bytes of the old mapping, as a guest
+		// read racing its own unmap would. Up to 8 pieces; a range of more mappings is copied
+		// under the lock, as are writes and everything with KYTY_BISECT's backing:locked.
+		struct Piece {
+			uint64_t offset;
+			uint64_t done;
+			size_t   bytes;
+		};
+		std::array<Piece, 8> pieces {};
+		size_t               count = 0;
+		{
+			std::lock_guard lock(m_mutex);
+			const auto      end     = vaddr + size;
+			auto            current = vaddr;
+			while (current < end) {
+				MapEntry entry {};
+				if (!FindContainingUnlocked(current, 1, &entry)) {
+					return false;
+				}
+				const auto bytes = std::min(end, entry.vaddr + entry.size) - current;
+				if (!RangeOk(entry.backing_offset + current - entry.vaddr, bytes)) {
+					return false;
+				}
+				if (count < pieces.size()) {
+					pieces[count] = {entry.backing_offset + current - entry.vaddr, current - vaddr,
+					                 static_cast<size_t>(bytes)};
+				}
+				count++;
+				current += bytes;
 			}
-			const auto bytes = std::min(end, entry.vaddr + entry.size) - current;
-			if (!RangeOk(entry.backing_offset + current - entry.vaddr, bytes)) {
-				return false;
-			}
-			current += bytes;
-		}
 
-		current = vaddr;
-		while (current < end) {
-			MapEntry entry {};
-			EXIT_IF(!FindContainingUnlocked(current, 1, &entry));
-			const auto bytes  = std::min(end, entry.vaddr + entry.size) - current;
-			const auto offset = entry.backing_offset + current - entry.vaddr;
-			transfer(m_backing_base + offset, current - vaddr, static_cast<size_t>(bytes));
-			current += bytes;
+			if (locked_copy || count > pieces.size() || BackingCopyLocked()) {
+				current = vaddr;
+				while (current < end) {
+					MapEntry entry {};
+					EXIT_IF(!FindContainingUnlocked(current, 1, &entry));
+					const auto bytes  = std::min(end, entry.vaddr + entry.size) - current;
+					const auto offset = entry.backing_offset + current - entry.vaddr;
+					transfer(m_backing_base + offset, current - vaddr, static_cast<size_t>(bytes));
+					current += bytes;
+				}
+				return true;
+			}
+		}
+		for (size_t i = 0; i < count; i++) {
+			transfer(m_backing_base + pieces[i].offset, pieces[i].done, pieces[i].bytes);
 		}
 		return true;
 	}
