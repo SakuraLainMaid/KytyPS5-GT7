@@ -165,6 +165,8 @@ struct DirectMemoryUse {
 	uint64_t allocated = 0;
 	uint64_t size      = 0;
 	uint64_t blocks    = 0;
+	// Of `allocated`, the bytes given room past the direct memory (round 81).
+	uint64_t overflow = 0;
 };
 [[nodiscard]] DirectMemoryUse GetDirectMemoryUse();
 // GPU thread: some byte of [vaddr, vaddr + size) was written by GPU work into a buffer, so the
@@ -302,6 +304,8 @@ bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
 bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);
 bool     TestGuestBackingOutsideAddressSpace();
 uint64_t TestGuestBackingSize();
+// The room past the direct and flexible memory for direct allocations that do not fit (round 81).
+uint64_t TestDirectMemoryOverflowSize();
 bool     TestGuestFreeRangeBounds();
 #endif
 

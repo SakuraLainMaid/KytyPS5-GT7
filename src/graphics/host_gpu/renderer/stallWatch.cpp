@@ -147,6 +147,11 @@ void UpdateMemoryText(const GraphicContext& graphics) {
 		peak                 = std::max(peak, use.allocated);
 		text += fmt::format(" | game memory {:.2f} of {:.2f} GB in {} blocks (peak {:.2f} GB)",
 		                    gb(use.allocated), gb(use.size), use.blocks, gb(peak));
+		if (use.overflow != 0) {
+			// Round 81: allocations that did not fit, given room past it.
+			text +=
+			    fmt::format(" ({:.2f} GB of it past the {:.2f})", gb(use.overflow), gb(use.size));
+		}
 	}
 	{
 		std::scoped_lock lock(g_memory_mutex);

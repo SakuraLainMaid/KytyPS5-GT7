@@ -638,9 +638,13 @@ void TestFlexibleMemoryCapacityIsBootFixed() {
 	Check(test, configured == TestFlexibleMemorySize,
 	      "boot flexible pool did not use the param.json value");
 	Check(test, configured == baseline, "boot flexible pool did not start at configured capacity");
-	Check(test, backing == SceKernelTotalPhysicalSize,
-	      "boot backing is not the single 13.5 GiB physical file");
-	Check(test, backing == Libs::LibKernel::Memory::KernelGetDirectMemorySize() + configured,
+	// The 13.5 GiB physical file, and the room past it for direct allocations that do not fit
+	// (round 81), which the game is not told of.
+	const auto overflow = Libs::LibKernel::Memory::TestDirectMemoryOverflowSize();
+	Check(test, backing == SceKernelTotalPhysicalSize + overflow,
+	      "boot backing is not the single 13.5 GiB physical file and its overflow room");
+	Check(test,
+	      backing - overflow == Libs::LibKernel::Memory::KernelGetDirectMemorySize() + configured,
 	      "direct and flexible regions do not partition the boot backing");
 
 	const auto address =
@@ -1804,6 +1808,125 @@ void TestDirectAlignmentStaysWithinSearchRange() {
 	    &phys_addr);
 	CheckFailed(test, result, "KernelAllocateDirectMemory(out-of-range alignment)");
 	Check(test, phys_addr == -1, "failed allocation modified physAddrOut");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// Round 81: a direct allocation searching up to the end of a full direct memory is given room past
+// the physical memory (the game asked for more than its 12.5 GB in some loads of a race); one
+// whose search stops short of the end still fails, and the room is mapped like any direct memory.
+void TestDirectMemoryOverflowRoom() {
+	using namespace Libs::LibKernel::Memory;
+	const char* test     = "DirectMemoryOverflowRoom";
+	const auto  overflow = TestDirectMemoryOverflowSize();
+	if (overflow == 0) {
+		std::printf("[host]    %-48s skipped (KYTY_DMEM_OVERFLOW_MB=0)\n", test);
+		return;
+	}
+	constexpr uint64_t block = 0x200000;
+	const auto         end   = static_cast<int64_t>(KernelGetDirectMemorySize());
+
+	// Fill the direct memory, a free range at a time.
+	std::vector<std::pair<int64_t, uint64_t>> taken;
+	for (;;) {
+		int64_t start = 0;
+		size_t  size  = 0;
+		if (KernelAvailableDirectMemorySize(0, end, 0, &start, &size) != OK || size == 0) {
+			break;
+		}
+		int64_t phys = -1;
+		CheckOk(test,
+		        KernelAllocateDirectMemory(start, start + static_cast<int64_t>(size), size, 0,
+		                                   SceKernelMtypeC, &phys),
+		        "KernelAllocateDirectMemory(fill)");
+		Check(test, phys == start, "fill did not take the free range it was given");
+		taken.emplace_back(phys, size);
+	}
+	Check(test, !taken.empty(), "no direct memory was free to fill");
+
+	int64_t short_search = -1;
+	CheckFailed(test,
+	            KernelAllocateDirectMemory(0, end - static_cast<int64_t>(SceKernelPageSize),
+	                                       SceKernelPageSize, 0, SceKernelMtypeC, &short_search),
+	            "KernelAllocateDirectMemory(search short of the end of a full memory)");
+	Check(test, short_search == -1, "failed allocation modified physAddrOut");
+
+	int64_t first  = -1;
+	int64_t second = -1;
+	CheckOk(test, KernelAllocateDirectMemory(0, end, block, block, SceKernelMtypeC, &first),
+	        "KernelAllocateDirectMemory(past a full memory)");
+	CheckOk(test, KernelAllocateDirectMemory(0, end, block, block, SceKernelMtypeC, &second),
+	        "KernelAllocateDirectMemory(past a full memory, again)");
+	for (const auto phys: {first, second}) {
+		Check(test,
+		      static_cast<uint64_t>(phys) >= SceKernelTotalPhysicalSize &&
+		          static_cast<uint64_t>(phys) + block <= SceKernelTotalPhysicalSize + overflow &&
+		          phys % static_cast<int64_t>(block) == 0,
+		      "overflow allocation is not in the room past the physical memory");
+	}
+	Check(test, first != second, "two overflow allocations share their room");
+
+	void* view = nullptr;
+	CheckOk(test,
+	        KernelMapNamedDirectMemory(&view, block, SceKernelProtCpuRw, 0, second, block,
+	                                   "overflow_direct"),
+	        "KernelMapNamedDirectMemory(overflow)");
+	if (view != nullptr) {
+		static_cast<volatile uint64_t*>(view)[7] = 0x8a1f00d5c0ffee81ull;
+		CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(view), block),
+		        "KernelMunmap(overflow)");
+		view = nullptr;
+		CheckOk(test,
+		        KernelMapNamedDirectMemory(&view, block, SceKernelProtCpuRw, 0, second, block,
+		                                   "overflow_direct_again"),
+		        "KernelMapNamedDirectMemory(overflow again)");
+		Check(test,
+		      view != nullptr && static_cast<volatile uint64_t*>(view)[7] == 0x8a1f00d5c0ffee81ull,
+		      "overflow memory lost its contents across a remap");
+		if (view != nullptr) {
+			CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(view), block),
+			        "KernelMunmap(overflow again)");
+		}
+	}
+
+	for (const auto& [phys, size]: taken) {
+		CheckOk(test, KernelCheckedReleaseDirectMemory(phys, size), "release(fill)");
+	}
+
+	// A walk of the direct memory (flags 1) ends at its end, as before, while the room's blocks
+	// answer queries of their own addresses.
+	struct QueryInfo {
+		int64_t start;
+		int64_t end;
+		int     memory_type;
+	};
+	QueryInfo info {-1, -1, -1};
+	for (const auto& [phys, size]: taken) {
+		// From the free range at the top of the direct memory (released above), when the fill
+		// took one there: nothing is allocated between it and the end.
+		if (phys + static_cast<int64_t>(size) == end) {
+			CheckOk(test, KernelDirectMemoryQuery(phys, 1, &info, sizeof(info)),
+			        "KernelDirectMemoryQuery(walk from the top free range)");
+			Check(test, info.start == end && info.end == end,
+			      "a walk of the direct memory went on past its end into the room");
+		}
+	}
+	info = {-1, -1, -1};
+	CheckOk(test, KernelDirectMemoryQuery(second, 0, &info, sizeof(info)),
+	        "KernelDirectMemoryQuery(overflow block)");
+	Check(test, info.start == second && info.end == second + static_cast<int64_t>(block),
+	      "a query of an overflow block did not find it");
+
+	CheckOk(test, KernelCheckedReleaseDirectMemory(first, block), "release(first overflow)");
+	CheckOk(test, KernelCheckedReleaseDirectMemory(second, block), "release(second overflow)");
+
+	// With room in the direct memory again, an allocation stays in it.
+	int64_t again = -1;
+	CheckOk(test, KernelAllocateDirectMemory(0, end, block, block, SceKernelMtypeC, &again),
+	        "KernelAllocateDirectMemory(after release)");
+	Check(test, again >= 0 && again + static_cast<int64_t>(block) <= end,
+	      "an allocation that fits went past the direct memory");
+	CheckOk(test, KernelCheckedReleaseDirectMemory(again, block), "release(after release)");
 
 	std::printf("[host]    %-48s ok\n", test);
 }
@@ -4349,6 +4472,7 @@ int main(int argc, char** argv) {
 	RunTest(TestDirectMapAcrossContiguousAllocations);
 	RunTest(TestDirectPhysicalFreeRangeReuseAndCoalescing);
 	RunTest(TestDirectAlignmentStaysWithinSearchRange);
+	RunTest(TestDirectMemoryOverflowRoom);
 	RunTest(TestDefaultDirectMapUsesSystemAddressRange);
 	RunTest(TestLargeDirectMapAliasesAcrossChunks);
 	RunTest(TestHintlessDirectMapUsesCanonicalGuestBase);

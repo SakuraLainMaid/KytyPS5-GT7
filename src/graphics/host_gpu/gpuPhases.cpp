@@ -28,6 +28,9 @@ struct Reporter {
 	std::array<uint64_t, PhaseCount + 1>  last_protect_count {};
 	std::array<uint64_t, PhaseCount + 1>                last_protect_pages {};
 	std::array<std::array<uint64_t, 3>, PhaseCount + 1> last_protect_modes {};
+	std::array<uint64_t, PhaseCount + 1>                last_upload_bytes {};
+	std::array<uint64_t, PhaseCount + 1>                last_upload_count {};
+	std::array<uint64_t, PhaseCount + 1>                last_upload_copies {};
 };
 
 // The names of the steps page protection changes are charged to (Detail::ChargesProtects).
@@ -128,6 +131,17 @@ void ReportIfDue(uint64_t frames) {
 	g_reporter.last_protect_count  = Detail::g_protect_count;
 	g_reporter.last_protect_pages  = Detail::g_protect_pages;
 	g_reporter.last_protect_modes  = Detail::g_protect_modes;
+	std::array<uint64_t, PhaseCount + 1> upload_bytes {};
+	std::array<uint64_t, PhaseCount + 1> upload_count {};
+	std::array<uint64_t, PhaseCount + 1> upload_copies {};
+	for (size_t i = 0; i <= PhaseCount; i++) {
+		upload_bytes[i]  = Detail::g_upload_bytes[i] - g_reporter.last_upload_bytes[i];
+		upload_count[i]  = Detail::g_upload_count[i] - g_reporter.last_upload_count[i];
+		upload_copies[i] = Detail::g_upload_copies[i] - g_reporter.last_upload_copies[i];
+	}
+	g_reporter.last_upload_bytes  = Detail::g_upload_bytes;
+	g_reporter.last_upload_count  = Detail::g_upload_count;
+	g_reporter.last_upload_copies = Detail::g_upload_copies;
 	g_reporter.last        = totals;
 	g_reporter.last_time   = now;
 	g_reporter.last_tsc    = tsc;
@@ -247,6 +261,44 @@ void ReportIfDue(uint64_t frames) {
 		}
 		if (!by_step.empty()) {
 			line += " | protects by step: " + by_step;
+		}
+	}
+	{
+		// Round 81: the guest bytes uploaded to the GPU by the step they were uploaded in, the
+		// most first (CPU writes made since a range was last uploaded; a frame's share with
+		// the frames below).
+		std::array<size_t, PhaseCount + 1> order {};
+		for (size_t i = 0; i < order.size(); i++) {
+			order[i] = i;
+		}
+		std::sort(order.begin(), order.end(),
+		          [&](size_t a, size_t b) { return upload_bytes[a] > upload_bytes[b]; });
+		std::string by_step;
+		uint64_t    total = 0;
+		for (const auto bytes: upload_bytes) {
+			total += bytes;
+		}
+		for (size_t k = 0, shown = 0; k < order.size() && shown < 8; k++) {
+			const auto i = order[k];
+			if (upload_count[i] == 0) {
+				continue;
+			}
+			shown++;
+			by_step += fmt::format("{}{} {} x {:.1f} KB ({:.1f} copies)",
+			                       by_step.empty() ? "" : ", ", StepName(i), upload_count[i],
+			                       static_cast<double>(upload_bytes[i]) / 1024.0 /
+			                           static_cast<double>(upload_count[i]),
+			                       static_cast<double>(upload_copies[i]) /
+			                           static_cast<double>(upload_count[i]));
+		}
+		if (!by_step.empty()) {
+			line +=
+			    fmt::format(" | buffer uploads {:.1f} MB", static_cast<double>(total) / 1048576.0);
+			if (new_frames != 0) {
+				line += fmt::format(" ({:.2f} MB a frame)", static_cast<double>(total) / 1048576.0 /
+				                                                static_cast<double>(new_frames));
+			}
+			line += " by step: " + by_step;
 		}
 	}
 

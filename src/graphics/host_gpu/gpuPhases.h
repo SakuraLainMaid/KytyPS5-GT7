@@ -97,6 +97,11 @@ inline std::array<uint64_t, static_cast<size_t>(Phase::Count) + 1> g_protect_cou
 inline std::array<uint64_t, static_cast<size_t>(Phase::Count) + 1> g_protect_pages {};
 inline std::array<std::array<uint64_t, 3>, static_cast<size_t>(Phase::Count) + 1>
                              g_protect_modes {};
+// Uploads of guest bytes to the GPU by the step they were made in (round 81): bytes, uploads and
+// the copies they were made of.
+inline std::array<uint64_t, static_cast<size_t>(Phase::Count) + 1> g_upload_bytes {};
+inline std::array<uint64_t, static_cast<size_t>(Phase::Count) + 1> g_upload_count {};
+inline std::array<uint64_t, static_cast<size_t>(Phase::Count) + 1> g_upload_copies {};
 [[nodiscard]] constexpr bool ChargesProtects(Phase phase) noexcept {
 	return phase == Phase::Process || phase == Phase::Command || phase == Phase::Draw ||
 	       phase == Phase::Dispatch || phase == Phase::BdaWalk ||
@@ -130,6 +135,18 @@ inline void NoteProtect(uint64_t bytes, uint32_t mode) noexcept {
 	const auto step = static_cast<size_t>(Detail::t_step);
 	Detail::g_protect_pages[step] += (bytes + 4095u) >> 12u;
 	Detail::g_protect_modes[step][mode < 2u ? mode : 2u]++;
+}
+
+// An upload of `bytes` of guest memory in `copies` copies, charged to the step as a page
+// protection change is, on the GPU thread (round 81).
+inline void NoteUpload(uint64_t bytes, uint64_t copies) noexcept {
+	if (!Detail::t_on) {
+		return;
+	}
+	const auto step = static_cast<size_t>(Detail::t_step);
+	Detail::g_upload_bytes[step] += bytes;
+	Detail::g_upload_count[step]++;
+	Detail::g_upload_copies[step] += copies;
 }
 
 // The count of `phase` so far (GPU thread).

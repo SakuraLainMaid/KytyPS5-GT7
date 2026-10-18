@@ -1040,6 +1040,28 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const bool depth_tile = tile == Prospero::TileMode::kDepth;
 	const bool msaa_tile  = depth_tile || tile == Prospero::TileMode::kRenderTarget;
 	const bool msaa_array = type == Prospero::ImageType::kColor2DMsaaArray;
+	// A T# no texture can be (the game's materials read descriptors it has already reused, as in
+	// the cases below): sampled as a null texture, as the console returns something rather than
+	// stopping, and logged the first times for each kind (round 81: two testers' races ended the
+	// emulator on such T#s, one in the interior view).
+	const auto null_texture = [&](std::atomic<uint32_t>& reports, const char* what) {
+		const auto report = reports.fetch_add(1, std::memory_order_relaxed);
+		if (report < 8u || (report & (report + 1u)) == 0u) {
+			LOGF("Texture %s (base %u, last %u, max %u, %ux%ux%u, type %u, format %u, tile %u) at "
+			     "0x%016" PRIx64 " bound as a null texture (%" PRIu32 " so far): "
+			     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			     what, base_level, last_level, max_mip, width, height,
+			     static_cast<uint32_t>(descriptor.Depth()) + 1u, static_cast<uint32_t>(type),
+			     static_cast<uint32_t>(descriptor.Format()), static_cast<uint32_t>(tile), address,
+			     report + 1u, descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
+			     descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+			     descriptor.fields[6], descriptor.fields[7]);
+		}
+		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                    : TextureCache::BindingType::Texture);
+		const auto id   = texture_cache.FindImage(desc);
+		return TextureBinding {id, nullptr, std::move(desc)};
+	};
 	// A first mip past the last: no view of any image. GT7 binds such a T# (its address and the
 	// words after it are not a texture's) while it leaves a race, the car materials it still
 	// draws reading descriptors already reused (2026-10-14, with tessellation drawing the cars).
@@ -1064,22 +1086,16 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		const auto id   = texture_cache.FindImage(desc);
 		return {id, nullptr, std::move(desc)};
 	}
-	if ((!multisampled && base_level > last_level) ||
-	    (multisampled &&
-	     (base_level != 0 || last_level == 0 || last_level > 3 || max_mip != last_level ||
-	      !msaa_tile || (descriptor.MsaaDepth() && !depth_tile) ||
-	      (!msaa_array && (descriptor.Depth() != 0 || descriptor.BaseArray5() != 0))))) {
-		EXIT("unsupported texture mip view: base=%u last=%u levels=%u max=%u type=%u tile=%u "
-		     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d "
-		     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-		     base_level, last_level, levels, descriptor.MaxMip(),
-		     static_cast<uint32_t>(descriptor.Type()), static_cast<uint32_t>(tile),
-		     static_cast<uint32_t>(resource.resource_class),
-		     static_cast<uint32_t>(resource.numeric_class),
-		     static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(resource.mip_mode),
-		     resource.read, resource.written, descriptor.fields[0], descriptor.fields[1],
-		     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
-		     descriptor.fields[6], descriptor.fields[7]);
+	// A multisample T# with mips or samples no multisample image has (an EXIT before round 81).
+	if (multisampled &&
+	    (base_level != 0 || last_level == 0 || last_level > 3 || max_mip != last_level ||
+	     !msaa_tile || (descriptor.MsaaDepth() && !depth_tile) ||
+	     (!msaa_array && (descriptor.Depth() != 0 || descriptor.BaseArray5() != 0)))) {
+		if (RejectBindlessTexture("multisample view", address)) {
+			return {};
+		}
+		static std::atomic<uint32_t> reports {0};
+		return null_texture(reports, "with a multisample view no image has");
 	}
 	const auto samples = multisampled ? 1u << last_level : 1u;
 	const auto depth          = static_cast<uint32_t>(descriptor.Depth()) + 1u;
@@ -1091,8 +1107,15 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	    storage || resource.numeric_class == Prospero::SampledTextureNumericClass(format);
 	if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
 	    !sampled_numeric_class) {
-		EXIT("sampled image numeric class mismatch: numeric=%u format=%u addr=0x%016" PRIx64 "\n",
-		     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(format), address);
+		// The shader samples another class of numbers (float, uint, sint) than the format holds
+		// (an EXIT before round 81).
+		if (RejectBindlessTexture("numeric class of the format", address)) {
+			return {};
+		}
+		static std::atomic<uint32_t> reports {0};
+		return null_texture(reports, resource.numeric_class == Prospero::TextureNumericClass::Float
+		                                 ? "of a format a float sampler cannot read"
+		                                 : "of a format an integer sampler cannot read");
 	}
 
 	const bool    volume       = type == Prospero::ImageType::kColor3D;
@@ -1136,10 +1159,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			if (RejectBindlessTexture("mip view changes the physical layout", address)) {
 				return {};
 			}
-			EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
-			     "extent=%ux%ux%u tile=%u\n",
-			     base_level, last_level, max_mip, width, height, depth,
-			     static_cast<uint32_t>(tile));
+			// Mips past the image's last (MAX_MIP) that no layout of its own mips can stand for:
+			// as with a first mip past the last, the words are not a texture's. Testers' races
+			// ended the emulator on such T#s (2026-10-18): 65x1x65 linear, mips 1 to 3 of an
+			// image of one mip (the 65x1 of the kart race's garbage T# again), and 75x1x19, mip
+			// 13 of one, in the interior view.
+			static std::atomic<uint32_t> reports {0};
+			return null_texture(reports, "with mips past its last");
 		}
 	}
 	uint32_t      pitch = 0;
@@ -1153,7 +1179,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			if (RejectBindlessTexture("multisample layout", address)) {
 				return {};
 			}
-			EXIT("unsupported multisample texture layout\n");
+			static std::atomic<uint32_t> reports {0};
+			return null_texture(reports, "with no known multisample layout");
 		}
 		size.size *= image_layers;
 	} else {
@@ -1161,13 +1188,15 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers,
 		                        physical_levels, tile, volume, size);
 	}
-	if ((size.size == 0 || size.align == 0 ||
-	     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0) &&
-	    RejectBindlessTexture("address not aligned for its tiling", address)) {
-		return {};
+	if (size.size == 0 || size.align == 0 ||
+	    (address & (static_cast<uint64_t>(size.align) - 1u)) != 0) {
+		// An empty layout, or an address its tiling cannot start at (an EXIT before round 81).
+		if (RejectBindlessTexture("address not aligned for its tiling", address)) {
+			return {};
+		}
+		static std::atomic<uint32_t> reports {0};
+		return null_texture(reports, "at an address its tiling cannot start at");
 	}
-	EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
-	                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, size.size);
 	}

@@ -1561,6 +1561,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		return nullptr;
 	}
 	Profiler::Add(Profiler::Counter::UploadBytes, static_cast<int64_t>(total_size));
+	GpuPhases::NoteUpload(total_size, copies.size());
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
