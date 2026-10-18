@@ -20,7 +20,9 @@ void PreferPerformanceCores(const char* name);
 // For KYTY_CPU_SET (the whole run) and KYTY_BISECT's cpu: steps (an A/B test within one).
 // Round 79: also "gpuvcache" (the threads RegisterGpuSideThread named prefer the processors
 // sharing the largest L3 cache, and every other thread the rest: Windows CPU sets) and
-// "gpufrequency" (the other way round).
+// "gpufrequency" (the other way round). Round 84: "gpucore", as "gpuvcache" but with the GPU
+// thread alone on one logical processor of the V-Cache die's last core, whose other logical
+// processor no thread of the process is given.
 bool SetProcessCpuSet(const char* which, std::string* description);
 
 // The placement the run starts with: KYTY_CPU_SET when it is set; otherwise, round 80,

@@ -1253,6 +1253,29 @@ static void NoteDrawRepeat(const DrawCallInfo& draw, const DrawRenderState& stat
 	}
 }
 
+// KYTY_OP_STATS=1 (round 84): the draw's group in the "Draw targets" line, its first color target
+// (its depth target when it has none): the passes the GPU thread's draw time goes to.
+static void NoteDrawTarget(const DrawRenderState& state) {
+	if (!GpuPhases::OpStatsOn()) {
+		return;
+	}
+	const ImageInfo* info  = nullptr;
+	bool             depth = false;
+	if (state.color_count > 0 && state.color_info[0].desc.info.data.address != 0) {
+		info = &state.color_info[0].desc.info;
+	} else if (state.depth_info.image_id) {
+		info  = &state.depth_info.desc.info;
+		depth = true;
+	}
+	if (info == nullptr || info->data.address == 0) {
+		return;
+	}
+	const uint64_t extent = (info->extent.width & 0xffffu) |
+	                        (uint64_t {info->extent.height & 0xffffu} << 16u) |
+	                        (uint64_t {info->resources.layers} << 32u);
+	GpuPhases::SetOpKey(info->data.address | (depth ? uint64_t {1} << 63u : 0u), extent);
+}
+
 // KYTY_DUMP_TESS_DRAWS="<hash>[,<hash>...]" (round 82, the roof spike): the inputs of the first
 // tessellated draws (up to 4 distinct index buffers per hash) whose stages include one of these
 // shaders, as guest memory holds them: the index buffer, each vertex buffer the first stage
@@ -2188,6 +2211,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
 	NoteDrawRepeat(draw, state, index_source, vertex_stages.size());
+	NoteDrawTarget(state);
 	uint32_t   mesh_groups = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
@@ -2811,6 +2835,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& guest_args) {
 	KYTY_PROFILER_FUNCTION();
 	const GpuPhases::Scope draw_phase(GpuPhases::Phase::Draw);
+	const GpuPhases::OpStats op_stats(false);
 	// A tessellated draw's time, whole (round 78).
 	std::optional<GpuPhases::Scope> tess_phase;
 	if (buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kPatch) {
@@ -2996,6 +3021,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 	const GpuPhases::Scope draw_phase(GpuPhases::Phase::Draw);
+	const GpuPhases::OpStats op_stats(false);
 	// A tessellated draw's time, whole (round 78).
 	std::optional<GpuPhases::Scope> tess_phase;
 	if (buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kPatch) {

@@ -3109,6 +3109,19 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	}
 }
 
+// The length in dwords that a binding's bounds checks compare with (round 84). Byte and halfword
+// accesses index bytes and halfwords up to four or two times it, so a range rounded down to whole
+// dwords hid the last bytes of one that ends inside a dword: the game's car glass reads a table
+// of 17,370 bytes, its last patch read its last two as zero, and one corner of it rose half a
+// metre above the roof. A read-only binding's length is rounded up: a dword read past the range
+// is the driver's robust access (zero or bytes of the buffer), as the hardware's is zero. A
+// written binding's stays rounded down, so that a dword store cannot reach past its range into
+// the bytes after it. KYTY_BISECT's buflen:old rounds every binding down, as before.
+static uint32_t BindingLengthDwords(uint64_t range, bool written) {
+	const auto bytes = written || Bisect::BufferLengthOld() ? range : range + 3u;
+	return static_cast<uint32_t>(bytes / sizeof(uint32_t));
+}
+
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -3156,7 +3169,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		prepared.shader_data[layout.BufferLengthDword() + i] =
 		    prepared.buffer_sources[i].size == 0
 		        ? 0u
-		        : static_cast<uint32_t>(prepared.buffers.back().range / sizeof(uint32_t));
+		        : BindingLengthDwords(prepared.buffers.back().range,
+		                              program.info.buffers[resource].written);
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {

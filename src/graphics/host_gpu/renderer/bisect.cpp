@@ -84,6 +84,8 @@ struct Step {
 	bool              refresh_old     = false;
 	bool              expand_old      = false;
 	bool              backing_locked  = false;
+	// Round 84.
+	bool              buflen_old      = false;
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
 	int32_t           dflush          = -1;   // dflush:<n>; -1: the usual
@@ -343,6 +345,10 @@ bool ParseAction(std::string_view action, Step& step) {
 		step.backing_locked = true;
 		return true;
 	}
+	if (action == "buflen:old") {
+		step.buflen_old = true;
+		return true;
+	}
 	if (action.starts_with("depth:equal-relaxed:")) {
 		const auto text = std::string(action.substr(20));
 		if (text.empty() || text.size() > 7 ||
@@ -400,7 +406,7 @@ bool ParseAction(std::string_view action, Step& step) {
 		return step.gpu_frames != 0;
 	}
 	if (action == "cpu:vcache" || action == "cpu:frequency" || action == "cpu:all" ||
-	    action == "cpu:gpuvcache" || action == "cpu:gpufrequency") {
+	    action == "cpu:gpuvcache" || action == "cpu:gpufrequency" || action == "cpu:gpucore") {
 		step.cpu_set = std::string(action.substr(4));
 		return true;
 	}
@@ -978,6 +984,11 @@ bool RefreshOld() {
 bool ExpandOld() {
 	const auto* step = Current();
 	return step != nullptr && step->expand_old;
+}
+
+bool BufferLengthOld() {
+	const auto* step = Current();
+	return step != nullptr && step->buflen_old;
 }
 
 float DepthEqualRelaxed() {

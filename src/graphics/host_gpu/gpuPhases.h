@@ -214,6 +214,65 @@ private:
 	bool     m_set_step = false;        // it set t_step (to restore when it ends)
 };
 
+// KYTY_OP_STATS=1 (round 84): the GPU thread's time by dispatch shader and by draw target. An
+// OpStats scope times one draw or dispatch whole, with what its BDA walk and its page protection
+// changes took; what the operation is grouped by (its shader for a dispatch, its first color
+// target, or depth target when it has none, for a draw) is set with SetOpKey once it is known,
+// and an operation that never sets it is not counted. The "GPU phases" report adds a "Dispatch
+// shaders" and a "Draw targets" line: the groups that took the most of the GPU thread, with their
+// operations a frame and microseconds each.
+namespace Detail {
+inline thread_local uint64_t t_op_key   = 0;
+inline thread_local uint64_t t_op_extra = 0;
+} // namespace Detail
+
+[[nodiscard]] bool OpStatsOn() noexcept;
+void NoteOp(bool dispatch, uint64_t key, uint64_t extra, uint64_t cycles, uint64_t bda_cycles,
+            uint64_t protect_cycles) noexcept;
+
+// Names what the operation being timed is grouped by (GPU thread): a dispatch's shader hash and
+// its thread groups; a draw's target address (bit 63 set for a depth target) and its extent
+// (width | height << 16 | layers << 32).
+inline void SetOpKey(uint64_t key, uint64_t extra) noexcept {
+	Detail::t_op_key   = key;
+	Detail::t_op_extra = extra;
+}
+
+class OpStats {
+public:
+	explicit OpStats(bool dispatch) noexcept: m_dispatch(dispatch) {
+		if (!Detail::t_on || !OpStatsOn()) {
+			return;
+		}
+		Detail::t_op_key = 0;
+		m_bda            = BdaCycles();
+		m_protect        = Detail::g_totals.cycles[static_cast<size_t>(Phase::Protect)];
+		m_start          = Now();
+	}
+	~OpStats() {
+		if (m_start == 0 || Detail::t_op_key == 0) {
+			return;
+		}
+		NoteOp(m_dispatch, Detail::t_op_key, Detail::t_op_extra, Now() - m_start,
+		       BdaCycles() - m_bda,
+		       Detail::g_totals.cycles[static_cast<size_t>(Phase::Protect)] - m_protect);
+		Detail::t_op_key = 0;
+	}
+	OpStats(const OpStats&)            = delete;
+	OpStats& operator=(const OpStats&) = delete;
+
+private:
+	[[nodiscard]] static uint64_t BdaCycles() noexcept {
+		return Detail::g_totals.cycles[static_cast<size_t>(Phase::DrawBda)] +
+		       Detail::g_totals.cycles[static_cast<size_t>(Phase::DispatchBda)];
+	}
+
+	bool     m_dispatch;
+	uint64_t m_start   = 0;
+	uint64_t m_bda     = 0;
+	uint64_t m_protect = 0;
+};
+
 // GPU thread, at its start: turns the phases on there (KYTY_GPU_PHASES=0 leaves them off).
 void Start();
 // GPU thread: logs the "GPU phases" line every 10 s; `frames`: the frames the guest has finished.

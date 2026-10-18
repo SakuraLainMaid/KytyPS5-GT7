@@ -1432,6 +1432,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
 	const GpuPhases::Scope dispatch_phase(GpuPhases::Phase::Dispatch);
+	const GpuPhases::OpStats op_stats(true);
 	EXIT_IF(buffer.IsInvalid());
 	{
 		const GpuPhases::Scope phase(GpuPhases::Phase::DispatchPending);
@@ -1548,6 +1549,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
+	if (GpuPhases::OpStatsOn()) {
+		GpuPhases::SetOpKey(program.shader_hash, uint64_t {input_info.workgroup_counts[0]} *
+		                                             input_info.workgroup_counts[1] *
+		                                             input_info.workgroup_counts[2]);
+	}
 	// KYTY_BISECT (bisect.h): a step that leaves out this shader's dispatches.
 	if (Bisect::SkipsShader(program.shader_hash)) {
 		if (FrameGraph::Logging()) {
@@ -1859,6 +1865,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const bool use_thread_dimensions =
 	    (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	const GpuPhases::Scope dispatch_phase(GpuPhases::Phase::Dispatch);
+	const GpuPhases::OpStats op_stats(true);
 	{
 		const GpuPhases::Scope phase(GpuPhases::Phase::DispatchPending);
 		m_context.GetCommandScheduler().PopPendingOperations(false);
@@ -1903,6 +1910,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 		ResetBindings();
 		return;
+	}
+	// Indirect: its thread groups are on the GPU (counted as none).
+	if (GpuPhases::OpStatsOn()) {
+		GpuPhases::SetOpKey(input_info.stage.program->shader_hash, 0);
 	}
 	// KYTY_BISECT (bisect.h): a step that leaves out this shader's dispatches.
 	if (Bisect::SkipsShader(input_info.stage.program->shader_hash)) {

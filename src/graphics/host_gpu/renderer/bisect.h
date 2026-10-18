@@ -194,6 +194,13 @@
 //                expander (which compares its whole code) at every dispatch
 //   backing:locked copies to and from guest memory hold the backing store's lock while they copy,
 //                as before (game threads' reads waited for the GPU thread's uploads)
+// and, round 84:
+//   buflen:old    a read-only buffer binding's length, which the shader's bounds checks compare
+//                with, is rounded down to whole dwords, as before, instead of up (byte reads of
+//                the last bytes of a range that ends inside a dword read zero: the roof spike)
+//   cpu:gpucore   as cpu:gpuvcache (the placement a run starts with on a Ryzen X3D), with the GPU
+//                thread alone on one core of the V-Cache die, whose SMT sibling no thread of the
+//                process is given (Common::SetProcessCpuSet)
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -295,6 +302,8 @@ void                      ApplyPending();
 [[nodiscard]] bool DrawStateOld();
 [[nodiscard]] bool RefreshOld();
 [[nodiscard]] bool ExpandOld();
+// Any thread: buflen:old.
+[[nodiscard]] bool BufferLengthOld();
 // Any thread: depth:equal-relaxed's bias in units of depth precision; 0 when off.
 [[nodiscard]] float DepthEqualRelaxed();
 

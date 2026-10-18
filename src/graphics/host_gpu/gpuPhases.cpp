@@ -10,7 +10,9 @@
 #include <fmt/format.h>
 #include <initializer_list>
 #include <string>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::GpuPhases {
 
@@ -72,12 +74,96 @@ const char* StepName(size_t index) {
 
 Reporter g_reporter;
 
+// KYTY_OP_STATS (round 84): the operations by group since the last report (GPU thread only).
+struct OpGroup {
+	uint64_t extra          = 0;
+	uint64_t count          = 0;
+	uint64_t cycles         = 0;
+	uint64_t bda_cycles     = 0;
+	uint64_t protect_cycles = 0;
+};
+std::unordered_map<uint64_t, OpGroup> g_dispatch_groups;
+std::unordered_map<uint64_t, OpGroup> g_draw_groups;
+
+// The groups that took the most cycles, at most `shown` of them, as one line's text.
+std::string DescribeGroups(const std::unordered_map<uint64_t, OpGroup>& groups, bool dispatch,
+                           double cycles_per_us, uint64_t frames, size_t shown) {
+	uint64_t                                         total_cycles = 0;
+	uint64_t                                         total_count  = 0;
+	std::vector<std::pair<uint64_t, const OpGroup*>> order;
+	order.reserve(groups.size());
+	for (const auto& [key, group]: groups) {
+		total_cycles += group.cycles;
+		total_count += group.count;
+		order.emplace_back(key, &group);
+	}
+	const auto take = std::min(shown, order.size());
+	std::partial_sort(
+	    order.begin(), order.begin() + static_cast<ptrdiff_t>(take), order.end(),
+	    [](const auto& a, const auto& b) { return a.second->cycles > b.second->cycles; });
+	const auto per_frame = [&](double value) {
+		return frames != 0 ? value / static_cast<double>(frames) : 0.0;
+	};
+	std::string text =
+	    fmt::format("{} {}, {} {} ({:.1f} a frame), {:.1f} ms a frame; the most:",
+	                dispatch ? "dispatches" : "draws", total_count, groups.size(),
+	                dispatch ? "shaders" : "targets", per_frame(static_cast<double>(total_count)),
+	                per_frame(static_cast<double>(total_cycles) / cycles_per_us / 1000.0));
+	for (size_t i = 0; i < take; i++) {
+		const auto& [key, group] = order[i];
+		const auto  n            = static_cast<double>(group->count);
+		const auto  us_each      = static_cast<double>(group->cycles) / cycles_per_us / n;
+		std::string what;
+		if (dispatch) {
+			what = fmt::format("cs {:016x} ({:.0f} groups)", key,
+			                   static_cast<double>(group->extra) / n);
+		} else {
+			const auto extent  = group->extra;
+			const auto layers  = extent >> 32u;
+			const auto address = key & ~(uint64_t {1} << 63u);
+			what = fmt::format("{} 0x{:x} {}x{}", (key >> 63u) != 0 ? "depth" : "color", address,
+			                   extent & 0xffffu, (extent >> 16u) & 0xffffu);
+			if (layers > 1u) {
+				what += fmt::format("x{}", layers);
+			}
+		}
+		text += fmt::format("{} {}: {:.1f} a frame x {:.2f} us = {:.2f} ms a frame ({:.0f}%; bda "
+		                    "{:.2f} us, protects {:.2f} us each)",
+		                    i == 0 ? "" : ";", what, per_frame(n), us_each,
+		                    per_frame(static_cast<double>(group->cycles) / cycles_per_us / 1000.0),
+		                    total_cycles != 0 ? 100.0 * static_cast<double>(group->cycles) /
+		                                            static_cast<double>(total_cycles)
+		                                      : 0.0,
+		                    static_cast<double>(group->bda_cycles) / cycles_per_us / n,
+		                    static_cast<double>(group->protect_cycles) / cycles_per_us / n);
+	}
+	return text;
+}
+
 bool EnabledFromEnvironment() {
 	const char* value = std::getenv("KYTY_GPU_PHASES");
 	return value == nullptr || value[0] != '0';
 }
 
 } // namespace
+
+bool OpStatsOn() noexcept {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_OP_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
+void NoteOp(bool dispatch, uint64_t key, uint64_t extra, uint64_t cycles, uint64_t bda_cycles,
+            uint64_t protect_cycles) noexcept {
+	auto& group = (dispatch ? g_dispatch_groups : g_draw_groups)[key];
+	group.extra = dispatch ? group.extra + extra : extra;
+	group.count++;
+	group.cycles += cycles;
+	group.bda_cycles += bda_cycles;
+	group.protect_cycles += protect_cycles;
+}
 
 void Start() {
 	if (!EnabledFromEnvironment()) {
@@ -89,6 +175,10 @@ void Start() {
 	g_reporter.next_check = g_reporter.last_tsc;
 	LOGF("GPU phases: every 10 s, a \"GPU phases\" line with the GPU thread's time by step of a "
 	     "draw and of a dispatch (KYTY_GPU_PHASES=0 turns it off)\n");
+	if (OpStatsOn()) {
+		LOGF("GPU phases: with it, \"Dispatch shaders\" and \"Draw targets\" lines: the GPU "
+		     "thread's time by dispatch shader and by draw target (KYTY_OP_STATS)\n");
+	}
 }
 
 void ReportIfDue(uint64_t frames) {
@@ -313,6 +403,14 @@ void ReportIfDue(uint64_t frames) {
 		                frame(Phase::DrawBda) + frame(Phase::DispatchBda), frame(Phase::Command));
 	}
 	LOGF("%s\n", line.c_str());
+	if (OpStatsOn()) {
+		LOGF("Dispatch shaders (%.1f s): %s\n", seconds,
+		     DescribeGroups(g_dispatch_groups, true, cycles_per_us, new_frames, 16).c_str());
+		LOGF("Draw targets (%.1f s): %s\n", seconds,
+		     DescribeGroups(g_draw_groups, false, cycles_per_us, new_frames, 16).c_str());
+		g_dispatch_groups.clear();
+		g_draw_groups.clear();
+	}
 }
 
 } // namespace Libs::Graphics::GpuPhases
