@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -93,6 +94,36 @@ public:
 				}
 			}
 		}
+	}
+	// The BDA walk's uploads in one tracker region (round 80): for each span of `spans` (inside
+	// one region, ascending, apart), its CPU-dirty pages become clean and func(span index,
+	// address, bytes) gets their runs; then one protection change write-protects them all,
+	// before the region's lock is released. Each span's own sync (ForEachUploadRange) made one
+	// protection change a span: two to three a region, 7 us each, 4 % of the GPU thread in a race.
+	template <typename Func>
+	void TakeCpuDirtySpans(std::span<const std::pair<uint64_t, uint64_t>> spans, Func&& func) {
+		if (spans.empty()) {
+			return;
+		}
+		CheckNotInUploadCallback();
+		const auto index = spans.front().first / TRACKER_REGION_SIZE;
+		ValidateRange(spans.front().first, spans.front().second);
+		auto* manager = m_regions[index].load(std::memory_order_acquire);
+		if (manager == nullptr) {
+			return;
+		}
+		std::scoped_lock lock(manager->lock);
+		for (size_t i = 0; i < spans.size(); i++) {
+			const auto [address, bytes] = spans[i];
+			if (bytes == 0 || address / TRACKER_REGION_SIZE != index ||
+			    (address + bytes - 1) / TRACKER_REGION_SIZE != index) {
+				EXIT("MemoryTracker: a span of the BDA walk leaves its region\n");
+			}
+			manager->TakeCpuModifiedRanges(
+			    address, bytes,
+			    [&](uint64_t run, uint64_t run_bytes) noexcept { func(i, run, run_bytes); });
+		}
+		manager->CommitCpuProtection();
 	}
 	// The CPU-dirty pages of the range, as runs of whole pages (appended to `runs`). Lock-free
 	// skip of a region whose summary is clean.

@@ -3205,6 +3205,21 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	return UnmapMemoryRange(vaddr, len);
 }
 
+DirectMemoryUse GetDirectMemoryUse() {
+	DirectMemoryUse use;
+	if (g_physical_memory == nullptr) {
+		return use;
+	}
+	use.size = PhysicalMemory::Size();
+	Common::LockGuard lock(g_physical_memory->GetMutex());
+	for (const auto& [start, block]: g_physical_memory->GetPhysicalBlocks()) {
+		(void)start;
+		use.allocated += block.size;
+		use.blocks++;
+	}
+	return use;
+}
+
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {
 	PRINT_NAME();
 

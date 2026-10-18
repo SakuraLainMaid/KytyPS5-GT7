@@ -7,6 +7,8 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdlib>
 
 namespace Libs::Graphics {
@@ -32,13 +34,32 @@ static bool UnnormalizedLodEnabled() {
 	return always || Bisect::UnnormalizedLod();
 }
 
-vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool integer_border) {
-	Common::LockGuard lock(m_mutex);
+uint64_t SamplerCache::NextGeneration() {
+	static std::atomic<uint64_t> next {1};
+	return next.fetch_add(1, std::memory_order_relaxed);
+}
 
+vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool integer_border) {
 	const bool       keep_lod = r.ForceUnormCoords() && UnnormalizedLodEnabled();
 	const SamplerKey key {r.fields[0], r.fields[1],    r.fields[2],
 	                      r.fields[3], integer_border, keep_lod};
+	// Round 80: each thread's front cache of the samplers it asked for (a sampler lives as long
+	// as its cache): every sampler of every draw took the lock and a map search, ~0.5 % of the GPU
+	// thread in a race.
+	struct Front {
+		uint64_t    generation = 0;
+		SamplerKey  key {};
+		vk::Sampler sampler = nullptr;
+	};
+	thread_local std::array<Front, 64> front {};
+	auto&                              slot = front[SamplerKeyHash {}(key) % front.size()];
+	if (slot.generation == m_generation && slot.key == key) {
+		return slot.sampler;
+	}
+
+	Common::LockGuard lock(m_mutex);
 	if (auto iter = m_samplers.find(key); iter != m_samplers.end()) {
+		slot = {m_generation, key, iter->second};
 		return iter->second;
 	}
 
@@ -175,6 +196,7 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool intege
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || vk_sampler == nullptr);
 
 	m_samplers.emplace(key, vk_sampler);
+	slot = {m_generation, key, vk_sampler};
 	return vk_sampler;
 }
 

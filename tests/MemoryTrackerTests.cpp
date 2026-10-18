@@ -3,6 +3,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/imageZoneStamps.h"
+#include "graphics/host_gpu/renderer/cache/pagedRangeSet.h"
 
 #include <atomic>
 #include <chrono>
@@ -11,9 +12,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <random>
 #include <semaphore>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -299,6 +302,127 @@ void TestRangeSet() {
             intersections[0].second == 0x1040 &&
             intersections[1].first == 0x1220 && intersections[1].second == 0x1240,
         "range set subtraction did not preserve both exact tails");
+}
+
+// The page bitmap of PagedRangeSet (round 80): its answers are the RangeSet's, over random
+// additions, subtractions and queries of every size, and every page holding bytes stays marked.
+void TestPagedRangeSet() {
+	using Libs::Graphics::PagedRangeSet;
+	std::mt19937_64 rng(0x5eed80);
+	for (int round = 0; round < 60; round++) {
+		PagedRangeSet  paged;
+		RangeSet       plain;
+		const uint64_t base = (rng() % 4) * (uint64_t {1} << 36) + (rng() % 1000) * 4096;
+		for (int op = 0; op < 2000; op++) {
+			uint64_t address = base + rng() % (uint64_t {64} << 20u);
+			uint64_t size    = 0;
+			switch (rng() % 4) {
+				case 0: size = 1 + rng() % 64; break;
+				case 1: size = 1 + rng() % 8192; break;
+				case 2: size = 1 + rng() % (uint64_t {1} << 20u); break;
+				default: size = 1 + rng() % (uint64_t {20} << 20u); break;
+			}
+			if (rng() % 5 == 0) {
+				address &= ~uint64_t {4095};
+			}
+			if (rng() % 5 == 0) {
+				size = (size + 4095) & ~uint64_t {4095};
+			}
+			const auto kind = rng() % 10;
+			if (kind < 3) {
+				paged.Add(address, size);
+				plain.Add(address, size);
+			} else if (kind < 6) {
+				paged.Subtract(address, size);
+				plain.Subtract(address, size);
+			} else if (kind == 9 && rng() % 50 == 0) {
+				paged.Clear();
+				plain.Clear();
+			} else {
+				Check(paged.Intersects(address, size) == plain.Intersects(address, size),
+				      "the paged range set answered an intersection unlike the range set");
+			}
+			if (op % 97 == 0) {
+				bool marked = true;
+				plain.ForEach([&](uint64_t begin, uint64_t end) {
+					for (uint64_t page = begin & ~uint64_t {4095}; page < end; page += 4096) {
+						marked = marked && paged.PageMarked(page);
+					}
+				});
+				Check(marked, "a page holding bytes of the paged range set was not marked");
+			}
+		}
+	}
+	PagedRangeSet edge;
+	edge.Add(0x10000, 0x10);
+	edge.Add(0x10ff0, 0x20);
+	edge.Subtract(0x10000, 0x10);
+	Check(edge.Intersects(0x10ff0, 1) && edge.Intersects(0x11000, 1) &&
+	          !edge.Intersects(0x10000, 0x800),
+	      "a subtraction cleared a page another range still holds bytes of");
+	edge.Subtract(0x10ff0, 0x20);
+	Check(!edge.PageMarked(0x10000) && !edge.PageMarked(0x11000) && edge.Empty(),
+	      "the last subtraction left a page marked");
+	// The last page of the address space: its check for bytes left must not wrap.
+	PagedRangeSet top;
+	top.Add(0xfffffffffffff000ull, 0x10);
+	top.Subtract(0xfffffffffffff800ull, 0x10);
+	Check(top.Intersects(0xfffffffffffff000ull, 0x10) && top.PageMarked(0xfffffffffffff000ull),
+	      "a subtraction on the last page unmarked it while it holds bytes");
+	top.Subtract(0xfffffffffffff000ull, 0x10);
+	Check(!top.PageMarked(0xfffffffffffff000ull) && top.Empty(),
+	      "the last page stayed marked without bytes");
+}
+
+// The BDA walk's spans of one region (round 80): their CPU-dirty pages become clean and
+// write-protected in one protection change, bridging the clean pages between them; a CPU-dirty
+// page outside every span stays dirty and writable (and splits the change in two).
+void TestCpuDirtySpans() {
+	TrackerHarness harness;
+	auto&          tracker   = harness.tracker;
+	const auto     page_size = harness.page_manager.GetPageSize();
+	auto*          memory    = Allocate(harness.page_manager, 16);
+	const auto     address   = reinterpret_cast<uint64_t>(memory);
+	tracker.ForEachUploadRange(
+	    address, page_size * 16, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	const auto page = [&](uint64_t index) { return address + page_size * index; };
+	for (const uint64_t index: {1u, 2u, 5u, 9u}) {
+		tracker.MarkRegionAsCpuModified(page(index) + 8, 8);
+	}
+	const std::vector<std::pair<uint64_t, uint64_t>> spans = {
+	    {page(1), page_size * 2}, {page(5), page_size}, {page(9), page_size}};
+	std::vector<std::tuple<size_t, uint64_t, uint64_t>> runs;
+	ResetProtectionLog();
+	tracker.TakeCpuDirtySpans(spans, [&](size_t span, uint64_t run, uint64_t bytes) noexcept {
+		runs.emplace_back(span, run, bytes);
+	});
+	Check(runs.size() == 3 && std::get<0>(runs[0]) == 0 && std::get<1>(runs[0]) == page(1) &&
+	          std::get<2>(runs[0]) == page_size * 2 && std::get<0>(runs[1]) == 1 &&
+	          std::get<1>(runs[1]) == page(5) && std::get<0>(runs[2]) == 2 &&
+	          std::get<1>(runs[2]) == page(9),
+	      "the spans' CPU-dirty runs were not given span by span");
+	Check(g_protection_calls == 1 && !tracker.IsRegionCpuModified(page(1), page_size * 9) &&
+	          Protection(memory + page_size * 1) == PAGE_READONLY &&
+	          Protection(memory + page_size * 9) == PAGE_READONLY,
+	      "the spans were not write-protected in one change");
+
+	tracker.MarkRegionAsCpuModified(page(2) + 8, 8);
+	tracker.MarkRegionAsCpuModified(page(7) + 8, 8);
+	tracker.MarkRegionAsCpuModified(page(9) + 8, 8);
+	const std::vector<std::pair<uint64_t, uint64_t>> apart = {{page(2), page_size},
+	                                                          {page(9), page_size}};
+	runs.clear();
+	ResetProtectionLog();
+	tracker.TakeCpuDirtySpans(apart, [&](size_t span, uint64_t run, uint64_t bytes) noexcept {
+		runs.emplace_back(span, run, bytes);
+	});
+	Check(runs.size() == 2 && g_protection_calls == 2 &&
+	          tracker.IsRegionCpuModified(page(7), page_size) && IsWritable(memory + page_size * 7),
+	      "a CPU-dirty page outside the spans was taken or protected");
+
+	tracker.MarkRegionAsCpuModified(address, page_size * 16);
+	tracker.UntrackMemory(address, page_size * 16);
+	Release(memory);
 }
 
 void TestGuestRange() {
@@ -1480,6 +1604,8 @@ int main(int argc, char **argv) {
   }
   TestGuestRange();
   TestRangeSet();
+  TestPagedRangeSet();
+  TestCpuDirtySpans();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();

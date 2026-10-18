@@ -9,6 +9,7 @@
 #include <fmt/format.h>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -99,6 +100,15 @@ std::vector<GpuSideThread> g_gpu_side_threads;
 bool               g_split_applied = false;
 std::vector<ULONG> g_split_gpu_ids;
 
+// The process's affinity before the emulator changed it ("start" gives it back), taken at the
+// first look.
+DWORD_PTR g_start_mask = 0;
+void      NoteStartMask(DWORD_PTR process_mask) {
+    if (g_start_mask == 0) {
+        g_start_mask = process_mask;
+    }
+}
+
 // The CPU set ids of the logical processors of group 0 in `mask`.
 std::vector<ULONG> CpuSetIds(DWORD_PTR mask) {
 	std::vector<ULONG> ids;
@@ -125,6 +135,39 @@ std::vector<ULONG> CpuSetIds(DWORD_PTR mask) {
 		offset += info->Size;
 	}
 	return ids;
+}
+
+// The L3 caches of processor group 0 (the process's, with up to 64 logical processors) and the
+// processors of `system_mask` sharing each.
+struct Cache {
+	DWORD_PTR mask = 0;
+	DWORD     size = 0;
+};
+std::vector<Cache> L3Caches(DWORD_PTR system_mask) {
+	std::vector<Cache> caches;
+	DWORD              length = 0;
+	GetLogicalProcessorInformationEx(RelationCache, nullptr, &length);
+	std::vector<uint8_t> buffer(length);
+	if (length != 0 &&
+	    GetLogicalProcessorInformationEx(
+	        RelationCache,
+	        reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()),
+	        &length) != FALSE) {
+		for (DWORD offset = 0; offset < length;) {
+			const auto* info =
+			    reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data() + offset);
+			if (info->Size == 0) {
+				break;
+			}
+			if (info->Relationship == RelationCache && info->Cache.Level == 3 &&
+			    info->Cache.GroupMask.Group == 0 &&
+			    (info->Cache.GroupMask.Mask & system_mask) != 0) {
+				caches.push_back({info->Cache.GroupMask.Mask & system_mask, info->Cache.CacheSize});
+			}
+			offset += info->Size;
+		}
+	}
+	return caches;
 }
 
 // Clears what a split placement set: the process's default CPU sets and the registered threads'.
@@ -168,6 +211,70 @@ void RegisterGpuSideThread(const char* name) {
 	g_gpu_side_threads.push_back(std::move(thread));
 }
 
+std::string StartCpuSet(std::string* reason) {
+	const auto because = [&](std::string text) {
+		if (reason != nullptr) {
+			*reason = std::move(text);
+		}
+	};
+	if (const char* value = std::getenv("KYTY_CPU_SET"); value != nullptr && value[0] != '\0') {
+		if (std::string_view(value) == "off") {
+			because("KYTY_CPU_SET=off");
+			return {};
+		}
+		because("KYTY_CPU_SET");
+		return value;
+	}
+	DWORD_PTR process_mask = 0, system_mask = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) == FALSE) {
+		because("the process's processors are unknown");
+		return {};
+	}
+	{
+		std::lock_guard lock(g_gpu_side_mutex);
+		NoteStartMask(process_mask);
+	}
+	// An affinity given before the start (Process Lasso, start /affinity, a launcher) is the
+	// user's choice: the placement would undo it.
+	const auto count = [](DWORD_PTR mask) {
+		uint32_t n = 0;
+		for (; mask != 0; mask &= mask - 1) {
+			n++;
+		}
+		return n;
+	};
+	if (process_mask != system_mask) {
+		because(fmt::format("the process was started on {} of the {} processors: left as it is",
+		                    count(process_mask), count(system_mask)));
+		return {};
+	}
+	const auto caches = L3Caches(system_mask);
+	if (caches.size() < 2) {
+		because(fmt::format("the processors share {} L3 cache(s)", caches.size()));
+		return {};
+	}
+	const auto [smallest, largest] = std::ranges::minmax_element(
+	    caches, [](const Cache& a, const Cache& b) { return a.size < b.size; });
+	if (smallest->size == largest->size) {
+		because(fmt::format("their {} L3 caches are alike ({} MB each)", caches.size(),
+		                    largest->size >> 20u));
+		return {};
+	}
+	// A 3D V-Cache die has 96 MB of L3 (the other die of the same chip 32 MB). Chips whose
+	// clusters differ otherwise (a mobile chip's compact cores with 8 MB beside 16 MB) are left
+	// alone: their small cluster is the slower one, not the one to keep the game's threads off.
+	constexpr DWORD VCacheBytes = 64u << 20u;
+	if (largest->size < VCacheBytes) {
+		because(fmt::format("their L3 caches differ ({} MB and {} MB), but none is a 3D V-Cache "
+		                    "die's",
+		                    largest->size >> 20u, smallest->size >> 20u));
+		return {};
+	}
+	because(fmt::format("their L3 caches differ ({} MB and {} MB)", largest->size >> 20u,
+	                    smallest->size >> 20u));
+	return "gpuvcache";
+}
+
 bool SetProcessCpuSet(const char* which, std::string* description) {
 	const auto describe = [&](std::string text) {
 		if (description != nullptr) {
@@ -181,35 +288,8 @@ bool SetProcessCpuSet(const char* which, std::string* description) {
 		describe("the process's processors are unknown");
 		return false;
 	}
-	// The L3 caches of processor group 0 (the process's, with up to 64 logical processors) and
-	// the processors sharing each.
-	struct Cache {
-		DWORD_PTR mask = 0;
-		DWORD     size = 0;
-	};
-	std::vector<Cache> caches;
-	DWORD              length = 0;
-	GetLogicalProcessorInformationEx(RelationCache, nullptr, &length);
-	std::vector<uint8_t> buffer(length);
-	if (length != 0 &&
-	    GetLogicalProcessorInformationEx(
-	        RelationCache,
-	        reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()),
-	        &length) != FALSE) {
-		for (DWORD offset = 0; offset < length;) {
-			const auto* info =
-			    reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data() + offset);
-			if (info->Size == 0) {
-				break;
-			}
-			if (info->Relationship == RelationCache && info->Cache.Level == 3 &&
-			    info->Cache.GroupMask.Group == 0 &&
-			    (info->Cache.GroupMask.Mask & system_mask) != 0) {
-				caches.push_back({info->Cache.GroupMask.Mask & system_mask, info->Cache.CacheSize});
-			}
-			offset += info->Size;
-		}
-	}
+	NoteStartMask(process_mask);
+	const auto caches = L3Caches(system_mask);
 	const auto count = [](DWORD_PTR mask) {
 		uint32_t n = 0;
 		for (; mask != 0; mask &= mask - 1) {
@@ -270,6 +350,10 @@ bool SetProcessCpuSet(const char* which, std::string* description) {
 	if (name == "all") {
 		mask = system_mask;
 		what = "every processor";
+	} else if (name == "start") {
+		// Back to what the process started with (a KYTY_BISECT step's end).
+		mask = g_start_mask != 0 ? g_start_mask : system_mask;
+		what = "the processors it started on";
 	} else if (name == "vcache" || name == "frequency") {
 		if (caches.size() < 2) {
 			describe(
@@ -289,7 +373,8 @@ bool SetProcessCpuSet(const char* which, std::string* description) {
 		                        : std::string("the processors outside the largest L3 cache");
 	} else {
 		describe(
-		    "not changed: KYTY_CPU_SET takes vcache, frequency, all, gpuvcache or gpufrequency");
+		    "not changed: KYTY_CPU_SET takes vcache, frequency, all, gpuvcache, gpufrequency or "
+		    "off");
 		return false;
 	}
 	if (mask == 0 || SetProcessAffinityMask(GetCurrentProcess(), mask) == FALSE) {
@@ -352,6 +437,20 @@ bool SetProcessCpuSet(const char* /*which*/, std::string* description) {
 	return false;
 }
 
+std::string StartCpuSet(std::string* reason) {
+	if (const char* value = std::getenv("KYTY_CPU_SET");
+	    value != nullptr && value[0] != '\0' && std::string_view(value) != "off") {
+		if (reason != nullptr) {
+			*reason = "KYTY_CPU_SET";
+		}
+		return value;
+	}
+	if (reason != nullptr) {
+		*reason = "only on Windows";
+	}
+	return {};
+}
+
 #else
 
 void PreferPerformanceCores(const char* /*name*/) {}
@@ -363,6 +462,20 @@ bool SetProcessCpuSet(const char* /*which*/, std::string* description) {
 		*description = "not changed: only on Windows";
 	}
 	return false;
+}
+
+std::string StartCpuSet(std::string* reason) {
+	if (const char* value = std::getenv("KYTY_CPU_SET");
+	    value != nullptr && value[0] != '\0' && std::string_view(value) != "off") {
+		if (reason != nullptr) {
+			*reason = "KYTY_CPU_SET";
+		}
+		return value;
+	}
+	if (reason != nullptr) {
+		*reason = "only on Windows";
+	}
+	return {};
 }
 
 #endif

@@ -26,6 +26,8 @@ struct Reporter {
 	Totals                                last {};
 	std::array<uint64_t, PhaseCount + 1>  last_protect_cycles {};
 	std::array<uint64_t, PhaseCount + 1>  last_protect_count {};
+	std::array<uint64_t, PhaseCount + 1>                last_protect_pages {};
+	std::array<std::array<uint64_t, 3>, PhaseCount + 1> last_protect_modes {};
 };
 
 // The names of the steps page protection changes are charged to (Detail::ChargesProtects).
@@ -111,12 +113,21 @@ void ReportIfDue(uint64_t frames) {
 	}
 	std::array<uint64_t, PhaseCount + 1> protect_cycles {};
 	std::array<uint64_t, PhaseCount + 1> protect_count {};
+	std::array<uint64_t, PhaseCount + 1>                protect_pages {};
+	std::array<std::array<uint64_t, 3>, PhaseCount + 1> protect_modes {};
 	for (size_t i = 0; i <= PhaseCount; i++) {
 		protect_cycles[i] = Detail::g_protect_cycles[i] - g_reporter.last_protect_cycles[i];
 		protect_count[i]  = Detail::g_protect_count[i] - g_reporter.last_protect_count[i];
+		protect_pages[i]  = Detail::g_protect_pages[i] - g_reporter.last_protect_pages[i];
+		for (size_t m = 0; m < 3; m++) {
+			protect_modes[i][m] =
+			    Detail::g_protect_modes[i][m] - g_reporter.last_protect_modes[i][m];
+		}
 	}
 	g_reporter.last_protect_cycles = Detail::g_protect_cycles;
 	g_reporter.last_protect_count  = Detail::g_protect_count;
+	g_reporter.last_protect_pages  = Detail::g_protect_pages;
+	g_reporter.last_protect_modes  = Detail::g_protect_modes;
 	g_reporter.last        = totals;
 	g_reporter.last_time   = now;
 	g_reporter.last_tsc    = tsc;
@@ -225,6 +236,14 @@ void ReportIfDue(uint64_t frames) {
 			                       protect_count[i],
 			                       static_cast<double>(protect_cycles[i]) / cycles_per_us /
 			                           static_cast<double>(protect_count[i]));
+			// Round 80: the pages a change covered, and what the changes made the pages.
+			const auto changes = static_cast<double>(protect_count[i]);
+			by_step += fmt::format(
+			    " ({:.1f} pages; {:.0f}% to no access, {:.0f}% read-only, {:.0f}% writable)",
+			    static_cast<double>(protect_pages[i]) / changes,
+			    100.0 * static_cast<double>(protect_modes[i][0]) / changes,
+			    100.0 * static_cast<double>(protect_modes[i][1]) / changes,
+			    100.0 * static_cast<double>(protect_modes[i][2]) / changes);
 		}
 		if (!by_step.empty()) {
 			line += " | protects by step: " + by_step;

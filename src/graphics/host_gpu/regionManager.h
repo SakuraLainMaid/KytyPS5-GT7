@@ -226,6 +226,28 @@ public:
 		}
 	}
 
+	// ForEachModifiedRange<DirtySource::Cpu, true> without its protection change (round 80): the
+	// CPU-dirty pages of the range become clean, and func gets their runs, but they stay writable
+	// until CommitCpuProtection, which the caller makes before it releases the lock (and before
+	// it reads the pages' bytes). Several ranges then change the protection in one call.
+	template <typename Func>
+	void TakeCpuModifiedRanges(uint64_t vaddr, uint64_t size, Func&& func) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		auto& bits              = GetBits<DirtySource::Cpu>();
+		if (bits.FirstRangeFrom(start).first >= end) {
+			return;
+		}
+		RegionBits mask(bits, start, end);
+		bits.UnsetRange(start, end);
+		if (bits.None()) {
+			StoreSummary<DirtySource::Cpu>(false);
+		}
+		for (const auto [first, last]: mask) {
+			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+		}
+	}
+	void CommitCpuProtection() { UpdateCpuProtection(); }
+
 	// The tracker mirrors the CPU summary in one bit per region (MemoryTracker::IsRangeCpuCleanHint).
 	// Set before the region is published.
 	void SetCpuSummaryBit(std::atomic<uint64_t>* word, uint64_t bit) noexcept {

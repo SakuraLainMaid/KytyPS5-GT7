@@ -684,11 +684,17 @@ void Start() {
 			std::this_thread::sleep_for(std::chrono::seconds(3));
 			(void)Common::HostSymbol(reinterpret_cast<uint64_t>(&Report));
 		}).detach();
-		if (const char* set = std::getenv("KYTY_CPU_SET"); set != nullptr && set[0] != '\0') {
+		std::string reason;
+		if (const auto set = Common::StartCpuSet(&reason); !set.empty()) {
 			std::string description;
-			const bool  ok = Common::SetProcessCpuSet(set, &description);
-			LOGF("CPU: KYTY_CPU_SET=%s: %s\n", set, description.c_str());
+			const bool  ok = Common::SetProcessCpuSet(set.c_str(), &description);
+			LOGF("CPU: %s=%s (%s): %s\n", reason == "KYTY_CPU_SET" ? "KYTY_CPU_SET" : "placement",
+			     set.c_str(), reason.c_str(), description.c_str());
 			(void)ok;
+		} else {
+			LOGF("CPU: the threads' placement is left alone (%s; KYTY_CPU_SET=gpuvcache places the "
+			     "GPU-side threads on the processors sharing the largest L3 cache)\n",
+			     reason.c_str());
 		}
 		SetSpinLocks(SpinLocksFromEnvironment());
 		Common::Sampler::Start();

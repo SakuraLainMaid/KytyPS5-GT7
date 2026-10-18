@@ -159,6 +159,14 @@ private:
 [[nodiscard]] std::string DescribeJournal(uint64_t vaddr, uint64_t size, uint64_t ms, size_t max);
 // The steady-clock time the journal stamps its entries with, in nanoseconds.
 [[nodiscard]] uint64_t JournalNowNs() noexcept;
+// The guest's direct memory: the bytes allocated now and the size it may use (round 80, for the
+// Perf line: a race's load came within 0.4 GB of it). Any thread.
+struct DirectMemoryUse {
+	uint64_t allocated = 0;
+	uint64_t size      = 0;
+	uint64_t blocks    = 0;
+};
+[[nodiscard]] DirectMemoryUse GetDirectMemoryUse();
 // GPU thread: some byte of [vaddr, vaddr + size) was written by GPU work into a buffer, so the
 // GPU holds it and a host read would wait for the GPU.
 [[nodiscard]] bool     IsGpuBufferWritten(uint64_t vaddr, uint64_t size);

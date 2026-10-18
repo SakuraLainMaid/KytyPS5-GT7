@@ -21,9 +21,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
 #include <chrono>
-#include <cstdint>
 #include <condition_variable>
+#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -33,6 +35,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <xxhash.h>
 
 #ifdef min
 #undef min
@@ -1610,8 +1613,28 @@ static bool AppendAmmMapRecord(uint64_t                                 command_
 	return CommitCommandBufferRecord(command_buffer, &state, record_size);
 }
 
+// KYTY_AMPR_READ_CHECK=1 (round 80; on with KYTY_TRACE_APR_READS too): each file read hashes the
+// bytes it read from the file and, once they are copied, what guest memory holds there, and logs
+// a read whose copy does not hold them (something wrote over it, or the copy missed pages). With
+// KYTY_TRACE_APR_READS the hash is on each read's line, so two runs' reads can be compared.
+static bool AprReadCheck() {
+	static const bool enabled = [] {
+		const char* check = std::getenv("KYTY_AMPR_READ_CHECK");
+		return (check != nullptr && check[0] == '1') ||
+		       std::getenv("KYTY_TRACE_APR_READS") != nullptr;
+	}();
+	return enabled;
+}
+
+struct AprReadHashes {
+	uint64_t file  = 0; // what the file held
+	uint64_t guest = 0; // what guest memory held after the copy
+	bool     made  = false;
+};
+
 static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offset,
-                               uint64_t destination, uint64_t size, uint64_t* bytes_read);
+                               uint64_t destination, uint64_t size, uint64_t* bytes_read,
+                               AprReadHashes* hashes);
 
 static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_engine,
                                      int32_t* execution_result, uint32_t* error_offset);
@@ -1851,21 +1874,48 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 					return OK;
 				}
 
-				// KYTY_TRACE_APR_READS=1: log every file read (path, offset, size), to map the
-				// assets a scene loads back to the game's table of contents.
+				// KYTY_TRACE_APR_READS=1: log every file read (path, offset, size, and the hash of
+				// its bytes), to map the assets a scene loads back to the game's table of
+				// contents and to compare two runs' reads.
 				static const bool trace_reads = std::getenv("KYTY_TRACE_APR_READS") != nullptr;
-				if (trace_reads) {
-					LOGF("APRREAD path=%s offset=0x%" PRIx64 " size=0x%" PRIx64 "\n",
-					     host_path.c_str(), command.file_offset, command.size);
-				}
 				if (LibKernel::Memory::TracesMemory(command.destination, command.size)) {
 					LibKernel::Memory::TraceMemory(
 					    "file read into 0x%016" PRIx64 "+0x%" PRIx64 " from %s at 0x%" PRIx64,
 					    command.destination, command.size, host_path.c_str(), command.file_offset);
 				}
-				uint64_t bytes_read = 0;
-				auto result = ReadHostFileToGuest(host_path, command.file_offset,
-				                                  command.destination, command.size, &bytes_read);
+				uint64_t      bytes_read = 0;
+				AprReadHashes hashes;
+				auto          result = ReadHostFileToGuest(host_path, command.file_offset,
+				                                           command.destination, command.size, &bytes_read,
+                                                  AprReadCheck() ? &hashes : nullptr);
+				if (trace_reads) {
+					LOGF("APRREAD path=%s offset=0x%" PRIx64 " size=0x%" PRIx64 " read=0x%" PRIx64
+					     " hash=%016" PRIx64 "\n",
+					     host_path.c_str(), command.file_offset, command.size, bytes_read,
+					     hashes.file);
+				}
+				if (hashes.made) {
+					static std::atomic<uint64_t> checked {0}, bad {0}, bytes {0};
+					const auto n = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+					bytes.fetch_add(bytes_read, std::memory_order_relaxed);
+					if (hashes.file != hashes.guest) {
+						const auto b = bad.fetch_add(1, std::memory_order_relaxed) + 1;
+						if (b <= 32 || std::has_single_bit(b)) {
+							LOGF("AMPR read check: the read of %s at 0x%" PRIx64 "+0x%" PRIx64
+							     " into 0x%016" PRIx64 " does not hold the file's bytes after "
+							     "its copy (file %016" PRIx64 ", guest %016" PRIx64 "; %" PRIu64
+							     " such reads so far)\n",
+							     host_path.c_str(), command.file_offset, bytes_read,
+							     command.destination, hashes.file, hashes.guest, b);
+						}
+					}
+					if (std::has_single_bit(n) && n >= 1024) {
+						LOGF("AMPR read check: %" PRIu64 " reads (%" PRIu64 " MB) checked, %" PRIu64
+						     " did not hold the file's bytes\n",
+						     n, bytes.load(std::memory_order_relaxed) >> 20u,
+						     bad.load(std::memory_order_relaxed));
+					}
+				}
 				if (result != OK) {
 					LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32
 					     ", path=%s dst=0x%016" PRIx64 " size=0x%" PRIx64 " offset=0x%" PRIx64 "\n",
@@ -2074,7 +2124,8 @@ static bool AdvanceCommandBuffer(uint64_t command_buffer, uint64_t record_size) 
 }
 
 static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offset,
-                               uint64_t destination, uint64_t size, uint64_t* bytes_read) {
+                               uint64_t destination, uint64_t size, uint64_t* bytes_read,
+                               AprReadHashes* hashes) {
 	if (bytes_read == nullptr) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
@@ -2142,6 +2193,13 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		chunk.resize(APR_HOST_READ_CHUNK_SIZE);
 	}
 
+	XXH3_state_t* file_hash = nullptr;
+	if (hashes != nullptr) {
+		file_hash = XXH3_createState();
+		if (file_hash != nullptr) {
+			XXH3_64bits_reset(file_hash);
+		}
+	}
 	while (*bytes_read < readable) {
 		const auto request = static_cast<uint32_t>(
 		    std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable - *bytes_read));
@@ -2150,8 +2208,29 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		if (read == 0) {
 			break;
 		}
+		if (file_hash != nullptr) {
+			XXH3_64bits_update(file_hash, chunk.data(), read);
+		}
 		std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), chunk.data(), read);
 		*bytes_read += read;
+	}
+	if (file_hash != nullptr) {
+		hashes->file = XXH3_64bits_digest(file_hash);
+		// What guest memory holds now, read through its backing (no tracking faults).
+		XXH3_64bits_reset(file_hash);
+		bool readable_back = true;
+		for (uint64_t done = 0; done < *bytes_read && readable_back;) {
+			const auto piece = std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, *bytes_read - done);
+			readable_back =
+			    LibKernel::Memory::TryReadBacking(destination + done, chunk.data(), piece);
+			if (readable_back) {
+				XXH3_64bits_update(file_hash, chunk.data(), piece);
+			}
+			done += piece;
+		}
+		hashes->guest = readable_back ? XXH3_64bits_digest(file_hash) : ~hashes->file;
+		hashes->made  = true;
+		XXH3_freeState(file_hash);
 	}
 	if (*bytes_read < readable) {
 		// The hardware engine would have written every byte; a short read here means the host

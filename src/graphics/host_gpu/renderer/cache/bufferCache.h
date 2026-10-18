@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCachePages.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
+#include "graphics/host_gpu/renderer/cache/pagedRangeSet.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/cache/writeTicks.h"
 
@@ -68,6 +69,26 @@ public:
 	// bytes still marked in it are never downloaded, there being no memory to put them in.
 	void                   ForgetUnmapped(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// GPU thread, between commands (round 80): while one lives, its ReadMemory calls copy bytes
+	// whose GPU writers are done on the readback queue (FastReadback), as a game thread's do,
+	// instead of waiting for everything queued on the GPU. Only where no command's bindings are
+	// being prepared (their writes are not recorded yet): a flip's read of the display buffer's
+	// compression metadata, where the check on the GPU cannot be made (TextureCache::
+	// MaterializeColorClear). KYTY_BISECT's flipcheck:old waits as before.
+	class GpuThreadFastReads final {
+	public:
+		explicit GpuThreadFastReads(BufferCache& cache) noexcept
+		    : m_cache(cache), m_previous(cache.m_gpu_thread_fast_reads) {
+			cache.m_gpu_thread_fast_reads = true;
+		}
+		~GpuThreadFastReads() { m_cache.m_gpu_thread_fast_reads = m_previous; }
+		GpuThreadFastReads(const GpuThreadFastReads&)            = delete;
+		GpuThreadFastReads& operator=(const GpuThreadFastReads&) = delete;
+
+	private:
+		BufferCache& m_cache;
+		bool         m_previous;
+	};
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	// needs_device_address: the caller reads the data through a buffer device address, which
@@ -296,6 +317,10 @@ private:
 	void                     DeleteBuffer(BufferId id);
 	[[nodiscard]] bool       SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                           bool is_written, bool is_texel_buffer);
+	// Records the copies of an upload UploadCopies staged from `source` into `buffer`, with their
+	// barriers (and the metadata watches' notes of the bytes).
+	void RecordUpload(Buffer& buffer, std::span<const vk::BufferCopy> copies, uint64_t total_size,
+	                  vk::Buffer source);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
@@ -344,7 +369,8 @@ private:
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                          m_buffers;
 	PageTable                                          m_page_table;
-	RangeSet                                           m_gpu_modified_ranges;
+	// With a page bitmap (round 80): HasGpuDirtyBytes answers most "no"s without the tree.
+	PagedRangeSet m_gpu_modified_ranges;
 	// Bytes whose download is recorded but not yet in guest memory.
 	RangeSet                                           m_downloading_ranges;
 	// Every in-flight download's ranges, one entry each: m_downloading_ranges is their union. A
@@ -394,6 +420,8 @@ private:
 	void NoteMetadataWrite(uint64_t vaddr, uint64_t size);
 	// Set by a fast readback that let the access go on (GPU thread), for ReadMemory's counts.
 	bool m_fast_step = false;
+	// GpuThreadFastReads is alive (GPU thread only).
+	bool m_gpu_thread_fast_reads = false;
 	// Readahead (ReadaheadEnabled), GPU thread only: the blocks learned in this generation and
 	// the one before, the GPU-written pieces of them waiting for the next flush, and what it did.
 	static constexpr uint64_t                          ReadaheadBlock      = 64 * 1024;

@@ -182,6 +182,9 @@ public:
 	uint64_t         frame_accessed_last = 0;
 	uint64_t         frame_guest_dropped = 0; // when the guest last dropped it from its heaps
 	size_t           lru_id             = 0;
+	// The LRU tick the cache last gave it (round 80): a touch in the same tick skips the list's
+	// node, a cache miss on most of the draws' textures.
+	uint64_t lru_tick = 0;
 	// Last GPU writer among live overlapping aliases; cleared when another alias takes the bytes.
 	bool             alias_owner        = false;
 	// Kept beside an image of another kind at its address, neither written by the GPU

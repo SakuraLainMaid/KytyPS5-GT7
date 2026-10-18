@@ -3,6 +3,7 @@
 #include "common/cpuAffinity.h"
 #include "common/logging/log.h"
 #include "common/perfStats.h"
+#include "graphics/host_gpu/renderer/cache/pagedRangeSet.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 
 #include <algorithm>
@@ -71,6 +72,10 @@ struct Step {
 	bool              faultblock_old  = false;
 	bool              alias_old       = false;
 	bool              spechash_off    = false;
+	bool              dirtyindex_off  = false;
+	bool              flipcheck_old   = false;
+	bool              bdaprotect_old  = false;
+	bool              listreset_off   = false;
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
 	int32_t           dflush          = -1;   // dflush:<n>; -1: the usual
@@ -281,6 +286,22 @@ bool ParseAction(std::string_view action, Step& step) {
 		step.spechash_off = true;
 		return true;
 	}
+	if (action == "dirtyindex:off") {
+		step.dirtyindex_off = true;
+		return true;
+	}
+	if (action == "flipcheck:old") {
+		step.flipcheck_old = true;
+		return true;
+	}
+	if (action == "bdaprotect:old") {
+		step.bdaprotect_old = true;
+		return true;
+	}
+	if (action == "listreset:off") {
+		step.listreset_off = true;
+		return true;
+	}
 	if (action.starts_with("depth:equal-relaxed:")) {
 		const auto text = std::string(action.substr(20));
 		if (text.empty() || text.size() > 7 ||
@@ -463,9 +484,15 @@ bool FirstUse(uint32_t bit) {
 	return (g_logged.fetch_or(bit, std::memory_order_acq_rel) & bit) == 0;
 }
 
+// The placement the run started with (Common::StartCpuSet: KYTY_CPU_SET, or round 80's default
+// on a Ryzen with a 3D V-Cache die beside another); "start" when it left the placement alone,
+// which gives the process back the processors it started on.
 std::string StartCpuSet() {
-	const char* value = std::getenv("KYTY_CPU_SET");
-	return value != nullptr && value[0] != '\0' ? std::string(value) : std::string("all");
+	static const std::string start = [] {
+		auto set = Common::StartCpuSet();
+		return set.empty() ? std::string("start") : set;
+	}();
+	return start;
 }
 
 // What the step that is on asks of the process (the CPU set, the log) and the name the Perf lines
@@ -490,6 +517,7 @@ void ApplyEffects(bool toggled = false) {
 		                              step->gpu_frames));
 	}
 	GpuTiming::SetWatch(step != nullptr && step->gpu_watch);
+	PagedRangeSet::SetIndexOff(step != nullptr && step->dirtyindex_off);
 	Common::PerfStats::SetSpinLocks(Common::PerfStats::SpinLocksFromEnvironment() ||
 	                                (step != nullptr && step->locks_spin));
 	static std::string applied = StartCpuSet();
@@ -854,6 +882,21 @@ bool ReadOnlyAliasesOff() {
 bool SpecHashOff() {
 	const auto* step = Current();
 	return step != nullptr && step->spechash_off;
+}
+
+bool FlipCheckOld() {
+	const auto* step = Current();
+	return step != nullptr && step->flipcheck_old;
+}
+
+bool BdaProtectOld() {
+	const auto* step = Current();
+	return step != nullptr && step->bdaprotect_old;
+}
+
+bool ListResetOff() {
+	const auto* step = Current();
+	return step != nullptr && step->listreset_off;
 }
 
 float DepthEqualRelaxed() {

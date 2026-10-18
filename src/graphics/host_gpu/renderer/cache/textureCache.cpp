@@ -1106,7 +1106,8 @@ void TextureCache::RegisterImage(ImageId id) {
 	m_zone_stamps.Stamp(image.info.data.address, image.info.data.size);
 	NoteImageChurn(image, true);
 	NoteBindlessStateChange(image);
-	image.lru_id     = m_lru_cache.Insert(id, LruClock());
+	image.lru_tick = LruClock();
+	image.lru_id   = m_lru_cache.Insert(id, image.lru_tick);
 	m_total_used_memory += image.AccountedSize();
 }
 
@@ -1247,9 +1248,15 @@ void TextureCache::FreeImage(ImageId id, const char* why, bool copied) {
 }
 
 void TextureCache::TouchImage(Image& image) {
-	image.frame_accessed_last = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	const auto frame          = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	image.frame_accessed_last = frame;
 	if (image.registered) {
-		m_lru_cache.Touch(image.lru_id, LruClock());
+		// LruClock, from the frame already read.
+		const auto clock = frame + m_gc_tick / 512;
+		if (image.lru_tick < clock) {
+			image.lru_tick = clock;
+			m_lru_cache.Touch(image.lru_id, clock);
+		}
 	}
 }
 
@@ -2312,10 +2319,13 @@ bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
 		}
 		return false;
 	};
-	// Any binding but a video-out read, which needs the guest bytes clean (the readback path). A
-	// texture or storage binding of a target is checked the same way: once the render target's
-	// check left its metadata GPU-written, the first sampling of it downloaded it instead.
-	if (!GpuColorClearEnabled() || desc.type == BindingType::VideoOut) {
+	// A texture or storage binding of a target is checked the same way: once the render target's
+	// check left its metadata GPU-written, the first sampling of it downloaded it instead. And
+	// (round 80) a flip's video-out read: the game's display buffers' DCC is rewritten every frame
+	// by its last compute dispatch, right before the flip, and reading it back waited ~3 ms a frame
+	// for the GPU to finish the frame (round 79's races; found no clear there: the menus' black
+	// frames are where it does). KYTY_BISECT's flipcheck:old reads it back, as before.
+	if (!GpuColorClearEnabled() || (desc.type == BindingType::VideoOut && Bisect::FlipCheckOld())) {
 		return false;
 	}
 	if (desc.info.IsVolume()) {
@@ -2353,6 +2363,13 @@ bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
 		}
 		if (!(image.backing.usage & vk::ImageUsageFlagBits::eColorAttachment)) {
 			return decline("image without color-attachment use");
+		}
+		// A flip of guest bytes newer than the image goes the old way: the read-back and its
+		// check that a compressed one has none (FindImage). (A CPU write next to it only, a
+		// "maybe", is checked against its hash by InitializeImage below.)
+		if (desc.type == BindingType::VideoOut &&
+		    (image.IsBufferModified() || image.IsDefinitelyCpuDirty())) {
+			return decline("video-out image older than its guest bytes");
 		}
 		samples = image.backing.samples;
 	}
@@ -3059,7 +3076,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	const auto checked_begin = range.address + slice_bytes * first;
 	const auto checked_bytes = slice_bytes * count;
 	if (gpu_written && !known_fill && GpuColorClearEnabled() &&
-	    desc.type != BindingType::VideoOut) {
+	    (desc.type != BindingType::VideoOut || !Bisect::FlipCheckOld())) {
 		// (A CPU write to bytes the GPU had not written leaves them CPU-dirty, which the watch
 		// does not see.)
 		const bool unwritten = !m_buffer_cache.IsRegionCpuModified(checked_begin, checked_bytes) &&
@@ -3109,7 +3126,14 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		}
 		// Who keeps writing it (the first few ranges): the download drains the GPU each time.
 		m_buffer_cache.WatchGpuWrites(range.address, range.size, "color metadata");
-		m_buffer_cache.ReadMemory(range.address, range.size, false);
+		if (desc.type == BindingType::VideoOut) {
+			// A flip the check on the GPU declined: between commands, so the bytes are copied on
+			// the readback queue if their writer is done (round 80).
+			const BufferCache::GpuThreadFastReads fast_reads(m_buffer_cache);
+			m_buffer_cache.ReadMemory(range.address, range.size, false);
+		} else {
+			m_buffer_cache.ReadMemory(range.address, range.size, false);
+		}
 	}
 	static std::atomic<uint64_t> downloads {0}, cleared {0};
 	bool                         found_clear = false;

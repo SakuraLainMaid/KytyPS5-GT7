@@ -18,7 +18,8 @@ struct GraphicContext;
 
 class SamplerCache {
 public:
-	explicit SamplerCache(GraphicContext& graphics): m_graphics(graphics) {
+	explicit SamplerCache(GraphicContext& graphics)
+	    : m_graphics(graphics), m_generation(NextGeneration()) {
 		EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	}
 	~SamplerCache();
@@ -43,7 +44,11 @@ private:
 		}
 	};
 
+	// Each cache's own number, for the threads' front caches of its samplers (GetSampler).
+	static uint64_t NextGeneration();
+
 	GraphicContext&                                             m_graphics;
+	uint64_t                                                    m_generation = 0;
 	Common::Mutex                                               m_mutex;
 	std::unordered_map<SamplerKey, vk::Sampler, SamplerKeyHash> m_samplers;
 };

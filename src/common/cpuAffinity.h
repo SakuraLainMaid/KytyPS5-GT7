@@ -23,6 +23,14 @@ void PreferPerformanceCores(const char* name);
 // "gpufrequency" (the other way round).
 bool SetProcessCpuSet(const char* which, std::string* description);
 
+// The placement the run starts with: KYTY_CPU_SET when it is set; otherwise, round 80,
+// "gpuvcache" on a CPU with a 3D V-Cache die beside another (a Ryzen X3D with two dies: the
+// GPU-side threads on the V-Cache die, +1.5 fps in round 79's races), unless the process was
+// started with an affinity of its own; else none (empty). `reason` says why. KYTY_CPU_SET=off
+// leaves the threads' placement alone, as before round 80; KYTY_CPU_SET=all runs every thread on
+// every processor.
+[[nodiscard]] std::string StartCpuSet(std::string* reason = nullptr);
+
 // The calling thread feeds the host GPU (the GPU thread, draw preparation, Vulkan recording):
 // SetProcessCpuSet's "gpuvcache" and "gpufrequency" place it apart from the other threads.
 void RegisterGpuSideThread(const char* name);

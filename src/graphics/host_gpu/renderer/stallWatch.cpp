@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 #include "common/perfStats.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <atomic>
@@ -139,6 +140,14 @@ void UpdateMemoryText(const GraphicContext& graphics) {
 	          "{:.1f} GB)",
         gb(graphics.GetDeviceMemoryUsage()), gb(graphics.GetRawMemoryBudget()),
         gb(graphics.GetTotalMemoryBudget()), gb(graphics.MemoryShortfall()));
+	// The guest's own direct memory (round 80): a race whose load needs more than it has fails
+	// its allocations, and the game then crashes.
+	if (const auto use = LibKernel::Memory::GetDirectMemoryUse(); use.size != 0) {
+		static uint64_t peak = 0;
+		peak                 = std::max(peak, use.allocated);
+		text += fmt::format(" | game memory {:.2f} of {:.2f} GB in {} blocks (peak {:.2f} GB)",
+		                    gb(use.allocated), gb(use.size), use.blocks, gb(peak));
+	}
 	{
 		std::scoped_lock lock(g_memory_mutex);
 		g_memory_text = std::move(text);

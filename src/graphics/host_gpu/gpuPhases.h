@@ -92,6 +92,11 @@ inline Totals g_totals;
 inline thread_local Phase                                          t_step = Phase::Count;
 inline std::array<uint64_t, static_cast<size_t>(Phase::Count) + 1> g_protect_cycles {};
 inline std::array<uint64_t, static_cast<size_t>(Phase::Count) + 1> g_protect_count {};
+// Round 80: the pages those changes covered, and what they set the pages to (no access,
+// read-only, read-write), by step.
+inline std::array<uint64_t, static_cast<size_t>(Phase::Count) + 1> g_protect_pages {};
+inline std::array<std::array<uint64_t, 3>, static_cast<size_t>(Phase::Count) + 1>
+                             g_protect_modes {};
 [[nodiscard]] constexpr bool ChargesProtects(Phase phase) noexcept {
 	return phase == Phase::Process || phase == Phase::Command || phase == Phase::Draw ||
 	       phase == Phase::Dispatch || phase == Phase::BdaWalk ||
@@ -114,6 +119,17 @@ inline void Count(Phase phase, uint64_t n) noexcept {
 	if (Detail::t_on) {
 		Detail::g_totals.count[static_cast<size_t>(phase)] += n;
 	}
+}
+
+// A page protection change of `bytes` to `mode` (0 no access, 1 read-only, 2 read-write), charged
+// to the step a Protect scope would charge it to, on the GPU thread (round 80).
+inline void NoteProtect(uint64_t bytes, uint32_t mode) noexcept {
+	if (!Detail::t_on) {
+		return;
+	}
+	const auto step = static_cast<size_t>(Detail::t_step);
+	Detail::g_protect_pages[step] += (bytes + 4095u) >> 12u;
+	Detail::g_protect_modes[step][mode < 2u ? mode : 2u]++;
 }
 
 // The count of `phase` so far (GPU thread).

@@ -171,7 +171,7 @@ bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t 
 	const auto                  buffer_address = buffer.CpuAddress();
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
-		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
+		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges.Ranges(), address, bytes,
 		                                           "buffer download");
 		    std::unique_lock lock(m_dirty_ranges_mutex);
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
@@ -1206,8 +1206,21 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 	}
 	Timeline::Mark("readmem", vaddr, from_gpu_thread ? 1u : 0u);
 	// Bytes the GPU has finished writing: copied on the readback queue at once, instead of behind
-	// what the renderer's queue still has to run.
-	if (async && FastReadback(buffer, vaddr, size, window_begin, window_end, is_write)) {
+	// what the renderer's queue still has to run. The GPU thread's own reads too where it allows
+	// (GpuThreadFastReads): the copy is done when FastReadback returns.
+	const bool gpu_thread_fast =
+	    from_gpu_thread && m_gpu_thread_fast_reads && !Bisect::FlipCheckOld();
+	if ((async || gpu_thread_fast) &&
+	    FastReadback(buffer, vaddr, size, window_begin, window_end, is_write)) {
+		if (gpu_thread_fast) {
+			static std::atomic<uint64_t> fast_reads {0};
+			const auto                   n = fast_reads.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (std::has_single_bit(n)) {
+				LOGF("ReadMemory: %" PRIu64 " reads of the GPU thread copied on the readback "
+				     "queue (round 80; flipcheck:old waits for the GPU as before)\n",
+				     n);
+			}
+		}
 		return 0;
 	}
 	if (!from_gpu_thread) {
@@ -1481,46 +1494,49 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    });
 	}
 	RecordSync(size, is_written, static_cast<bool>(source), timed ? walk_timer.GetTimeS() : 0.0);
-	if (source && m_metadata_watch_count.load(std::memory_order_relaxed) != 0) {
-		// Bytes the CPU wrote, uploaded over what a fast-clear check left there.
-		std::unique_lock lock(m_dirty_ranges_mutex);
-		for (const auto& copy: copies) {
-			NoteMetadataWrite(buffer.CpuAddress() + copy.dstOffset, copy.size);
-		}
-	}
 	if (source) {
-		KYTY_PROFILER_BLOCK("Sync::Copy");
-		m_scheduler.NoteTransfer(StallWatch::Transfer::BufferUpload, total_size);
-		auto& command = m_scheduler.Current();
-		command.EndRendering();
-		const auto native = command.Recorder();
-		vk::BufferMemoryBarrier before {};
-		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
-		                       vk::AccessFlagBits::eTransferRead |
-		                       vk::AccessFlagBits::eTransferWrite;
-		before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
-		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.buffer              = buffer.Handle();
-		before.offset              = 0;
-		before.size                = buffer.Size();
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::PipelineStageFlagBits::eTransfer,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
-		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
-		                  copies.data());
-		auto after          = before;
-		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-		                       vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+		RecordUpload(buffer, copies, total_size, source);
 	}
 	if (is_texel_buffer && !is_written) {
 		KYTY_PROFILER_BLOCK("Sync::TexelImage");
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
 	}
 	return false;
+}
+
+void BufferCache::RecordUpload(Buffer& buffer, std::span<const vk::BufferCopy> copies,
+                               uint64_t total_size, vk::Buffer source) {
+	if (m_metadata_watch_count.load(std::memory_order_relaxed) != 0) {
+		// Bytes the CPU wrote, uploaded over what a fast-clear check left there.
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		for (const auto& copy: copies) {
+			NoteMetadataWrite(buffer.CpuAddress() + copy.dstOffset, copy.size);
+		}
+	}
+	KYTY_PROFILER_BLOCK("Sync::Copy");
+	m_scheduler.NoteTransfer(StallWatch::Transfer::BufferUpload, total_size);
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto              native = command.Recorder();
+	vk::BufferMemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+	                       vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = buffer.Handle();
+	before.offset              = 0;
+	before.size                = buffer.Size();
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
+	                       0, nullptr, 1, &before, 0, nullptr);
+	native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()), copies.data());
+	auto after          = before;
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 }
 
 // Reads guest memory for an upload. The guest can unmap memory a cached buffer still covers: AMM
@@ -1823,7 +1839,34 @@ std::unordered_map<uint64_t, WriterDownloads> g_writer_downloads;
 uint64_t                                      g_game_downloads = 0;
 } // namespace
 
+// Whether GpuWritersOf may be asked (round 80): its records were made for every GPU write, a map
+// insertion under a lock and a clock read each, ~1 % of the GPU thread in a race, for logs that
+// only the frame captures (F9), KYTY_WATCH_SHADER and KYTY_TRACE_IMAGES write, and the game
+// threads' downloads by writer. KYTY_GPU_WRITERS=1 keeps them always (a capture then also names
+// the writers of earlier frames).
+static bool GpuWriterRecordsWanted() {
+	static const bool always = [] {
+		const auto set = [](const char* name) {
+			const char* value = std::getenv(name);
+			return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+		};
+		return set("KYTY_GPU_WRITERS") || set("KYTY_WATCH_SHADER") || set("KYTY_TRACE_IMAGES");
+	}();
+	return always || FrameGraph::Logging();
+}
+
 void BufferCache::RecordGpuWriter(uint64_t vaddr, uint64_t size, uint64_t shader, uint64_t tick) {
+	// Records stop being made outside the stretches that want them: those of a stretch are
+	// dropped when it ends, so nothing names old writers later.
+	static std::atomic<bool> recording {false};
+	if (!GpuWriterRecordsWanted()) {
+		if (recording.exchange(false, std::memory_order_relaxed)) {
+			std::lock_guard lock(g_writers_mutex);
+			g_writers.clear();
+		}
+		return;
+	}
+	recording.store(true, std::memory_order_relaxed);
 	const auto      now = StallWatch::NowNs();
 	std::lock_guard lock(g_writers_mutex);
 	if (g_writers.size() >= 65536) {
@@ -1907,8 +1950,11 @@ void BufferCache::ReportGameThreadDownload(uint64_t vaddr, uint64_t bytes, uint6
 			                        static_cast<double>(writer.aged));
 		}
 	}
-	LOGF("ReadMemory: %" PRIu64 " game-thread downloads, by writer:%s\n", g_game_downloads,
-	     line.c_str());
+	LOGF("ReadMemory: %" PRIu64 " game-thread downloads, by writer:%s%s\n", g_game_downloads,
+	     line.c_str(),
+	     GpuWriterRecordsWanted() ? ""
+	                              : " (writers are recorded only with KYTY_GPU_WRITERS=1 or in "
+	                                "F9 captures: \"unknown\" otherwise)");
 }
 
 bool BufferCache::ReadaheadEnabled() {
@@ -2608,8 +2654,9 @@ void BufferCache::RunGarbageCollector() {
 			// See CreateBuffer: the tracker rejects address 0, so this one is never collected.
 			return false;
 		}
-		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
-		                                           buffer.Size(), "garbage collection");
+		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges.Ranges(),
+		                                           buffer.CpuAddress(), buffer.Size(),
+		                                           "garbage collection");
 		// An aged GPU-dirty buffer is downloaded and dropped under either policy. Retaining it
 		// (the non-aggressive rule before) leaves its GPU-written bytes owning the pages
 		// forever, and the images that share those pages are then re-sourced from the
@@ -2718,6 +2765,12 @@ uint64_t BufferCache::SynchronizeBdaPending(const RangeSet& mapped) {
 	thread_local std::vector<std::pair<uint64_t, uint64_t>> runs;
 	uint64_t                                                regions = 0;
 	const bool                                              by_run  = Bisect::BdaSpanOff();
+	// Round 80: the spans of a region's buffers write-protect their pages again in one change
+	// (MemoryTracker::TakeCpuDirtySpans); KYTY_BISECT's bdaprotect:old syncs each span on its own.
+	const bool                         together = !by_run && !Bisect::BdaProtectOld();
+	thread_local std::vector<BufferId> span_buffers;
+	thread_local std::vector<std::pair<uint64_t, uint64_t>> spans;
+	thread_local std::vector<std::vector<vk::BufferCopy>>   span_copies;
 	// A buffer's runs in one mapped part of the region: the buffers do not overlap and the runs
 	// ascend, so they come one after another.
 	const auto sync_runs = [&] {
@@ -2730,12 +2783,19 @@ uint64_t BufferCache::SynchronizeBdaPending(const RangeSet& mapped) {
 		BufferId   current {};
 		uint64_t   span_begin = 0;
 		uint64_t   span_end   = 0;
+		span_buffers.clear();
+		spans.clear();
 		const auto flush      = [&] {
             if (current) {
-                (void)SynchronizeBuffer(m_slot_buffers[current], span_begin, span_end - span_begin,
-				                             false, false);
-                current = {};
-            }
+				if (together) {
+					span_buffers.push_back(current);
+					spans.emplace_back(span_begin, span_end - span_begin);
+				} else {
+					(void)SynchronizeBuffer(m_slot_buffers[current], span_begin,
+					                        span_end - span_begin, false, false);
+				}
+				current = {};
+			}
 		};
 		for (const auto& [address, bytes]: runs) {
 			const auto end = address + bytes;
@@ -2761,6 +2821,34 @@ uint64_t BufferCache::SynchronizeBdaPending(const RangeSet& mapped) {
 			}
 		}
 		flush();
+		if (!together || spans.empty()) {
+			return;
+		}
+		const GpuPhases::Scope phase(GpuPhases::Phase::BufferSync);
+		if (span_copies.size() < spans.size()) {
+			span_copies.resize(spans.size());
+		}
+		std::vector<uint64_t> totals(spans.size(), 0);
+		for (size_t i = 0; i < spans.size(); i++) {
+			span_copies[i].clear();
+		}
+		m_memory_tracker.TakeCpuDirtySpans(
+		    spans, [&](size_t index, uint64_t address, uint64_t bytes) noexcept {
+			    auto& buffer = m_slot_buffers[span_buffers[index]];
+			    span_copies[index].emplace_back(totals[index], buffer.Offset(address), bytes);
+			    totals[index] += bytes;
+		    });
+		for (size_t i = 0; i < spans.size(); i++) {
+			auto& buffer = m_slot_buffers[span_buffers[i]];
+			RecordSync(spans[i].second, false, !span_copies[i].empty(), 0.0);
+			if (span_copies[i].empty()) {
+				continue;
+			}
+			const auto source = UploadCopies(buffer, span_copies[i], totals[i]);
+			if (source) {
+				RecordUpload(buffer, span_copies[i], totals[i], source);
+			}
+		}
 	};
 	m_memory_tracker.TakeBdaPending([&](uint64_t region) {
 		regions++;

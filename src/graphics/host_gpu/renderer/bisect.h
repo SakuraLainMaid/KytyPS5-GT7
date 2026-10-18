@@ -163,6 +163,22 @@
 //   cpu:gpuvcache the GPU thread and the emulator's threads that feed it (draw preparation,
 //                Vulkan recording) prefer the processors sharing the largest L3 cache and every
 //                other thread the rest (cpu:gpufrequency the other way round)
+// and (round 80):
+//   cpu:all      every thread runs on any processor, as before round 80 (which places the GPU
+//                thread and its helpers as cpu:gpuvcache does on a Ryzen with a 3D V-Cache die
+//                beside another, Common::StartCpuSet)
+//   dirtyindex:off whether guest bytes hold GPU-written ones is asked of the range tree every
+//                time, as before round 80, instead of first of a bitmap of the pages they touch
+//   flipcheck:old a flip reads the display buffer's compression metadata back for its fast
+//                clear, waiting for everything queued on the GPU, as before round 80, instead of
+//                checking it on the GPU as a render target's is (or, where that cannot be,
+//                copying it on the readback queue once its writer is done)
+//   bdaprotect:old a walk for shaders that read memory through addresses write-protects again
+//                the pages it uploaded buffer by buffer, as before round 80, instead of all those
+//                of a tracker region at once
+//   listreset:off an indexed list draw whose indices hold the guest's primitive reset index draws
+//                it as a vertex, as before round 80, instead of dropping the primitive it falls in
+//                (KYTY_LIST_RESET=0 for the whole run)
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -248,6 +264,11 @@ void                      ApplyPending();
 [[nodiscard]] bool FaultBlockAroundImagesOff();
 [[nodiscard]] bool ReadOnlyAliasesOff();
 [[nodiscard]] bool SpecHashOff();
+// Any thread: flipcheck:old; bdaprotect:old; listreset:off (dirtyindex:off is applied to
+// PagedRangeSet directly).
+[[nodiscard]] bool FlipCheckOld();
+[[nodiscard]] bool BdaProtectOld();
+[[nodiscard]] bool ListResetOff();
 // Any thread: depth:equal-relaxed's bias in units of depth precision; 0 when off.
 [[nodiscard]] float DepthEqualRelaxed();
 
