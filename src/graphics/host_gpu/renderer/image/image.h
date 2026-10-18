@@ -184,6 +184,9 @@ public:
 	size_t           lru_id             = 0;
 	// Last GPU writer among live overlapping aliases; cleared when another alias takes the bytes.
 	bool             alias_owner        = false;
+	// Kept beside an image of another kind at its address, neither written by the GPU
+	// (TextureCache::KeepReadOnlyAlias, round 79): a GPU write to one of them frees the others.
+	bool read_only_alias = false;
 	// CommandScheduler tick, and metadata slices, MaterializeDccClear last resolved this image's
 	// DCC metadata for. UINT64_MAX means never checked. Lets repeated FindImage lookups within
 	// the same still-unsubmitted recording (i.e. many draws to the same bound render target) skip

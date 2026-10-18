@@ -37,7 +37,8 @@ namespace {
 // "faultblock:off" too): a CPU write fault in a block of that size that also faulted less than
 // 100 ms before releases the whole aligned block from the buffer cache's write tracking, instead
 // of the faulting page alone, when no byte of it is GPU-written (checked in the same lock hold as
-// the release) and no image lies in it. The game rewrites some heaps every frame a page at a time,
+// the release) and no image lies in it (round 79: when one does, the block's pages it does not lie
+// on; ReleaseAroundImages). The game rewrites some heaps every frame a page at a time,
 // and each of those pages faulted on its own (a signal, a protection change and a TLB flush on
 // every processor): 40,000 faults a second at Tokyo. Its other pages are uploaded at the block's
 // next use, changed or not. Not once a shader stores through shader addresses (those stores mark
@@ -87,10 +88,14 @@ bool BlockFaultedRecently(uint64_t block_index, uint64_t now_ms) {
 // The blocks released (and the faults that did not release one) in the last 10 s or so, logged.
 std::atomic<uint64_t> g_released_blocks {0};
 std::atomic<uint64_t> g_page_faults {0};
+std::atomic<uint64_t> g_around_images {0};
 std::atomic<uint64_t> g_fault_report_ms {0};
 
-void NoteWriteFault(bool released, uint64_t now_ms) {
-	(released ? g_released_blocks : g_page_faults).fetch_add(1, std::memory_order_relaxed);
+void NoteWriteFault(bool released, bool around_image, uint64_t now_ms) {
+	(around_image ? g_around_images
+	 : released   ? g_released_blocks
+	              : g_page_faults)
+	    .fetch_add(1, std::memory_order_relaxed);
 	auto last = g_fault_report_ms.load(std::memory_order_relaxed);
 	if (last == 0) {
 		g_fault_report_ms.compare_exchange_strong(last, now_ms, std::memory_order_relaxed);
@@ -102,8 +107,52 @@ void NoteWriteFault(bool released, uint64_t now_ms) {
 	}
 	const auto blocks = g_released_blocks.exchange(0, std::memory_order_relaxed);
 	const auto pages  = g_page_faults.exchange(0, std::memory_order_relaxed);
-	LOGF("Write faults, %.0f s: %" PRIu64 " released a whole block, %" PRIu64 " their own page\n",
-	     static_cast<double>(now_ms - last) / 1000.0, blocks, pages);
+	const auto around = g_around_images.exchange(0, std::memory_order_relaxed);
+	LOGF("Write faults, %.0f s: %" PRIu64 " released a whole block, %" PRIu64
+	     " the pages of their block around an image, %" PRIu64 " their own page\n",
+	     static_cast<double>(now_ms - last) / 1000.0, blocks, around, pages);
+}
+
+// Round 79: a write fault in a block that faulted again and that an image lies in releases the
+// runs of the block's pages no image lies on (each run on its own, so one holding GPU-written
+// bytes stays tracked), as a fault in a block without images releases the whole block. The pages
+// an image lies on keep faulting one by one (the texture cache's own tracking of them is what
+// those faults are for). Returns the pages released; fault_released tells whether the faulting
+// page is among them.
+uint64_t ReleaseAroundImages(BufferCache& cache, uint64_t block, uint64_t block_bytes,
+                             uint64_t image_pages, uint64_t fault_vaddr, bool& fault_released) {
+	fault_released       = false;
+	const uint64_t pages = block_bytes / TRACKER_PAGE_SIZE;
+	if (pages == 0 || pages > 64 || block_bytes % TRACKER_PAGE_SIZE != 0) {
+		return 0;
+	}
+	const uint64_t all       = pages == 64 ? ~uint64_t {0} : (uint64_t {1} << pages) - 1u;
+	const uint64_t imageless = ~image_pages & all;
+	if (imageless == 0) {
+		return 0;
+	}
+	const auto fault_page = (fault_vaddr - block) / TRACKER_PAGE_SIZE;
+	uint64_t   released   = 0;
+	for (uint64_t first = 0; first < pages;) {
+		if ((imageless >> first & 1u) == 0) {
+			first++;
+			continue;
+		}
+		uint64_t last = first;
+		while (last + 1 < pages && (imageless >> (last + 1) & 1u) != 0) {
+			last++;
+		}
+		const auto begin = block + first * TRACKER_PAGE_SIZE;
+		const auto bytes = (last - first + 1) * TRACKER_PAGE_SIZE;
+		if (cache.ReleaseBlockForCpuWrite(begin, bytes)) {
+			LibKernel::Memory::JournalWrite(begin, bytes,
+			                                LibKernel::Memory::WriteSource::CpuWriteFault);
+			released += last - first + 1;
+			fault_released = fault_released || (fault_page >= first && fault_page <= last);
+		}
+		first = last + 1;
+	}
+	return released;
 }
 
 // Hot pages (Bisect::HotPages): whether the page (or block) faulted within 250 ms of its fault
@@ -232,6 +281,8 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			const auto now      = NowMs();
 			const auto block    = Common::AlignDown(fault_vaddr, block_bytes);
 			bool       released = false;
+			// The pages released around an image (round 79), the faulting one among them or not.
+			uint64_t around = 0;
 			if (!BlockFaultedRecently(block / block_bytes, now)) {
 				outcome = Outcome::NotRecent;
 			} else if (m_buffer_cache.AddressWritesSeen()) {
@@ -239,11 +290,21 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			} else if (!IsMapped(block, block_bytes)) {
 				outcome = Outcome::BlockUnmapped;
 			} else {
-				// The texture cache first: an image in the block keeps it to the faulting page.
-				texture_done = true;
+				// The texture cache first: an image in the block keeps the pages it lies on to
+				// their own faults (before round 79, the whole block: 88 % of a race's write
+				// faults were in blocks of GT7's per-frame memory that an image lies in).
+				texture_done         = true;
+				uint64_t image_pages = 0;
 				if (m_texture_cache.InvalidateMemoryNear(fault_vaddr, fault_size, block,
-				                                         block_bytes)) {
+				                                         block_bytes, &image_pages)) {
 					outcome = Outcome::ImageInBlock;
+					if (!Bisect::FaultBlockAroundImagesOff()) {
+						around = ReleaseAroundImages(m_buffer_cache, block, block_bytes,
+						                             image_pages, fault_vaddr, released);
+						if (around != 0) {
+							outcome = Outcome::AroundImage;
+						}
+					}
 				} else if (!m_buffer_cache.ReleaseBlockForCpuWrite(block, block_bytes)) {
 					outcome = Outcome::GpuBytes;
 				} else {
@@ -251,8 +312,13 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 					released = true;
 				}
 			}
-			NoteWriteFault(released, now);
+			NoteWriteFault(released, around != 0, now);
 			FaultPages::Note(fault_vaddr, frame, outcome);
+			if (released && around != 0) {
+				// The released runs were journaled as they were released.
+				m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
+				return true;
+			}
 			if (released) {
 				LibKernel::Memory::JournalWrite(block, block_bytes,
 				                                LibKernel::Memory::WriteSource::CpuWriteFault);

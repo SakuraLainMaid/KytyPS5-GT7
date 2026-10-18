@@ -75,7 +75,7 @@ private:
 	void Dispatch(const DrawPrep::Key& key, const PipelineCache::DrawPrepInputs& inputs);
 	void Walk(Job& job);
 	// Publishes the result of job `index` (none: nothing prepared) once those before it are.
-	void Finish(uint64_t index, DrawPrep::PacketResult* result);
+	void Finish(uint64_t index, std::unique_ptr<DrawPrep::PacketResult> result);
 	void Scan(const Item& item);
 	void ScanDraw(uint64_t seq, uint32_t ordinal, const uint32_t* packet);
 	void ScanDispatch(uint64_t seq, uint32_t ordinal, const uint32_t* packet, uint32_t opcode);
@@ -100,7 +100,7 @@ private:
 	bool                                                      m_job_stop   = false;
 	uint64_t                                                  m_next_index = 0; // scanner
 	std::mutex                                                m_order_mutex;
-	std::map<uint64_t, std::optional<DrawPrep::PacketResult>> m_done;
+	std::map<uint64_t, std::unique_ptr<DrawPrep::PacketResult>> m_done; // null: none
 	uint64_t                                                  m_next_publish = 0;
 	std::atomic<bool>                                         m_stopping {false};
 	std::vector<std::thread>                                  m_workers;

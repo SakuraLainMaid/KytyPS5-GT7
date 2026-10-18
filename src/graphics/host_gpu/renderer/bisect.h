@@ -152,6 +152,20 @@
 //   texmemo:global a texture binding kept for reuse is looked up again whenever any image was
 //                made or dropped anywhere, as before round 78, instead of only when one was over
 //                memory near its own (TextureCache::RangeStamp)
+// and (round 79):
+//   faultblock:old a write fault in a block an image lies in releases its own page only, as
+//                before round 79, instead of the block's pages no image lies on as well
+//   alias:old    a texture read of memory another image of another kind holds replaces that image
+//                (or is copied into a larger one), as before round 79, even when neither was
+//                ever written by the GPU (TextureCache::KeepReadOnlyAlias)
+//   spechash:off a stage's shader permutation is found by comparing its specialization, as
+//                before round 79, instead of by the hash the draw-prep scanner made of it
+//   cpu:gpuvcache the GPU thread and the emulator's threads that feed it (draw preparation,
+//                Vulkan recording) prefer the processors sharing the largest L3 cache and every
+//                other thread the rest (cpu:gpufrequency the other way round)
+// KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
+// 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
+// with the ones next to it, made on nearly the same frames.
 namespace Libs::Graphics::Bisect {
 
 // The GPU thread, at its start: applies the start step's CPU set and log setting.
@@ -230,6 +244,10 @@ void                      ApplyPending();
 // Any thread: drawprep:notess; texmemo:global.
 [[nodiscard]] bool DrawPrepNoTess();
 [[nodiscard]] bool TextureMemoGlobal();
+// Any thread: faultblock:old; alias:old; spechash:off.
+[[nodiscard]] bool FaultBlockAroundImagesOff();
+[[nodiscard]] bool ReadOnlyAliasesOff();
+[[nodiscard]] bool SpecHashOff();
 // Any thread: depth:equal-relaxed's bias in units of depth precision; 0 when off.
 [[nodiscard]] float DepthEqualRelaxed();
 

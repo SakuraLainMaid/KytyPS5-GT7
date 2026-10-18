@@ -713,6 +713,7 @@ void GuestGpu::ThreadRun(void* data) {
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	Common::PreferPerformanceCores("GPU thread");
+	Common::RegisterGpuSideThread("Thread_Gpu");
 	Profiler::t_gpu_thread = true;
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;

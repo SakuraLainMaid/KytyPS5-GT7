@@ -18,6 +18,8 @@ enum class Outcome : uint8_t {
 	ImageInBlock,  // a write fault in a block an image lies in
 	GpuBytes,      // a write fault in a block that holds GPU-written bytes
 	BlocksOff,     // a write fault with block release off
+	AroundImage,   // a write fault in a block an image lies in, whose other pages it released
+	               // (round 79)
 	Read,          // a read fault (on memory the GPU wrote)
 	Count
 };

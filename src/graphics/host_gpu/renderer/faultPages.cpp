@@ -232,7 +232,7 @@ private:
 				            : fmt::format("{:.1f}", static_cast<double>(value) /
 				                                        static_cast<double>(frames_done));
 			};
-			auto config = Common::PerfStats::Configuration();
+			auto config = Common::PerfStats::WindowConfiguration();
 			if (config.empty()) {
 				config = "normal";
 			}
@@ -243,7 +243,8 @@ private:
 			    "a frame's pages faulted the frame before too; %" PRIu64
 			    " pages fault in 3/4 of the frames or more (%s of the faults) | what the write "
 			    "faults did: released a block %s, first in their block in 100 ms %s, address "
-			    "writes %s, an image in the block %s, GPU-written bytes in the block %s, block not "
+			    "writes %s, an image in the block %s, released the block around an image %s, "
+			    "GPU-written bytes in the block %s, block not "
 			    "mapped %s, blocks off %s | reads %s a frame on %s pages (%s the frame before too) "
 			    "| %s submissions a frame | hot pages: %" PRIu64 " now, %" PRIu64
 			    " made hot, %s refreshes a frame making %s pages CPU-dirty again a frame, %" PRIu64
@@ -256,11 +257,12 @@ private:
 			    w.steady_pages, Percent(w.steady_hits, w.faults).c_str(),
 			    outcome(Outcome::Released).c_str(), outcome(Outcome::NotRecent).c_str(),
 			    outcome(Outcome::AddressWrites).c_str(), outcome(Outcome::ImageInBlock).c_str(),
-			    outcome(Outcome::GpuBytes).c_str(), outcome(Outcome::BlockUnmapped).c_str(),
-			    outcome(Outcome::BlocksOff).c_str(), per_frame(r.faults).c_str(),
-			    per_frame(r.pages).c_str(), Percent(r.again, r.again_of).c_str(),
-			    per_done(subs_done).c_str(), g_hot_now.load(std::memory_order_relaxed), marked,
-			    per_done(refreshes).c_str(), per_done(redirtied).c_str(), clears);
+			    outcome(Outcome::AroundImage).c_str(), outcome(Outcome::GpuBytes).c_str(),
+			    outcome(Outcome::BlockUnmapped).c_str(), outcome(Outcome::BlocksOff).c_str(),
+			    per_frame(r.faults).c_str(), per_frame(r.pages).c_str(),
+			    Percent(r.again, r.again_of).c_str(), per_done(subs_done).c_str(),
+			    g_hot_now.load(std::memory_order_relaxed), marked, per_done(refreshes).c_str(),
+			    per_done(redirtied).c_str(), clears);
 		}
 	}
 

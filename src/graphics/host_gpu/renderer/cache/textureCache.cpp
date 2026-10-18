@@ -1167,6 +1167,10 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image->IsGpuModified()) {
 		EXIT("TextureCache: deleting a GPU-modified image without resolving its contents\n");
 	}
+	if (image->read_only_alias) {
+		image->read_only_alias = false;
+		m_read_only_aliases--;
+	}
 	m_download_images.erase(id);
 	if (image->info.HasMetadata()) {
 		const auto metadata = m_surface_metas.find(image->info.metadata.range.address);
@@ -1795,6 +1799,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
 	if (requested.data.address == cached.info.data.address &&
 	    requested.BlockExtent() == cached.info.BlockExtent() && requested_block == cached_block) {
+		if (KeepReadOnlyAlias(requested, binding, cached)) {
+			return {.image = merged_id, .kept_alias = true};
+		}
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
 			return {depth_id};
 		}
@@ -1896,6 +1903,81 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		FreeImage(cached_id, "an image over its memory took its place");
 	}
 	return {merged_id};
+}
+
+namespace {
+// Read-only aliases (round 79): at most this large, each.
+constexpr uint64_t ReadOnlyAliasMaxBytes = uint64_t {64} << 10u;
+} // namespace
+
+bool TextureCache::ReadOnlyAliasCandidate(const Image& image) {
+	return image.registered && !image.depth_id && image.stencil_ids.empty() &&
+	       !image.IsGpuModified() && !image.gpu_pixels && !image.IsBufferModified() &&
+	       !image.usage.storage && !image.usage.render_target && !image.usage.depth_target &&
+	       !image.usage.video_out && !image.binding.is_target && !image.binding.shader_write &&
+	       image.info.samples == 1 && image.backing.samples == 1 && !image.info.HasStencil() &&
+	       !image.info.HasMetadata() && !image.info.data.Empty() &&
+	       image.info.data.size <= ReadOnlyAliasMaxBytes;
+}
+
+bool TextureCache::KeepReadOnlyAlias(const ImageInfo& requested, BindingType binding,
+                                     const Image& cached) const {
+	if (binding != BindingType::Texture || Bisect::ReadOnlyAliasesOff() ||
+	    !ReadOnlyAliasCandidate(cached) || requested.samples != 1 || requested.HasStencil() ||
+	    requested.HasMetadata() || requested.data.Empty() ||
+	    requested.data.size > ReadOnlyAliasMaxBytes ||
+	    requested.data.address != cached.info.data.address ||
+	    requested.tile_mode != cached.info.tile_mode) {
+		return false;
+	}
+	// Kinds one native image cannot serve both of, where a read of the other kind replaced the
+	// image before: a volume and a flat image (ResolveDepthOverlap's recreation, ExpandImage), a
+	// depth read of a color image (ResolveDepthOverlap's recreation). A color read of a depth
+	// image goes on using the depth image, as before.
+	return requested.IsVolume() != cached.info.IsVolume() ||
+	       (requested.IsDepth() && !cached.info.IsDepth());
+}
+
+void TextureCache::MarkReadOnlyAlias(Image& image) {
+	if (!image.read_only_alias && image.registered) {
+		image.read_only_alias = true;
+		m_read_only_aliases++;
+	}
+}
+
+void TextureCache::FreeReadOnlyAliasesOf(const Image& image) {
+	if (image.info.data.Empty()) {
+		return;
+	}
+	// Its siblings start where it does: they are among the owners of its first page.
+	ImageIds siblings;
+	if (const auto* owners =
+	        m_image_page_table.Find(image.info.data.address >> ImagePageTable::kPageBits);
+	    owners != nullptr) {
+		owners->ForEach([&](ImageId id) {
+			const auto* other = m_slot_images.try_get(id);
+			// One bound as a target in the draw at hand is left to its own write (freeing it
+			// here would leave the draw a target that is gone).
+			if (other != nullptr && other != &image && other->registered &&
+			    other->read_only_alias && other->info.data.address == image.info.data.address &&
+			    !other->IsGpuModified() && !other->binding.is_target) {
+				siblings.push_back(id);
+			}
+		});
+	}
+	siblings.ForEach([&](ImageId id) {
+		auto& other = m_slot_images[id];
+		if (other.binding.is_bound || other.binding.is_target) {
+			other.binding.needs_rebind = true;
+		}
+		FreeImage(id, "a GPU write over a read-only alias of it");
+	});
+	// Written by the GPU now: no longer one either.
+	if (auto* self = m_slot_images.try_get(image.self_id);
+	    self != nullptr && self == &image && self->read_only_alias) {
+		self->read_only_alias = false;
+		m_read_only_aliases--;
+	}
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
@@ -3331,12 +3413,16 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_b
 		// otherwise looked up page by page over their whole size, a page table lookup each 16 KB
 		// (3 % of the GPU thread in a race, round 68).
 		ImageIds candidates;
+		// alias:old (an A/B step): the read-only aliases are not found as they are; the overlap
+		// loop replaces them as before round 79.
+		const bool hide_aliases = m_read_only_aliases != 0 && Bisect::ReadOnlyAliasesOff();
 		if (const auto* owners =
 		        m_image_page_table.Find(desc.info.data.address >> ImagePageTable::kPageBits);
 		    owners != nullptr) {
 			owners->ForEach([&](ImageId id) {
 				const auto* image = m_slot_images.try_get(id);
-				if (image != nullptr && SameBacking(image->info, desc.info, exact_format)) {
+				if (image != nullptr && SameBacking(image->info, desc.info, exact_format) &&
+				    !(hide_aliases && image->read_only_alias)) {
 					result = id;
 				}
 			});
@@ -3345,13 +3431,16 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_b
 			candidates = FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 			for (const auto id: candidates) {
 				const auto& image = m_slot_images[id];
-				if (SameBacking(image.info, desc.info, exact_format)) {
+				if (SameBacking(image.info, desc.info, exact_format) &&
+				    !(hide_aliases && image.read_only_alias)) {
 					result = id;
 				}
 			}
 		}
 		// Found with the same backing: the overlap loop below does not run.
 		const bool backing_match = static_cast<bool>(result);
+		// The images the overlap loop left beside the one this binding gets (round 79).
+		ImageIds kept_aliases;
 
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
@@ -3368,6 +3457,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_b
 			ImageId    placed_in  = {};
 			bool       placed_raw = false; // placed against the binding's own address
 			for (const auto candidate: candidates) {
+				// Freed by an earlier overlap of this loop (a GPU write there frees read-only
+				// aliases, round 79): nothing to resolve against.
+				if (const auto* live = m_slot_images.try_get(candidate);
+				    live == nullptr || !live->registered) {
+					continue;
+				}
 				if (old_views) {
 					view_mip   = -1;
 					view_layer = -1;
@@ -3377,6 +3472,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_b
 				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
 				const bool  direct      = merged_info.data.address == desc.info.data.address;
 				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
+				if (overlap.kept_alias) {
+					kept_aliases.push_back(candidate);
+				}
 				if (overlap.image) {
 					result = overlap.image;
 					if (old_views || overlap.mip >= 0 || overlap.layer >= 0) {
@@ -3445,6 +3543,42 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_b
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
+			}
+		}
+		if (!kept_aliases.empty()) {
+			// The images the overlap loop kept beside the one this binding gets are aliases of
+			// it, made or found: flagged together, so a GPU write to any of them frees the
+			// others. When it is not one a read-only alias may be (written by the GPU, or
+			// elsewhere), the kept ones go, as before round 79.
+			auto&      got = m_slot_images[result];
+			const bool pair =
+			    ReadOnlyAliasCandidate(got) && got.info.data.address == desc.info.data.address;
+			kept_aliases.ForEach([&](ImageId id) {
+				auto* kept = m_slot_images.try_get(id);
+				if (kept == nullptr || !kept->registered || id == result) {
+					return;
+				}
+				if (pair) {
+					MarkReadOnlyAlias(*kept);
+					return;
+				}
+				if (kept->binding.is_bound || kept->binding.is_target) {
+					kept->binding.needs_rebind = true;
+				}
+				FreeImage(id, "an image of another kind over the same memory");
+			});
+			if (pair) {
+				MarkReadOnlyAlias(got);
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+					LOGF("TextureCache: 0x%012" PRIx64 "+0x%" PRIx64
+					     " %ux%ux%u fmt %d beside %zu image(s) of another kind there, kept as "
+					     "read-only aliases (round 79; %" PRIu64 " now)\n",
+					     got.info.data.address, got.info.data.size, got.info.extent.width,
+					     got.info.extent.height, got.info.extent.depth,
+					     static_cast<int>(got.info.pixel_format), kept_aliases.size(),
+					     m_read_only_aliases);
+				}
 			}
 		}
 		auto& image = m_slot_images[result];
@@ -3727,6 +3861,9 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	}
 	// The GPU's pixels from now on, not the guest bytes an upload took.
 	image.content_hash_valid = false;
+	if (m_read_only_aliases != 0) {
+		FreeReadOnlyAliasesOf(image);
+	}
 	// Aliases aged by frames stay alive side by side. A single owner among them: this write
 	// supersedes the bytes of every other live image overlapping it, so none of those may later
 	// be written back (collector, linear readback, buffer sync) over it. Their native contents
@@ -4067,9 +4204,12 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 }
 
 bool TextureCache::InvalidateMemoryNear(uint64_t address, uint64_t size, uint64_t block,
-                                        uint64_t block_size) {
+                                        uint64_t block_size, uint64_t* image_pages) {
 	if (!GuestRange {address, size}.Valid() || !GuestRange {block, block_size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
+	}
+	if (image_pages != nullptr) {
+		*image_pages = 0;
 	}
 	if (!MayHaveImages(std::min(address, block),
 	                   std::max(address + size, block + block_size) - std::min(address, block))) {
@@ -4077,7 +4217,41 @@ bool TextureCache::InvalidateMemoryNear(uint64_t address, uint64_t size, uint64_
 	}
 	std::scoped_lock lock {m_lock};
 	InvalidateCpuAliases(address, size);
-	return !FindImagesInRegion(block, block_size, true).empty();
+	const auto found = FindImagesInRegion(block, block_size, true);
+	if (found.empty()) {
+		return false;
+	}
+	if (image_pages != nullptr) {
+		// The pages the texture cache watches for each image (its tracked range: an image a CPU
+		// write untracked is uploaded again at its next use, and its pages need no fault of
+		// their own until then).
+		const uint64_t pages = block_size / TRACKER_PAGE_SIZE;
+		if (pages > 64 || block_size % TRACKER_PAGE_SIZE != 0 || block % TRACKER_PAGE_SIZE != 0) {
+			*image_pages = ~uint64_t {0};
+			return true;
+		}
+		const auto block_end = block + block_size;
+		uint64_t   mask      = 0;
+		for (const auto id: found) {
+			const auto* image = m_slot_images.try_get(id);
+			if (image == nullptr || image->info.data.Empty()) {
+				mask = pages == 64 ? ~uint64_t {0} : (uint64_t {1} << pages) - 1u;
+				break;
+			}
+			if (!image->IsTracked()) {
+				continue;
+			}
+			const auto begin =
+			    std::max(Common::AlignDown(image->track_addr, TRACKER_PAGE_SIZE), block);
+			const auto end =
+			    std::min(Common::AlignUp(image->track_addr_end, TRACKER_PAGE_SIZE), block_end);
+			for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE) {
+				mask |= uint64_t {1} << ((page - block) / TRACKER_PAGE_SIZE);
+			}
+		}
+		*image_pages = mask;
+	}
+	return true;
 }
 
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {

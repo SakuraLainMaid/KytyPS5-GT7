@@ -115,6 +115,7 @@ struct Counters {
 Counters g_counters;
 
 std::atomic<ExtraReporter> g_extra_reporter {nullptr};
+std::atomic<ReportHook>    g_report_hook {nullptr};
 
 uint64_t NowNs() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -151,6 +152,7 @@ std::unordered_map<uint32_t, std::string> g_names;
 
 std::mutex  g_configuration_mutex;
 std::string g_configuration;
+std::string g_window_configuration;
 
 std::string ThreadName(uint32_t tid) {
 	{
@@ -424,6 +426,9 @@ void Run() {
 		const auto seconds = std::chrono::duration<double>(now - last).count();
 		last               = now;
 		Report(seconds, cpu);
+		if (const auto hook = g_report_hook.load(std::memory_order_acquire); hook != nullptr) {
+			hook();
+		}
 	}
 }
 
@@ -603,6 +608,10 @@ bool SpinLocksFromEnvironment() {
 	return spin;
 }
 
+void SetReportHook(ReportHook hook) {
+	g_report_hook.store(hook, std::memory_order_release);
+}
+
 void SetExtraReporter(ExtraReporter reporter) {
 	g_extra_reporter.store(reporter, std::memory_order_release);
 }
@@ -652,6 +661,16 @@ void SetConfiguration(std::string_view name) {
 std::string Configuration() {
 	std::scoped_lock lock(g_configuration_mutex);
 	return g_configuration;
+}
+
+void SetWindowConfiguration(std::string_view name) {
+	std::scoped_lock lock(g_configuration_mutex);
+	g_window_configuration = std::string(name);
+}
+
+std::string WindowConfiguration() {
+	std::scoped_lock lock(g_configuration_mutex);
+	return g_window_configuration.empty() ? g_configuration : g_window_configuration;
 }
 
 void Start() {

@@ -206,10 +206,19 @@ void NameThread(const char* name);
 [[nodiscard]] std::string                                   ThreadNameOf(uint32_t tid);
 [[nodiscard]] std::vector<std::pair<uint32_t, std::string>> NamedThreads();
 
+// Called by the reporter thread after each report's lines (KYTY_BISECT_AB's alternation); null
+// for none.
+using ReportHook = void (*)();
+void SetReportHook(ReportHook hook);
+
 // The configuration the lines name (KYTY_BISECT's step), empty for none.
 void SetConfiguration(std::string_view name);
 // The name SetConfiguration gave (empty: none).
 [[nodiscard]] std::string Configuration();
+// For the reports that span several Perf lines (every 10 s): the name SetWindowConfiguration gave
+// (KYTY_BISECT_AB: "<step> A/B" while the step alternates with normal), else Configuration().
+void                      SetWindowConfiguration(std::string_view name);
+[[nodiscard]] std::string WindowConfiguration();
 
 // Starts the reporter (the first call; later ones do nothing), and the sampler when KYTY_SAMPLE
 // asks for it (common/sampler.h).

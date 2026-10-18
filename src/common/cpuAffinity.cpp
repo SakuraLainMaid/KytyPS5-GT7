@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fmt/format.h>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -82,12 +83,98 @@ void PreferPerformanceCores(const char* name) {
 	     fast.size(), sets.size(), static_cast<unsigned>(highest), ok ? "" : " - failed");
 }
 
+namespace {
+
+struct GpuSideThread {
+	HANDLE      handle = nullptr;
+	std::string name;
+	// Its own selection when it registered (PreferPerformanceCores'), restored by ClearSplit.
+	std::vector<ULONG> own_sets;
+};
+
+std::mutex                 g_gpu_side_mutex;
+std::vector<GpuSideThread> g_gpu_side_threads;
+// Whether "gpuvcache" or "gpufrequency" set CPU sets that a later choice has to clear, and the
+// sets they gave the GPU-side threads (a thread registered later gets them too).
+bool               g_split_applied = false;
+std::vector<ULONG> g_split_gpu_ids;
+
+// The CPU set ids of the logical processors of group 0 in `mask`.
+std::vector<ULONG> CpuSetIds(DWORD_PTR mask) {
+	std::vector<ULONG> ids;
+	ULONG              length = 0;
+	GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+	if (length == 0) {
+		return ids;
+	}
+	std::vector<uint8_t> buffer(length);
+	if (!GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()),
+	                                length, &length, GetCurrentProcess(), 0)) {
+		return ids;
+	}
+	for (ULONG offset = 0; offset < length;) {
+		const auto* info = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data() + offset);
+		if (info->Size == 0) {
+			break;
+		}
+		if (info->Type == CpuSetInformation && info->CpuSet.Group == 0 &&
+		    info->CpuSet.LogicalProcessorIndex < sizeof(DWORD_PTR) * 8u &&
+		    (mask & (DWORD_PTR {1} << info->CpuSet.LogicalProcessorIndex)) != 0) {
+			ids.push_back(info->CpuSet.Id);
+		}
+		offset += info->Size;
+	}
+	return ids;
+}
+
+// Clears what a split placement set: the process's default CPU sets and the registered threads'.
+void ClearSplit() {
+	if (!g_split_applied) {
+		return;
+	}
+	SetProcessDefaultCpuSets(GetCurrentProcess(), nullptr, 0);
+	for (const auto& thread: g_gpu_side_threads) {
+		SetThreadSelectedCpuSets(thread.handle,
+		                         thread.own_sets.empty() ? nullptr : thread.own_sets.data(),
+		                         static_cast<ULONG>(thread.own_sets.size()));
+	}
+	g_split_applied = false;
+	g_split_gpu_ids.clear();
+}
+
+} // namespace
+
+void RegisterGpuSideThread(const char* name) {
+	HANDLE handle = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION,
+	                           FALSE, GetCurrentThreadId());
+	if (handle == nullptr) {
+		return;
+	}
+	GpuSideThread thread {handle, name != nullptr ? std::string(name) : std::string(), {}};
+	ULONG         count = 0;
+	if (GetThreadSelectedCpuSets(handle, nullptr, 0, &count) == FALSE && count != 0) {
+		thread.own_sets.resize(count);
+		if (GetThreadSelectedCpuSets(handle, thread.own_sets.data(), count, &count) == FALSE) {
+			thread.own_sets.clear();
+		}
+		thread.own_sets.resize(std::min<size_t>(count, thread.own_sets.size()));
+	}
+	std::lock_guard lock(g_gpu_side_mutex);
+	// Registered after a split was applied: placed with the others.
+	if (g_split_applied && !g_split_gpu_ids.empty()) {
+		SetThreadSelectedCpuSets(handle, g_split_gpu_ids.data(),
+		                         static_cast<ULONG>(g_split_gpu_ids.size()));
+	}
+	g_gpu_side_threads.push_back(std::move(thread));
+}
+
 bool SetProcessCpuSet(const char* which, std::string* description) {
 	const auto describe = [&](std::string text) {
 		if (description != nullptr) {
 			*description = std::move(text);
 		}
 	};
+	std::lock_guard gpu_side_lock(g_gpu_side_mutex);
 	DWORD_PTR process_mask = 0, system_mask = 0;
 	if (which == nullptr ||
 	    GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) == FALSE) {
@@ -133,6 +220,53 @@ bool SetProcessCpuSet(const char* which, std::string* description) {
 	const std::string name(which);
 	DWORD_PTR         mask = 0;
 	std::string       what;
+	if (name == "gpuvcache" || name == "gpufrequency") {
+		if (caches.size() < 2) {
+			describe(
+			    fmt::format("not changed: the processors share {} L3 cache(s)", caches.size()));
+			return false;
+		}
+		const auto largest = std::ranges::max_element(
+		    caches, [](const Cache& a, const Cache& b) { return a.size < b.size; });
+		const DWORD_PTR vcache   = largest->mask;
+		const DWORD_PTR others   = system_mask & ~vcache;
+		const DWORD_PTR gpu      = name == "gpuvcache" ? vcache : others;
+		const DWORD_PTR rest     = name == "gpuvcache" ? others : vcache;
+		const auto      gpu_ids  = CpuSetIds(gpu);
+		const auto      rest_ids = CpuSetIds(rest);
+		if (gpu_ids.empty() || rest_ids.empty()) {
+			describe("not changed: no CPU sets");
+			return false;
+		}
+		// A whole-process mask from an earlier step would leave the sets nothing to choose from.
+		if (SetProcessAffinityMask(GetCurrentProcess(), system_mask) == FALSE ||
+		    SetProcessDefaultCpuSets(GetCurrentProcess(), rest_ids.data(),
+		                             static_cast<ULONG>(rest_ids.size())) == FALSE) {
+			describe("not changed: the process's CPU sets were refused");
+			return false;
+		}
+		g_split_applied = true;
+		g_split_gpu_ids = gpu_ids;
+		std::string threads;
+		size_t      placed = 0;
+		for (const auto& thread: g_gpu_side_threads) {
+			if (SetThreadSelectedCpuSets(thread.handle, gpu_ids.data(),
+			                             static_cast<ULONG>(gpu_ids.size())) != FALSE) {
+				placed++;
+				threads += (threads.empty() ? "" : ", ") + thread.name;
+			}
+		}
+		describe(fmt::format(
+		    "{} of {} GPU-side threads ({}; any registered later as well) prefer the {} "
+		    "processors {} (mask 0x{:x}), the other threads the {} others (mask 0x{:x})",
+		    placed, g_gpu_side_threads.size(), threads, count(gpu),
+		    name == "gpuvcache"
+		        ? fmt::format("sharing the largest L3 cache ({} MB)", largest->size >> 20u)
+		        : std::string("outside the largest L3 cache"),
+		    gpu, count(rest), rest));
+		return true;
+	}
+	ClearSplit();
 	if (name == "all") {
 		mask = system_mask;
 		what = "every processor";
@@ -154,7 +288,8 @@ bool SetProcessCpuSet(const char* which, std::string* description) {
 		                                      largest->size >> 20u)
 		                        : std::string("the processors outside the largest L3 cache");
 	} else {
-		describe("not changed: KYTY_CPU_SET takes vcache, frequency or all");
+		describe(
+		    "not changed: KYTY_CPU_SET takes vcache, frequency, all, gpuvcache or gpufrequency");
 		return false;
 	}
 	if (mask == 0 || SetProcessAffinityMask(GetCurrentProcess(), mask) == FALSE) {
@@ -167,6 +302,8 @@ bool SetProcessCpuSet(const char* which, std::string* description) {
 }
 
 #elif !defined(__APPLE__)
+
+void RegisterGpuSideThread(const char* /*name*/) {}
 
 void PreferPerformanceCores(const char* name) {
 	if (!Enabled()) {
@@ -218,6 +355,8 @@ bool SetProcessCpuSet(const char* /*which*/, std::string* description) {
 #else
 
 void PreferPerformanceCores(const char* /*name*/) {}
+
+void RegisterGpuSideThread(const char* /*name*/) {}
 
 bool SetProcessCpuSet(const char* /*which*/, std::string* description) {
 	if (description != nullptr) {

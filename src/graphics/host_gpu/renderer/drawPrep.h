@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -87,6 +88,9 @@ struct StageResult {
 	bool                                         gpu_fills = false;
 	ShaderRecompiler::IR::ResourceSnapshot       resources;
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
+	// Its hash (PipelineCache's SpecializationHash, round 79), made here so the GPU thread finds
+	// the stage's permutation without reading the specialization (0: none made).
+	uint64_t                                     specialization_hash = 0;
 	ReadSet                                      reads;
 };
 
@@ -105,9 +109,13 @@ void        ClearCurrent();
 [[nodiscard]] Key        GpuProgress(uint32_t queue);
 
 // Scanner: a prepared packet, in stream order. Waits a little while too many results wait.
-void Publish(PacketResult&& result);
-// Scanner: a result to fill, reusing the buffers of one the GPU thread is done with.
-void Recycle(PacketResult& result);
+// Results are held by pointer (round 79): the GPU thread's Take moved each one it passed, some 15
+// vectors a stage, ~1.5 % of its time in a race.
+void Publish(std::unique_ptr<PacketResult> result);
+// Scanner: a result to fill, reusing the buffers of one the GPU thread is done with; Discard
+// gives back one that was not published (its walk failed).
+[[nodiscard]] std::unique_ptr<PacketResult> Recycle();
+void                                        Discard(std::unique_ptr<PacketResult> result);
 // GPU thread: the prepared refresh of `stage` for the current packet, or null; consumed ones too
 // (a later draw of the same packet may use it again). The result stays owned by the store.
 [[nodiscard]] StageResult* Take(uint32_t stage);

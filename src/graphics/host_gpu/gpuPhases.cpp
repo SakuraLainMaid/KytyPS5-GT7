@@ -137,7 +137,7 @@ void ReportIfDue(uint64_t frames) {
 	};
 
 	std::string line = fmt::format("GPU phases ({:.1f} s)", seconds);
-	if (const auto step = Common::PerfStats::Configuration(); !step.empty()) {
+	if (const auto step = Common::PerfStats::WindowConfiguration(); !step.empty()) {
 		line += fmt::format(" [{}]", step);
 	}
 	line += fmt::format(": {} frames", new_frames);

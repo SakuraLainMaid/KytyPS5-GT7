@@ -18,7 +18,14 @@ void PreferPerformanceCores(const char* name);
 // "frequency" (the others) or "all" (every processor the system lets the process use). Windows
 // only; returns false and says why in `description` otherwise, or for a name it does not know.
 // For KYTY_CPU_SET (the whole run) and KYTY_BISECT's cpu: steps (an A/B test within one).
+// Round 79: also "gpuvcache" (the threads RegisterGpuSideThread named prefer the processors
+// sharing the largest L3 cache, and every other thread the rest: Windows CPU sets) and
+// "gpufrequency" (the other way round).
 bool SetProcessCpuSet(const char* which, std::string* description);
+
+// The calling thread feeds the host GPU (the GPU thread, draw preparation, Vulkan recording):
+// SetProcessCpuSet's "gpuvcache" and "gpufrequency" place it apart from the other threads.
+void RegisterGpuSideThread(const char* name);
 
 } // namespace Common
 

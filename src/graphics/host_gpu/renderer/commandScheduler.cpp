@@ -510,6 +510,9 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			// For the thread report and the stall reports (set once the scheduler has its name).
 			Common::PerfStats::NameThread(m_timeline->Name() == "render" ? "GpuPriority"
 			                                                             : "PresentPriority");
+			if (m_timeline->Name() == "render") {
+				Common::RegisterGpuSideThread("GpuPriority");
+			}
 			named = true;
 		}
 		const auto known      = m_master.KnownGpuTick();
@@ -853,6 +856,7 @@ vk::CommandBuffer CommandScheduler::DrainRecording() {
 void CommandScheduler::RecordingThread(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("GpuRecord");
 	Common::PreferPerformanceCores("Vulkan recording thread");
+	Common::RegisterGpuSideThread("GpuRecord");
 	// A command's stashed arrays may sit in up to two chunks before its own: executed chunks are
 	// recycled only after the next two have run.
 	std::deque<std::unique_ptr<Chunk>> retained;

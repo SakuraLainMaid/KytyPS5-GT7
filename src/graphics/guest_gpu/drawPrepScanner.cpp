@@ -1,5 +1,6 @@
 #include "graphics/guest_gpu/drawPrepScanner.h"
 
+#include "common/cpuAffinity.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -145,6 +146,7 @@ DrawPrepScanner::~DrawPrepScanner() {
 
 void DrawPrepScanner::WorkerRun() {
 	KYTY_PROFILER_THREAD("Thread_DrawPrepWalk");
+	Common::RegisterGpuSideThread("Thread_DrawPrepWalk");
 	// As the scanner thread: clean-backing reads that check the GPU-dirty ranges themselves.
 	LibKernel::Memory::SetGpuReadDelegate(true);
 	for (;;) {
@@ -191,35 +193,31 @@ void DrawPrepScanner::Walk(Job& job) {
 		Finish(job.index, nullptr);
 		return;
 	}
-	DrawPrep::PacketResult result;
-	DrawPrep::Recycle(result);
-	result.key = job.key;
-	if (m_renderer.GetPipelineCache().DrawPrepWalk(job.inputs, result)) {
-		Finish(job.index, &result);
+	auto result = DrawPrep::Recycle();
+	result->key = job.key;
+	if (m_renderer.GetPipelineCache().DrawPrepWalk(job.inputs, *result)) {
+		Finish(job.index, std::move(result));
 	} else {
+		DrawPrep::Discard(std::move(result));
 		Finish(job.index, nullptr);
 	}
 }
 
-void DrawPrepScanner::Finish(uint64_t index, DrawPrep::PacketResult* result) {
+void DrawPrepScanner::Finish(uint64_t index, std::unique_ptr<DrawPrep::PacketResult> result) {
 	// Going away: nothing more is published (Publish can wait while the GPU thread is gone).
 	if (m_stopping.load(std::memory_order_relaxed)) {
 		return;
 	}
 	std::lock_guard lock(m_order_mutex);
 	if (index != m_next_publish) {
-		m_done.emplace(index, result != nullptr ? std::optional(std::move(*result)) : std::nullopt);
+		m_done.emplace(index, std::move(result));
 		return;
 	}
-	if (result != nullptr) {
-		DrawPrep::Publish(std::move(*result));
-	}
+	DrawPrep::Publish(std::move(result));
 	m_next_publish++;
 	for (auto next = m_done.begin(); next != m_done.end() && next->first == m_next_publish;
 	     next      = m_done.erase(next)) {
-		if (next->second.has_value()) {
-			DrawPrep::Publish(std::move(*next->second));
-		}
+		DrawPrep::Publish(std::move(next->second));
 		m_next_publish++;
 	}
 }
@@ -243,6 +241,7 @@ void DrawPrepScanner::EnqueueReset(uint32_t queue) {
 
 void DrawPrepScanner::Run() {
 	KYTY_PROFILER_THREAD("Thread_DrawPrep");
+	Common::RegisterGpuSideThread("Thread_DrawPrep");
 	// The clean-backing reads (TryReadGpuCleanBacking) answer "maybe GPU-written" on any other
 	// thread; a read delegate checks the buffer cache's GPU-dirty ranges under their shared lock,
 	// which the GPU thread holds exclusively whenever it changes them.

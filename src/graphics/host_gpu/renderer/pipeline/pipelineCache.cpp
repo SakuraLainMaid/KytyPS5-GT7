@@ -1121,6 +1121,53 @@ bool UnnormalizedSamplingFix() {
 
 namespace {
 
+// Round 79: a hash of a stage's specialization, field by field (the structs hold padding), for
+// ProgramCache::Get's permutation lookup. A field added to them must be hashed too: the sizes
+// below change with one.
+uint64_t SpecializationHash(const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+	using Specialization = ShaderRecompiler::IR::ResourceSpecialization;
+	static_assert(sizeof(Specialization::Buffer) == 28 && sizeof(Specialization::Image) == 40 &&
+	                  sizeof(Specialization::Sampler) == 8 &&
+	                  sizeof(Specialization) == 3 * sizeof(std::vector<uint32_t>),
+	              "ResourceSpecialization changed: hash its new fields in SpecializationHash");
+	thread_local std::vector<uint32_t> words;
+	words.clear();
+	words.push_back(static_cast<uint32_t>(specialization.buffers.size()));
+	words.push_back(static_cast<uint32_t>(specialization.images.size()));
+	words.push_back(static_cast<uint32_t>(specialization.samplers.size()));
+	for (const auto& buffer: specialization.buffers) {
+		words.insert(words.end(),
+		             {buffer.packed_stride, static_cast<uint32_t>(buffer.descriptor_format),
+		              buffer.descriptor_swizzle,
+		              static_cast<uint32_t>(buffer.zero_stride_oob) |
+		                  (static_cast<uint32_t>(buffer.write_tracked) << 1u),
+		              buffer.indirect_root, buffer.indirect_mapping_offset,
+		              buffer.indirect_search_iterations});
+	}
+	for (const auto& image: specialization.images) {
+		words.insert(
+		    words.end(),
+		    {static_cast<uint32_t>(image.numeric_class), static_cast<uint32_t>(image.dimension),
+		     image.mip_count, static_cast<uint32_t>(image.conversion_format), image.shader_swizzle,
+		     image.indirect_root, image.indirect_mapping_offset, image.indirect_search_iterations,
+		     static_cast<uint32_t>(image.cube) | (static_cast<uint32_t>(image.fmask) << 1u) |
+		         (static_cast<uint32_t>(image.bindless) << 2u) |
+		         (static_cast<uint32_t>(image.runtime) << 3u) |
+		         (static_cast<uint32_t>(image.clamp_half_float) << 4u),
+		     static_cast<uint32_t>(image.fmask_fragments)});
+	}
+	for (const auto& sampler: specialization.samplers) {
+		words.insert(words.end(),
+		             {static_cast<uint32_t>(sampler.bindless), sampler.bindless_mapping_offset});
+	}
+	const auto hash = XXH3_64bits(words.data(), words.size() * sizeof(uint32_t));
+	return hash != 0 ? hash : 1u; // 0 means none (DrawPrep::StageResult)
+}
+
+} // namespace
+
+namespace {
+
 // The result type of every result id of a module, from one SPIRV-Tools parse.
 spv_result_t ScanResultTypes(void* user_data, const spv_parsed_instruction_t* inst) {
 	auto& types = *static_cast<std::unordered_map<uint32_t, uint32_t>*>(user_data);
@@ -1733,6 +1780,7 @@ private:
 	void Run() {
 		KYTY_PROFILER_THREAD("StagePrep");
 		Common::PreferPerformanceCores("stage preparation helper");
+		Common::RegisterGpuSideThread("StagePrep");
 		Libs::LibKernel::Memory::SetGpuReadDelegate(true);
 		auto last_job = std::chrono::steady_clock::now();
 		while (!m_stop_flag.load(std::memory_order_acquire)) {
@@ -1815,6 +1863,7 @@ struct PipelineCache::ProgramCache {
 
 	struct Permutation {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		uint64_t                                     specialization_hash = 0;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
 	};
@@ -1837,6 +1886,10 @@ struct PipelineCache::ProgramCache {
 		uint64_t prepared_serial = 0;
 		// The permutation the last lookup found (at most one matches), compared first.
 		size_t last_permutation = 0;
+		// SpecializationHash(specialization), when the draw-prep scanner made it with the
+		// specialization the last take swapped in (round 79); the permutation is then found by it.
+		uint64_t specialization_hash       = 0;
+		bool     specialization_hash_valid = false;
 	};
 
 	struct ProgramKeyHash {
@@ -1933,15 +1986,16 @@ struct PipelineCache::ProgramCache {
 		}
 		const auto id = ++next_shader_id;
 		source.permutations.push_back({
-		    .specialization = source.specialization,
-		    .program        = std::move(program),
-		    .handle         = {.id                = id,
-		                       .module            = module,
-		                       .spirv_words       = static_cast<uint32_t>(spirv.size()),
-		                       .hash              = options.shader_hash,
-		                       .pixel_rate_module = pixel_rate_module,
-		                       .normalized_module = normalized_module,
-		                       .normalized_id     = normalized_module != nullptr ? ++next_shader_id : 0u},
+		    .specialization      = source.specialization,
+		    .specialization_hash = SpecializationHash(source.specialization),
+		    .program             = std::move(program),
+		    .handle              = {.id                = id,
+		                            .module            = module,
+		                            .spirv_words       = static_cast<uint32_t>(spirv.size()),
+		                            .hash              = options.shader_hash,
+		                            .pixel_rate_module = pixel_rate_module,
+		                            .normalized_module = normalized_module,
+		                            .normalized_id     = normalized_module != nullptr ? ++next_shader_id : 0u},
 		});
 		const auto& permutation = source.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &source.resources};
@@ -2175,6 +2229,7 @@ struct PipelineCache::ProgramCache {
 				}
 				t_srt_shader_hash = params.hash;
 				bool materialized = false;
+				bool scanned      = false;
 				if (TakePrepared(&entry->second)) {
 					entry->second.prepared_serial = 0;
 					// Refreshed in this draw's parallel window (PrepareStagesInParallel).
@@ -2189,6 +2244,7 @@ struct PipelineCache::ProgramCache {
 				           }()) {
 					// Prepared by the draw-prep scanner from the same inputs and bytes.
 					materialized = true;
+					scanned      = true;
 				} else {
 					const GpuPhases::Scope phase(GpuPhases::Phase::ProgramWalk);
 					std::lock_guard        walk_lock(entry->second.walk_mutex);
@@ -2196,6 +2252,10 @@ struct PipelineCache::ProgramCache {
 					materialized = ShaderRecompiler::IR::MaterializeResources(
 					    entry->second.resource_plan, runtime, entry->second.resources,
 					    entry->second.specialization);
+				}
+				if (!scanned) {
+					// Refreshed here: its specialization has no hash made with it.
+					entry->second.specialization_hash_valid = false;
 				}
 				t_srt_shader_hash = 0;
 				runtime.gpu_written = nullptr;
@@ -2233,12 +2293,17 @@ struct PipelineCache::ProgramCache {
 				}
 			}
 			auto&      source  = entry->second;
+			// Round 79: by the hash the scanner made, when there is one (comparing the
+			// specializations themselves read the scanner's freshly written vectors: ~2 % of the
+			// GPU thread in a race). KYTY_BISECT's spechash:off compares them again.
+			const bool by_hash = source.specialization_hash_valid && !Bisect::SpecHashOff();
 			const auto matches = [&](const Permutation& candidate) {
 				const auto& layout = candidate.program.bindings;
 				return layout.push_data_start_dword ==
 				           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
 				                                                    layout.ShaderDataDwords()) &&
-				       candidate.specialization == source.specialization;
+				       (by_hash ? candidate.specialization_hash == source.specialization_hash
+				                : candidate.specialization == source.specialization);
 			};
 			Permutation* permutation = nullptr;
 			if (source.last_permutation < source.permutations.size() &&
@@ -2248,6 +2313,20 @@ struct PipelineCache::ProgramCache {
 			           found != source.permutations.end()) {
 				permutation             = &*found;
 				source.last_permutation = static_cast<size_t>(found - source.permutations.begin());
+			}
+			if (permutation != nullptr && by_hash && DrawPrep::VerifyMode() != 0 &&
+			    !(permutation->specialization == source.specialization)) {
+				// KYTY_DRAW_PREP_VERIFY: the hash found a permutation of another specialization.
+				DrawPrep::Add(DrawPrep::Counter::VerifyMismatches);
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+					LOGF("DrawPrep verify: %s 0x%016" PRIx64 " specialization hash %016" PRIx64
+					     " found a permutation of another specialization\n",
+					     StageLabel(stage), params.hash, source.specialization_hash);
+				}
+				if (DrawPrep::VerifyMode() == 2) {
+					EXIT("DrawPrep verify: specialization hash collision\n");
+				}
 			}
 			if (permutation != nullptr) {
 				input_info.stage = {.program   = &permutation->program,
@@ -2873,6 +2952,12 @@ struct PipelineCache::ProgramCache {
 		if (vs == nullptr || vs == ps) {
 			return;
 		}
+		// The walks below write both entries' refreshes, even when they fail: neither holds a
+		// prepared result or the specialization a hash was made of any more.
+		for (auto* entry: {ps, vs}) {
+			entry->prepared_serial           = 0;
+			entry->specialization_hash_valid = false;
+		}
 		struct Context {
 			SourceEntry*        entry;
 			const ShaderParams* params;
@@ -3099,6 +3184,7 @@ struct PipelineCache::ProgramCache {
 			DrawPrep::Add(DrawPrep::Counter::FailWalk);
 			return false;
 		}
+		result.specialization_hash = SpecializationHash(result.specialization);
 		static std::atomic<uint64_t> serials {0};
 		result.ok       = true;
 		result.consumed = false;
@@ -3234,6 +3320,8 @@ struct PipelineCache::ProgramCache {
 		// Swapped, not moved: the entry's old buffers go back to the scanner with the result.
 		std::swap(entry.resources, result->resources);
 		std::swap(entry.specialization, result->specialization);
+		entry.specialization_hash       = result->specialization_hash;
+		entry.specialization_hash_valid = result->specialization_hash != 0;
 		entry.prepared_serial = result->serial;
 		DrawPrep::Add(DrawPrep::Counter::Used);
 		return true;

@@ -68,6 +68,9 @@ struct Step {
 	bool              unorm_old       = false;
 	bool              drawprep_notess = false;
 	bool              texmemo_global  = false;
+	bool              faultblock_old  = false;
+	bool              alias_old       = false;
+	bool              spechash_off    = false;
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
 	int32_t           dflush          = -1;   // dflush:<n>; -1: the usual
@@ -266,6 +269,18 @@ bool ParseAction(std::string_view action, Step& step) {
 		step.texmemo_global = true;
 		return true;
 	}
+	if (action == "faultblock:old") {
+		step.faultblock_old = true;
+		return true;
+	}
+	if (action == "alias:old") {
+		step.alias_old = true;
+		return true;
+	}
+	if (action == "spechash:off") {
+		step.spechash_off = true;
+		return true;
+	}
 	if (action.starts_with("depth:equal-relaxed:")) {
 		const auto text = std::string(action.substr(20));
 		if (text.empty() || text.size() > 7 ||
@@ -322,7 +337,8 @@ bool ParseAction(std::string_view action, Step& step) {
 		    static_cast<uint32_t>(std::strtoul(std::string(frames).c_str(), nullptr, 10));
 		return step.gpu_frames != 0;
 	}
-	if (action == "cpu:vcache" || action == "cpu:frequency" || action == "cpu:all") {
+	if (action == "cpu:vcache" || action == "cpu:frequency" || action == "cpu:all" ||
+	    action == "cpu:gpuvcache" || action == "cpu:gpufrequency") {
 		step.cpu_set = std::string(action.substr(4));
 		return true;
 	}
@@ -423,10 +439,24 @@ std::string             g_picture;
 std::optional<uint32_t> g_pending;
 uint32_t                g_presses = 0;
 
+// KYTY_BISECT_AB=1 (round 79): the step that is on alternates with normal at each Perf line.
+bool AbMode() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BISECT_AB");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+// While AbMode alternates: the step that is on is off for now (its "base" lines).
+std::atomic<bool> g_ab_base {false};
+
 const Step* Current() {
 	const auto& steps   = Steps();
 	const auto  current = g_current.load(std::memory_order_acquire);
-	return current == 0 || current > steps.size() ? nullptr : &steps[current - 1];
+	if (current == 0 || current > steps.size() || g_ab_base.load(std::memory_order_acquire)) {
+		return nullptr;
+	}
+	return &steps[current - 1];
 }
 
 bool FirstUse(uint32_t bit) {
@@ -439,14 +469,22 @@ std::string StartCpuSet() {
 }
 
 // What the step that is on asks of the process (the CPU set, the log) and the name the Perf lines
-// give it. Once at the start, then at every change.
-void ApplyEffects() {
+// give it. Once at the start, then at every change (toggled: KYTY_BISECT_AB's alternation, which
+// does not time GPU frames again).
+void ApplyEffects(bool toggled = false) {
 	const auto& steps   = Steps();
 	const auto  current = g_current.load(std::memory_order_acquire);
-	const Step* step    = current == 0 || current > steps.size() ? nullptr : &steps[current - 1];
-	Common::PerfStats::SetConfiguration(step != nullptr ? step->name : std::string("normal"));
+	const Step* chosen  = current == 0 || current > steps.size() ? nullptr : &steps[current - 1];
+	const bool  base    = chosen != nullptr && g_ab_base.load(std::memory_order_acquire);
+	const Step* step    = base ? nullptr : chosen;
+	Common::PerfStats::SetConfiguration(chosen == nullptr ? std::string("normal")
+	                                    : base            ? chosen->name + " base"
+	                                                      : chosen->name);
+	// The 10 s reports span both halves of an alternation.
+	Common::PerfStats::SetWindowConfiguration(chosen != nullptr && AbMode() ? chosen->name + " A/B"
+	                                                                        : std::string());
 	Log::SetMuted(step != nullptr && step->log_off);
-	if (step != nullptr && step->gpu_frames != 0) {
+	if (step != nullptr && step->gpu_frames != 0 && !toggled) {
 		GpuTiming::RequestFrames(step->gpu_frames);
 		Log::WriteUnmuted(fmt::format("Bisect: gputime: timing the next {} frames on the GPU\n",
 		                              step->gpu_frames));
@@ -470,9 +508,21 @@ void ApplyLocked() {
 		return;
 	}
 	g_logged.store(0, std::memory_order_release);
+	g_ab_base.store(false, std::memory_order_release);
 	g_current.store(*g_pending, std::memory_order_release);
 	g_pending.reset();
 	ApplyEffects();
+}
+
+// The Perf reporter, after each Perf line (AbMode): the step that is on goes off, or on again.
+void OnPerfReport() {
+	std::scoped_lock lock(g_pending_mutex);
+	if (g_pending.has_value() || g_current.load(std::memory_order_acquire) == 0) {
+		return;
+	}
+	const bool base = !g_ab_base.load(std::memory_order_acquire);
+	g_ab_base.store(base, std::memory_order_release);
+	ApplyEffects(true);
 }
 
 std::string FileName(std::string_view name) {
@@ -576,6 +626,11 @@ bool PassesDepthCompare(bool big_depth_image) {
 void Start() {
 	if (Steps().empty()) {
 		return;
+	}
+	if (AbMode()) {
+		LOGF("Bisect: KYTY_BISECT_AB=1: the step that is on alternates with normal at each Perf "
+		     "line (\"<step>\" and \"<step> base\")\n");
+		Common::PerfStats::SetReportHook(&OnPerfReport);
 	}
 	std::scoped_lock lock(g_pending_mutex);
 	ApplyEffects();
@@ -784,6 +839,21 @@ bool DrawPrepNoTess() {
 bool TextureMemoGlobal() {
 	const auto* step = Current();
 	return step != nullptr && step->texmemo_global;
+}
+
+bool FaultBlockAroundImagesOff() {
+	const auto* step = Current();
+	return step != nullptr && step->faultblock_old;
+}
+
+bool ReadOnlyAliasesOff() {
+	const auto* step = Current();
+	return step != nullptr && step->alias_old;
+}
+
+bool SpecHashOff() {
+	const auto* step = Current();
+	return step != nullptr && step->spechash_off;
 }
 
 float DepthEqualRelaxed() {

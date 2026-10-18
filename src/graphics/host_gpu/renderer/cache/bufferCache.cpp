@@ -878,7 +878,7 @@ struct FastReadbackReport {
 		const double average = stats.done != 0 ? static_cast<double>(stats.wait_ns) / 1e3 /
 		                                             static_cast<double>(stats.done)
 		                                       : 0.0;
-		const auto   step    = Common::PerfStats::Configuration();
+		const auto   step    = Common::PerfStats::WindowConfiguration();
 		const auto   tag     = step.empty() ? std::string() : " [" + step + "]";
 		LOGF("Fast readback: %" PRIu64 " of %" PRIu64
 		     " reads copied on the readback queue%s (%.1f MB, waited %.0f us on average, longest "

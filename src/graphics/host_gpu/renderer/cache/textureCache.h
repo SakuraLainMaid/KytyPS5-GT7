@@ -127,8 +127,10 @@ public:
 	[[nodiscard]] static bool ClearsTargetsFromFills();
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	// InvalidateMemory, and whether any image lies in [block, block + block_size) (one lock).
+	// image_pages (round 79): the tracker pages of the block an image lies on, bit i for its page
+	// i (every bit for a block of more than 64 pages that holds an image).
 	[[nodiscard]] bool InvalidateMemoryNear(uint64_t address, uint64_t size, uint64_t block,
-	                                        uint64_t block_size);
+	                                        uint64_t block_size, uint64_t* image_pages = nullptr);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
@@ -345,6 +347,8 @@ private:
 		ImageId image;
 		int32_t mip   = -1;
 		int32_t layer = -1;
+		// The cached image stays beside an image of the requested kind (KeepReadOnlyAlias).
+		bool kept_alias = false;
 	};
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
@@ -425,6 +429,19 @@ private:
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
+	// Round 79: whether a texture read of `requested` leaves `cached` (at the same address, with
+	// the same block extent and size) in place beside an image of its own, instead of replacing
+	// it: both small, single-sampled and never written by the GPU, and of kinds no one native
+	// image serves (a volume and a flat image, a depth read of a color image). GT7 reads a 1x1
+	// placeholder as R8, R16 and D16, flat and as a volume: each read of another kind replaced
+	// the image before, 250 to 500 times a frame. Caller holds m_lock.
+	[[nodiscard]] bool        KeepReadOnlyAlias(const ImageInfo& requested, BindingType binding,
+	                                            const Image& cached) const;
+	[[nodiscard]] static bool ReadOnlyAliasCandidate(const Image& image);
+	void                      MarkReadOnlyAlias(Image& image);
+	// A GPU write to `image`: the read-only aliases that start where it does are freed (their
+	// bytes are no longer what the memory holds). Caller holds m_lock.
+	void                        FreeReadOnlyAliasesOf(const Image& image);
 	void                        RefreshImage(ImageId id);
 	// Small linear images the CPU writes, compared with their guest bytes instead of trusting
 	// the page tracking alone (KYTY_GUEST_HASH_IMAGES_KB).
@@ -547,6 +564,8 @@ private:
 	[[nodiscard]] uint64_t LruClock() const noexcept;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
+	// Registered images kept as read-only aliases (KeepReadOnlyAlias); m_lock.
+	uint64_t m_read_only_aliases = 0;
 	// KYTY_TRACE_IMAGES (null when it is not set).
 	std::unique_ptr<TraceState> m_trace;
 	std::unique_ptr<GpuScan>    m_gpu_scan;

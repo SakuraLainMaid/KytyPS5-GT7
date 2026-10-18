@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_set>
@@ -27,10 +28,10 @@ constexpr size_t MaxPending = 8192;
 constexpr size_t MaxRecycled = 4096;
 
 struct Store {
-	std::mutex                mutex;
-	std::condition_variable   space;
-	std::array<std::deque<PacketResult>, MaxQueues> pending; // per queue
-	std::vector<PacketResult> recycled;
+	std::mutex                                                       mutex;
+	std::condition_variable                                          space;
+	std::array<std::deque<std::unique_ptr<PacketResult>>, MaxQueues> pending; // per queue
+	std::vector<std::unique_ptr<PacketResult>>                       recycled;
 };
 
 Store& GetStore() {
@@ -199,34 +200,58 @@ Key GpuProgress(uint32_t queue) {
 	        .ordinal = static_cast<uint32_t>(packed & 0xffffffu)};
 }
 
-void Publish(PacketResult&& result) {
+void Publish(std::unique_ptr<PacketResult> result) {
+	if (result == nullptr) {
+		return;
+	}
 	auto&            store = GetStore();
 	std::unique_lock lock(store.mutex);
 	// While the GPU thread is far behind, wait for it a little; a result that does not fit is
 	// dropped (the GPU thread walks that draw itself), so the scanner never waits for good.
-	auto& pending = store.pending[result.key.queue % MaxQueues];
+	auto& pending = store.pending[result->key.queue % MaxQueues];
 	for (int i = 0; i < 100 && pending.size() >= MaxPending; i++) {
 		store.space.wait_for(lock, std::chrono::milliseconds(1));
 	}
 	if (pending.size() >= MaxPending) {
+		if (store.recycled.size() < MaxRecycled) {
+			store.recycled.push_back(std::move(result));
+		}
 		return;
 	}
 	pending.push_back(std::move(result));
 }
 
-void Recycle(PacketResult& result) {
+void Discard(std::unique_ptr<PacketResult> result) {
+	if (result == nullptr) {
+		return;
+	}
 	auto&           store = GetStore();
 	std::lock_guard lock(store.mutex);
-	if (!store.recycled.empty()) {
-		result = std::move(store.recycled.back());
-		store.recycled.pop_back();
+	if (store.recycled.size() < MaxRecycled) {
+		store.recycled.push_back(std::move(result));
 	}
-	result.key         = {};
-	result.stage_count = 0;
-	for (auto& stage: result.stages) {
+}
+
+std::unique_ptr<PacketResult> Recycle() {
+	std::unique_ptr<PacketResult> result;
+	{
+		auto&           store = GetStore();
+		std::lock_guard lock(store.mutex);
+		if (!store.recycled.empty()) {
+			result = std::move(store.recycled.back());
+			store.recycled.pop_back();
+		}
+	}
+	if (result == nullptr) {
+		result = std::make_unique<PacketResult>();
+	}
+	result->key         = {};
+	result->stage_count = 0;
+	for (auto& stage: result->stages) {
 		stage.ok       = false;
 		stage.consumed = false;
 	}
+	return result;
 }
 
 StageResult* Take(uint32_t stage) {
@@ -242,7 +267,7 @@ StageResult* Take(uint32_t stage) {
 	std::lock_guard lock(store.mutex);
 	auto&           pending = store.pending[key->queue % MaxQueues];
 	bool            popped = false;
-	while (!pending.empty() && pending.front().key.Before(*key)) {
+	while (!pending.empty() && pending.front()->key.Before(*key)) {
 		if (store.recycled.size() < MaxRecycled) {
 			store.recycled.push_back(std::move(pending.front()));
 		}
@@ -257,7 +282,7 @@ StageResult* Take(uint32_t stage) {
 		Add(Counter::MissEmpty);
 		return nullptr;
 	}
-	auto& front = pending.front();
+	auto& front = *pending.front();
 	if (front.key.seq != key->seq || front.key.ordinal != key->ordinal) {
 		Add(Counter::MissNone);
 		Add(Counter::MissLater);
@@ -271,8 +296,8 @@ StageResult* Take(uint32_t stage) {
 	for (uint32_t i = 0; i < front.stage_count; i++) {
 		auto& result = front.stages[i];
 		if (result.ok && result.stage == stage) {
-			// The deque keeps references stable across the scanner's push_back; only this thread
-			// pops, so the result stays valid until the next Take.
+			// Held by pointer: the scanner's push_back moves only the pointer, and only this
+			// thread pops, so the result stays valid until the next Take.
 			return &result;
 		}
 	}
