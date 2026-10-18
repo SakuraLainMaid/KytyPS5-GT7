@@ -17,16 +17,20 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -53,6 +57,52 @@ struct ShaderMapEntry {
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
+// Bumped by every ShaderMapUserData: each thread's copies of entries (FindShaderMapEntry) are
+// current while it stays the same.
+static std::atomic<uint64_t> g_shader_map_generation {1};
+
+// KYTY_SHADER_MAP_CACHE=0: every lookup takes the map's lock, as before round 78.
+static bool ShaderMapCacheEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SHADER_MAP_CACHE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// The entry ShaderMapUserData registered for addr. Each draw looks up its stages' entries (a
+// tessellated one five times, a dispatch twice), and so do the draw-prep scanner's threads: all of
+// them took this one lock. Entries are only ever replaced, never removed, so a thread keeps copies
+// of the ones it asked for, until the next registration.
+static bool FindShaderMapEntry(uint64_t addr, ShaderMapEntry& out) {
+	struct Slot {
+		uint64_t       addr       = 0;
+		uint64_t       generation = 0;
+		ShaderMapEntry entry {};
+	};
+	thread_local std::array<Slot, 32> slots {};
+	const auto generation = g_shader_map_generation.load(std::memory_order_acquire);
+	auto&      slot       = slots[((addr >> 4u) * 0x9E3779B97F4A7C15ull) >> 59u];
+	const bool cached     = ShaderMapCacheEnabled();
+	if (cached && slot.generation == generation && slot.addr == addr) {
+		out = slot.entry;
+		return true;
+	}
+	std::scoped_lock lock(g_shader_map_mutex);
+	if (g_shader_map == nullptr) {
+		return false;
+	}
+	const auto iter = g_shader_map->find(addr);
+	if (iter == g_shader_map->end()) {
+		return false;
+	}
+	out = iter->second;
+	if (cached) {
+		// The generation read before the lock: a registration since then makes this copy stale.
+		slot = {addr, generation, iter->second};
+	}
+	return true;
+}
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -79,15 +129,14 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	}
 	std::scoped_lock lock(g_shader_map_mutex);
 	(*g_shader_map)[addr] = {mapped, hash};
+	g_shader_map_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT_IF(g_shader_map == nullptr);
 
-	std::scoped_lock lock(g_shader_map_mutex);
-
-	if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
-		return iter->second;
+	if (ShaderMapEntry entry; FindShaderMapEntry(addr, entry)) {
+		return entry;
 	}
 
 	EXIT("%s shader=0x%016" PRIx64 " is missing from ShaderMap\n", label, addr);
@@ -311,7 +360,9 @@ static void cs_check(const HW::CsStageRegisters& cs, const HW::ShaderRegisters& 
 }
 #endif
 
-static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
+// `mismatch`, when given, is set (and the description left unfinished) where a buffer would end
+// the emulator: the draw-prep scanner's descriptions, from vertex tables that may be stale.
+static void ShaderDetectBuffers(ShaderVertexInputInfo& info, bool* mismatch = nullptr) {
 	KYTY_PROFILER_FUNCTION();
 
 	info.buffers_num = 0;
@@ -334,6 +385,10 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 				uint64_t offset2 = b.addr - base;
 
 				if (offset1 < stride && offset2 < stride) {
+					if (mismatch != nullptr && b.num_records != r.NumRecords()) {
+						*mismatch = true;
+						return;
+					}
 					EXIT_NOT_IMPLEMENTED(b.num_records != r.NumRecords());
 					b.addr = base;
 					break;
@@ -503,6 +558,116 @@ static bool FirstVertexInputReport(uint64_t shader_addr, uint32_t kind) {
 	return reported.insert(shader_addr ^ (static_cast<uint64_t>(kind) << 56u)).second;
 }
 
+// The user SGPRs that hold a vertex shader's vertex table pointers, as the draw path read them from
+// its AGC header (round 78): the draw-prep scanner describes a tessellated draw's LS stage from
+// these, without reading the header in guest memory itself. Current while the shader map's
+// generation stays (a shader registered again at the address may have other ones).
+struct VertexTableRegs {
+	int      buffer_reg = -1;
+	int      attrib_reg = -1;
+	uint64_t generation = 0;
+};
+static std::mutex                                    g_vertex_table_regs_mutex;
+static std::unordered_map<uint64_t, VertexTableRegs> g_vertex_table_regs;
+
+static void NoteVertexTableRegs(uint64_t shader_addr, const ShaderVertexMetadata& metadata) {
+	const auto generation = g_shader_map_generation.load(std::memory_order_acquire);
+	// Each thread notes a shader once a generation.
+	thread_local std::unordered_map<uint64_t, uint64_t> noted;
+	if (noted.size() > 65536) {
+		noted.clear();
+	}
+	auto& noted_generation = noted[shader_addr];
+	if (noted_generation == generation) {
+		return;
+	}
+	noted_generation = generation;
+	std::scoped_lock lock(g_vertex_table_regs_mutex);
+	if (g_vertex_table_regs.size() > 65536) {
+		g_vertex_table_regs.clear();
+	}
+	g_vertex_table_regs[shader_addr] = {metadata.vertex_buffer_reg, metadata.vertex_attrib_reg,
+	                                    generation};
+}
+
+static bool FindVertexTableRegs(uint64_t shader_addr, VertexTableRegs& regs) {
+	const auto       generation = g_shader_map_generation.load(std::memory_order_acquire);
+	std::scoped_lock lock(g_vertex_table_regs_mutex);
+	const auto       found = g_vertex_table_regs.find(shader_addr);
+	if (found == g_vertex_table_regs.end() || found->second.generation != generation) {
+		return false;
+	}
+	regs = found->second;
+	return true;
+}
+
+// ShaderGetStaticVertexInputInfo for the draw-prep scanner (round 78), from its copy of the
+// registers, which can be stale: the table registers the draw path found in the header, the
+// tables' words copied from memory no GPU work has written (never a fault, never a pointer
+// followed), and false wherever the draw path would end the emulator or log.
+static bool ShaderGetStaticVertexInputInfoForScan(uint64_t                   shader_addr,
+                                                  const HW::UserSgprInfo&    user_sgpr,
+                                                  const HW::ShaderRegisters& sh,
+                                                  const ShaderMappedData&    data,
+                                                  ShaderVertexInputInfo&     info) {
+	info                     = {};
+	info.pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
+	info.scratch_size_dwords = data.scratch_size_dwords;
+	VertexTableRegs regs;
+	if (shader_addr == 0 || !FindVertexTableRegs(shader_addr, regs)) {
+		return false;
+	}
+	if (regs.attrib_reg < 0) {
+		return true;
+	}
+	constexpr int Sgprs = HW::UserSgprInfo::SGPRS_MAX;
+	if (regs.buffer_reg < 0 || regs.attrib_reg + 1 >= Sgprs || regs.buffer_reg + 1 >= Sgprs ||
+	    data.input_semantics == nullptr || data.num_input_semantics == 0 ||
+	    data.num_input_semantics > ShaderVertexInputInfo::RES_MAX) {
+		return false;
+	}
+	info.fetch_external   = false;
+	info.fetch_embedded   = true;
+	info.fetch_attrib_reg = regs.attrib_reg;
+	info.fetch_buffer_reg = regs.buffer_reg;
+	const auto attrib_address =
+	    static_cast<uint64_t>(user_sgpr.value[regs.attrib_reg]) |
+	    (static_cast<uint64_t>(user_sgpr.value[regs.attrib_reg + 1]) << 32u);
+	const auto buffer_address =
+	    static_cast<uint64_t>(user_sgpr.value[regs.buffer_reg]) |
+	    (static_cast<uint64_t>(user_sgpr.value[regs.buffer_reg + 1]) << 32u);
+	if (attrib_address == 0 || buffer_address == 0) {
+		return false;
+	}
+	const auto semantics    = std::span<const ShaderSemantic>(data.input_semantics_snapshot.data(),
+	                                                          data.num_input_semantics);
+	uint32_t   max_semantic = 0;
+	for (const auto& in: semantics) {
+		if (in.static_vb_index == 1 || in.static_attribute == 1) {
+			return false;
+		}
+		max_semantic = std::max<uint32_t>(max_semantic, in.semantic);
+	}
+	std::array<uint32_t, 256> attrib {};
+	if (!LibKernel::Memory::TryReadGpuCleanBacking(attrib_address, attrib.data(),
+	                                               (max_semantic + 1u) * sizeof(uint32_t))) {
+		return false;
+	}
+	uint32_t max_index = 0;
+	for (const auto& in: semantics) {
+		max_index = std::max<uint32_t>(max_index, attrib[in.semantic] & 0x1fu);
+	}
+	std::array<uint32_t, ShaderVertexInputInfo::RES_MAX * 4> buffer {};
+	if (!LibKernel::Memory::TryReadGpuCleanBacking(buffer_address, buffer.data(),
+	                                               (max_index + 1u) * 4u * sizeof(uint32_t))) {
+		return false;
+	}
+	ShaderApplyAttribSemantics(info, semantics, attrib.data(), buffer.data());
+	bool mismatch = false;
+	ShaderDetectBuffers(info, &mismatch);
+	return !mismatch;
+}
+
 static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserSgprInfo& user_sgpr,
                                            uint32_t user_sgpr_num, const HW::ShaderRegisters& sh,
                                            const ShaderMappedData& data,
@@ -530,6 +695,7 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 		}
 		return false;
 	}
+	NoteVertexTableRegs(shader_addr, metadata);
 
 	if (metadata.vertex_attrib_reg >= 0) {
 		info.fetch_external   = false;
@@ -851,12 +1017,8 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 
 // The content hash ShaderMapUserData registered for the code at addr, or 0.
 static uint64_t MappedShaderHash(uint64_t addr) {
-	std::scoped_lock lock(g_shader_map_mutex);
-	if (g_shader_map == nullptr) {
-		return 0;
-	}
-	const auto iter = g_shader_map->find(addr);
-	return iter != g_shader_map->end() ? iter->second.hash : 0;
+	ShaderMapEntry entry;
+	return FindShaderMapEntry(addr, entry) ? entry.hash : 0;
 }
 
 uint64_t ShaderDeclaredHash(uint64_t shader_addr) {
@@ -865,12 +1027,8 @@ uint64_t ShaderDeclaredHash(uint64_t shader_addr) {
 
 // Declared in frameGraph.h (diagnostics): not part of the recompiler's interface.
 uint32_t ShaderCodeSizeBytes(uint64_t shader_addr) {
-	std::scoped_lock lock(g_shader_map_mutex);
-	if (g_shader_map == nullptr) {
-		return 0;
-	}
-	const auto iter = g_shader_map->find(shader_addr);
-	return iter != g_shader_map->end() ? iter->second.data.code_size_bytes : 0u;
+	ShaderMapEntry entry;
+	return FindShaderMapEntry(shader_addr, entry) ? entry.data.code_size_bytes : 0u;
 }
 
 // Tessellation program pairs the analysis has already rejected, keyed by the registered LS/HS
@@ -928,25 +1086,59 @@ static uint64_t TessellationProgramKey(const HW::VertexShaderInfo& regs,
 	return XXH3_64bits(words, sizeof(words));
 }
 
-bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
-                                 std::array<ShaderVertexInputInfo, 3>& input_info,
-                                 std::array<ShaderParams, 3>&          params) {
+// `scan`: the draw-prep scanner's description (PrepareTessellationProgramsForScan), from a copy of
+// the registers that can be stale: it takes only a program set the analysis has accepted already,
+// returns false where the draw path would end the emulator, and logs and dumps nothing.
+static bool PrepareTessellationProgramsImpl(const HW::VertexShaderInfo&           regs,
+                                            const HW::Context&                    context,
+                                            std::array<ShaderVertexInputInfo, 3>& input_info,
+                                            std::array<ShaderParams, 3>& params, bool scan) {
 	const auto& sh        = context.GetShaderRegisters();
 	const auto  tess_key  = TessellationProgramKey(regs, sh);
+	// What the analysis found for this set, when it accepted it (one lock for both questions).
+	std::optional<ShaderTessellationInputInfo> accepted_tess;
 	{
 		std::scoped_lock lock(g_rejected_tessellation_mutex);
 		if (g_rejected_tessellation.contains(tess_key)) {
 			return false;
 		}
+		if (const auto found = g_accepted_tessellation.find(tess_key);
+		    found != g_accepted_tessellation.end()) {
+			accepted_tess = found->second;
+		} else if (scan) {
+			return false;
+		}
 	}
-	const auto [local, local_hash] = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
-	const auto [control, control_hash] = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
-	const auto [evaluation, evaluation_hash] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
-	EXIT_NOT_IMPLEMENTED(local.type != Prospero::ShaderBinaryType::kHsFront ||
-	                     control.type != Prospero::ShaderBinaryType::kHsBack ||
-	                     evaluation.type != Prospero::ShaderBinaryType::kGs);
-	EXIT_NOT_IMPLEMENTED((context.GetShaderStages() & 0x4u) == 0 ||
-	                     (context.GetShaderStages() & 0x00600020u) != 0);
+	ShaderMapEntry local_entry;
+	ShaderMapEntry control_entry;
+	ShaderMapEntry evaluation_entry;
+	if (scan) {
+		if (!FindShaderMapEntry(regs.ls_regs.data_addr, local_entry) ||
+		    !FindShaderMapEntry(regs.hs_regs.data_addr, control_entry) ||
+		    !FindShaderMapEntry(regs.es_regs.data_addr, evaluation_entry)) {
+			return false;
+		}
+	} else {
+		local_entry      = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
+		control_entry    = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
+		evaluation_entry = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
+	}
+	const auto& [local, local_hash]           = local_entry;
+	const auto& [control, control_hash]       = control_entry;
+	const auto& [evaluation, evaluation_hash] = evaluation_entry;
+	const bool unsupported_types = local.type != Prospero::ShaderBinaryType::kHsFront ||
+	                               control.type != Prospero::ShaderBinaryType::kHsBack ||
+	                               evaluation.type != Prospero::ShaderBinaryType::kGs;
+	const bool unsupported_stages =
+	    (context.GetShaderStages() & 0x4u) == 0 || (context.GetShaderStages() & 0x00600020u) != 0;
+	// User SGPR counts are 6-bit fields: past 32 the draw path ends the emulator (GetShaderParams).
+	if (scan && (unsupported_types || unsupported_stages || regs.hs_regs.user_data_addr == 0 ||
+	             regs.hs_regs.rsrc2.user_sgpr > HW::UserSgprInfo::SGPRS_MAX ||
+	             regs.gs_regs.rsrc2.user_sgpr > HW::UserSgprInfo::SGPRS_MAX)) {
+		return false;
+	}
+	EXIT_NOT_IMPLEMENTED(unsupported_types);
+	EXIT_NOT_IMPLEMENTED(unsupported_stages);
 	EXIT_IF(regs.hs_regs.user_data_addr == 0);
 
 	const auto local_users      = std::span(regs.hs_user_sgpr.value, regs.hs_regs.rsrc2.user_sgpr);
@@ -963,8 +1155,14 @@ bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Con
 	params[1].user_data[1] = static_cast<uint32_t>(regs.hs_regs.user_data_addr >> 32u);
 
 	input_info = {};
-	if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
-	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, input_info[0])) {
+	if (scan) {
+		if (!ShaderGetStaticVertexInputInfoForScan(regs.ls_regs.data_addr, regs.hs_user_sgpr, sh,
+		                                           local, input_info[0])) {
+			return false;
+		}
+	} else if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
+	                                           regs.hs_regs.rsrc2.user_sgpr, sh, local,
+	                                           input_info[0])) {
 		EXIT("failed to prepare local shader program\n");
 	}
 	input_info[0].logical_stage       = ShaderType::Local;
@@ -981,18 +1179,16 @@ bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Con
 	    .partitioning          = (sh.m_vgtTfParam >> 2u) & 0x3u,
 	    .output_topology       = (sh.m_vgtTfParam >> 5u) & 0x3u,
 	};
-	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
-	        tess.output_control_points == 0 || tess.output_control_points > 32);
-	bool analysed = false;
-	{
-		std::scoped_lock lock(g_rejected_tessellation_mutex);
-		if (const auto found = g_accepted_tessellation.find(tess_key);
-		    found != g_accepted_tessellation.end()) {
-			tess     = found->second;
-			analysed = true;
-		}
+	const bool bad_points = tess.input_control_points == 0 || tess.input_control_points > 32 ||
+	                        tess.output_control_points == 0 || tess.output_control_points > 32;
+	if (scan && bad_points) {
+		return false;
 	}
-	if (!analysed) {
+	EXIT_IF(bad_points);
+	const bool analysed = accepted_tess.has_value();
+	if (analysed) {
+		tess = *accepted_tess;
+	} else {
 		DumpTessellationPrograms(params, {local_hash, control_hash, evaluation_hash}, sh);
 		const bool accepted =
 		    ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess);
@@ -1030,12 +1226,15 @@ bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Con
 			tess.min_level_bits = std::bit_cast<uint32_t>(cap);
 		}
 	}
-	{
+	static std::atomic_bool factor_ranges_logged {false};
+	if (!scan && !factor_ranges_logged.load(std::memory_order_relaxed)) {
 		static std::mutex                   logged_mutex;
 		static std::unordered_set<uint64_t> logged;
 		std::scoped_lock                    lock(logged_mutex);
-		if (logged.size() < 8u &&
-		    logged.insert((uint64_t {tess.min_level_bits} << 32u) | tess.max_level_bits).second) {
+		if (logged.size() >= 8u) {
+			factor_ranges_logged.store(true, std::memory_order_relaxed);
+		} else if (logged.insert((uint64_t {tess.min_level_bits} << 32u) | tess.max_level_bits)
+		               .second) {
 			LOGF(
 			    "Tessellation factor range: VGT_HOS_MIN_TESS_LEVEL %g, VGT_HOS_MAX_TESS_LEVEL %g\n",
 			    static_cast<double>(std::bit_cast<float>(tess.min_level_bits)),
@@ -1046,6 +1245,19 @@ bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Con
 		stage.tess = tess;
 	}
 	return true;
+}
+
+bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
+                                 std::array<ShaderVertexInputInfo, 3>& input_info,
+                                 std::array<ShaderParams, 3>&          params) {
+	return PrepareTessellationProgramsImpl(regs, context, input_info, params, false);
+}
+
+bool PrepareTessellationProgramsForScan(const HW::VertexShaderInfo&           regs,
+                                        const HW::Context&                    context,
+                                        std::array<ShaderVertexInputInfo, 3>& input_info,
+                                        std::array<ShaderParams, 3>&          params) {
+	return PrepareTessellationProgramsImpl(regs, context, input_info, params, true);
 }
 
 ShaderParams PrepareProgram(

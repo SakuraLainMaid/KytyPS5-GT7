@@ -48,6 +48,7 @@
 #include <string_view>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -908,6 +909,138 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	return image.usage.storage ? BindingType::Storage : BindingType::Texture;
 }
 
+namespace {
+
+// Images registered and unregistered (round 78): GT7 makes and drops hundreds of images a frame,
+// and each change makes texture bindings kept for reuse look again (RangeStamp). Every 10 s an
+// "Image churn" line: how many, where (by 256 MB area of guest memory), what dropped them
+// (FreeImage's reasons) and the images made again most often (the same address, size and format).
+struct ImageChurnStats {
+	std::mutex                      mutex;
+	uint64_t                        registered   = 0;
+	uint64_t                        unregistered = 0;
+	uint64_t                        bytes        = 0;
+	std::map<uint64_t, uint64_t>    by_area; // address >> 28: registrations
+	std::map<const char*, uint64_t> freed;   // FreeImage's reason
+	struct Remade {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint32_t width   = 0;
+		uint32_t height  = 0;
+		uint32_t layers  = 0;
+		uint32_t mips    = 0;
+		int      format  = 0;
+		uint64_t count   = 0;
+	};
+	std::unordered_map<uint64_t, Remade>  remade; // by address, size and format
+	std::chrono::steady_clock::time_point last {};
+};
+
+ImageChurnStats& ImageChurn() {
+	static ImageChurnStats stats;
+	return stats;
+}
+
+void ReportImageChurnLocked(ImageChurnStats& stats, std::chrono::steady_clock::time_point now) {
+	const double seconds = std::chrono::duration<double>(now - stats.last).count();
+	std::string  areas;
+	std::vector<std::pair<uint64_t, uint64_t>> by_area(stats.by_area.begin(), stats.by_area.end());
+	std::ranges::sort(by_area, [](const auto& a, const auto& b) { return a.second > b.second; });
+	for (size_t i = 0; i < by_area.size() && i < 6; i++) {
+		areas += fmt::format("{}0x{:x}: {}", i == 0 ? "" : ", ", by_area[i].first << 28u,
+		                     by_area[i].second);
+	}
+	std::string                                   freed;
+	std::vector<std::pair<const char*, uint64_t>> reasons(stats.freed.begin(), stats.freed.end());
+	std::ranges::sort(reasons, [](const auto& a, const auto& b) { return a.second > b.second; });
+	for (size_t i = 0; i < reasons.size() && i < 6; i++) {
+		freed += fmt::format("{}{} {}", i == 0 ? "" : ", ",
+		                     reasons[i].first != nullptr ? reasons[i].first : "(other)",
+		                     reasons[i].second);
+	}
+	std::vector<ImageChurnStats::Remade> remade;
+	for (const auto& [key, entry]: stats.remade) {
+		(void)key;
+		if (entry.count >= 2) {
+			remade.push_back(entry);
+		}
+	}
+	std::ranges::sort(remade, [](const auto& a, const auto& b) { return a.count > b.count; });
+	std::string again;
+	for (size_t i = 0; i < remade.size() && i < 8; i++) {
+		const auto& e = remade[i];
+		again += fmt::format("{}0x{:012x}+0x{:x} {}x{} layers {} mips {} fmt {} ({}x)",
+		                     i == 0 ? "" : "; ", e.address, e.size, e.width, e.height, e.layers,
+		                     e.mips, e.format, e.count);
+	}
+	LOGF("Image churn (%.0f s): %" PRIu64 " images registered (%" PRIu64 " MB), %" PRIu64
+	     " unregistered, %zu distinct (address, size, format), %zu of them made again | by area: "
+	     "%s | dropped: %s | made again most: %s\n",
+	     seconds, stats.registered, stats.bytes >> 20u, stats.unregistered, stats.remade.size(),
+	     remade.size(), areas.empty() ? "none" : areas.c_str(),
+	     freed.empty() ? "none" : freed.c_str(), again.empty() ? "none" : again.c_str());
+	stats.registered   = 0;
+	stats.unregistered = 0;
+	stats.bytes        = 0;
+	stats.by_area.clear();
+	stats.freed.clear();
+	stats.remade.clear();
+	stats.last = now;
+}
+
+// Under the texture cache's lock: counts only (ReportImageChurnIfDue logs, outside it).
+void NoteImageChurn(const Image& image, bool registered) {
+	auto&           stats = ImageChurn();
+	std::lock_guard lock(stats.mutex);
+	if (registered) {
+		stats.registered++;
+		stats.bytes += image.info.data.size;
+		stats.by_area[image.info.data.address >> 28u]++;
+		const uint64_t words[3] = {image.info.data.address, image.info.data.size,
+		                           static_cast<uint64_t>(image.info.pixel_format)};
+		if (stats.remade.size() < 65536) {
+			auto& entry = stats.remade[XXH3_64bits(words, sizeof(words))];
+			entry       = {image.info.data.address,
+			               image.info.data.size,
+			               image.info.extent.width,
+			               image.info.extent.height,
+			               image.info.resources.layers,
+			               image.info.resources.levels,
+			               static_cast<int>(image.info.pixel_format),
+			               entry.count + 1};
+		}
+	} else {
+		stats.unregistered++;
+	}
+}
+
+} // namespace
+
+void ReportImageChurnIfDue() {
+	auto&           stats = ImageChurn();
+	const auto      now   = std::chrono::steady_clock::now();
+	std::lock_guard lock(stats.mutex);
+	if (stats.last.time_since_epoch().count() == 0) {
+		stats.last = now;
+		return;
+	}
+	if (now - stats.last >= std::chrono::seconds(10)) {
+		ReportImageChurnLocked(stats, now);
+	}
+}
+
+namespace {
+
+void NoteImageFreed(const char* why) {
+	auto&           stats = ImageChurn();
+	std::lock_guard lock(stats.mutex);
+	if (stats.freed.size() < 64 || stats.freed.contains(why)) {
+		stats.freed[why]++;
+	}
+}
+
+} // namespace
+
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	m_slot_images[id].self_id = id;
@@ -970,6 +1103,8 @@ void TextureCache::RegisterImage(ImageId id) {
 	});
 	image.registered = true;
 	m_image_set_generation.fetch_add(1, std::memory_order_acq_rel);
+	m_zone_stamps.Stamp(image.info.data.address, image.info.data.size);
+	NoteImageChurn(image, true);
 	NoteBindlessStateChange(image);
 	image.lru_id     = m_lru_cache.Insert(id, LruClock());
 	m_total_used_memory += image.AccountedSize();
@@ -1007,6 +1142,8 @@ void TextureCache::UnregisterImage(ImageId id) {
 	m_total_used_memory -= accounted;
 	image.registered = false;
 	m_image_set_generation.fetch_add(1, std::memory_order_acq_rel);
+	m_zone_stamps.Stamp(image.info.data.address, image.info.data.size);
+	NoteImageChurn(image, false);
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -1072,6 +1209,9 @@ void TextureCache::ReleaseImage(ImageId id) {
 
 void TextureCache::FreeImage(ImageId id, const char* why, bool copied) {
 	auto& image = m_slot_images[id];
+	if (image.registered) {
+		NoteImageFreed(why);
+	}
 	// Pixels only this image held: the next image over the memory starts from the guest bytes.
 	if (image.gpu_pixels && image.IsGpuModified() && !copied && why != nullptr &&
 	    image.registered && !image.depth_id) {

@@ -261,6 +261,10 @@ public:
 		ShaderVertexInputInfo  vertex_info;
 		ShaderParams           compute_params;
 		ShaderComputeInputInfo compute_info;
+		// A tessellated draw (round 78): its LS, HS and ES stages, in that order (vertex_params
+		// and vertex_info are not used then); empty otherwise.
+		std::vector<ShaderParams>          tess_params;
+		std::vector<ShaderVertexInputInfo> tess_info;
 	};
 	bool DrawPrepDescribeGraphics(const HW::VertexShaderInfo& vertex_regs,
 	                              const HW::PixelShaderInfo&  pixel_regs,
@@ -299,14 +303,17 @@ public:
 private:
 	struct ProgramCache;
 
-	// GetGraphicsPrograms' stage inputs from the registers (shared with DrawPrepDescribeGraphics).
-	bool DescribeGraphicsStages(const HW::VertexShaderInfo& vertex_regs,
-	                            const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
-	                            const HW::Context& context, const HW::UserConfig& user_config,
-	                            std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-	                            bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
-	                            ShaderPixelInputInfo& pixel_info,
-	                            std::array<ShaderParams, 3>& vertex_params, ShaderParams& pixel_params);
+	// GetGraphicsPrograms' stage inputs from the registers (shared with DrawPrepDescribeGraphics;
+	// `scan`: the scanner's, whose tessellation stages are described without ever ending the
+	// emulator, PrepareTessellationProgramsForScan).
+	bool DescribeGraphicsStages(
+	    const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
+	    const HW::ShaderRegisters& sh, const HW::Context& context,
+	    const HW::UserConfig&                               user_config,
+	    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+	    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
+	    ShaderPixelInputInfo& pixel_info, std::array<ShaderParams, 3>& vertex_params,
+	    ShaderParams& pixel_params, bool scan = false);
 
 	struct GraphicsPipelineKey {
 		PipelineRenderingState   rendering;

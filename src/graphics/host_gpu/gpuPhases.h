@@ -69,6 +69,8 @@ enum class Phase : uint32_t {
 	BdaRegions,     // (a count only) the tracker regions those walks visited
 	BdaProtects,    // (a count only) the page protection changes those walks made
 	SpecCheck,      // CommitBindings' check of specialization reads against the draw's writes
+	TessDraw,       // a tessellated draw, whole (inside Draw; round 78)
+	TessPrograms,   // its shaders (inside DrawPrograms)
 	Count
 };
 

@@ -2,6 +2,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/renderer/cache/imageZoneStamps.h"
 
 #include <atomic>
 #include <chrono>
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <semaphore>
 #include <string>
 #include <thread>
@@ -975,6 +977,48 @@ void TestDirtyRegionWalk() {
   Release(memory);
 }
 
+// The texture memo's zone stamps (round 78): a range's stamp moves when an image is registered
+// or unregistered over it, and stays when that happens elsewhere.
+void TestImageZoneStamps() {
+  auto stamps = std::make_unique<Libs::Graphics::ImageZoneStamps>();
+  constexpr uint64_t MB = 1ull << 20u;
+  const uint64_t texture = 0x9'0000'0000ull + 3 * MB + 0x1000; // a small texture
+  const uint64_t big = 0x12'0000'0000ull;                      // 32 MB: regions, not zones
+  const auto t0 = stamps->RangeStamp(texture, 0x4000);
+  const auto b0 = stamps->RangeStamp(big, 32 * MB);
+  Check(t0 != 0, "a range has a stamp");
+  Check(stamps->RangeStamp(texture, 0x4000) == t0, "a stamp stays while nothing changes");
+
+  // A light grid in per-frame memory far away: neither range moves.
+  stamps->Stamp(0x10'0400'0000ull, 0x1000);
+  Check(stamps->RangeStamp(texture, 0x4000) == t0, "a change elsewhere leaves a range's stamp");
+  Check(stamps->RangeStamp(big, 32 * MB) == b0, "a change elsewhere leaves a long range's stamp");
+
+  // An image over the texture's zone (not over its bytes): the stamp moves.
+  stamps->Stamp(texture + 0x8000, 0x1000);
+  const auto t1 = stamps->RangeStamp(texture, 0x4000);
+  Check(t1 != t0, "a change in the zone moves the stamp");
+  Check(stamps->RangeStamp(texture, 0x4000) == t1, "the new stamp stays");
+
+  // An image that covers the texture from far below it.
+  stamps->Stamp(texture - 2 * MB, 4 * MB);
+  Check(stamps->RangeStamp(texture, 0x4000) != t1, "a covering image moves the stamp");
+
+  // A change inside the long range's regions moves it.
+  stamps->Stamp(big + 20 * MB, 0x2000);
+  Check(stamps->RangeStamp(big, 32 * MB) != b0, "a change in a long range's region moves it");
+
+  // A huge image moves every stamp.
+  const auto t2 = stamps->RangeStamp(texture, 0x4000);
+  stamps->Stamp(0x20'0000'0000ull, 8192 * MB);
+  Check(stamps->RangeStamp(texture, 0x4000) != t2, "a huge image moves every stamp");
+
+  // A range too long to look at never keeps its stamp.
+  const auto huge = stamps->RangeStamp(0x30'0000'0000ull, 65ull * 64 * MB);
+  Check(stamps->RangeStamp(0x30'0000'0000ull, 65ull * 64 * MB) != huge,
+        "a range of more than 64 regions has no stamp that stays");
+}
+
 void TestBdaPendingRegions() {
   // The BDA walk's pending regions (MemoryTracker::TakeBdaPending): a region is
   // pending when it is created, when pages of it become CPU-dirty and when
@@ -1451,6 +1495,7 @@ int main(int argc, char **argv) {
   TestRegionBitmapHint();
   TestDirtyRegionWalk();
   TestBdaPendingRegions();
+  TestImageZoneStamps();
   TestUploadDoesNotSerializeDisjointRegion();
   TestDownloadDoesNotSerializeDisjointRegion();
   TestGpuUnmarkUsesRegionMask();

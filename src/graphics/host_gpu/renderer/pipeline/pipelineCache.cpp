@@ -55,6 +55,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -3479,9 +3480,20 @@ bool PipelineCache::DescribeGraphicsStages(
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
-    std::array<ShaderParams, 3>& vertex_params, ShaderParams& pixel_params) {
+    std::array<ShaderParams, 3>& vertex_params, ShaderParams& pixel_params, bool scan) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
-	if (tess_active) {
+	// The scanner's register copy can be stale: a user SGPR count past 32 (a 6-bit field) ends the
+	// emulator in GetShaderParams, so the scanner leaves such a draw to the GPU thread.
+	constexpr uint32_t MaxUserSgprs = HW::UserSgprInfo::SGPRS_MAX;
+	if (scan && (vertex_regs.gs_regs.rsrc2.user_sgpr > MaxUserSgprs ||
+	             (pixel_active && pixel_regs.ps_regs.rsrc2.user_sgpr > MaxUserSgprs))) {
+		return false;
+	}
+	if (tess_active && scan) {
+		if (!PrepareTessellationProgramsForScan(vertex_regs, context, vertex_info, vertex_params)) {
+			return false;
+		}
+	} else if (tess_active) {
 		if (!PrepareTessellationPrograms(vertex_regs, context, vertex_info, vertex_params)) {
 			if (!ShaderFailureNonFatal()) {
 				EXIT("unsupported tessellation programs\n");
@@ -3630,6 +3642,19 @@ static uint64_t DrawPrepVertexIdentity(const HW::VertexShaderInfo& vertex_regs) 
 	return vertex_regs.es_regs.data_addr ^ (vertex_regs.gs_regs.data_addr << 1u);
 }
 
+// A tessellated draw's (round 78): its three programs and the registers that configure the
+// tessellator, tagged apart from the identities above.
+static uint64_t DrawPrepTessIdentity(const HW::VertexShaderInfo& vertex_regs,
+                                     const HW::ShaderRegisters&  sh) {
+	const uint64_t words[6] = {0x7e55u,
+	                           vertex_regs.ls_regs.data_addr,
+	                           vertex_regs.hs_regs.data_addr,
+	                           vertex_regs.es_regs.data_addr,
+	                           sh.m_vgtLsHsConfig,
+	                           sh.m_vgtTfParam};
+	return XXH3_64bits(words, sizeof(words));
+}
+
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
@@ -3684,8 +3709,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			program.normalized_samplers = true;
 		}
 	}
-	if (DrawPrep::Enabled() && !tess_active && (!pixel_active || result.pixel)) {
-		DrawPrep::NoteGoodPair(DrawPrepVertexIdentity(vertex_regs),
+	if (DrawPrep::Enabled() && (!pixel_active || result.pixel)) {
+		DrawPrep::NoteGoodPair(tess_active ? DrawPrepTessIdentity(vertex_regs, sh)
+		                                   : DrawPrepVertexIdentity(vertex_regs),
 		                       pixel_active ? pixel_regs.ps_regs.data_addr : 0u);
 	}
 	return result;
@@ -3696,11 +3722,15 @@ bool PipelineCache::DrawPrepDescribeGraphics(
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     DrawPrepInputs& inputs) {
-	if (user_config.GetPrimType() == Prospero::PrimitiveType::kPatch) {
+	// Tessellated draws are prepared too since round 78 (GT7's car bodies: four stages a draw, all
+	// walked on the GPU thread before); KYTY_BISECT's drawprep:notess leaves them to it again.
+	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
+	if (tess_active && Bisect::DrawPrepNoTess()) {
 		DrawPrep::Add(DrawPrep::Counter::SkipUnsupported);
 		return false;
 	}
-	if (!DrawPrep::IsGoodPair(DrawPrepVertexIdentity(vertex_regs),
+	if (!DrawPrep::IsGoodPair(tess_active ? DrawPrepTessIdentity(vertex_regs, sh)
+	                                      : DrawPrepVertexIdentity(vertex_regs),
 	                          pixel_active ? pixel_regs.ps_regs.data_addr : 0u)) {
 		DrawPrep::Add(DrawPrep::Counter::SkipUnknownPair);
 		return false;
@@ -3709,14 +3739,22 @@ bool PipelineCache::DrawPrepDescribeGraphics(
 	std::array<ShaderParams, 3>          vertex_params;
 	if (!DescribeGraphicsStages(vertex_regs, pixel_regs, sh, context, user_config,
 	                            target_export_mapping, pixel_active, vertex_info, inputs.pixel_info,
-	                            vertex_params, inputs.pixel_params)) {
+	                            vertex_params, inputs.pixel_params, true)) {
 		DrawPrep::Add(DrawPrep::Counter::SkipUnsupported);
 		return false;
 	}
-	inputs.compute       = false;
-	inputs.pixel         = pixel_active;
-	inputs.vertex_params = vertex_params[0];
-	inputs.vertex_info   = vertex_info[0];
+	inputs.compute = false;
+	inputs.pixel   = pixel_active;
+	if (tess_active) {
+		inputs.tess_params.assign(vertex_params.begin(), vertex_params.end());
+		inputs.tess_info.assign(vertex_info.begin(), vertex_info.end());
+		DrawPrep::Add(DrawPrep::Counter::TessScanned);
+	} else {
+		inputs.tess_params.clear();
+		inputs.tess_info.clear();
+		inputs.vertex_params = vertex_params[0];
+		inputs.vertex_info   = vertex_info[0];
+	}
 	return true;
 }
 
@@ -3726,6 +3764,11 @@ bool PipelineCache::DrawPrepDescribeCompute(const HW::ComputeShaderInfo&  regs,
                                             DrawPrepInputs&               inputs) {
 	if (!DrawPrep::IsGoodPair(regs.cs_regs.data_addr, UINT64_MAX)) {
 		DrawPrep::Add(DrawPrep::Counter::SkipUnknownPair);
+		return false;
+	}
+	// As DescribeGraphicsStages: a count GetShaderParams would end the emulator on.
+	if (regs.cs_regs.user_sgpr > HW::UserSgprInfo::SGPRS_MAX) {
+		DrawPrep::Add(DrawPrep::Counter::SkipUnsupported);
 		return false;
 	}
 	inputs.compute                         = true;
@@ -3750,6 +3793,18 @@ bool PipelineCache::DrawPrepWalk(const DrawPrepInputs& inputs, DrawPrep::PacketR
 	if (inputs.pixel && m_program_cache->ScanStage(inputs.pixel_params, inputs.pixel_info,
 	                                               ShaderType::Pixel, out.stages[0])) {
 		out.stage_count++;
+	}
+	if (!inputs.tess_info.empty()) {
+		// LS, HS and ES, each taken by its own stage (DrawPrep::Take).
+		static_assert(std::tuple_size_v<decltype(out.stages)> >= 4);
+		for (size_t i = 0; i < inputs.tess_info.size() && i < inputs.tess_params.size(); i++) {
+			if (m_program_cache->ScanStage(inputs.tess_params[i], inputs.tess_info[i],
+			                               inputs.tess_info[i].logical_stage,
+			                               out.stages[out.stage_count])) {
+				out.stage_count++;
+			}
+		}
+		return out.stage_count != 0;
 	}
 	if (m_program_cache->ScanStage(inputs.vertex_params, inputs.vertex_info,
 	                               inputs.vertex_info.logical_stage, out.stages[out.stage_count])) {

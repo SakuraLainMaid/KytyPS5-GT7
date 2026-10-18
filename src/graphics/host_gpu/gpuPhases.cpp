@@ -170,6 +170,10 @@ void ReportIfDue(uint64_t frames) {
 	                    {"commit", Phase::DrawCommit},
 	                    {"emit", Phase::DrawEmit}});
 	line += fmt::format(" (describe {:.2f})", each(Phase::Describe, Phase::Draw));
+	// Round 78: the tessellated ones among them (GT7's car bodies), and their shaders' share.
+	line += fmt::format(" | tessellated draws {}, {:.2f} us each (shaders {:.2f})",
+	                    count(Phase::TessDraw), each(Phase::TessDraw, Phase::TessDraw),
+	                    each(Phase::TessPrograms, Phase::TessDraw));
 
 	line += fmt::format(" | dispatches {}, {:.2f} us each:", count(Phase::Dispatch),
 	                    each(Phase::Dispatch, Phase::Dispatch));

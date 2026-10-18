@@ -37,6 +37,12 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
                                                const HW::Context&          context,
                                                std::array<ShaderVertexInputInfo, 3>& input_info,
                                                std::array<ShaderParams, 3>&          params);
+// The same for the draw-prep scanner, from its copy of the registers: only a program set the
+// draw path has had accepted already; false (never an exit) for anything else.
+[[nodiscard]] bool
+PrepareTessellationProgramsForScan(const HW::VertexShaderInfo& regs, const HW::Context& context,
+                                   std::array<ShaderVertexInputInfo, 3>& input_info,
+                                   std::array<ShaderParams, 3>&          params);
 ShaderParams PrepareProgram(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,

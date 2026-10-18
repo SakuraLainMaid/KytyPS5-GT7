@@ -7,6 +7,7 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/renderer/cache/imageZoneStamps.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/conditionalClear.h"
@@ -52,6 +53,10 @@ struct BufferFillClear {
 	std::string* what = nullptr;
 };
 
+// The "Image churn" line (round 78: images registered and unregistered, by area, why dropped and
+// which most often), when 10 s have passed since the last. Not under the texture cache's lock.
+void ReportImageChurnIfDue();
+
 class TextureCache {
 public:
 	// Called before a bindless-pinned image is unregistered.
@@ -85,6 +90,12 @@ public:
 	// description the same image, so a binding resolved before can name it again.
 	[[nodiscard]] uint64_t ImageSetGeneration() const noexcept {
 		return m_image_set_generation.load(std::memory_order_acquire);
+	}
+	// The same for one range of guest memory (round 78): it stays while no image over memory
+	// near the range was registered or unregistered (ImageZoneStamps), so FindImage gives a
+	// description there the same image. KYTY_BISECT's texmemo:global goes back to the generation.
+	[[nodiscard]] uint64_t RangeStamp(uint64_t address, uint64_t size) const noexcept {
+		return m_zone_stamps.RangeStamp(address, size);
 	}
 	// GPU thread: whether a sampled texture binding of image `id` may be kept for reuse at all: a
 	// registered image that is not a depth image nor a depth image's stencil plane, without
@@ -464,8 +475,10 @@ private:
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	TrackingSpinLock m_lock {Common::PerfStats::Lock::TextureCache};
-	// Registrations and unregistrations of images (ImageSetGeneration).
+	// Registrations and unregistrations of images (ImageSetGeneration), and where they were
+	// (RangeStamp).
 	std::atomic<uint64_t> m_image_set_generation {1};
+	ImageZoneStamps                                   m_zone_stamps;
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
 	// Render-target fast clears decided on the GPU (MaterializeColorClear); made at first use.

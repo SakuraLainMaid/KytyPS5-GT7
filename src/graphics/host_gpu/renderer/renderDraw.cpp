@@ -1196,6 +1196,10 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
 	const GpuPhases::Scope phase(GpuPhases::Phase::DrawPrograms);
+	std::optional<GpuPhases::Scope> tess_phase;
+	if (buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kPatch) {
+		tess_phase.emplace(GpuPhases::Phase::TessPrograms);
+	}
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
 	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
@@ -2187,6 +2191,11 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& guest_args) {
 	KYTY_PROFILER_FUNCTION();
 	const GpuPhases::Scope draw_phase(GpuPhases::Phase::Draw);
+	// A tessellated draw's time, whole (round 78).
+	std::optional<GpuPhases::Scope> tess_phase;
+	if (buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kPatch) {
+		tess_phase.emplace(GpuPhases::Phase::TessDraw);
+	}
 	DrawIndexArgs args = guest_args;
 	if (args.gpu_args_address != 0 &&
 	    !GpuIndexedArgsSupported(buffer, args.index_type_and_size)) {
@@ -2342,6 +2351,11 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 	const GpuPhases::Scope draw_phase(GpuPhases::Phase::Draw);
+	// A tessellated draw's time, whole (round 78).
+	std::optional<GpuPhases::Scope> tess_phase;
+	if (buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kPatch) {
+		tess_phase.emplace(GpuPhases::Phase::TessDraw);
+	}
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);

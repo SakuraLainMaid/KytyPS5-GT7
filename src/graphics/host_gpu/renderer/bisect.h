@@ -146,6 +146,12 @@
 //                round 77 (KYTY_UNNORMALIZED_FIX=0 for the whole run), instead of running its copy
 //                that turns them into normalized ones at the LOD it names
 //                (SpirvNormalizedExplicitLod)
+// and (round 78):
+//   drawprep:notess the draw-prep scanner leaves tessellated draws to the GPU thread, as before
+//                round 78, which then walks their four stages' descriptors itself
+//   texmemo:global a texture binding kept for reuse is looked up again whenever any image was
+//                made or dropped anywhere, as before round 78, instead of only when one was over
+//                memory near its own (TextureCache::RangeStamp)
 namespace Libs::Graphics::Bisect {
 
 // The GPU thread, at its start: applies the start step's CPU set and log setting.
@@ -221,6 +227,9 @@ void                      ApplyPending();
 [[nodiscard]] bool UnnormalizedLod();
 // Any thread: unorm:old.
 [[nodiscard]] bool UnnormalizedOld();
+// Any thread: drawprep:notess; texmemo:global.
+[[nodiscard]] bool DrawPrepNoTess();
+[[nodiscard]] bool TextureMemoGlobal();
 // Any thread: depth:equal-relaxed's bias in units of depth precision; 0 when off.
 [[nodiscard]] float DepthEqualRelaxed();
 

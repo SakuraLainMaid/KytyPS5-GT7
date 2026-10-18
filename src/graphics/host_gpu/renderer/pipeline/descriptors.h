@@ -34,6 +34,9 @@ struct TextureBinding {
 	// it (0: it may not be kept).
 	vk::ImageView memo_view       = nullptr;
 	uint64_t      memo_generation = 0;
+	// The stamp of the descriptor's memory at that lookup (TextureCache::RangeStamp, round 78):
+	// the binding is kept while it stays.
+	uint64_t memo_stamp = 0;
 };
 
 struct PreparedBindings {

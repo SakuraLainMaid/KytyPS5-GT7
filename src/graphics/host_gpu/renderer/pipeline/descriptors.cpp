@@ -788,6 +788,10 @@ struct TextureMemo {
 	uint64_t      generation = 0; // 0: none
 	uint32_t      base_level = 0;
 	uint32_t      base_layer = 0;
+	// The stamp of the descriptor's memory when it was kept (TextureCache::RangeStamp): it is
+	// current while the stamp stays (round 78), or, with KYTY_BISECT's texmemo:global, while the
+	// generation of the whole image set does, as before.
+	uint64_t stamp = 0;
 };
 
 struct TextureDescEntry {
@@ -822,15 +826,41 @@ bool TextureMemoEligible(const ShaderRecompiler::IR::ImageResource& resource) {
 }
 
 // A lookup the memo may keep (TextureBinding::memo_generation): the image was there with the same
-// backing, and the image set did not change during the lookup. Results that came out of overlap
-// resolution are left out: those can change with nothing registered or unregistered (an alias
-// that ages out is freed by a later lookup), and the view base they adjust is the last
-// candidate's.
+// backing, and no image over the descriptor's memory was made or dropped during the lookup (with
+// texmemo:global, none anywhere). Results that came out of overlap resolution are left out: those
+// can change with nothing registered or unregistered (an alias that ages out is freed by a later
+// lookup), and the view base they adjust is the last candidate's.
+// `range`: the descriptor's memory, whose stamp before the lookup was `stamp`.
 void KeepForMemo(TextureBinding& binding, bool use_memo, bool same_backing, uint64_t generation,
-                 const TextureCache& texture_cache) {
-	if (use_memo && same_backing && texture_cache.ImageSetGeneration() == generation) {
-		binding.memo_generation = generation;
+                 uint64_t stamp, const GuestRange& range, const TextureCache& texture_cache) {
+	if (!use_memo || !same_backing) {
+		return;
 	}
+	if (Bisect::TextureMemoGlobal()) {
+		if (texture_cache.ImageSetGeneration() == generation) {
+			binding.memo_generation = generation;
+			binding.memo_stamp      = texture_cache.RangeStamp(range.address, range.size);
+		}
+		return;
+	}
+	if (texture_cache.RangeStamp(range.address, range.size) == stamp) {
+		// The generation as it is now, for the global test should the step change.
+		binding.memo_generation = texture_cache.ImageSetGeneration();
+		binding.memo_stamp      = stamp;
+	}
+}
+
+// Whether a kept binding is still current for its descriptor's memory.
+bool MemoCurrent(const TextureMemo& memo, const TextureCache::ImageDesc& desc,
+                 const TextureCache& texture_cache) {
+	if (memo.generation == 0) {
+		return false;
+	}
+	if (Bisect::TextureMemoGlobal()) {
+		return memo.generation == texture_cache.ImageSetGeneration();
+	}
+	return memo.stamp != 0 &&
+	       memo.stamp == texture_cache.RangeStamp(desc.info.data.address, desc.info.data.size);
 }
 
 // Counted on the GPU thread, logged every 10 s ("Texture memo").
@@ -840,11 +870,19 @@ struct TextureMemoCounts {
 	uint64_t reused   = 0; // used again as it was
 	uint64_t refused  = 0; // the image had changed: looked up again
 	uint64_t recorded = 0;
+	// Why the others were looked up (round 78): a descriptor not seen before, one with nothing
+	// kept, one kept before an image near its memory was made or dropped, or one whose image has
+	// gone or must be bound again.
+	uint64_t                              miss_new   = 0;
+	uint64_t                              miss_none  = 0;
+	uint64_t                              miss_stale = 0;
+	uint64_t                              miss_image = 0;
 	std::chrono::steady_clock::time_point last {};
 };
 TextureMemoCounts g_texture_memo_counts;
 
 void ReportTextureMemo() {
+	ReportImageChurnIfDue();
 	auto&      c   = g_texture_memo_counts;
 	const auto now = std::chrono::steady_clock::now();
 	if (c.last.time_since_epoch().count() == 0) {
@@ -854,11 +892,17 @@ void ReportTextureMemo() {
 	if (now - c.last < std::chrono::seconds(10)) {
 		return;
 	}
-	LOGF("Texture memo (%.0f s): %" PRIu64 " sampled bindings, %" PRIu64 " found in the memo (%" PRIu64
-	     " used again, %" PRIu64 " looked up again: the image had changed), %" PRIu64
-	     " kept for reuse%s\n",
-	     std::chrono::duration<double>(now - c.last).count(), c.lookups, c.found, c.reused, c.refused,
-	     c.recorded, TextureMemoEnabled() ? "" : " (off)");
+	LOGF("Texture memo (%.0f s): %" PRIu64 " sampled bindings, %" PRIu64
+	     " found in the memo (%" PRIu64 " used again, %" PRIu64
+	     " looked up again: the image had changed), %" PRIu64
+	     " kept for reuse%s; the others: %" PRIu64 " new descriptors, %" PRIu64
+	     " with nothing kept, %" PRIu64
+	     " kept before an image near them was made or dropped%s, %" PRIu64
+	     " whose image had gone\n",
+	     std::chrono::duration<double>(now - c.last).count(), c.lookups, c.found, c.reused,
+	     c.refused, c.recorded, TextureMemoEnabled() ? "" : " (off)", c.miss_new, c.miss_none,
+	     c.miss_stale, Bisect::TextureMemoGlobal() ? " (anywhere: texmemo:global)" : "",
+	     c.miss_image);
 	c = {};
 	c.last = now;
 }
@@ -942,8 +986,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	if (use_cache) {
 		if (const auto it = cache.find(key); it != cache.end()) {
 			auto& entry = it->second;
-			if (use_memo && entry.memo.generation != 0 &&
-			    entry.memo.generation == texture_cache.ImageSetGeneration()) {
+			if (use_memo && MemoCurrent(entry.memo, entry.desc, texture_cache)) {
 				// The image FindImage would find: RebindImages checks it is unchanged before it
 				// uses the view again, and looks it up again otherwise.
 				const auto* image = texture_cache.m_slot_images.try_get(entry.memo.id);
@@ -956,15 +999,24 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 					binding.memo_view                 = entry.memo.view;
 					return binding;
 				}
+				g_texture_memo_counts.miss_image++;
+			} else if (use_memo) {
+				(entry.memo.generation == 0 ? g_texture_memo_counts.miss_none
+				                            : g_texture_memo_counts.miss_stale)++;
 			}
 			const auto generation   = texture_cache.ImageSetGeneration();
+			const auto range        = entry.desc.info.data;
+			const auto stamp        = texture_cache.RangeStamp(range.address, range.size);
 			bool       same_backing = false;
 			auto       binding      = FindResolvedTexture(
                 resource, descriptor, entry.desc, entry.shader_conversion, entry.pixel_format,
                 entry.view_format, entry.size, use_memo ? &same_backing : nullptr);
-			KeepForMemo(binding, use_memo, same_backing, generation, texture_cache);
+			KeepForMemo(binding, use_memo, same_backing, generation, stamp, range, texture_cache);
 			return binding;
 		}
+	}
+	if (use_memo) {
+		g_texture_memo_counts.miss_new++;
 	}
 
 	const auto address         = descriptor.Base40();
@@ -1176,11 +1228,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		                                     shader_conversion});
 	}
 	const auto generation   = texture_cache.ImageSetGeneration();
+	const auto range        = desc.info.data;
+	const auto stamp        = texture_cache.RangeStamp(range.address, range.size);
 	bool       same_backing = false;
 	auto       binding = FindResolvedTexture(resource, descriptor, std::move(desc), shader_conversion,
 	                                         pixel_format, view_format, size.size,
 	                                         use_memo ? &same_backing : nullptr);
-	KeepForMemo(binding, use_memo, same_backing, generation, texture_cache);
+	KeepForMemo(binding, use_memo, same_backing, generation, stamp, range, texture_cache);
 	return binding;
 }
 
@@ -1208,8 +1262,12 @@ void RenderExecutor::RecordTextureMemo(const ShaderRecompiler::IR::ImageResource
 		it->second.memo = {};
 		return;
 	}
-	it->second.memo = {binding.image_id, binding.image_view, binding.memo_generation,
-	                   binding.desc.view_info.base_level, binding.desc.view_info.base_layer};
+	it->second.memo = {binding.image_id,
+	                   binding.image_view,
+	                   binding.memo_generation,
+	                   binding.desc.view_info.base_level,
+	                   binding.desc.view_info.base_layer,
+	                   binding.memo_stamp};
 	g_texture_memo_counts.recorded++;
 }
 

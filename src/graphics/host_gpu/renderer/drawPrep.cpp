@@ -151,6 +151,15 @@ bool ReadSet::Validate() const {
 				if (std::memcmp(backing + (address - page), expected, in_page) != 0) {
 					return false;
 				}
+			} else if (const auto* range_backing =
+			               LibKernel::Memory::FindGpuCleanBacking(address, in_page);
+			           range_backing != nullptr) {
+				// A page with GPU-written bytes elsewhere: this range compared where it lies, as
+				// the copy below would compare it (round 78: those copies were ~2 % of the GPU
+				// thread in a race).
+				if (std::memcmp(range_backing, expected, in_page) != 0) {
+					return false;
+				}
 			} else {
 				if (current.size() < in_page) {
 					current.resize(in_page);
@@ -295,7 +304,8 @@ void LogCountersIfDue() {
 		previous[i]      = value;
 	}
 	const auto c = [&](Counter counter) { return static_cast<unsigned long long>(delta[static_cast<size_t>(counter)]); };
-	LOGF("DrawPrep (10 s): scanned %llu, prepared %llu stages, skipped behind %llu / unknown pair "
+	LOGF("DrawPrep (10 s): scanned %llu, prepared %llu stages (tessellated draws %llu), skipped "
+	     "behind %llu / unknown pair "
 	     "%llu / unsupported %llu / no entry %llu, walk failed %llu, tainted %llu (indirect %llu, "
 	     "context %llu); GPU takes %llu, "
 	     "used %llu (again %llu), miss none %llu (no packet %llu, nothing waiting %llu, a later "
@@ -303,7 +313,7 @@ void LogCountersIfDue() {
 	     "%llu / inputs "
 	     "%llu / reads %llu; COND_EXEC: scanner %llu (stepped over %llu, stopped %llu), GPU "
 	     "thread %llu (stepped over %llu); verify %llu checks, %llu mismatches\n",
-	     c(Counter::Scanned), c(Counter::Prepared), c(Counter::SkipBehind),
+	     c(Counter::Scanned), c(Counter::Prepared), c(Counter::TessScanned), c(Counter::SkipBehind),
 	     c(Counter::SkipUnknownPair), c(Counter::SkipUnsupported), c(Counter::SkipNoEntry),
 	     c(Counter::FailWalk), c(Counter::Tainted), c(Counter::TaintIndirect),
 	     c(Counter::TaintContext), c(Counter::Takes), c(Counter::Used) + c(Counter::Reused),

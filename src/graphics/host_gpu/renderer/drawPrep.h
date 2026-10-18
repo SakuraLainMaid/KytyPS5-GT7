@@ -91,8 +91,9 @@ struct StageResult {
 };
 
 struct PacketResult {
-	Key                        key;
-	std::array<StageResult, 2> stages;
+	Key key;
+	// A pixel stage and a vertex stage, or a pixel stage and a tessellated draw's three (round 78).
+	std::array<StageResult, 4> stages;
 	uint32_t                   stage_count = 0;
 };
 
@@ -117,7 +118,8 @@ enum class Counter : uint32_t {
 	Prepared,        // stage refreshes prepared
 	SkipBehind,      // packets the GPU thread had already passed
 	SkipUnknownPair, // shader pair the GPU thread has not prepared yet
-	SkipUnsupported, // tessellation, no vertex shader, a skip-listed compute shader, ...
+	SkipUnsupported, // no vertex shader, a skip-listed compute shader, a tessellated draw the
+	                 // scanner cannot describe, ...
 	SkipNoEntry,     // program not translated yet
 	FailWalk,        // walk failed (unclean or unreadable bytes)
 	Tainted,         // packets scanned while the register copy was unreliable
@@ -144,6 +146,7 @@ enum class Counter : uint32_t {
 	MissReads,       // recorded bytes changed or are no longer clean
 	VerifyChecks,
 	VerifyMismatches,
+	TessScanned, // tessellated draws described for preparation (round 78)
 	Count,
 };
 void Add(Counter counter, uint64_t value = 1);

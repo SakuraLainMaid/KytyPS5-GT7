@@ -66,6 +66,8 @@ struct Step {
 	bool              hiz_off         = false;
 	bool              unorm_lod       = false;
 	bool              unorm_old       = false;
+	bool              drawprep_notess = false;
+	bool              texmemo_global  = false;
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
 	int32_t           dflush          = -1;   // dflush:<n>; -1: the usual
@@ -254,6 +256,14 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "unorm:old") {
 		step.unorm_old = true;
+		return true;
+	}
+	if (action == "drawprep:notess") {
+		step.drawprep_notess = true;
+		return true;
+	}
+	if (action == "texmemo:global") {
+		step.texmemo_global = true;
 		return true;
 	}
 	if (action.starts_with("depth:equal-relaxed:")) {
@@ -764,6 +774,16 @@ bool UnnormalizedLod() {
 bool UnnormalizedOld() {
 	const auto* step = Current();
 	return step != nullptr && step->unorm_old;
+}
+
+bool DrawPrepNoTess() {
+	const auto* step = Current();
+	return step != nullptr && step->drawprep_notess;
+}
+
+bool TextureMemoGlobal() {
+	const auto* step = Current();
+	return step != nullptr && step->texmemo_global;
 }
 
 float DepthEqualRelaxed() {
