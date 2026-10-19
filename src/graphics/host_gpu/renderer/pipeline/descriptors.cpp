@@ -2467,6 +2467,13 @@ static void LogFrameGraphStage(RenderContext& context, const ShaderStageRuntime&
 		                program.info.buffers[i].formatted ? " formatted" : "", r.Base48(), bytes,
 		                mapped, r.Stride(), r.NumRecords(), r.RawFormat(), gpu ? 'G' : '-',
 		                cpu ? 'C' : '-', writers.empty() ? "-" : writers.c_str(), hash.c_str());
+		// Round 91: the first bytes of a small read-only buffer of large records (a draw's
+		// instances: 240 bytes each for the crowds), as the draw reads them.
+		if (mapped != 0 && mapped <= 16u * 1024u && r.Stride() >= 64u &&
+		    !program.info.buffers[i].written && !gpu) {
+			FrameGraph::LogBytes(fmt::format("{} buf[{}] bytes", stage, i).c_str(), r.Base48(),
+			                     std::min<uint64_t>(mapped, 512u));
+		}
 		if (mapped != 0) {
 			FrameGraph::NoteBuffer(r.Base48(), mapped);
 		}

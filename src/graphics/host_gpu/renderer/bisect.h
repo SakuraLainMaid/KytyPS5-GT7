@@ -208,6 +208,14 @@
 //   bdasync:submission the CPU's writes are synchronized for shaders that read memory through
 //                addresses once a guest submission, as before round 90, instead of again after
 //                each wait on memory that passes in it (KYTY_BDA_WAIT_SYNC=0 for the whole run)
+// and, round 91:
+//   gbuffer:sync a G-buffer pass into a texture (two color targets of 256 texels or more each way,
+//                a depth test that writes depth) compiles its new pipelines on the GPU thread, as
+//                before round 91 when the target was small and not drawn every frame, instead of
+//                being skipped while they compile (KYTY_DEFER_GBUFFER=0 for the whole run)
+//   depthread:old a draw that samples its depth target read-only binds it for the attachment
+//                alone first, as before round 91 (two barriers per draw), instead of for the
+//                attachment and a shader read at once
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -322,6 +330,9 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] float DepthEqualRelaxed();
 // GPU thread: bdasync:submission.
 [[nodiscard]] bool BdaSyncSubmission();
+// GPU thread: gbuffer:sync; depthread:old (round 91).
+[[nodiscard]] bool GbufferSync();
+[[nodiscard]] bool DepthReadOld();
 
 } // namespace Libs::Graphics::Bisect
 

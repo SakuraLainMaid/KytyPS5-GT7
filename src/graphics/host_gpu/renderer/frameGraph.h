@@ -51,6 +51,11 @@ void                   Log(const char* format, ...) KYTY_FORMAT_PRINTF(1, 2);
 // reads, to compare two draws over the same data.
 inline constexpr uint64_t HashBytes = 256ull << 10u;
 [[nodiscard]] std::string BytesHash(BufferCache& cache, uint64_t address, uint64_t size);
+// Round 91: and " (changed since op <n>)" when the frame read the same range before with other
+// bytes; every range hashed is hashed again after the frame ("FG 0 rehash" lines). LogBytes
+// logs guest bytes as they are now (up to 4 KB), as lines of the current operation: once a
+// capture for each range, and again after a BytesHash of it found them changed.
+void LogBytes(const char* label, uint64_t address, uint64_t size);
 
 // Buffer contents shown after the frame: the first KeepBytes of each.
 inline constexpr uint64_t KeepBytes = 1024;

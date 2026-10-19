@@ -39,6 +39,20 @@ std::map<uint64_t, uint64_t>                  g_buffers;   // guest address -> b
 std::map<uint64_t, std::pair<uint64_t, bool>> g_readbacks; // small linear images: bytes, read back
 std::set<uint64_t>           g_shaders;
 std::set<uint64_t>           g_grid_checks;
+// Round 91: the guest ranges hashed in this capture (BytesHash), with the hash and the operation
+// that first read them: re-hashed after the frame, and a range that changes between two of the
+// frame's reads is marked where it is read again.
+struct HashedRange {
+	uint64_t hash  = 0;
+	uint32_t first = 0; // the first operation that read these bytes
+	uint32_t last  = 0; // the last one that did
+};
+std::map<std::pair<uint64_t, uint64_t>, HashedRange> g_hashed;
+constexpr size_t                                     MaxHashed = 65536;
+// The addresses LogBytes logged in this capture: once each, and again when their bytes changed.
+std::set<uint64_t> g_bytes_logged;
+// Round 91: captures left to begin right after this one (KYTY_FG_FRAMES).
+uint32_t g_frames_left = 0;
 // Verification: the ranges claimed in this capture and the bytes they download; the counts of
 // the comparisons that landed (written as they land, from the scheduler's completion work).
 std::set<std::pair<uint64_t, uint64_t>> g_verify_claimed;
@@ -174,6 +188,64 @@ void LogReadbacks(BufferCache& cache) {
 	}
 }
 
+// Round 91: KYTY_FG_FRAMES=<n> (1 to 8, default 1): a capture logs n frames in a row, each its own
+// capture: a frame's data against the next one's.
+uint32_t CaptureFrames() {
+	static const uint32_t frames = [] {
+		const char* value = std::getenv("KYTY_FG_FRAMES");
+		const auto  n     = value != nullptr ? std::strtoul(value, nullptr, 10) : 1ul;
+		return static_cast<uint32_t>(std::clamp<unsigned long>(n, 1ul, 8ul));
+	}();
+	return frames;
+}
+
+// Round 91: the ranges the frame's draws hashed, hashed again now: the ones that changed after
+// they were read (the CPU wrote them later in the frame, or after it).
+void LogRehash(BufferCache& cache) {
+	if (g_hashed.empty()) {
+		return;
+	}
+	thread_local std::unique_ptr<uint8_t[]> scratch;
+	if (scratch == nullptr) {
+		scratch.reset(new uint8_t[HashBytes]);
+	}
+	// At most 1 GB read again (the GPU thread does it while the game waits for the frame).
+	constexpr uint64_t Budget  = 1ull << 30u;
+	uint64_t           read    = 0;
+	uint64_t           changed = 0;
+	uint64_t           gpu     = 0;
+	uint64_t           gone    = 0;
+	uint64_t           skipped = 0;
+	uint32_t           lines   = 0;
+	for (const auto& [range, hashed]: g_hashed) {
+		const auto& [address, size] = range;
+		if (read + size > Budget) {
+			skipped++;
+			continue;
+		}
+		read += size;
+		if (cache.HasGpuDirtyBytes(address, size)) {
+			gpu++;
+			continue;
+		}
+		if (!LibKernel::Memory::TryReadBacking(address, scratch.get(), size)) {
+			gone++;
+			continue;
+		}
+		if (XXH3_64bits(scratch.get(), size) == hashed.hash) {
+			continue;
+		}
+		changed++;
+		if (lines++ < 4000) {
+			LOGF("FG 0 rehash 0x%012" PRIx64 "+0x%" PRIx64 " read at ops %u to %u: changed since\n",
+			     address, size, hashed.first, hashed.last);
+		}
+	}
+	LOGF("FG 0 rehash: %zu ranges the frame read, %" PRIu64 " changed since (%" PRIu64
+	     " GPU-written now, %" PRIu64 " unreadable, %" PRIu64 " past the 1 GB budget)\n",
+	     g_hashed.size(), changed, gpu, gone, skipped);
+}
+
 void LogBuffers(BufferCache& cache) {
 	std::vector<std::pair<uint64_t, uint64_t>> ranges(g_buffers.begin(), g_buffers.end());
 	// The GPU's writes first (one wait for all of them).
@@ -204,23 +276,37 @@ uint64_t GpuThreadFrames() {
 
 void OnFrameBoundary(BufferCache& cache) {
 	g_frame_ends++;
+	bool continued = false;
 	if (g_active.load(std::memory_order_relaxed)) {
 		g_logging.store(false, std::memory_order_relaxed);
 		g_active.store(false, std::memory_order_relaxed);
 		LOGF("FG 0 end of frame: capture %u, %u operations%s\n", g_capture, g_op,
 		     g_truncated ? " (lines truncated)" : "");
+		// Before the buffers' downloads, which clear the marks of what the GPU wrote.
+		LogRehash(cache);
 		LogBuffers(cache);
 		LogReadbacks(cache);
 		LogVerify(cache);
 		LOGF("FG 0 end capture %u (%zu shaders dumped)\n", g_capture, g_shaders.size());
 		g_buffers.clear();
 		g_readbacks.clear();
-		// The next frame may be captured too.
+		g_hashed.clear();
+		g_bytes_logged.clear();
+		// The next frame may be captured too (KYTY_FG_FRAMES: at once).
+		if (g_frames_left != 0) {
+			g_frames_left--;
+			continued = true;
+		}
 	}
 	const auto& frames    = ScheduledFrames();
 	const bool  scheduled = std::find(frames.begin(), frames.end(), g_frame_ends) != frames.end();
-	if (!g_requested.exchange(false, std::memory_order_relaxed) && !scheduled) {
+	const bool  requested = g_requested.exchange(false, std::memory_order_relaxed);
+	if (!continued && !requested && !scheduled) {
 		return;
+	}
+	if (!continued) {
+		// A new capture (F9, or a scheduled one): it and the frames after it.
+		g_frames_left = CaptureFrames() - 1u;
 	}
 	g_capture++;
 	g_op           = 0;
@@ -231,6 +317,8 @@ void OnFrameBoundary(BufferCache& cache) {
 	g_readbacks.clear();
 	g_shaders.clear();
 	g_grid_checks.clear();
+	g_hashed.clear();
+	g_bytes_logged.clear();
 	ResetVerify();
 	LOGF("FG 0 begin capture %u after frame end %" PRIu64 "\n", g_capture, g_frame_ends);
 	if (VerifyEnabled()) {
@@ -287,8 +375,44 @@ std::string BytesHash(BufferCache& cache, uint64_t address, uint64_t size) {
 	if (size == 0 || !LibKernel::Memory::TryReadBacking(address, scratch.get(), size)) {
 		return "-";
 	}
-	return fmt::format("{:016x}{}", XXH3_64bits(scratch.get(), size),
-	                   cache.HasGpuDirtyBytes(address, size) ? " [G]" : "");
+	const auto  hash = XXH3_64bits(scratch.get(), size);
+	const bool  gpu  = cache.HasGpuDirtyBytes(address, size);
+	std::string changed;
+	if (Logging() && !gpu) {
+		const auto key = std::make_pair(address, size);
+		if (const auto found = g_hashed.find(key); found != g_hashed.end()) {
+			if (found->second.hash != hash) {
+				// Changed after op `last` read it (by the CPU, or a download of the GPU's writes).
+				changed       = fmt::format(" (changed since op {})", found->second.last);
+				found->second = {hash, g_op, g_op};
+				g_bytes_logged.erase(address);
+			} else {
+				found->second.last = g_op;
+			}
+		} else if (g_hashed.size() < MaxHashed) {
+			g_hashed.emplace(key, HashedRange {hash, g_op, g_op});
+		}
+	}
+	return fmt::format("{:016x}{}{}", hash, gpu ? " [G]" : "", changed);
+}
+
+void LogBytes(const char* label, uint64_t address, uint64_t size) {
+	if (!Logging() || address == 0 || size == 0 || !g_bytes_logged.insert(address).second) {
+		return;
+	}
+	size = std::min<uint64_t>(LibKernel::Memory::TryClampRangeSize(address, size), 4096u) &
+	       ~uint64_t {3};
+	std::vector<uint32_t> words(size / 4u);
+	if (words.empty() || !LibKernel::Memory::TryReadBacking(address, words.data(), size)) {
+		return;
+	}
+	for (size_t row = 0; row < words.size(); row += 16) {
+		std::string line;
+		for (size_t k = row; k < std::min(words.size(), row + 16); k++) {
+			line += fmt::format(" {:08x}", words[k]);
+		}
+		Log("  %s +0x%03zx:%s", label, row * 4u, line.c_str());
+	}
 }
 
 void NoteBuffer(uint64_t address, uint64_t size) {

@@ -3735,6 +3735,41 @@ bool DepthTestedDraw(const HW::Context& context) {
 	       (control.zfunc != CompareAlways || control.z_write_enable);
 }
 
+// Round 91: a 3D pass into two color targets or more, each at least 256 texels each way, with a
+// depth test that can fail and a depth write: a G-buffer pass into a texture, not a UI or layer
+// picture. A game's car view shown before an event drew one into 1024x512 targets the first
+// frame it showed: 64 pipelines compiled on the GPU thread, 50 s of black screens in a session,
+// ~5 s at a time (2026-10-19). Such a draw may be skipped while its shaders translate and its
+// pipeline compiles, from its first frame: a picture drawn only once would miss what was skipped.
+// KYTY_DEFER_GBUFFER=0 (or KYTY_DEFER_REDRAWN=0, all of these rules) turns this off; the F8 step
+// gbuffer:sync too.
+bool GbufferPassDraw(const HW::Context& context) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DEFER_GBUFFER");
+		return value == nullptr || value[0] != '0';
+	}();
+	constexpr uint8_t CompareAlways = 7;
+	const auto&       control       = context.GetDepthControl();
+	if (!enabled || Bisect::GbufferSync() || !control.z_write_enable ||
+	    control.zfunc == CompareAlways || !DepthTestedDraw(context)) {
+		return false;
+	}
+	constexpr uint32_t MinExtent = 256;
+	const auto         mask      = context.GetRenderTargetMask();
+	uint32_t           targets   = 0;
+	for (uint32_t slot = 0; slot < 8; slot++) {
+		const auto& target = context.GetRenderTarget(slot);
+		if (((mask >> (slot * 4u)) & 0x0fu) == 0 || target.base.addr == 0) {
+			continue;
+		}
+		if (target.attrib2.width + 1u < MinExtent || target.attrib2.height + 1u < MinExtent) {
+			return false;
+		}
+		targets++;
+	}
+	return targets >= 2;
+}
+
 // Whether this draw's target is one the game draws every frame (see above), noting the draw.
 bool RedrawnTargetDraw(const HW::Context& context) {
 	const auto& frames = NoteTargetFrame(context);
@@ -3744,7 +3779,7 @@ bool RedrawnTargetDraw(const HW::Context& context) {
 	if (ReflectionCubeDraw(context)) {
 		return frames.frames >= 2;
 	}
-	return frames.steady && DepthTestedDraw(context);
+	return (frames.steady && DepthTestedDraw(context)) || GbufferPassDraw(context);
 }
 
 } // namespace

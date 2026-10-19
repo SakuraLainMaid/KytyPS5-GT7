@@ -90,6 +90,9 @@ struct Step {
 	uint32_t          cube_every      = 0;    // cube:<n>; 0: KYTY_CUBE_EVERY
 	// Round 90.
 	bool              bdasync_submission = false;
+	// Round 91.
+	bool              gbuffer_sync    = false;
+	bool              depthread_old   = false;
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
 	int32_t           dflush          = -1;   // dflush:<n>; -1: the usual
@@ -355,6 +358,14 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "bdasync:submission") {
 		step.bdasync_submission = true;
+		return true;
+	}
+	if (action == "gbuffer:sync") {
+		step.gbuffer_sync = true;
+		return true;
+	}
+	if (action == "depthread:old") {
+		step.depthread_old = true;
 		return true;
 	}
 	if (action.starts_with("cube:")) {
@@ -1027,6 +1038,16 @@ float DepthEqualRelaxed() {
 bool BdaSyncSubmission() {
 	const auto* step = Current();
 	return step != nullptr && step->bdasync_submission;
+}
+
+bool GbufferSync() {
+	const auto* step = Current();
+	return step != nullptr && step->gbuffer_sync;
+}
+
+bool DepthReadOld() {
+	const auto* step = Current();
+	return step != nullptr && step->depthread_old;
 }
 
 bool WholeUnnormalizedViews() {

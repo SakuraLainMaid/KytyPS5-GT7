@@ -868,15 +868,27 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				     "using the GENERAL layout\n");
 			}
 		}
-		auto layout = depth_attachment_layout(depth);
-		if (sampled_aspects & ~DepthReadableAspects(layout)) {
+		auto       layout          = depth_attachment_layout(depth);
+		const bool readable_layout = !(sampled_aspects & ~DepthReadableAspects(layout));
+		if (!readable_layout) {
 			layout = m_context.GetGraphics().attachment_feedback_loop_enabled
 			             ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
 			             : vk::ImageLayout::eGeneral;
 		}
 		// The attachment store writes even when guest depth/stencil tests do not.
-		const auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-		                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+		auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+		              vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+		// Round 91: a draw that samples the depth target without writing what it samples reads it
+		// as a texture too: that access now, as its descriptors will ask (PrepareBindings).
+		// Otherwise the state went from the attachment's to the attachment's and a shader read's
+		// at every such draw, a barrier each way and the rendering ended twice per draw. After
+		// BryanKAdams' BryKytyPS5 (408d4e57). Only in a layout that reads the sampled aspect: in
+		// the feedback-loop or GENERAL layout, a draw writing one mip while sampling another
+		// would then find no barrier at all after the draw before wrote what it samples. The F8
+		// step depthread:old as before.
+		if (sampled_aspects && !feedback_aspects && readable_layout && !Bisect::DepthReadOld()) {
+			access |= vk::AccessFlagBits2::eShaderRead;
+		}
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access = access;
 		const auto& view                = depth.desc.view_info;
