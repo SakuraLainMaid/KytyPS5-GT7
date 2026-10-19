@@ -78,6 +78,10 @@ enum class Phase : uint32_t {
 	PipelineCompile, // a pipeline compiled on the GPU thread (small ones, compute ones)
 	TranslationSkip, // (a count only) a draw skipped while its shader translated
 	PipelineSkip,    // (a count only) a draw skipped while its pipeline compiled
+	// Round 87: new pipelines looked up in the driver's caches alone before a background compile.
+	PipelineProbe,     // a lookup
+	PipelineProbeHit,  // (a count only) one the driver had: created at once
+	PipelineProbeMiss, // (a count only) one it did not have: compiled in the background
 	Count
 };
 

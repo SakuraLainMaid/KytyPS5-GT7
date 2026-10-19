@@ -1317,6 +1317,8 @@ static void LearnCubeTarget(CommandBuffer& buffer, const DrawRenderState& state)
 		return;
 	}
 	g_cube_targets[g_cube_target_count++] = address;
+	// Round 87: its draws may be skipped while their shaders translate or pipelines compile.
+	NoteReflectionCubeTarget(address);
 	LOGF("Reflection cube: color target 0x%" PRIx64 ", %ux%u, 6 layers: its draws run every "
 	     "frame, or every nth with KYTY_CUBE_EVERY=<n> (now %u)\n",
 	     address, info.extent.width, info.extent.height, CubeEvery());
@@ -2491,19 +2493,26 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			              image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
 		       });
 	};
-	bool may_defer = !(state.ps_active && writes_memory(state.ps_input_info.stage));
+	bool writes = state.ps_active && writes_memory(state.ps_input_info.stage);
 	for (const auto& stage: vertex_stages) {
-		may_defer = may_defer && !writes_memory(stage.stage);
+		writes = writes || writes_memory(stage.stage);
 	}
-	// Glyphs and cached layers: drawn once into small targets (SmallColorTargetDraw).
-	may_defer = may_defer && !SmallColorTargetDraw(buffer.GetRegisters());
+	// Glyphs and cached layers: drawn once into small targets (SmallColorTargetDraw), unless the
+	// game draws the target every frame (round 87: its reflection cubes, RedrawnTargetDraw).
+	auto defer = PipelineDefer::Allowed;
+	if (writes) {
+		defer = PipelineDefer::WritesMemory;
+	} else if (SmallColorTargetDraw(buffer.GetRegisters()) && !state.programs.redrawn_target) {
+		defer = PipelineDefer::SmallTarget;
+	}
+
 	PipelineCache::Pipeline* deferred_pipeline = nullptr;
 	{
 		const GpuPhases::Scope phase(GpuPhases::Phase::DrawPipeline);
 		deferred_pipeline = m_context.GetPipelineCache().TryGetGraphicsPipeline(
 		    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages,
 		    buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
-		    primitive_restart_enable, state.programs, may_defer);
+		    primitive_restart_enable, state.programs, defer);
 	}
 	if (deferred_pipeline == nullptr) {
 		if (FrameGraph::Logging()) {

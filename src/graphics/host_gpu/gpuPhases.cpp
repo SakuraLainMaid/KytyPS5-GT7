@@ -420,16 +420,18 @@ void ReportIfDue(uint64_t frames) {
 		};
 		if (count(Phase::ShaderDisk) + count(Phase::ShaderCompile) + count(Phase::PipelineWait) +
 		        count(Phase::PipelineCompile) + count(Phase::TranslationSkip) +
-		        count(Phase::PipelineSkip) !=
+		        count(Phase::PipelineSkip) + count(Phase::PipelineProbe) !=
 		    0) {
-			LOGF(
-			    "Shader work (%.1f s): on the GPU thread %s, %s, %s, %s; draws skipped while their "
-			    "shaders translated %" PRIu64 ", while their pipeline compiled %" PRIu64 "\n",
-			    seconds, work("disk cache reads", Phase::ShaderDisk).c_str(),
-			    work("translations and compiles", Phase::ShaderCompile).c_str(),
-			    work("pipeline waits", Phase::PipelineWait).c_str(),
-			    work("pipeline compiles", Phase::PipelineCompile).c_str(),
-			    count(Phase::TranslationSkip), count(Phase::PipelineSkip));
+			LOGF("Shader work (%.1f s): on the GPU thread %s, %s, %s (found %" PRIu64
+			     ", to compile %" PRIu64 "), %s, %s; draws skipped while their shaders "
+			     "translated %" PRIu64 ", while their pipeline compiled %" PRIu64 "\n",
+			     seconds, work("disk cache reads", Phase::ShaderDisk).c_str(),
+			     work("translations and compiles", Phase::ShaderCompile).c_str(),
+			     work("pipeline cache lookups", Phase::PipelineProbe).c_str(),
+			     count(Phase::PipelineProbeHit), count(Phase::PipelineProbeMiss),
+			     work("pipeline waits", Phase::PipelineWait).c_str(),
+			     work("pipeline compiles", Phase::PipelineCompile).c_str(),
+			     count(Phase::TranslationSkip), count(Phase::PipelineSkip));
 		}
 	}
 	if (OpStatsOn()) {

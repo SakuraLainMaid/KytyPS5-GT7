@@ -715,19 +715,25 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	return owner;
 }
 
-vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build, vk::PipelineCache driver_cache,
-                                  vk::Pipeline* pipeline) {
+vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build,
+                                  vk::PipelineCache driver_cache, vk::Pipeline* pipeline,
+                                  bool cache_only) {
 	const auto create_begin = std::chrono::steady_clock::now();
+	auto       info         = build.pipeline_info;
+	if (cache_only) {
+		info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+	}
 	const auto result =
-	    build.device.createGraphicsPipelines(driver_cache, 1, &build.pipeline_info, nullptr, pipeline);
+	    build.device.createGraphicsPipelines(driver_cache, 1, &info, nullptr, pipeline);
 	// On the GPU thread, a slow pipeline stops every queue.
 	if (const auto create_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - create_begin)
 	                               .count();
 	    create_ms >= 500) {
 		LOGF("PipelineTrace: slow graphics pipeline VS=0x%016" PRIx64 " PS=0x%016" PRIx64
-		     " ms=%lld\n",
-		     build.vs_hash, build.ps_hash, static_cast<long long>(create_ms));
+		     " ms=%lld%s\n",
+		     build.vs_hash, build.ps_hash, static_cast<long long>(create_ms),
+		     cache_only ? " (a cache lookup)" : "");
 	}
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",

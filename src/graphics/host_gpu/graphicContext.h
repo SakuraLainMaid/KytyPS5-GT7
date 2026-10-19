@@ -118,6 +118,9 @@ struct GraphicContext {
 	// subgroupSizeControl is enabled: the device has more than one subgroup size.
 	bool                               subgroup_size_control_enabled         = false;
 	bool                               sample_rate_shading_enabled           = false;
+	// pipelineCreationCacheControl: a pipeline can be looked up in the driver's caches alone
+	// (FAIL_ON_PIPELINE_COMPILE_REQUIRED), PipelineCache's probe (round 87).
+	bool pipeline_cache_control_enabled = false;
 	// Attachments with different sample counts in one draw (PS5 EQAA: depth at the coverage
 	// count, color at the fragment count). AMD allows either side to be larger; NV only allows
 	// color <= depth, with rasterization at the depth count.

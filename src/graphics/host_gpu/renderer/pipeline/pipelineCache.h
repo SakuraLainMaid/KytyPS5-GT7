@@ -10,7 +10,9 @@
 #include "graphics/shader/shaderCompiler.h"
 
 #include <array>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -216,6 +218,19 @@ class PipelineCompiler;
 // their pipeline compiles (pipelineCache.cpp).
 bool SmallColorTargetDraw(const HW::Context& context);
 
+// A reflection cube's color target (renderDraw.cpp learns them; round 87): once the game has
+// drawn it in most recent frames, the draws into it may be skipped while their shaders translate
+// or their pipelines compile. GPU thread only.
+void NoteReflectionCubeTarget(uint64_t address);
+
+// Why a draw's new pipeline may not be compiled in the background (TryGetGraphicsPipeline).
+enum class PipelineDefer : uint8_t {
+	Allowed,      // the draw may be skipped while a worker compiles it
+	WritesMemory, // the draw writes buffers or storage images, which others may read
+	SmallTarget,  // a small target the game does not draw every frame: glyphs, cached layers
+	Never,        // GetGraphicsPipeline
+};
+
 class PipelineCache {
 public:
 	explicit PipelineCache(GraphicContext& graphics);
@@ -237,6 +252,11 @@ public:
 	struct GraphicsPrograms {
 		std::array<ShaderProgram, 3> vertex;
 		ShaderProgram pixel;
+		// The game draws into this draw's target every frame (drawn in at least three of the six
+		// frames before, and a reflection cube or a pass tested against a depth target): skipping
+		// the draw while its shaders translate or its pipeline compiles loses one frame of it,
+		// not a picture drawn once (round 87, RedrawnTargetDraw in pipelineCache.cpp).
+		bool redrawn_target = false;
 
 		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }
 	};
@@ -288,15 +308,15 @@ public:
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
 	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                              const GraphicsPrograms& programs);
-	// As GetGraphicsPipeline; with may_defer, a pipeline the driver does not compile within a
-	// short wait is compiled on a worker thread, and nullptr says to skip this draw.
+	// As GetGraphicsPipeline; with PipelineDefer::Allowed, a pipeline the driver does not have
+	// is compiled on a worker thread, and nullptr says to skip this draw.
 	Pipeline* TryGetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                                 const RenderDepthInfo&                 depth,
 	                                 std::span<const ShaderVertexInputInfo> vertex_info,
 	                                 CommandBuffer&                         command,
 	                                 const ShaderPixelInputInfo*            ps_input_info,
 	                                 vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                                 const GraphicsPrograms& programs, bool may_defer);
+	                                 const GraphicsPrograms& programs, PipelineDefer defer);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
@@ -349,10 +369,19 @@ private:
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	std::unique_ptr<PipelineCompiler>                       m_compiler;
 	uint64_t                                                m_deferred_draws = 0;
+	// Round 87: whether a new pipeline is first looked up in the driver's caches alone
+	// (pipelineCreationCacheControl; KYTY_PIPELINE_PROBE=0 turns it off), and what is left of
+	// this frame's time for waits on background compiles (KYTY_PIPELINE_FRAME_WAIT_MS).
+	bool                                  m_probe      = false;
+	uint64_t                              m_wait_frame = UINT64_MAX;
+	std::chrono::microseconds             m_wait_left {0};
+	std::chrono::steady_clock::time_point m_wait_renewed {};
 
 	void InitializeDriverCache();
 	// Takes a finished background compile into the pipeline; false while it still runs.
 	bool FinishPending(Pipeline& pipeline);
+	// Waits for a background compile while this frame's budget lasts.
+	void WaitForPipeline(const PendingGraphicsPipeline& job);
 };
 
 // KYTY_DYNAMIC_RASTER_STATE (default on): cull mode and front face (and, except on macOS, the
@@ -374,9 +403,11 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 // False for an embedded-fetch attribute whose components the shader only replaces by constants:
 // it gets no native vertex attribute, and its buffer is not bound for it.
 [[nodiscard]] bool VertexAttributeFetched(const ShaderVertexInputInfo& info, int attribute);
-// Any thread.
-vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build, vk::PipelineCache driver_cache,
-                                  vk::Pipeline* pipeline);
+// Any thread. With cache_only (pipelineCreationCacheControl), the driver only looks the pipeline
+// up in its caches: vk::Result::ePipelineCompileRequired when it would have to compile it.
+vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build,
+                                  vk::PipelineCache driver_cache, vk::Pipeline* pipeline,
+                                  bool cache_only = false);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,
                             const PipelineVertexInputState&        vertex_input,

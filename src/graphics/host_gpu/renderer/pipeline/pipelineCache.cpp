@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawPrep.h"
+#include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
@@ -34,6 +35,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
@@ -1493,6 +1495,21 @@ static const std::chrono::milliseconds g_pipeline_wait = [] {
 	const char* value = std::getenv("KYTY_PIPELINE_WAIT_MS");
 	return std::chrono::milliseconds(value != nullptr ? std::strtoul(value, nullptr, 10) : 20u);
 }();
+// Round 87: the time a frame spends in all waiting for background compiles
+// (KYTY_PIPELINE_FRAME_WAIT_MS; by default 6 ms, 2 ms when the driver's caches are asked first, as
+// a pipeline they hold is then created at once). Before, each new pipeline had its 20 ms.
+static const std::optional<uint32_t> g_pipeline_frame_wait_ms = []() -> std::optional<uint32_t> {
+	const char* value = std::getenv("KYTY_PIPELINE_FRAME_WAIT_MS");
+	if (value == nullptr || *value == '\0') {
+		return std::nullopt;
+	}
+	return static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+}();
+// KYTY_PIPELINE_PROBE=0: never ask the driver's caches first (round 87).
+static const bool g_pipeline_probe = [] {
+	const char* value = std::getenv("KYTY_PIPELINE_PROBE");
+	return value == nullptr || value[0] != '0';
+}();
 
 struct PendingGraphicsPipeline {
 	std::unique_ptr<GraphicsPipelineBuild> build;
@@ -1546,7 +1563,7 @@ public:
 	}
 
 	// Waits up to the budget; true when the job is done.
-	bool Wait(const PendingGraphicsPipeline& job, std::chrono::milliseconds budget) {
+	bool Wait(const PendingGraphicsPipeline& job, std::chrono::microseconds budget) {
 		KYTY_PROFILER_BLOCK("PipelineCompiler::Wait");
 		std::unique_lock lock(m_mutex);
 		return m_done.wait_for(lock, budget,
@@ -1623,7 +1640,8 @@ private:
 // user data values (the disk cache's source key holds the same), so a worker can do it while the
 // draw is skipped; the materialization and the SPIR-V that need guest memory stay on the GPU
 // thread. Only draws with the depth test on are deferred (GetGraphicsPrograms): UI and layer
-// draws, which a game may draw once, translate at once, as their pipelines compile at once.
+// draws, which a game may draw once, translate at once, as their pipelines compile at once, but
+// for targets the game draws every frame (RedrawnTargetDraw, round 87).
 // Compute always translates at once: a skipped dispatch can leave data unwritten.
 static const bool g_async_translation = [] {
 	const char* value = std::getenv("KYTY_ASYNC_TRANSLATION");
@@ -2700,7 +2718,9 @@ struct PipelineCache::ProgramCache {
 		}
 		// The rewrite is mechanical, but a broken copy is a broken pipeline: the validator checks
 		// the first copies whatever --shader-validation says, and every copy after one fails.
-		constexpr uint32_t CheckedCopies = 32;
+		// Four, not 32 (round 87): no copy has ever failed, and checking 32 took the GPU thread
+		// 1.8 s at every start (the game's are large).
+		constexpr uint32_t CheckedCopies = 4;
 		if (pixel_rate_checked < CheckedCopies || pixel_rate_failed ||
 		    Config::ShaderValidationEnabled()) {
 			if (!ValidateShaderSpirvNow(options.dump_label, options.shader_hash, variant)) {
@@ -3391,9 +3411,39 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		                                32u)
 		         : std::clamp(std::thread::hardware_concurrency() / 3u, 2u, 10u);
 		m_compiler = std::make_unique<PipelineCompiler>(threads);
-		PipelineCacheLog("Vulkan pipelines: compiled on {} worker threads (wait {} ms)", threads,
-		                 g_pipeline_wait.count());
+		m_probe                      = g_pipeline_probe && graphics.pipeline_cache_control_enabled;
+		const uint32_t frame_wait_ms = g_pipeline_frame_wait_ms.value_or(m_probe ? 2u : 6u);
+		PipelineCacheLog("Vulkan pipelines: compiled on {} worker threads (wait {} ms for one, {} "
+		                 "ms a frame); the driver's caches asked first: {}",
+		                 threads, g_pipeline_wait.count(), frame_wait_ms,
+		                 m_probe                                    ? "yes"
+		                 : !graphics.pipeline_cache_control_enabled ? "no (not supported)"
+		                                                            : "no (KYTY_PIPELINE_PROBE=0)");
 	}
+}
+
+void PipelineCache::WaitForPipeline(const PendingGraphicsPipeline& job) {
+	// The budget is renewed each frame, and every 50 ms for a game whose frames the GPU thread
+	// does not see end (no suspend points).
+	const auto frame = FrameGraph::GpuThreadFrames();
+	const auto now   = std::chrono::steady_clock::now();
+	if (frame != m_wait_frame || now - m_wait_renewed >= std::chrono::milliseconds(50)) {
+		m_wait_frame   = frame;
+		m_wait_renewed = now;
+		m_wait_left =
+		    std::chrono::milliseconds(g_pipeline_frame_wait_ms.value_or(m_probe ? 2u : 6u));
+	}
+	const auto budget = std::min<std::chrono::microseconds>(g_pipeline_wait, m_wait_left);
+	if (budget.count() <= 0) {
+		return;
+	}
+	{
+		const GpuPhases::Scope wait_phase(GpuPhases::Phase::PipelineWait);
+		(void)m_compiler->Wait(job, budget);
+	}
+	const auto spent = std::chrono::duration_cast<std::chrono::microseconds>(
+	    std::chrono::steady_clock::now() - now);
+	m_wait_left -= std::min(spent, m_wait_left);
 }
 
 PipelineCache::~PipelineCache() {
@@ -3595,6 +3645,100 @@ bool SmallColorTargetDraw(const HW::Context& context) {
 	return found;
 }
 
+// Round 87: which targets the game draws into every frame. The rule above also caught the game's
+// reflection cubes (512x512 and 1024x1024, six layers), which it redraws every frame with the
+// scenery around the car: each new object in them translated and compiled on the GPU thread, and
+// a pipeline of those takes the driver about a second, so the race stopped for a second at a
+// time, several times every 10 s, all race long (2026-10-18, warm86: up to 38 s of 42). A draw
+// into such a target may be skipped while its shaders translate or its pipeline compiles: it
+// misses a frame or a few, not a picture drawn once. Such a target was drawn in at least three of
+// the six frames before, and is a reflection cube (learned by renderDraw.cpp), or the draw tests
+// against a depth target bound with it, with a test that can fail or a depth write (a 3D pass:
+// the depth test enable alone is not enough, the lost glyphs above had it set).
+// KYTY_DEFER_REDRAWN=0 turns the rule off. GPU thread only.
+namespace {
+
+const bool g_defer_redrawn = [] {
+	const char* value = std::getenv("KYTY_DEFER_REDRAWN");
+	return value == nullptr || value[0] != '0';
+}();
+
+std::array<uint64_t, 4> g_reflection_cubes {};
+uint32_t                g_reflection_cube_count = 0;
+
+// The frames a target was drawn in: bit i, i frames before `last`.
+struct TargetFrames {
+	uint64_t last = 0;
+	uint32_t bits = 0;
+};
+std::unordered_map<uint64_t, TargetFrames> g_target_frames;
+
+// Notes a draw into its target (its first color target, else its depth target) in this frame;
+// true when the game drew into the target in at least three of the six frames before.
+bool NoteTargetFrame(const HW::Context& context) {
+	const auto mask = context.GetRenderTargetMask();
+	uint64_t   key  = 0;
+	for (uint32_t slot = 0; slot < 8 && key == 0; slot++) {
+		const auto& target = context.GetRenderTarget(slot);
+		if (((mask >> (slot * 4u)) & 0x0fu) != 0) {
+			key = target.base.addr;
+		}
+	}
+	if (key == 0) {
+		const auto address = context.GetDepthRenderTarget().z_read_base_addr;
+		key                = address != 0 ? address | (uint64_t {1} << 63u) : 0;
+	}
+	if (key == 0) {
+		return false;
+	}
+	if (g_target_frames.size() >= 16384 && !g_target_frames.contains(key)) {
+		g_target_frames.clear();
+	}
+	const auto frame = FrameGraph::GpuThreadFrames();
+	auto&      entry = g_target_frames[key];
+	if (frame != entry.last) {
+		const auto delta = frame - entry.last;
+		entry.bits       = delta >= 32 ? 0u : entry.bits << delta;
+		entry.last       = frame;
+	}
+	entry.bits |= 1u;
+	return std::popcount(entry.bits & 0x7eu) >= 3;
+}
+
+bool ReflectionCubeDraw(const HW::Context& context) {
+	const auto address = context.GetRenderTarget(0).base.addr;
+	const auto known   = std::span(g_reflection_cubes.data(), g_reflection_cube_count);
+	return address != 0 && (context.GetRenderTargetMask() & 0x0fu) != 0 &&
+	       std::ranges::find(known, address) != known.end();
+}
+
+// A depth test against a depth target bound with the draw, one that can fail (or writes depth).
+bool DepthTestedDraw(const HW::Context& context) {
+	constexpr uint8_t CompareAlways = 7;
+	const auto&       control       = context.GetDepthControl();
+	const auto&       depth         = context.GetDepthRenderTarget();
+	return control.z_enable && depth.z_info.format != Prospero::DepthFormat::kInvalid &&
+	       depth.z_read_base_addr != 0 &&
+	       (control.zfunc != CompareAlways || control.z_write_enable);
+}
+
+// Whether this draw's target is one the game draws every frame (see above), noting the draw.
+bool RedrawnTargetDraw(const HW::Context& context) {
+	const bool redrawn = NoteTargetFrame(context);
+	return g_defer_redrawn && redrawn && (ReflectionCubeDraw(context) || DepthTestedDraw(context));
+}
+
+} // namespace
+
+void NoteReflectionCubeTarget(uint64_t address) {
+	const auto known = std::span(g_reflection_cubes.data(), g_reflection_cube_count);
+	if (address == 0 || g_reflection_cube_count >= g_reflection_cubes.size() ||
+	    std::ranges::find(known, address) != known.end()) {
+		return;
+	}
+	g_reflection_cubes[g_reflection_cube_count++] = address;
+}
+
 bool PipelineCache::DescribeGraphicsStages(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
@@ -3794,14 +3938,17 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms  result;
+	result.redrawn_target = RedrawnTargetDraw(context);
 	// New shaders of 3D draws (depth test on) translate on the workers while the draw is skipped;
-	// UI and layer draws translate at once (TranslationWorkers).
+	// UI and layer draws translate at once (TranslationWorkers), unless the game draws their
+	// target every frame (round 87: its reflection cubes).
 	struct DeferScope {
 		ProgramCache& cache;
 		~DeferScope() { cache.SetDeferTranslation(false); }
 	} defer_scope {*m_program_cache};
-	m_program_cache->SetDeferTranslation(context.GetDepthControl().z_enable &&
-	                                     !SmallColorTargetDraw(context));
+	m_program_cache->SetDeferTranslation(
+	    (context.GetDepthControl().z_enable && !SmallColorTargetDraw(context)) ||
+	    result.redrawn_target);
 	struct PreparedScope {
 		ProgramCache& cache;
 		~PreparedScope() { cache.prepared = {}; }
@@ -3962,8 +4109,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const GraphicsPrograms& programs) {
-	auto* pipeline = TryGetGraphicsPipeline(colors, depth, vertex_info, command, ps_input_info,
-	                                        topology, primitive_restart_enable, programs, false);
+	auto* pipeline =
+	    TryGetGraphicsPipeline(colors, depth, vertex_info, command, ps_input_info, topology,
+	                           primitive_restart_enable, programs, PipelineDefer::Never);
 	EXIT_IF(pipeline == nullptr);
 	return *pipeline;
 }
@@ -3989,7 +4137,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-    bool primitive_restart_enable, const GraphicsPrograms& programs, bool may_defer) {
+    bool primitive_restart_enable, const GraphicsPrograms& programs, PipelineDefer defer) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -4200,7 +4348,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		}
 	}
 
-	const auto defer = [&] {
+	const auto skip_draw = [&] {
 		GpuPhases::Count(GpuPhases::Phase::PipelineSkip, 1);
 		Profiler::Add(Profiler::Counter::SkippedPipelinePending);
 		Profiler::CommandZone::Annotate("skipped: pipeline compiling");
@@ -4230,7 +4378,15 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
 		auto& found = *iter->second;
 		if (found.pending && !FinishPending(found)) {
-			return defer();
+			if (defer == PipelineDefer::Allowed) {
+				return skip_draw();
+			}
+			// A draw that may not be skipped waits for the compile another draw of the same
+			// pipeline sent to the background (round 87: more of those are sent now).
+			const GpuPhases::Scope wait_phase(GpuPhases::Phase::PipelineWait);
+			while (!FinishPending(found)) {
+				(void)m_compiler->Wait(*found.pending, std::chrono::milliseconds(100));
+			}
 		}
 		return &found;
 	}
@@ -4255,30 +4411,68 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		vertex_words += program.spirv_words;
 	}
 	const uint64_t spirv_words = vertex_words + pixel_program.spirv_words;
-	// Stencil does not count: UI libraries clip their panels with stencil masks.
-	const bool layer_draw = !depth.depth_test_enable && !depth.depth_write_enable &&
+	const uint64_t vs_hash     = vs_input_info.stage.program->shader_hash;
+	const uint64_t ps_hash     = ps_active ? ps_input_info->stage.program->shader_hash : 0;
+	// Stencil does not count: UI libraries clip their panels with stencil masks. A target the game
+	// draws every frame is no layer drawn once (round 87).
+	const bool layer_draw = !programs.redrawn_target && !depth.depth_test_enable &&
+	                        !depth.depth_write_enable &&
 	                        vertex_words <= g_pipeline_sync_ui_vs_words;
-	if (may_defer && spirv_words > g_pipeline_sync_words && !layer_draw && m_compiler != nullptr &&
-	    !m_compiler->Stopped()) {
-		// A pipeline the driver has cached finishes within the wait; a new one is compiled in
-		// the background, and its draws are skipped until it is ready.
+	const bool background = defer == PipelineDefer::Allowed &&
+	                        spirv_words > g_pipeline_sync_words && !layer_draw &&
+	                        m_compiler != nullptr && !m_compiler->Stopped();
+	bool probed = false;
+	if (background && m_probe) {
+		// Round 87: a pipeline the driver has in its caches is created here at once, and one it
+		// would have to compile goes to a worker at once. Before, the GPU thread waited up to
+		// 20 ms for each new pipeline in case it was cached, and those of a new track take the
+		// driver about a second each: the waits took 2-4 s of every 10 s of a race on one.
+		const auto       probe_begin = std::chrono::steady_clock::now();
+		GpuPhases::Scope probe_phase(GpuPhases::Phase::PipelineProbe);
+		const auto result = CreateGraphicsPipeline(*build, m_driver_cache, &cached->pipeline, true);
+		probe_phase.End();
+		if (result == vk::Result::eSuccess && cached->pipeline != nullptr) {
+			GpuPhases::Count(GpuPhases::Phase::PipelineProbeHit, 1);
+			ReportGraphicsPipelineBuilt(vs_hash, ps_hash, probe_begin);
+			LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
+			auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+			EXIT_IF(!inserted);
+			return iter->second.get();
+		}
+		if (cached->pipeline != nullptr) {
+			m_graphics.device.destroyPipeline(cached->pipeline, nullptr);
+			cached->pipeline = nullptr;
+		}
+		if (result != vk::Result::ePipelineCompileRequired) {
+			// A driver that cannot answer: compile as before, without asking again.
+			m_probe = false;
+			PipelineCacheLog("Vulkan pipelines: the driver's cache lookup returned {}; looking "
+			                 "up no more",
+			                 vk::to_string(result));
+		}
+		probed = true;
+	}
+	if (background) {
+		// A new pipeline is compiled in the background, and its draws are skipped until it is
+		// ready; a short wait catches one the driver had cached (KYTY_PIPELINE_FRAME_WAIT_MS a
+		// frame in all, at most KYTY_PIPELINE_WAIT_MS for one).
 		auto job          = std::make_shared<PendingGraphicsPipeline>();
 		job->build        = std::move(build);
 		job->driver_cache = m_driver_cache;
-		job->vs_hash      = vs_input_info.stage.program->shader_hash;
-		job->ps_hash      = ps_active ? ps_input_info->stage.program->shader_hash : 0;
+		job->vs_hash      = vs_hash;
+		job->ps_hash      = ps_hash;
 		cached->pending   = job;
 		Profiler::Add(Profiler::Counter::PipelinesPending);
 		m_compiler->Submit(job);
-		{
-			const GpuPhases::Scope wait_phase(GpuPhases::Phase::PipelineWait);
-			(void)m_compiler->Wait(*job, g_pipeline_wait);
+		if (probed) {
+			GpuPhases::Count(GpuPhases::Phase::PipelineProbeMiss, 1);
 		}
+		WaitForPipeline(*job);
 		auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 		EXIT_IF(!inserted);
 		auto& pipeline = *iter->second;
 		if (!FinishPending(pipeline)) {
-			return defer();
+			return skip_draw();
 		}
 		LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 		return &pipeline;
@@ -4288,10 +4482,35 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	const auto result = CreateGraphicsPipeline(*build, m_driver_cache, &cached->pipeline);
 	compile_phase.End();
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-	ReportGraphicsPipelineBuilt(vs_input_info.stage.program->shader_hash,
-	                            ps_active ? ps_input_info->stage.program->shader_hash : 0,
-	                            build_begin);
+	ReportGraphicsPipelineBuilt(vs_hash, ps_hash, build_begin);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
+	if (const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+	                                                              build_begin)
+	                        .count();
+	    ms >= 100.0) {
+		// Round 87: why a slow one was compiled on the GPU thread (it stopped the game that long).
+		const char*     reason = defer == PipelineDefer::WritesMemory ? "its draw writes memory"
+		                         : defer == PipelineDefer::SmallTarget
+		                             ? "a small target not drawn every frame"
+		                         : defer == PipelineDefer::Never        ? "asked for at once"
+		                         : spirv_words <= g_pipeline_sync_words ? "small shaders"
+		                         : layer_draw ? "a draw without depth, a UI or layer draw"
+		                                      : "no compile threads";
+		const auto&     target = color_count > 0 ? colors[0].desc.info : depth.desc.info;
+		static uint64_t slow   = 0;
+		slow++;
+		if (slow <= 64 || std::has_single_bit(slow)) {
+			LOGF("PipelineCache: compiled on the GPU thread in %.0f ms (%s): VS 0x%016" PRIx64
+			     " (%" PRIu64 " words) PS 0x%016" PRIx64 " (%u words), target 0x%" PRIx64
+			     " %ux%u layers %u (%u colors), depth test %d write %d, redrawn %d (%" PRIu64
+			     " so far)\n",
+			     ms, reason, vs_hash, vertex_words, ps_hash,
+			     ps_active ? pixel_program.spirv_words : 0u, target.data.address,
+			     target.extent.width, target.extent.height, target.resources.layers, color_count,
+			     depth.depth_test_enable ? 1 : 0, depth.depth_write_enable ? 1 : 0,
+			     programs.redrawn_target ? 1 : 0, slow);
+		}
+	}
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 
