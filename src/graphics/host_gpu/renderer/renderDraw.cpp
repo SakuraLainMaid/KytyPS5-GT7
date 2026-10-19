@@ -2179,6 +2179,79 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, const CommandRecorder
 	}
 }
 
+// Round 93, diagnostics (an F9 capture): a draw that tests depth for EQUAL without writing it
+// (a colour pass over its depth prepass) is drawn twice more after itself, its colour and stencil
+// writes off, each in an occlusion query (FrameGraphQueries::Kind): "as close or closer" with a
+// bias towards the camera, and without a depth test. Only a draw whose stages write no memory,
+// with its counts on the CPU (no GPU arguments, no mesh shader). The next draw sets its dynamic
+// state again.
+static void DrawDepthEqualProbes(const HW::UserConfig& ucfg, const CommandRecorder& vk_buffer,
+                                 const DrawCallInfo& draw, const DrawEmitInfo& emit,
+                                 const DrawRenderState&                 state,
+                                 std::span<const ShaderVertexInputInfo> vertex_stages,
+                                 const RenderState&                     rendering) {
+	const auto& depth = state.depth_info;
+	if (!depth.image_id || !depth.depth_test_enable || depth.depth_write_enable ||
+	    depth.depth_compare_op != vk::CompareOp::eEqual) {
+		return;
+	}
+	// Stores through addresses and GDS too: a probe would repeat them (and the one without a depth
+	// test, for hidden fragments as well).
+	const auto writes_memory = [](const ShaderStageRuntime& runtime) {
+		const auto& program = *runtime.program;
+		return HasShaderBufferWrites(runtime) || program.has_address_writes ||
+		       std::ranges::any_of(program.bindings.descriptors,
+		                           [](const auto& binding) {
+			                           return binding.kind ==
+			                                  ShaderRecompiler::IR::DescriptorBindingKind::Gds;
+		                           }) ||
+		       std::ranges::any_of(program.info.images, [](const auto& image) {
+			       return image.written &&
+			              image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+		       });
+	};
+	if (state.ps_active && writes_memory(state.ps_input_info.stage)) {
+		return;
+	}
+	for (const auto& stage: vertex_stages) {
+		if (writes_memory(stage.stage)) {
+			return;
+		}
+	}
+#if defined(__APPLE__)
+	// No color write enables to turn off (MoltenVK): the probes would draw.
+	if (rendering.num_color_attachments != 0) {
+		return;
+	}
+#else
+	if (rendering.num_color_attachments != 0) {
+		const std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> off {};
+		vk_buffer.setColorWriteEnableEXT(rendering.num_color_attachments, off.data());
+	}
+#endif
+	if (depth.stencil_test_enable) {
+		vk_buffer.setStencilWriteMask(vk::StencilFaceFlagBits::eFrontAndBack, 0u);
+	}
+	const bool reversed_z = ReversedDepth(depth);
+	for (const auto kind: {FrameGraphQueries::Kind::Close, FrameGraphQueries::Kind::Anywhere}) {
+		const bool close = kind == FrameGraphQueries::Kind::Close;
+		vk_buffer.setDepthCompareOp(!close       ? vk::CompareOp::eAlways
+		                            : reversed_z ? vk::CompareOp::eGreaterOrEqual
+		                                         : vk::CompareOp::eLessOrEqual);
+		vk_buffer.setDepthBiasEnable(close ? VK_TRUE : VK_FALSE);
+		if (close) {
+			vk_buffer.setDepthBias(reversed_z ? 16384.0f : -16384.0f, 0.0f,
+			                       reversed_z ? 4.0f : -4.0f);
+		}
+		const auto query = FrameGraphQueries::BeginExtra(vk_buffer, kind);
+		if (query < 0) {
+			return;
+		}
+		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+		FrameGraphQueries::EndDraw(vk_buffer, query);
+	}
+}
+
 // Diagnostics (the frame graph): the draw's shaders, render targets and depth state, before its
 // stages' bindings (PrepareBindings); the shaders' code is dumped. Dispatch-like draws (a few
 // vertices, or no depth target) show their buffers' contents after the frame.
@@ -2902,6 +2975,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    }
 		    return detail;
 	    });
+	if (FrameGraph::Logging() && state.depth_info.image_id && state.depth_info.depth_test_enable) {
+		// Which way is closer on this depth target, from the draws that test GREATER or LESS.
+		(void)ReversedDepth(state.depth_info);
+	}
+	if (samples_query >= 0 && !mesh_active && !vertex_indirect_buffer) {
+		DrawDepthEqualProbes(ucfg, vk_buffer, draw, emit, state, vertex_stages, rendering);
+	}
 
 	SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
 	vk::PipelineStageFlags shader_write_stages = {};

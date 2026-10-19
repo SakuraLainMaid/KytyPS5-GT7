@@ -332,14 +332,14 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 }
 
 // Round 92 (from BryanKAdams' BryKytyPS5, a25a2b97): the stream ring takes the GPU thread's
-// per-draw copies (small CPU-written buffers, flattened resource tables, shader data). In
-// write-combined device memory those copies stall the memory accesses after them; in cached host
-// memory they stay in the CPU's caches, and the GPU reads them over the bus about as fast (0.15 to
-// 0.3 us a draw less there, for 1% more GPU time). KYTY_STREAM_DEVICE=1 keeps the ring in device
-// memory; the step stream:device switches to one there.
+// per-draw copies (small CPU-written buffers, flattened resource tables, shader data). That fork
+// measured them faster in cached host memory than in write-combined device memory; here, in a
+// race, the device ring was 0.8 ms a frame faster (19.7 against 19.3 fps, 51 A/B pairs, round 92),
+// so it stays the default. KYTY_STREAM_HOST=1 puts the ring in cached host memory; the step
+// stream:host switches to one there.
 static bool StreamRingInHostMemory() {
-	const char* value = std::getenv("KYTY_STREAM_DEVICE");
-	return value == nullptr || value[0] != '1';
+	const char* value = std::getenv("KYTY_STREAM_HOST");
+	return value != nullptr && value[0] == '1';
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -362,17 +362,17 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
-	if (StreamRingInHostMemory() && Bisect::StreamDeviceConfigured()) {
-		m_stream_device =
-		    std::make_unique<StreamBuffer>(graphics, scheduler, MemoryUsage::Stream, 64 * MiB);
+	if (!StreamRingInHostMemory() && Bisect::StreamHostConfigured()) {
+		m_stream_other = std::make_unique<StreamBuffer>(graphics, scheduler, MemoryUsage::Stream,
+		                                                64 * MiB, true);
 	}
 	// Vulkan memory property bits: 1 device-local, 2 host-visible, 4 coherent, 8 cached.
 	LOGF("Stream ring: memory 0x%x (%s)%s\n", m_stream_buffer.MemoryProperties(),
-	     StreamRingInHostMemory() ? "cached host memory" : "device memory, KYTY_STREAM_DEVICE=1",
-	     m_stream_device != nullptr ? fmt::format(", for stream:device a ring in memory 0x{:x}",
-	                                              m_stream_device->MemoryProperties())
-	                                      .c_str()
-	                                : "");
+	     StreamRingInHostMemory() ? "cached host memory, KYTY_STREAM_HOST=1" : "device memory",
+	     m_stream_other != nullptr ? fmt::format(", for stream:host a ring in memory 0x{:x}",
+	                                             m_stream_other->MemoryProperties())
+	                                     .c_str()
+	                               : "");
 	// Readahead's downloads go at the end of the command buffer that wrote their bytes.
 	m_scheduler.SetBeforeFlush(&BufferCache::IssueReadaheadHook, this);
 	// Game threads' reads of bytes the GPU has finished writing go on a queue of their own.

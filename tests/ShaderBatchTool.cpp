@@ -26,6 +26,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
@@ -114,7 +115,12 @@ std::vector<char> ReadFile(const std::filesystem::path& path) {
 
 // Kept alive for the whole run: the shader map and the hash cache hold these addresses.
 void* CopyAligned(const std::vector<char>& bytes, size_t alignment) {
+#ifdef _WIN32
 	void* memory = _aligned_malloc(std::max<size_t>(bytes.size(), 1), alignment);
+#else
+	void* memory = std::aligned_alloc(
+	    alignment, (std::max<size_t>(bytes.size(), 1) + alignment - 1) / alignment * alignment);
+#endif
 	std::memcpy(memory, bytes.data(), bytes.size());
 	return memory;
 }
@@ -726,6 +732,204 @@ void RunShader(const std::filesystem::path& folder, const ManifestRow& row) {
 	            unsupported.c_str(), spirv.c_str(), spirv_words, emit_ms);
 }
 
+// --raw-cs <code.bin> <user sgprs> <tgid x,y,z enables as "xyz" letters>
+// <threads x>: a compute shader from an F9 capture's shader-dumps (raw code, no
+// header), with the registers given.
+void RunRawCompute(const std::filesystem::path& path, uint32_t user_sgpr, const std::string& tgid,
+                   uint32_t threads_x) {
+	const auto       bytes = ReadFile(path);
+	auto*            code  = CopyAligned(bytes, 256);
+	ShaderMappedData mapped;
+	mapped.type            = Prospero::ShaderBinaryType::kCs;
+	mapped.code_size_bytes = static_cast<uint32_t>(bytes.size());
+	ShaderMapUserData(reinterpret_cast<uint64_t>(code), mapped);
+	GuestState state;
+	auto&      cs   = state.compute.cs_regs;
+	cs.data_addr    = reinterpret_cast<uint64_t>(code);
+	cs.user_sgpr    = static_cast<uint8_t>(user_sgpr);
+	cs.tgid_x_en    = tgid.find('x') != std::string::npos;
+	cs.tgid_y_en    = tgid.find('y') != std::string::npos;
+	cs.tgid_z_en    = tgid.find('z') != std::string::npos;
+	cs.tg_size_en   = tgid.find('t') != std::string::npos;
+	cs.num_thread_x = threads_x;
+	cs.num_thread_y = 1;
+	cs.num_thread_z = 1;
+	cs.vgprs        = 63;
+	cs.wave_size    = 64;
+	FillUserData(state.compute.cs_user_sgpr);
+	state.compute.cs_user_sgpr.count = user_sgpr;
+	ShaderComputeInputInfo compute_info;
+	compute_info.host_subgroup_size = 32;
+	// 'd': a dispatch with the thread-dimension initiator, its counts in GPU
+	// memory (indirect).
+	compute_info.dispatch_thread_dimensions   = tgid.find('d') != std::string::npos;
+	compute_info.dispatch_dimensions_indirect = compute_info.dispatch_thread_dimensions;
+	auto params = PrepareProgram(state.compute, state.context.GetShaderRegisters(), compute_info);
+	ShaderStageInputInfo stage_input {};
+	stage_input.compute = &compute_info;
+	ShaderRecompiler::CompileOptions options;
+	options.stage       = ShaderType::Compute;
+	options.shader_hash = params.hash;
+	options.user_data   = std::span<const uint32_t>(params.user_data).first(params.user_data_count);
+	options.back_code   = params.back_code;
+	options.dump_ir     = true;
+	options.early_dump  = false;
+	options.dump_label  = "ShaderBatch";
+	options.input_info  = stage_input;
+	options.wave_size   = compute_info.wave_size;
+	options.non_fatal   = true;
+	options.bindless_images = true;
+	// KYTY_RAW_CALL_TABLE=<user data offset of the call table V#, hex>: s[0:1]
+	// points at stand-in memory whose V# there spans a table of 12 records
+	// {target, data}, each target a function that returns at once; the shader is
+	// expanded as in-game (no reported targets: the calls take the miss path)
+	// before it is translated.
+	std::vector<uint32_t> user_data(options.user_data.begin(), options.user_data.end());
+	std::vector<uint32_t> expanded;
+	if (const char* table = std::getenv("KYTY_RAW_CALL_TABLE"); table != nullptr) {
+		constexpr uint64_t Root     = 0x0000001000000000ull;
+		constexpr uint64_t Table    = 0x0000001000100000ull;
+		constexpr uint64_t Function = 0x0000001000200000ull;
+		constexpr uint32_t Records  = 12;
+		const uint64_t     at       = std::strtoull(table, nullptr, 16);
+		user_data[0]                = static_cast<uint32_t>(Root);
+		user_data[1]                = static_cast<uint32_t>(Root >> 32u);
+		const auto read             = [&](uint64_t address, std::span<uint32_t> words) {
+            for (size_t i = 0; i < words.size(); i++) {
+                const uint64_t a = address + i * 4u;
+                uint32_t       v = MemoryPattern[(a >> 2u) & 3u];
+                if (a >= Root + at && a < Root + at + 16u) {
+                    const uint32_t w = static_cast<uint32_t>((a - Root - at) / 4u);
+                    v                = w == 0   ? static_cast<uint32_t>(Table)
+					                               : w == 1 ? static_cast<uint32_t>(Table >> 32u)
+					                               : w == 2 ? Records * 16u
+					                                        : MemoryPattern[3];
+                } else if (a >= Table && a < Table + Records * 16u) {
+                    const uint32_t r = static_cast<uint32_t>((a - Table) / 16u);
+                    const uint32_t w = static_cast<uint32_t>((a - Table) / 4u) & 3u;
+                    const uint64_t f = Function + r * 0x100u;
+                    v                = w == 0   ? static_cast<uint32_t>(f)
+					                               : w == 1 ? static_cast<uint32_t>(f >> 32u)
+					                                        : 0x1000u + r;
+                } else if (a >= Function && a < Function + Records * 0x100u) {
+                    v = ((a - Function) % 0x100u) == 0 ? 0xbe80200eu
+					                                               : 0xbf800000u; // s_setpc s[14:15]
+                }
+                words[i] = v;
+            }
+            return true;
+		};
+		ShaderRecompiler::Decoder::ShaderFunctionExpander expander;
+		std::string                                       reason;
+		std::string                                       summary;
+		const bool ok = expander.Expand(params.code, params.Base(), user_data, read, expanded,
+		                                reason, options.wave_size, params.hash, &summary);
+		std::printf("EXPAND\t%s\t%zu words\t%s\t%s\n", ok ? "ok" : "failed", expanded.size(),
+		            reason.c_str(), summary.c_str());
+		if (const char* out = std::getenv("KYTY_RAW_EXPANDED_OUT"); out != nullptr) {
+			std::ofstream file(out, std::ios::binary);
+			file.write(reinterpret_cast<const char*>(expanded.data()),
+			           static_cast<std::streamsize>(expanded.size() * 4u));
+		}
+		options.user_data = user_data;
+	}
+	auto translated = ShaderRecompiler::TranslateProgram(
+	    expanded.empty() ? params.code : std::span<const uint32_t>(expanded), options);
+	std::printf("RAW\t%016" PRIx64 "\t%s\n", params.hash,
+	            translated.unsupported ? "gave up" : "ok");
+}
+
+// --replay <log> <CS_hash_words.gaveup.txt>: the translation of a compute shader that
+// gave up in-game, from what it left in shader-dumps/ (DumpGaveUpCompute in
+// pipelineCache.cpp): the code as it was translated (the .gaveup.bin next to
+// it), its user data and its stage's registers.
+void ReplayCompute(const std::filesystem::path& text_path) {
+	std::ifstream          text(text_path);
+	std::string            line;
+	ShaderComputeInputInfo info;
+	std::vector<uint32_t>  user_data;
+	uint64_t               hash = 0;
+	while (std::getline(text, line)) {
+		const auto field = [&](const char* name) -> const char* {
+			const auto at = line.find(name);
+			return at == std::string::npos ? nullptr : line.c_str() + at + std::strlen(name);
+		};
+		if (const char* v = field("hash="); v != nullptr && line.starts_with("hash=")) {
+			hash = std::strtoull(v, nullptr, 16);
+		}
+		if (const char* v = field("threads="); v != nullptr && line.starts_with("threads=")) {
+			std::sscanf(v, "%u %u %u", &info.threads_num[0], &info.threads_num[1],
+			            &info.threads_num[2]);
+			if (const char* w = field("lds_dwords="))
+				info.lds_size_dwords = std::strtoul(w, nullptr, 10);
+			if (const char* w = field("scratch_dwords="))
+				info.scratch_size_dwords = std::strtoul(w, nullptr, 10);
+			if (const char* w = field("wave=")) info.wave_size = std::strtoul(w, nullptr, 10);
+			if (const char* w = field("host_subgroup="))
+				info.host_subgroup_size = std::strtoul(w, nullptr, 10);
+		}
+		if (const char* v = field("float_mode="); v != nullptr && line.starts_with("float_mode=")) {
+			info.float_mode = static_cast<uint8_t>(std::strtoul(v, nullptr, 10));
+			int x = 0, y = 0, z = 0;
+			if (const char* w = field("group_id=")) std::sscanf(w, "%d %d %d", &x, &y, &z);
+			info.group_id[0] = x != 0;
+			info.group_id[1] = y != 0;
+			info.group_id[2] = z != 0;
+			if (const char* w = field("thread_ids=")) info.thread_ids_num = std::atoi(w);
+			if (const char* w = field("tg_size=")) info.tg_size_en = std::atoi(w) != 0;
+			if (const char* w = field("workgroup_register="))
+				info.workgroup_register = std::atoi(w);
+			if (const char* w = field("thread_dimensions="))
+				info.dispatch_thread_dimensions = std::atoi(w) != 0;
+			if (const char* w = field("indirect="))
+				info.dispatch_dimensions_indirect = std::atoi(w) != 0;
+			if (const char* w = field("counts=")) {
+				std::sscanf(w, "%u %u %u", &info.workgroup_counts[0], &info.workgroup_counts[1],
+				            &info.workgroup_counts[2]);
+			}
+		}
+		if (const char* v = field("lds_storage=");
+		    v != nullptr && line.starts_with("lds_storage=")) {
+			info.lds_storage = std::atoi(v) != 0;
+			if (const char* w = field("dispatch_threads=")) {
+				std::sscanf(w, "%u %u %u", &info.dispatch_threads_num[0],
+				            &info.dispatch_threads_num[1], &info.dispatch_threads_num[2]);
+			}
+		}
+		if (const char* v = field("user_data="); v != nullptr && line.starts_with("user_data=")) {
+			char* end = const_cast<char*>(v);
+			while (*end != '\0') {
+				char*      next  = nullptr;
+				const auto value = std::strtoul(end, &next, 16);
+				if (next == end) break;
+				user_data.push_back(static_cast<uint32_t>(value));
+				end = next;
+			}
+		}
+	}
+	auto bin_path = text_path;
+	bin_path.replace_extension(".bin");
+	const auto            bytes = ReadFile(bin_path);
+	std::vector<uint32_t> code(bytes.size() / 4u);
+	std::memcpy(code.data(), bytes.data(), code.size() * 4u);
+	ShaderStageInputInfo stage_input {};
+	stage_input.compute = &info;
+	ShaderRecompiler::CompileOptions options;
+	options.stage           = ShaderType::Compute;
+	options.shader_hash     = hash;
+	options.user_data       = user_data;
+	options.dump_ir         = true;
+	options.early_dump      = false;
+	options.dump_label      = "ShaderBatch";
+	options.input_info      = stage_input;
+	options.wave_size       = info.wave_size;
+	options.non_fatal       = true;
+	options.bindless_images = true;
+	auto translated         = ShaderRecompiler::TranslateProgram(code, options);
+	std::printf("REPLAY\t%016" PRIx64 "\t%zu words\t%zu user data\t%s\n", hash, code.size(),
+	            user_data.size(), translated.unsupported ? "gave up" : "ok");
+}
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -758,6 +962,24 @@ int main(int argc, char* argv[]) {
 	AddVectoredExceptionHandler(1, ReportCrash);
 #endif
 
+	if (folder == "--replay") {
+		// shader_batch_tool --replay <log> <CS_hash_words.gaveup.txt>
+		if (argc < 4) {
+			return 2;
+		}
+		ReplayCompute(argv[3]);
+		return 0;
+	}
+	if (folder == "--raw-cs") {
+		// shader_batch_tool --raw-cs <log> <code.bin> <user sgprs> <tgid
+		// letters> <threads x>
+		if (argc < 7) {
+			return 2;
+		}
+		RunRawCompute(argv[3], static_cast<uint32_t>(std::strtoul(argv[4], nullptr, 10)), argv[5],
+		              static_cast<uint32_t>(std::strtoul(argv[6], nullptr, 10)));
+		return 0;
+	}
 	const auto rows = ReadManifest(folder);
 	for (size_t i = first; i < std::min(end, rows.size()); i++) {
 		std::printf("START\t%zu\t%016" PRIx64 "\n", i, rows[i].hash);

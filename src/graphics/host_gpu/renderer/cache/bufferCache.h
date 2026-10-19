@@ -114,11 +114,11 @@ public:
 		}
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
-	// The ring per-draw copies go to: in cached host memory (round 92), or for the step
-	// stream:device the one in device memory.
+	// The ring per-draw copies go to: in device memory, or for the step stream:host the one in
+	// cached host memory (round 92).
 	[[nodiscard]] StreamBuffer& ActiveStream() noexcept {
-		return m_stream_device != nullptr && Bisect::StreamDevice() ? *m_stream_device
-		                                                            : m_stream_buffer;
+		return m_stream_other != nullptr && Bisect::StreamHost() ? *m_stream_other
+		                                                         : m_stream_buffer;
 	}
 	// The tiler's: the usual ring whatever step runs (one taken at its start would stay).
 	[[nodiscard]] StreamBuffer& GetStreamRing() noexcept { return m_stream_buffer; }
@@ -470,8 +470,8 @@ private:
 	};
 	std::vector<UploadRead> m_upload_reads;
 	StreamBuffer                                       m_stream_buffer;
-	// For the step stream:device (made only when a step has it).
-	std::unique_ptr<StreamBuffer>                      m_stream_device;
+	// For the step stream:host (made only when a step has it).
+	std::unique_ptr<StreamBuffer>                      m_stream_other;
 	StreamBuffer                                       m_download_buffer;
 	StreamBuffer                                       m_device_buffer;
 	TextureCache&                                      m_texture_cache;

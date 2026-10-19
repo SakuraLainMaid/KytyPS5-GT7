@@ -94,7 +94,7 @@ struct Step {
 	bool              gbuffer_sync    = false;
 	bool              depthread_old   = false;
 	// Round 92.
-	bool              stream_device     = false;
+	bool              stream_host       = false;
 	bool              buffers_dedicated = false;
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
@@ -371,8 +371,8 @@ bool ParseAction(std::string_view action, Step& step) {
 		step.depthread_old = true;
 		return true;
 	}
-	if (action == "stream:device") {
-		step.stream_device = true;
+	if (action == "stream:host") {
+		step.stream_host = true;
 		return true;
 	}
 	if (action == "buffers:dedicated") {
@@ -1061,18 +1061,18 @@ bool DepthReadOld() {
 	return step != nullptr && step->depthread_old;
 }
 
-bool StreamDeviceConfigured() {
+bool StreamHostConfigured() {
 	static const bool configured = [] {
 		const auto& steps = Steps();
 		return std::any_of(steps.begin(), steps.end(),
-		                   [](const Step& step) { return step.stream_device; });
+		                   [](const Step& step) { return step.stream_host; });
 	}();
 	return configured;
 }
 
-bool StreamDevice() {
+bool StreamHost() {
 	const auto* step = Current();
-	return step != nullptr && step->stream_device;
+	return step != nullptr && step->stream_host;
 }
 
 bool BuffersDedicated() {

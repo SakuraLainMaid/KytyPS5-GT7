@@ -1536,7 +1536,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			FrameGraph::Log("  not run: no program (%016" PRIx64 ")",
 			                ShaderDeclaredHash(cs_regs.cs_regs.data_addr));
 			FrameGraph::NoteShader("CS", ShaderDeclaredHash(cs_regs.cs_regs.data_addr),
-			                       cs_regs.cs_regs.data_addr, nullptr, 0);
+			                       cs_regs.cs_regs.data_addr, cs_regs.cs_user_sgpr.value,
+			                       cs_regs.cs_user_sgpr.count);
 		}
 		ResetBindings();
 		return;
@@ -1662,7 +1663,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                thread_group_x, thread_group_y, thread_group_z, input_info.threads_num[0],
 		                input_info.threads_num[1], input_info.threads_num[2]);
 		FrameGraph::NoteShader("CS", ShaderDeclaredHash(cs_regs.cs_regs.data_addr),
-		                       cs_regs.cs_regs.data_addr, nullptr, 0);
+		                       cs_regs.cs_regs.data_addr, cs_regs.cs_user_sgpr.value,
+		                       cs_regs.cs_user_sgpr.count);
 		FrameGraph::SetShowBuffers(true);
 	}
 	const TraceShaderScope trace_shader(program.shader_hash);
@@ -1906,7 +1908,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			FrameGraph::Log("  not run: no program (%016" PRIx64 ")",
 			                ShaderDeclaredHash(cs_regs.cs_regs.data_addr));
 			FrameGraph::NoteShader("CS", ShaderDeclaredHash(cs_regs.cs_regs.data_addr),
-			                       cs_regs.cs_regs.data_addr, nullptr, 0);
+			                       cs_regs.cs_regs.data_addr, cs_regs.cs_user_sgpr.value,
+			                       cs_regs.cs_user_sgpr.count);
 		}
 		ResetBindings();
 		return;
@@ -1938,7 +1941,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		                input_info.stage.program->shader_hash, input_info.threads_num[0],
 		                input_info.threads_num[1], input_info.threads_num[2]);
 		FrameGraph::NoteShader("CS", ShaderDeclaredHash(cs_regs.cs_regs.data_addr),
-		                       cs_regs.cs_regs.data_addr, nullptr, 0);
+		                       cs_regs.cs_regs.data_addr, cs_regs.cs_user_sgpr.value,
+		                       cs_regs.cs_user_sgpr.count);
 	}
 	const TraceShaderScope trace_shader(input_info.stage.program->shader_hash);
 	{

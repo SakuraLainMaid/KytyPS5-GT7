@@ -612,6 +612,71 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 	file.Write(spirv.data(), spirv.size() * sizeof(uint32_t));
 }
 
+// Round 93: KYTY_CALL_EVERY_TARGET (default on): a compute shader whose expansion gave up is
+// expanded again with every target of its call tables (ProgramCache::ExpandShaderFunctions).
+static bool ExpandEveryTarget() {
+	static const bool value = [] {
+		const char* text = std::getenv("KYTY_CALL_EVERY_TARGET");
+		return text == nullptr || text[0] != '0';
+	}();
+	return value;
+}
+
+// Round 93: a compute program that gives up leaves what an offline replay needs (the shader
+// batch tool's --replay mode) in shader-dumps/: the code it translated (expanded when it calls
+// functions), its user data and its stage's registers. The first 64 of a run, once for each
+// shader and code size (a second expansion of the same shader gets files of its own).
+static void DumpGaveUpCompute(uint64_t hash, std::span<const uint32_t> code,
+                              std::span<const uint32_t>     user_data,
+                              const ShaderComputeInputInfo& info, uint32_t failure_pc) {
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> dumped;
+	{
+		const std::lock_guard lock(mutex);
+		if (dumped.size() >= 64 || !dumped.insert(hash ^ (uint64_t {code.size()} << 40u)).second) {
+			return;
+		}
+	}
+	std::error_code created;
+	std::filesystem::create_directories("shader-dumps", created);
+	char path[112];
+	std::snprintf(path, sizeof(path), "shader-dumps/CS_%016" PRIx64 "_%zu.gaveup.bin", hash,
+	              code.size());
+	if (FILE* file = std::fopen(path, "wb"); file != nullptr) {
+		std::fwrite(code.data(), sizeof(uint32_t), code.size(), file);
+		std::fclose(file);
+	}
+	std::snprintf(path, sizeof(path), "shader-dumps/CS_%016" PRIx64 "_%zu.gaveup.txt", hash,
+	              code.size());
+	FILE* file = std::fopen(path, "w");
+	if (file == nullptr) {
+		return;
+	}
+	std::fprintf(file, "hash=%016" PRIx64 " words=%zu failure_pc=0x%x\n", hash, code.size(),
+	             failure_pc);
+	std::fprintf(
+	    file, "threads=%u %u %u lds_dwords=%u scratch_dwords=%u wave=%u host_subgroup=%u\n",
+	    info.threads_num[0], info.threads_num[1], info.threads_num[2], info.lds_size_dwords,
+	    info.scratch_size_dwords, info.wave_size, info.host_subgroup_size);
+	std::fprintf(file,
+	             "float_mode=%u group_id=%d %d %d thread_ids=%d tg_size=%d workgroup_register=%d "
+	             "thread_dimensions=%d indirect=%d counts=%u %u %u\n",
+	             info.float_mode, info.group_id[0] ? 1 : 0, info.group_id[1] ? 1 : 0,
+	             info.group_id[2] ? 1 : 0, info.thread_ids_num, info.tg_size_en ? 1 : 0,
+	             info.workgroup_register, info.dispatch_thread_dimensions ? 1 : 0,
+	             info.dispatch_dimensions_indirect ? 1 : 0, info.workgroup_counts[0],
+	             info.workgroup_counts[1], info.workgroup_counts[2]);
+	std::fprintf(file, "lds_storage=%d dispatch_threads=%u %u %u\n", info.lds_storage ? 1 : 0,
+	             info.dispatch_threads_num[0], info.dispatch_threads_num[1],
+	             info.dispatch_threads_num[2]);
+	std::fprintf(file, "user_data=");
+	for (const auto word: user_data) {
+		std::fprintf(file, "%08x ", word);
+	}
+	std::fprintf(file, "\n");
+	std::fclose(file);
+}
+
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
                         std::span<const uint32_t> code) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -2569,6 +2634,10 @@ struct PipelineCache::ProgramCache {
 			translated = ShaderRecompiler::TranslateProgram(compile_code, options);
 		}
 		if (translated.unsupported) {
+			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+				DumpGaveUpCompute(params.hash, compile_code, user_data, input_info,
+				                  ShaderRecompiler::IR::LastResourceTrackingFailurePc());
+			}
 			if (!lookup_key.function_code.empty()) {
 				// A table target's inlined body the resource tracking could not follow: leave
 				// it out of the next expansion (it takes the miss path) instead of giving up
@@ -2584,6 +2653,27 @@ struct PipelineCache::ProgramCache {
 					     ": excluding table target 0x%016" PRIx64
 					     " (its body failed resource tracking at pc 0x%08x)\n",
 					     params.hash, target, pc);
+				}
+				// The material passes of the ray tracing mode call their materials through tables
+				// of runtime records: an expansion inlines only the targets the GPU reported
+				// missing (ReportShaderCallMiss), and the first one, which inlines none, gave up
+				// in resource tracking outside any inlined body, so the shader never ran to report
+				// any (round 92's capture: 31 dispatches, the cars' reflections never shaded). A
+				// compute shader in that state is expanded next with every target of its tables
+				// (none when a table holds more than the expander inlines without reports).
+				// KYTY_CALL_EVERY_TARGET=0: no such expansion.
+				if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+					const auto reported =
+					    ShaderRecompiler::Decoder::ShaderCallMissTargets(params.hash);
+					if (target == 0 && ExpandEveryTarget() &&
+					    ShaderRecompiler::Decoder::ShaderCallRuntimeRecords() &&
+					    (reported == nullptr || reported->empty()) &&
+					    expand_every_target.insert(params.hash).second) {
+						LOGF("Shader function expansion hash=%016" PRIx64
+						     ": its translation gave up before the GPU reported any table target; "
+						     "it is expanded again with every table target\n",
+						     params.hash);
+					}
 				}
 			}
 			// Remember the refusal: a skipped shader is dispatched again every frame, and
@@ -2887,12 +2977,24 @@ struct PipelineCache::ProgramCache {
 		}
 		std::string reason;
 		std::string summary;
-		const bool  ok = function_expander.Expand(
+		// Round 93: a shader whose expansion with the reported table targets alone could not be
+		// translated is expanded with every target of its tables (ExpandEveryTarget).
+		if (const auto every = expand_every_target.find(params.hash);
+		    every != expand_every_target.end()) {
+			// Reports arrived after all (a target the expansion left out ran): from now on the
+			// expansion follows them, as for any shader.
+			const auto reported = ShaderRecompiler::Decoder::ShaderCallMissTargets(params.hash);
+			if (reported != nullptr && !reported->empty()) {
+				expand_every_target.erase(every);
+			}
+		}
+		const uint64_t expand_hash = expand_every_target.contains(params.hash) ? 0 : params.hash;
+		const bool     ok          = function_expander.Expand(
             params.code, params.Base(), user_data,
             [](uint64_t address, std::span<uint32_t> words) {
                 return ReadShaderGuestMemoryRaw(nullptr, address, words);
             },
-            expanded, reason, wave_size, params.hash, &summary);
+            expanded, reason, wave_size, expand_hash, &summary);
 		if (ok && expanded.empty() && summary.empty() && params.hash != 0) {
 			if (call_free.size() >= 65536) {
 				call_free.clear();
@@ -2930,6 +3032,8 @@ struct PipelineCache::ProgramCache {
 	std::shared_mutex                                              programs_mutex;
 	std::unordered_set<ProgramKey, ProgramKeyHash>                 unsupported;
 	ShaderRecompiler::Decoder::ShaderFunctionExpander             function_expander;
+	// Round 93: compute shaders expanded with every table target (ExpandEveryTarget).
+	std::unordered_set<uint64_t> expand_every_target;
 	// Shaders the expander found to make no calls, by code address: the hash and size of the code
 	// it saw (round 82).
 	struct CallFreeCode {

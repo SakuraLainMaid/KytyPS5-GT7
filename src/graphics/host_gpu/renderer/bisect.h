@@ -217,9 +217,10 @@
 //                alone first, as before round 91 (two barriers per draw), instead of for the
 //                attachment and a shader read at once
 // and, round 92 (from BryanKAdams' BryKytyPS5):
-//   stream:device the per-draw copies of small CPU-written buffers, flattened resource tables and
-//                shader data go to a ring in device memory (write-combined), as before, instead of
-//                the ring in cached host memory (KYTY_STREAM_DEVICE=1 for the whole run)
+//   stream:host  the per-draw copies of small CPU-written buffers, flattened resource tables and
+//                shader data go to a ring in cached host memory instead of the one in device
+//                memory (write-combined), as BryKytyPS5 does (KYTY_STREAM_HOST=1 for the whole run;
+//                a race in round 92: 0.8 ms a frame slower, so not the default)
 //   buffers:dedicated a game buffer made while the step is on gets memory of its own, as before,
 //                instead of a place in a shared block when it is 64 MB or less
 //                (KYTY_BUFFERS_DEDICATED=1 for the whole run)
@@ -340,10 +341,10 @@ void RequestPicture(const std::string& name);
 // GPU thread: gbuffer:sync; depthread:old (round 91).
 [[nodiscard]] bool GbufferSync();
 [[nodiscard]] bool DepthReadOld();
-// Round 92: some step has stream:device (the device ring is made at the start for it); the
-// current one has it; the current one has buffers:dedicated.
-[[nodiscard]] bool StreamDeviceConfigured();
-[[nodiscard]] bool StreamDevice();
+// Round 92: some step has stream:host (the host ring is made at the start for it); the current
+// one has it; the current one has buffers:dedicated.
+[[nodiscard]] bool StreamHostConfigured();
+[[nodiscard]] bool StreamHost();
 [[nodiscard]] bool BuffersDedicated();
 
 } // namespace Libs::Graphics::Bisect

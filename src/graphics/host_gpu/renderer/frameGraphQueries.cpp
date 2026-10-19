@@ -35,6 +35,7 @@ struct State {
 	bool                  ready  = false; // PrepareDraw left a query for the next BeginDraw
 	uint64_t              missed = 0;     // draws without a query
 	std::vector<uint32_t> ops    = std::vector<uint32_t>(PoolQueries, Unused);
+	std::vector<uint8_t>  kinds  = std::vector<uint8_t>(PoolQueries, 0); // Kind of each
 };
 
 State& GetState() {
@@ -83,7 +84,20 @@ int32_t BeginDraw(const CommandRecorder& recorder) {
 	}
 	state.ready      = false;
 	const auto query = state.used++;
-	state.ops[query] = FrameGraph::CurrentOp();
+	state.ops[query]   = FrameGraph::CurrentOp();
+	state.kinds[query] = static_cast<uint8_t>(Kind::Draw);
+	recorder.beginQuery(state.pool, query);
+	return static_cast<int32_t>(query);
+}
+
+int32_t BeginExtra(const CommandRecorder& recorder, Kind kind) {
+	auto& state = GetState();
+	if (!state.pool || !state.reset || !FrameGraph::Logging() || state.used >= PoolQueries) {
+		return -1;
+	}
+	const auto query   = state.used++;
+	state.ops[query]   = FrameGraph::CurrentOp();
+	state.kinds[query] = static_cast<uint8_t>(kind);
 	recorder.beginQuery(state.pool, query);
 	return static_cast<int32_t>(query);
 }
@@ -115,9 +129,19 @@ void LogResults() {
 				if (state.ops[q] == Unused || values[q * 2u + 1u] == 0) {
 					continue;
 				}
-				counted++;
-				none += values[q * 2u] == 0 ? 1u : 0u;
-				LOGF("FG %u   samples passed: %" PRIu64 "\n", state.ops[q], values[q * 2u]);
+				const auto kind  = static_cast<Kind>(state.kinds[q]);
+				const auto count = values[q * 2u];
+				if (kind == Kind::Draw) {
+					counted++;
+					none += count == 0 ? 1u : 0u;
+					LOGF("FG %u   samples passed: %" PRIu64 "\n", state.ops[q], count);
+				} else if (kind == Kind::Close) {
+					LOGF("FG %u   samples passed as close or closer (16384 units): %" PRIu64 "\n",
+					     state.ops[q], count);
+				} else {
+					LOGF("FG %u   samples drawn without a depth test: %" PRIu64 "\n", state.ops[q],
+					     count);
+				}
 			}
 		}
 		LOGF("FG 0 samples: %" PRIu64 " draws counted, %" PRIu64 " of them passed none; %" PRIu64

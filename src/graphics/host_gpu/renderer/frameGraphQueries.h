@@ -25,6 +25,14 @@ namespace Libs::Graphics::FrameGraphQueries {
 void PrepareDraw(vk::Device device, CommandScheduler& scheduler, const CommandRecorder& recorder);
 // GPU thread: a query around a draw's commands, in its rendering, after PrepareDraw; -1: none.
 [[nodiscard]] int32_t BeginDraw(const CommandRecorder& recorder);
+// Round 93: what a query counts. A draw that tests depth for EQUAL without writing it is drawn
+// again after itself in a capture, colour and stencil writes off: once testing "as close or
+// closer" with a bias of 16384 units of its depth precision and 4 of its slope towards the camera
+// (Close), once without a depth test (Anywhere). Against the draw's own count they tell a pass
+// that lands a little apart from its depth prepass from one that something nearer hides.
+enum class Kind : uint8_t { Draw, Close, Anywhere };
+// GPU thread: another query after the draw's own ended, in the same rendering; -1: none.
+[[nodiscard]] int32_t BeginExtra(const CommandRecorder& recorder, Kind kind);
 void                  EndDraw(const CommandRecorder& recorder, int32_t query);
 // GPU thread, after the frame: queries to read (wait for the GPU, then LogResults).
 [[nodiscard]] bool Pending();
