@@ -219,8 +219,8 @@ class PipelineCompiler;
 bool SmallColorTargetDraw(const HW::Context& context);
 
 // A reflection cube's color target (renderDraw.cpp learns them; round 87): once the game has
-// drawn it in most recent frames, the draws into it may be skipped while their shaders translate
-// or their pipelines compile. GPU thread only.
+// drawn it in two frames, the draws into it may be skipped while their shaders translate or their
+// pipelines compile. GPU thread only.
 void NoteReflectionCubeTarget(uint64_t address);
 
 // Why a draw's new pipeline may not be compiled in the background (TryGetGraphicsPipeline).
@@ -252,10 +252,11 @@ public:
 	struct GraphicsPrograms {
 		std::array<ShaderProgram, 3> vertex;
 		ShaderProgram pixel;
-		// The game draws into this draw's target every frame (drawn in at least three of the six
-		// frames before, and a reflection cube or a pass tested against a depth target): skipping
-		// the draw while its shaders translate or its pipeline compiles loses one frame of it,
-		// not a picture drawn once (round 87, RedrawnTargetDraw in pipelineCache.cpp).
+		// The game draws into this draw's target every frame (a reflection cube drawn in two
+		// frames or more, or a pass tested against a depth target into a target drawn in three
+		// of six frames in a row, and in use since): skipping the draw while its shaders translate
+		// or its pipeline compiles loses one frame of it, not a picture drawn once (rounds 87 and
+		// 88, RedrawnTargetDraw in pipelineCache.cpp).
 		bool redrawn_target = false;
 
 		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }

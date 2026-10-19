@@ -3651,11 +3651,14 @@ bool SmallColorTargetDraw(const HW::Context& context) {
 // a pipeline of those takes the driver about a second, so the race stopped for a second at a
 // time, several times every 10 s, all race long (2026-10-18, warm86: up to 38 s of 42). A draw
 // into such a target may be skipped while its shaders translate or its pipeline compiles: it
-// misses a frame or a few, not a picture drawn once. Such a target was drawn in at least three of
-// the six frames before, and is a reflection cube (learned by renderDraw.cpp), or the draw tests
-// against a depth target bound with it, with a test that can fail or a depth write (a 3D pass:
-// the depth test enable alone is not enough, the lost glyphs above had it set).
-// KYTY_DEFER_REDRAWN=0 turns the rule off. GPU thread only.
+// misses a frame or a few, not a picture drawn once. Such a target is a reflection cube (learned
+// by renderDraw.cpp) the game has drawn in two frames or more, or one drawn in at least three of
+// six frames in a row at some time, when the draw tests against a depth target bound with it,
+// with a test that can fail or a depth write (a 3D pass: the depth test enable alone is not
+// enough, the lost glyphs above had it set). The second holds until the target goes unused for
+// 32 frames; the cube's count is kept for good (round 88): the race start had none of the frames
+// before (a loading screen), and round 87 compiled 46 cube pipelines on the GPU thread there,
+// 44 s. KYTY_DEFER_REDRAWN=0 turns the rule off. GPU thread only.
 namespace {
 
 const bool g_defer_redrawn = [] {
@@ -3666,16 +3669,19 @@ const bool g_defer_redrawn = [] {
 std::array<uint64_t, 4> g_reflection_cubes {};
 uint32_t                g_reflection_cube_count = 0;
 
-// The frames a target was drawn in: bit i, i frames before `last`.
+// The frames a target was drawn in: bit i, i frames before `last`; how many frames in all (up to
+// a few), and whether it was ever drawn in three of six frames in a row.
 struct TargetFrames {
-	uint64_t last = 0;
-	uint32_t bits = 0;
+	uint64_t last   = UINT64_MAX;
+	uint32_t bits   = 0;
+	uint32_t frames = 0;
+	bool     steady = false;
 };
 std::unordered_map<uint64_t, TargetFrames> g_target_frames;
+const TargetFrames                         g_no_target_frames {};
 
-// Notes a draw into its target (its first color target, else its depth target) in this frame;
-// true when the game drew into the target in at least three of the six frames before.
-bool NoteTargetFrame(const HW::Context& context) {
+// Notes a draw into its target (its first color target, else its depth target) in this frame.
+const TargetFrames& NoteTargetFrame(const HW::Context& context) {
 	const auto mask = context.GetRenderTargetMask();
 	uint64_t   key  = 0;
 	for (uint32_t slot = 0; slot < 8 && key == 0; slot++) {
@@ -3689,7 +3695,7 @@ bool NoteTargetFrame(const HW::Context& context) {
 		key                = address != 0 ? address | (uint64_t {1} << 63u) : 0;
 	}
 	if (key == 0) {
-		return false;
+		return g_no_target_frames;
 	}
 	if (g_target_frames.size() >= 16384 && !g_target_frames.contains(key)) {
 		g_target_frames.clear();
@@ -3698,11 +3704,18 @@ bool NoteTargetFrame(const HW::Context& context) {
 	auto&      entry = g_target_frames[key];
 	if (frame != entry.last) {
 		const auto delta = frame - entry.last;
-		entry.bits       = delta >= 32 ? 0u : entry.bits << delta;
-		entry.last       = frame;
+		const bool gap   = entry.last == UINT64_MAX || delta >= 32;
+		entry.bits       = gap ? 0u : entry.bits << delta;
+		// A target unused for 32 frames may be memory the game uses for something else now
+		// (one drawn once): it must show three frames of six again. A reflection cube keeps its
+		// count (a race start comes after a loading screen of many frames).
+		entry.steady = entry.steady && !gap;
+		entry.last   = frame;
+		entry.frames = std::min(entry.frames + 1u, 16u);
 	}
 	entry.bits |= 1u;
-	return std::popcount(entry.bits & 0x7eu) >= 3;
+	entry.steady = entry.steady || std::popcount(entry.bits & 0x7eu) >= 3;
+	return entry;
 }
 
 bool ReflectionCubeDraw(const HW::Context& context) {
@@ -3724,8 +3737,14 @@ bool DepthTestedDraw(const HW::Context& context) {
 
 // Whether this draw's target is one the game draws every frame (see above), noting the draw.
 bool RedrawnTargetDraw(const HW::Context& context) {
-	const bool redrawn = NoteTargetFrame(context);
-	return g_defer_redrawn && redrawn && (ReflectionCubeDraw(context) || DepthTestedDraw(context));
+	const auto& frames = NoteTargetFrame(context);
+	if (!g_defer_redrawn) {
+		return false;
+	}
+	if (ReflectionCubeDraw(context)) {
+		return frames.frames >= 2;
+	}
+	return frames.steady && DepthTestedDraw(context);
 }
 
 } // namespace

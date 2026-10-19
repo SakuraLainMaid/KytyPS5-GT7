@@ -40,7 +40,9 @@ std::vector<std::string> Patterns() {
 		return patterns;
 	}
 	if (std::string_view(value) == "1") {
-		return {"Thread_Gpu", "Job#0", "Job#1", "GpuRecord", "Thread_DrawPrep", "GpuPriority"};
+		// Every job thread (round 88): the game's loading moves between them, and a thread
+		// busy at 100% went unseen while Job#0 and Job#1 waited.
+		return {"Thread_Gpu", "Job#*", "GpuRecord", "Thread_DrawPrep", "GpuPriority"};
 	}
 	std::string_view rest(value);
 	while (!rest.empty()) {

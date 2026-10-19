@@ -353,6 +353,13 @@ static void TraceRangeChange(const char* what, uint64_t start, uint64_t size, co
 	            what, start, size, type, protection, offset, count);
 }
 
+// The guest's virtual address ranges, sorted by start, never overlapping, and merged with their
+// neighbours where SameMergeKey allows. Round 88: an ordered map instead of a vector, and the
+// committed bytes kept as merged spans as the ranges change. Each change rebuilt and re-sorted
+// the whole vector (and ReplaceSpan and QuerySpan walked it from the start): the game maps
+// streaming memory thousands of times while it loads a track, over tens of thousands of ranges,
+// and its loading threads spent minutes there while it drew nothing (2026-10-18, warm87: 80 s at
+// a time with no frame). Every change is now local, logarithmic in the number of ranges.
 class VirtualRanges {
 public:
 	struct Range {
@@ -372,15 +379,10 @@ public:
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
 
-		if (start == 0 || size == 0) {
+		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
 		}
-		auto position = LowerBound(start);
-		if ((position != m_ranges.end() &&
-		     VirtualRangesOverlap(start, size, position->start, position->size)) ||
-		    (position != m_ranges.begin() &&
-		     VirtualRangesOverlap(start, size, std::prev(position)->start,
-		                          std::prev(position)->size))) {
+		if (FindOverlap(start, size) != nullptr) {
 			return false;
 		}
 
@@ -393,9 +395,7 @@ public:
 		r.type           = type;
 		r.disallow_merge = disallow_merge;
 		CopyVirtualRangeName(r.name, name);
-		const auto index = static_cast<size_t>(position - m_ranges.begin());
-		m_ranges.insert(position, r);
-		MergeAroundUnlocked(index);
+		MergeAroundUnlocked(InsertUnlocked(r));
 		TraceRangeChange("mapped", start, size, magic_enum::enum_name(type).data(), protection,
 		                 offset);
 		return true;
@@ -407,14 +407,13 @@ public:
 		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
 		TraceRangeChange("unmapped", start, size, "-", 0, 0);
 
-		auto position = LowerBound(start);
-		if (position != m_ranges.end() && position->start == start && position->size == size) {
-			m_ranges.erase(position);
+		if (auto exact = m_ranges.find(start);
+		    exact != m_ranges.end() && exact->second.size == size) {
+			EraseUnlocked(exact);
 			return true;
 		}
-		auto removed = RemoveUnlocked(start, size);
-		MergeUnlocked();
-		return removed;
+		// Removing makes no new neighbours, so nothing new can merge.
+		return RemoveUnlocked(start, size);
 	}
 
 	bool HasOverlap(uint64_t start, uint64_t size) {
@@ -441,12 +440,10 @@ public:
 		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
 		TraceRangeChange("reservation released", start, size, "-", 0, 0);
 
-		for (size_t index = 0; index < m_ranges.size(); index++) {
-			auto& r = m_ranges[index];
-			if (r.start == start && r.size == size && IsReservedRangeType(r.type)) {
-				m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(index));
-				return true;
-			}
+		if (auto exact = m_ranges.find(start); exact != m_ranges.end() &&
+		                                       exact->second.size == size &&
+		                                       IsReservedRangeType(exact->second.type)) {
+			EraseUnlocked(exact);
 		}
 		return true;
 	}
@@ -462,21 +459,15 @@ public:
 			return false;
 		}
 
-		auto current = start;
-		const auto end = start + size;
+		// Every byte must lie in a range of the expected type.
+		auto       current = start;
+		const auto end     = start + size;
 		while (current < end) {
-			const Range* candidate = nullptr;
-			for (const auto& r: m_ranges) {
-				if (r.type == expected_type && current >= r.start &&
-				    current < End(r.start, r.size)) {
-					candidate = &r;
-					break;
-				}
-			}
-			if (candidate == nullptr) {
+			const auto containing = ContainingUnlocked(current);
+			if (containing == m_ranges.end() || containing->second.type != expected_type) {
 				return false;
 			}
-			current = std::min(end, End(candidate->start, candidate->size));
+			current = std::min(end, End(containing->second.start, containing->second.size));
 		}
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -497,10 +488,7 @@ public:
 		replacement.disallow_merge = disallow_merge;
 		CopyVirtualRangeName(replacement.name, name);
 		RemoveUnlocked(start, size);
-		auto position = LowerBound(start);
-		const auto index = static_cast<size_t>(position - m_ranges.begin());
-		m_ranges.insert(position, replacement);
-		MergeAroundUnlocked(index);
+		MergeAroundUnlocked(InsertUnlocked(replacement));
 		return true;
 	}
 
@@ -508,10 +496,10 @@ public:
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
 
-		auto position = LowerBound(start);
-		if (position != m_ranges.end() && position->start == start && position->size == size) {
-			CopyVirtualRangeName(position->name, name);
-			MergeAroundUnlocked(static_cast<size_t>(position - m_ranges.begin()));
+		if (auto exact = m_ranges.find(start);
+		    exact != m_ranges.end() && exact->second.size == size) {
+			CopyVirtualRangeName(exact->second.name, name);
+			MergeAroundUnlocked(exact);
 			return;
 		}
 		EditUnlocked(start, size, [name](Range* r) { CopyVirtualRangeName(r->name, name); });
@@ -537,13 +525,11 @@ public:
 
 		Common::LockGuard lock(m_mutex);
 
-		auto next = std::upper_bound(
-		    m_ranges.begin(), m_ranges.end(), addr,
-		    [](uint64_t value, const Range& range) { return value < range.start; });
+		auto next = m_ranges.upper_bound(addr);
 		if (next != m_ranges.begin()) {
-			auto current = std::prev(next);
-			if (addr < End(current->start, current->size)) {
-				*out = *current;
+			const auto& current = std::prev(next)->second;
+			if (addr < End(current.start, current.size)) {
+				*out = current;
 				return true;
 			}
 		}
@@ -551,7 +537,7 @@ public:
 			return false;
 		}
 
-		*out = *next;
+		*out = next->second;
 		return true;
 	}
 
@@ -566,8 +552,9 @@ public:
 
 		const auto end     = start + size;
 		auto       current = start;
-		for (const auto& range: m_ranges) {
-			const auto range_end = End(range.start, range.size);
+		for (auto it = FirstEndingAfterUnlocked(start); it != m_ranges.end(); ++it) {
+			const auto& range     = it->second;
+			const auto  range_end = End(range.start, range.size);
 			if (range_end <= current) {
 				continue;
 			}
@@ -622,8 +609,9 @@ public:
                           protection != 0 ? (protection & 2 ? " rw" : " r") : "");
             text += piece;
 		};
-		for (const auto& r: m_ranges) {
-			const auto range_end = End(r.start, r.size);
+		for (auto it = FirstEndingAfterUnlocked(start); it != m_ranges.end(); ++it) {
+			const auto& r         = it->second;
+			const auto  range_end = End(r.start, r.size);
 			if (range_end <= current) {
 				continue;
 			}
@@ -657,21 +645,14 @@ public:
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return true;
 		}
-		const auto generation = m_coverage_generation.load(std::memory_order_relaxed);
-		if (m_spans_generation != generation) {
-			RebuildSpansUnlocked();
-			m_spans_generation = generation;
-		}
 		const auto end  = start + size;
-		auto       span = std::upper_bound(
-            m_spans.begin(), m_spans.end(), start,
-            [](uint64_t value, const Span& candidate) { return value < candidate.start; });
-		if (span != m_spans.begin()) {
+		auto       span = m_coverage.upper_bound(start);
+		if (span != m_coverage.begin()) {
 			--span;
 		}
-		for (; span != m_spans.end() && span->start < end; ++span) {
-			const auto from = std::max(start, span->start);
-			const auto to   = std::min(end, span->end);
+		for (; span != m_coverage.end() && span->first < end; ++span) {
+			const auto from = std::max(start, span->first);
+			const auto to   = std::min(end, span->second);
 			if (from >= to) {
 				continue;
 			}
@@ -689,21 +670,14 @@ public:
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return 0;
 		}
-		const auto generation = m_coverage_generation.load(std::memory_order_relaxed);
-		if (m_spans_generation != generation) {
-			RebuildSpansUnlocked();
-			m_spans_generation = generation;
-		}
 		const auto end = start + size;
 		// The last span that starts before the end.
-		auto span = std::lower_bound(
-		    m_spans.begin(), m_spans.end(), end,
-		    [](const Span& candidate, uint64_t value) { return candidate.start < value; });
-		if (span == m_spans.begin()) {
+		auto span = m_coverage.lower_bound(end);
+		if (span == m_coverage.begin()) {
 			return 0;
 		}
 		--span;
-		return span->end > start ? std::min(end, span->end) - start : 0;
+		return span->second > start ? std::min(end, span->second) - start : 0;
 	}
 
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
@@ -712,42 +686,32 @@ public:
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
 		}
-		// Committed bytes as merged spans, rebuilt after coverage changed: a heap-wide descriptor
-		// spans thousands of mappings, and while the game streams (it maps memory hundreds of
-		// times a second) the per-thread answers of TryClampRangeSize keep missing, so the walk
-		// below ran under the lock at ~4 us a call (the helicopter cut, 2026-10-09).
-		// KYTY_CLAMP_SPANS=0 walks the ranges as before.
+		// Committed bytes as merged spans: a heap-wide descriptor spans thousands of mappings,
+		// and while the game streams (it maps memory hundreds of times a second) the per-thread
+		// answers of TryClampRangeSize keep missing, so the walk below ran under the lock at ~4 us
+		// a call (the helicopter cut, 2026-10-09). KYTY_CLAMP_SPANS=0 walks the ranges as before.
 		static const bool spans = [] {
 			const char* value = std::getenv("KYTY_CLAMP_SPANS");
 			return value == nullptr || value[0] != '0';
 		}();
 		if (spans) {
-			const auto generation = m_coverage_generation.load(std::memory_order_relaxed);
-			if (m_spans_generation != generation) {
-				RebuildSpansUnlocked();
-				m_spans_generation = generation;
-			}
-			auto span = std::upper_bound(
-			    m_spans.begin(), m_spans.end(), virtual_addr,
-			    [](uint64_t value, const Span& candidate) { return value < candidate.start; });
-			if (span == m_spans.begin()) {
+			auto span = m_coverage.upper_bound(virtual_addr);
+			if (span == m_coverage.begin()) {
 				return 0;
 			}
 			--span;
-			return virtual_addr < span->end ? std::min(size, span->end - virtual_addr) : 0;
+			return virtual_addr < span->second ? std::min(size, span->second - virtual_addr) : 0;
 		}
 
-		auto vma = std::upper_bound(
-		    m_ranges.begin(), m_ranges.end(), virtual_addr,
-		    [](uint64_t value, const Range& range) { return value < range.start; });
+		auto vma = m_ranges.upper_bound(virtual_addr);
 		if (vma == m_ranges.begin()) {
 			return 0;
 		}
 		--vma;
 
-		const auto vma_end = End(vma->start, vma->size);
-		if (virtual_addr < vma->start || virtual_addr >= vma_end ||
-		    !IsCommittedRangeType(vma->type)) {
+		const auto vma_end = End(vma->second.start, vma->second.size);
+		if (virtual_addr < vma->second.start || virtual_addr >= vma_end ||
+		    !IsCommittedRangeType(vma->second.type)) {
 			return 0;
 		}
 
@@ -755,9 +719,9 @@ public:
 		uint64_t expected     = virtual_addr + clamped_size;
 		++vma;
 
-		while (vma != m_ranges.end() && vma->start == expected && IsCommittedRangeType(vma->type) &&
-		       clamped_size < size) {
-			const auto chunk = std::min(size - clamped_size, vma->size);
+		while (vma != m_ranges.end() && vma->second.start == expected &&
+		       IsCommittedRangeType(vma->second.type) && clamped_size < size) {
+			const auto chunk = std::min(size - clamped_size, vma->second.size);
 			clamped_size += chunk;
 			expected += chunk;
 			++vma;
@@ -770,7 +734,8 @@ public:
 		Common::LockGuard lock(m_mutex);
 
 		uint64_t used = 0;
-		for (const auto& r: m_ranges) {
+		for (const auto& [start, r]: m_ranges) {
+			(void)start;
 			if (!IsCommittedRangeType(r.type) || r.size == 0) {
 				continue;
 			}
@@ -792,28 +757,10 @@ public:
 	}
 
 private:
+	using RangeMap = std::map<uint64_t, Range>;
+
 	static uint64_t End(uint64_t start, uint64_t size) {
 		return (UINT64_MAX - start < size ? UINT64_MAX : start + size);
-	}
-
-	// Maximal runs of adjacent committed ranges, as ClampRangeSize's walk joins them.
-	struct Span {
-		uint64_t start = 0;
-		uint64_t end   = 0;
-	};
-	void RebuildSpansUnlocked() {
-		m_spans.clear();
-		for (const auto& r: m_ranges) {
-			if (!IsCommittedRangeType(r.type) || r.size == 0) {
-				continue;
-			}
-			const auto end = End(r.start, r.size);
-			if (!m_spans.empty() && m_spans.back().end == r.start) {
-				m_spans.back().end = end;
-			} else {
-				m_spans.push_back({r.start, end});
-			}
-		}
 	}
 
 	static bool SameMergeKey(const Range& left, const Range& right) {
@@ -827,52 +774,102 @@ private:
 		       std::strncmp(left.name, right.name, KERNEL_MAXIMUM_NAME_LENGTH) == 0;
 	}
 
-	static void AddPiece(std::vector<Range>* ranges, const Range& source, uint64_t start,
-	                     uint64_t end) {
-		EXIT_IF(ranges == nullptr);
-
-		if (end <= start) {
-			return;
-		}
-
+	// The piece [start, end) of a range, as AddPiece made it.
+	static Range Piece(const Range& source, uint64_t start, uint64_t end) {
 		Range piece = source;
 		piece.start = start;
 		piece.size  = end - start;
 		if (piece.type == VirtualRangeType::Direct) {
 			piece.offset += start - source.start;
 		}
-		ranges->push_back(piece);
+		return piece;
 	}
 
-	std::vector<Range>::iterator LowerBound(uint64_t start) {
-		return std::lower_bound(
-		    m_ranges.begin(), m_ranges.end(), start,
-		    [](const Range& range, uint64_t value) { return range.start < value; });
-	}
-
-	void MergeAroundUnlocked(size_t index) {
-		if (index >= m_ranges.size()) {
-			return;
+	// The range holding addr, or end.
+	RangeMap::iterator ContainingUnlocked(uint64_t addr) {
+		auto next = m_ranges.upper_bound(addr);
+		if (next == m_ranges.begin()) {
+			return m_ranges.end();
 		}
-		if (index != 0) {
-			auto& previous = m_ranges[index - 1];
-			auto& current  = m_ranges[index];
-			if (End(previous.start, previous.size) == current.start &&
-			    SameMergeKey(previous, current)) {
-				previous.size += current.size;
-				m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(index));
-				index--;
+		auto current = std::prev(next);
+		return addr < End(current->second.start, current->second.size) ? current : m_ranges.end();
+	}
+
+	// The first range that ends after addr (the one holding it, else the next one).
+	RangeMap::iterator FirstEndingAfterUnlocked(uint64_t addr) {
+		auto next = m_ranges.upper_bound(addr);
+		if (next != m_ranges.begin()) {
+			auto current = std::prev(next);
+			if (addr < End(current->second.start, current->second.size)) {
+				return current;
 			}
 		}
-		while (index + 1 < m_ranges.size()) {
-			auto& current = m_ranges[index];
-			auto& next    = m_ranges[index + 1];
-			if (End(current.start, current.size) != next.start || !SameMergeKey(current, next)) {
+		return next;
+	}
+
+	// A new range (nothing overlaps it), with its committed bytes.
+	RangeMap::iterator InsertUnlocked(const Range& range) {
+		auto [inserted, ok] = m_ranges.emplace(range.start, range);
+		EXIT_IF(!ok);
+		if (IsCommittedRangeType(range.type)) {
+			CoverAddUnlocked(range.start, End(range.start, range.size));
+		}
+		return inserted;
+	}
+
+	// Removes a range, with its committed bytes; the iterator after it.
+	RangeMap::iterator EraseUnlocked(RangeMap::iterator range) {
+		if (IsCommittedRangeType(range->second.type)) {
+			CoverRemoveUnlocked(range->second.start, End(range->second.start, range->second.size));
+		}
+		return m_ranges.erase(range);
+	}
+
+	// Joins the range with its neighbours while they may merge (as before, the one before it,
+	// then those after it). Merging leaves the committed bytes as they are: merged ranges have
+	// one type.
+	RangeMap::iterator MergeAroundUnlocked(RangeMap::iterator current) {
+		if (current == m_ranges.end()) {
+			return current;
+		}
+		if (current != m_ranges.begin()) {
+			auto previous = std::prev(current);
+			if (End(previous->second.start, previous->second.size) == current->second.start &&
+			    SameMergeKey(previous->second, current->second)) {
+				previous->second.size += current->second.size;
+				m_ranges.erase(current);
+				current = previous;
+			}
+		}
+		for (;;) {
+			auto next = std::next(current);
+			if (next == m_ranges.end() ||
+			    End(current->second.start, current->second.size) != next->second.start ||
+			    !SameMergeKey(current->second, next->second)) {
 				break;
 			}
-			current.size += next.size;
-			m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(index + 1));
+			current->second.size += next->second.size;
+			m_ranges.erase(next);
 		}
+		return current;
+	}
+
+	// Cuts the range holding addr in two at addr (no bytes change); the range starting at addr,
+	// or the first one after it.
+	RangeMap::iterator SplitAtUnlocked(uint64_t addr) {
+		const auto containing = ContainingUnlocked(addr);
+		if (containing == m_ranges.end()) {
+			return m_ranges.lower_bound(addr);
+		}
+		if (containing->second.start == addr) {
+			return containing;
+		}
+		const auto source       = containing->second;
+		const auto end          = End(source.start, source.size);
+		containing->second.size = addr - source.start;
+		auto [tail, ok]         = m_ranges.emplace(addr, Piece(source, addr, end));
+		EXIT_IF(!ok);
+		return tail;
 	}
 
 	template <typename EditFunc>
@@ -880,36 +877,26 @@ private:
 		if (size == 0) {
 			return;
 		}
-
-		std::vector<Range> out;
-		auto               edit_end = End(start, size);
-
-		for (const auto& r: m_ranges) {
-			auto r_end = End(r.start, r.size);
-			if (!VirtualRangesOverlap(start, size, r.start, r.size)) {
-				out.push_back(r);
-				continue;
-			}
-
-			auto mid_start = std::max(start, r.start);
-			auto mid_end   = std::min(edit_end, r_end);
-
-			AddPiece(&out, r, r.start, mid_start);
-
-			Range mid = r;
-			mid.start = mid_start;
-			mid.size  = mid_end - mid_start;
-			if (mid.type == VirtualRangeType::Direct) {
-				mid.offset += mid_start - r.start;
-			}
-			edit(&mid);
-			out.push_back(mid);
-
-			AddPiece(&out, r, mid_end, r_end);
+		const auto edit_end = End(start, size);
+		auto       first    = SplitAtUnlocked(start);
+		if (first == m_ranges.end() || first->second.start >= edit_end) {
+			return;
 		}
-
-		m_ranges = out;
-		MergeUnlocked();
+		SplitAtUnlocked(edit_end);
+		auto last = first;
+		while (last != m_ranges.end() && last->second.start < edit_end) {
+			edit(&last->second);
+			++last;
+		}
+		// Only the edited ranges and their two neighbours can merge anew.
+		auto current = first != m_ranges.begin() ? std::prev(first) : first;
+		while (current != m_ranges.end()) {
+			const bool past = current->second.start >= edit_end;
+			current         = std::next(MergeAroundUnlocked(current));
+			if (past) {
+				break;
+			}
+		}
 	}
 
 	bool RemoveUnlocked(uint64_t start, uint64_t size) {
@@ -917,72 +904,96 @@ private:
 			return false;
 		}
 
-		std::vector<Range> out;
-		bool               removed = false;
-		auto               rem_end = End(start, size);
-
-		for (const auto& r: m_ranges) {
-			auto r_end = End(r.start, r.size);
-			if (!VirtualRangesOverlap(start, size, r.start, r.size)) {
-				out.push_back(r);
-				continue;
+		const auto rem_end = End(start, size);
+		bool       removed = false;
+		auto       it      = FirstEndingAfterUnlocked(start);
+		while (it != m_ranges.end() && it->second.start < rem_end) {
+			const auto r     = it->second;
+			const auto r_end = End(r.start, r.size);
+			removed          = true;
+			it               = EraseUnlocked(it);
+			if (r.start < start) {
+				InsertUnlocked(Piece(r, r.start, start));
 			}
-
-			removed = true;
-			AddPiece(&out, r, r.start, std::max(start, r.start));
-			AddPiece(&out, r, std::min(rem_end, r_end), r_end);
+			if (rem_end < r_end) {
+				it = InsertUnlocked(Piece(r, rem_end, r_end));
+				break;
+			}
 		}
-
-		m_ranges = out;
 		return removed;
 	}
 
-	void MergeUnlocked() {
-		if (m_ranges.size() < 2) {
-			return;
-		}
-
-		std::sort(m_ranges.begin(), m_ranges.end(),
-		          [](const Range& left, const Range& right) { return left.start < right.start; });
-
-		std::vector<Range> merged;
-		for (const auto& r: m_ranges) {
-			if (!merged.empty()) {
-				auto& last = merged[merged.size() - 1];
-				if (End(last.start, last.size) == r.start && SameMergeKey(last, r)) {
-					last.size += r.size;
-					continue;
-				}
-			}
-			merged.push_back(r);
-		}
-		m_ranges = merged;
-	}
-
-	Range* FindOverlap(uint64_t start, uint64_t size) {
-		auto position = LowerBound(start);
+	// As before: the range starting at or after start, else the one before it.
+	const Range* FindOverlap(uint64_t start, uint64_t size) {
+		auto position = m_ranges.lower_bound(start);
 		if (position != m_ranges.end() &&
-		    VirtualRangesOverlap(start, size, position->start, position->size)) {
-			return &*position;
+		    VirtualRangesOverlap(start, size, position->second.start, position->second.size)) {
+			return &position->second;
 		}
 		if (position != m_ranges.begin()) {
 			auto previous = std::prev(position);
-			if (VirtualRangesOverlap(start, size, previous->start, previous->size)) {
-				return &*previous;
+			if (VirtualRangesOverlap(start, size, previous->second.start, previous->second.size)) {
+				return &previous->second;
 			}
 		}
 		return nullptr;
 	}
 
-	std::vector<Range> m_ranges;
-	Common::Mutex      m_mutex;
+	// The committed bytes, as disjoint spans that do not touch: [first, second).
+	void CoverAddUnlocked(uint64_t start, uint64_t end) {
+		if (start >= end) {
+			return;
+		}
+		auto it = m_coverage.upper_bound(start);
+		if (it != m_coverage.begin()) {
+			auto previous = std::prev(it);
+			if (previous->second >= start) {
+				start = previous->first;
+				end   = std::max(end, previous->second);
+				it    = m_coverage.erase(previous);
+			}
+		}
+		while (it != m_coverage.end() && it->first <= end) {
+			end = std::max(end, it->second);
+			it  = m_coverage.erase(it);
+		}
+		m_coverage.emplace(start, end);
+	}
+
+	void CoverRemoveUnlocked(uint64_t start, uint64_t end) {
+		if (start >= end) {
+			return;
+		}
+		auto it = m_coverage.upper_bound(start);
+		if (it != m_coverage.begin()) {
+			--it;
+		}
+		while (it != m_coverage.end() && it->first < end) {
+			const auto span_start = it->first;
+			const auto span_end   = it->second;
+			if (span_end <= start) {
+				++it;
+				continue;
+			}
+			it = m_coverage.erase(it);
+			if (span_start < start) {
+				m_coverage.emplace(span_start, start);
+			}
+			if (span_end > end) {
+				m_coverage.emplace(end, span_end);
+				break;
+			}
+		}
+	}
+
+	RangeMap                     m_ranges;
+	std::map<uint64_t, uint64_t> m_coverage;
+	Common::Mutex                m_mutex;
 	// Bumped by every change of the ranges.
 	std::atomic<uint64_t> m_generation {1};
 	// Bumped by the changes of committed coverage (CoverageGeneration): TryClampRangeSize's
-	// per-thread answers and m_spans are valid while it is unchanged.
+	// per-thread answers are valid while it is unchanged.
 	std::atomic<uint64_t> m_coverage_generation {1};
-	std::vector<Span>     m_spans;
-	uint64_t              m_spans_generation = 0;
 };
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
