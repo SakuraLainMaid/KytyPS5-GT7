@@ -1,0 +1,66 @@
+name: Bug report (this fork)
+description: A crash, freeze, graphics problem or slowdown in a build of this fork.
+title: "[BUG]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing. One problem per report, please, and search the existing issues first.
+        See [docs/GT7.md](https://github.com/usa-ratt/KytyPS5-GT7/blob/gt7-eqaa/docs/GT7.md) for the settings the builds are tested with
+        and the problems already known.
+
+  - type: input
+    id: build
+    attributes:
+      label: Build
+      description: The release you downloaded (its name, like KytyPS5-2026-10-19-abc1234).
+      placeholder: "KytyPS5-2026-10-19-abc1234"
+    validations:
+      required: true
+
+  - type: input
+    id: pc
+    attributes:
+      label: PC
+      description: CPU, graphics card (and driver version), RAM, Windows version.
+      placeholder: "Ryzen 5 5600, RTX 3060 (driver 581.xx), 16 GB, Windows 11"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of problem
+      options:
+        - Crash (the emulator closes or shows an error)
+        - Freeze (the picture stops, with or without sound)
+        - Graphics (missing, wrong or flickering things)
+        - Slow (low frame rate)
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Where in the game (menu, track, mode, camera), what you did, what you saw, and whether it happens every time.
+    validations:
+      required: true
+
+  - type: textarea
+    id: settings
+    attributes:
+      label: Settings changed
+      description: Any launcher setting that differs from docs/GT7.md (resolution, bindless textures, reflections every other frame, ...). Write "none" if none.
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log and screenshots
+      description: |
+        Zip the log file (_kyty.txt next to kyty_emulator.exe, written with Printf output set to File) and drag the zip here, with any screenshots. If the zip is too large, the last part of the log is the most useful.
+    validations:
+      required: false

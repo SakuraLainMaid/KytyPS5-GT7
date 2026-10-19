@@ -47,15 +47,53 @@ In the game's own graphics options, use the **performance (frame rate) mode, not
 No environment variables are needed to play. The `KYTY_*` variables mentioned in the commit
 history are for diagnostic runs only.
 
-The first time you reach a new area, the game stutters while its shaders are translated and
-compiled. They are cached, so later runs through the same area are smoother.
+**Pop-in on new tracks is expected.** The first time you drive a track (or a part of one), its
+shaders are compiled while you drive, in the background: scenery, cars' details and reflections
+appear a moment late instead of the game freezing while they compile. The compiled shaders are
+cached, so the second time on the same track things are there from the start. On a fast PC most
+of a new track is in within half a lap; on slower PCs it takes longer. After a graphics driver
+update everything is compiled once more.
+
+To report a problem, open an issue on this repository with the **Bug report** form (attach the
+zipped `_kyty.txt` log).
+
+## What's new (October 19, 2026)
+
+- **No more long freezes on new tracks.** Driving onto a part of a track the game had not loaded
+  yet froze the picture for seconds to more than a minute (audio kept playing), and some loading
+  screens never finished. The game maps memory thousands of times while it streams a track in,
+  and the emulator's record of the game's memory was rebuilt on every change; each change now
+  costs microseconds instead of milliseconds. In one race on a new track the picture stood still
+  in 248 of 449 two-second stretches before, and in 1 of 144 after.
+- **Shader compiling no longer stops the game.** New shaders for the cars' reflections, and for
+  other passes the game redraws every frame, were compiled while the game waited, about a second
+  each; they are compiled in the background now (that is the pop-in above). The emulator also asks
+  the graphics driver first whether it already has a compiled shader, and no longer waits on the
+  ones it has to compile.
+- **The launcher tells you when a new build is out**, when it starts (untick "check for updates
+  on startup" to turn it off).
+- **Reflections every other frame (faster)**: a launcher option (game settings) that redraws the
+  cars' reflections every other frame instead of every frame: about 1 fps more in a race, about
+  4 fps more in a time trial, with no difference we could see.
+- The thin spike that stuck out of the cars' roofs is gone (all cars).
+- A crash when the emulator wrote a depth image back to memory while freeing it is fixed (seen in
+  My First Gran Turismo with bindless textures on).
+- Races that need more memory than the game's own get up to 8 GB more room past it (4 GB before).
+
+Known problems in this build:
+
+- Rarely, after several races in one session, a loading screen keeps spinning and never ends.
+  Restart the game.
+- Once, in a race on a new track in the chase view, most of the track disappeared after it had
+  loaded (cars and some objects stayed); switching to the cockpit view and back brought it back.
 
 ## Current state
 
 As of October 2026:
 
 - The game reaches its menus and runs races.
-- Frame rate at 3840x2160 on the PC above: about 18 to 22 fps in a race against AI cars at Tokyo.
+- Frame rate at 3840x2160 on the PC above: about 18 to 22 fps in a race against AI cars at Tokyo,
+  high 30s to near 50 fps in a time trial.
 - On a Ryzen with 3D V-Cache on one of its two dies (such as the 7950X3D), the emulator's
   graphics threads start on the V-Cache cores by themselves (about 2 fps in a race). Starting the
   emulator with an affinity of your own (Process Lasso, for example) keeps yours, and
