@@ -278,6 +278,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
 	m_ui->checkBox_trophy_notifications->setChecked(info.trophy_enabled);
 	m_ui->checkBox_bindless->setChecked(info.bindless_images_enabled);
+	m_ui->checkBox_reflections_half_rate->setChecked(info.reflections_half_rate);
 	m_ui->lineEdit_skip_shaders->setText(info.skip_shader_hashes);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
 	m_ui->comboBox_console_language->clear();
@@ -439,6 +440,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
 	info.trophy_enabled            = ui.checkBox_trophy_notifications->isChecked();
 	info.bindless_images_enabled   = ui.checkBox_bindless->isChecked();
+	info.reflections_half_rate     = ui.checkBox_reflections_half_rate->isChecked();
 	info.skip_shader_hashes        = ui.lineEdit_skip_shaders->text().simplified().remove(' ');
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
 	info.console_language          = ui.comboBox_console_language->currentIndex();

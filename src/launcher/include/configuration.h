@@ -122,6 +122,7 @@ public:
 	bool                   tessellation_enabled        = false;
 	bool                   trophy_enabled              = true;
 	bool                   bindless_images_enabled     = false;
+	bool                   reflections_half_rate       = false;
 	QString                skip_shader_hashes;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
@@ -157,6 +158,7 @@ public:
 		tessellation_enabled        = other.tessellation_enabled;
 		trophy_enabled              = other.trophy_enabled;
 		bindless_images_enabled     = other.bindless_images_enabled;
+		reflections_half_rate       = other.reflections_half_rate;
 		skip_shader_hashes          = other.skip_shader_hashes;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;

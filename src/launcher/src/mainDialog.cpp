@@ -252,6 +252,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (info.bindless_images_enabled) {
 		args << "--bindless";
 	}
+	if (info.reflections_half_rate) {
+		args << "--reflections-every" << QStringLiteral("2");
+	}
 	if (!info.skip_shader_hashes.isEmpty()) {
 		args << "--skip-shaders" << info.skip_shader_hashes;
 	}

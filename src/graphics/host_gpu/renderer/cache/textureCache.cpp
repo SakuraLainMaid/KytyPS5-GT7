@@ -2093,6 +2093,15 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 		transfer.valid = IsSupportedDepthPlaneReadback(info) && info.resources.layers != 0 &&
 		             info.data.size % info.resources.layers == 0 &&
 		             Prospero::NumBytesPerElement(info.guest_format) == info.bytes_per_block;
+		// Round 86: a depth image whose rows (pitch x height) do not fit in its share of its
+		// range is not downloaded (DownloadDepth stopped the emulator on one that the garbage
+		// collector wrote back, in another title of the series). It stays until it is safe to
+		// free, as an image whose download is unsupported does.
+		if (transfer.valid) {
+			const uint64_t guest_slice =
+			    static_cast<uint64_t>(info.pitch) * info.extent.height * info.bytes_per_block;
+			transfer.valid = guest_slice <= info.data.size / info.resources.layers;
+		}
 		return transfer;
 	}
 	if (info.metadata.compression != VideoOutCompression::Uncompressed) {

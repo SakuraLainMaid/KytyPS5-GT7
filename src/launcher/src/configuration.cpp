@@ -15,6 +15,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(tessellation_enabled);
 	KYTY_CFG_SET(trophy_enabled);
 	KYTY_CFG_SET(bindless_images_enabled);
+	KYTY_CFG_SET(reflections_half_rate);
 	KYTY_CFG_SET(skip_shader_hashes);
 	KYTY_CFG_SET(vblank_frequency);
 	KYTY_CFG_SET(console_language);
@@ -60,6 +61,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(tessellation_enabled);
 	trophy_enabled   = s.value("trophy_enabled", trophy_enabled).toBool();
 	KYTY_CFG_GET(bindless_images_enabled);
+	reflections_half_rate = s.value("reflections_half_rate", false).toBool();
 	KYTY_CFG_GET(skip_shader_hashes);
 	vblank_frequency = s.value("vblank_frequency", vblank_frequency).toInt();
 	console_language = s.value("console_language", console_language).toInt();

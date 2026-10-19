@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cinttypes>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <initializer_list>
@@ -33,6 +34,8 @@ struct Reporter {
 	std::array<uint64_t, PhaseCount + 1>                last_upload_bytes {};
 	std::array<uint64_t, PhaseCount + 1>                last_upload_count {};
 	std::array<uint64_t, PhaseCount + 1>                last_upload_copies {};
+	// The longest scope of each phase in the window just reported (Totals::longest).
+	std::array<uint64_t, PhaseCount> last_longest {};
 };
 
 // The names of the steps page protection changes are charged to (Detail::ChargesProtects).
@@ -232,6 +235,8 @@ void ReportIfDue(uint64_t frames) {
 	g_reporter.last_upload_bytes  = Detail::g_upload_bytes;
 	g_reporter.last_upload_count  = Detail::g_upload_count;
 	g_reporter.last_upload_copies = Detail::g_upload_copies;
+	g_reporter.last_longest       = totals.longest;
+	Detail::g_totals.longest.fill(0);
 	g_reporter.last        = totals;
 	g_reporter.last_time   = now;
 	g_reporter.last_tsc    = tsc;
@@ -403,6 +408,30 @@ void ReportIfDue(uint64_t frames) {
 		                frame(Phase::DrawBda) + frame(Phase::DispatchBda), frame(Phase::Command));
 	}
 	LOGF("%s\n", line.c_str());
+	{
+		// Round 86: the GPU thread's shader and pipeline work, when there was some.
+		const auto longest_ms = [&](Phase phase) {
+			return static_cast<double>(g_reporter.last_longest[static_cast<size_t>(phase)]) /
+			       cycles_per_us / 1000.0;
+		};
+		const auto work = [&](const char* name, Phase phase) {
+			return fmt::format("{} {} in {:.0f} ms (longest {:.1f} ms)", name, count(phase),
+			                   us(phase) / 1000.0, longest_ms(phase));
+		};
+		if (count(Phase::ShaderDisk) + count(Phase::ShaderCompile) + count(Phase::PipelineWait) +
+		        count(Phase::PipelineCompile) + count(Phase::TranslationSkip) +
+		        count(Phase::PipelineSkip) !=
+		    0) {
+			LOGF(
+			    "Shader work (%.1f s): on the GPU thread %s, %s, %s, %s; draws skipped while their "
+			    "shaders translated %" PRIu64 ", while their pipeline compiled %" PRIu64 "\n",
+			    seconds, work("disk cache reads", Phase::ShaderDisk).c_str(),
+			    work("translations and compiles", Phase::ShaderCompile).c_str(),
+			    work("pipeline waits", Phase::PipelineWait).c_str(),
+			    work("pipeline compiles", Phase::PipelineCompile).c_str(),
+			    count(Phase::TranslationSkip), count(Phase::PipelineSkip));
+		}
+	}
 	if (OpStatsOn()) {
 		LOGF("Dispatch shaders (%.1f s): %s\n", seconds,
 		     DescribeGroups(g_dispatch_groups, true, cycles_per_us, new_frames, 16).c_str());

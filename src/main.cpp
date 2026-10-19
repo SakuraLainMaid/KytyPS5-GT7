@@ -136,6 +136,7 @@ static void PrintUsage() {
 	    "  --trophy-notifications <true|false>   Show trophy unlock toasts and play their sound.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --bindless                           Sample heap-indexed images through bindless arrays.\n");
+	::printf("  --reflections-every <n>              Redraw reflection cubes every nth frame.\n");
 	::printf("  --no-float-image-atomics             Skip shaders that run integer image atomics on R32\n"
 	         "                                       float images (they run by default).\n");
 	::printf("  --skip-shaders <hash,...>            Skip the draws and dispatches of these guest shaders\n"
@@ -417,6 +418,21 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			if (!ParseInt32(value, options.config.gpu_index)) {
 				::printf("invalid gpu index: %s\n", value.c_str());
 				return false;
+			}
+		} else if (arg == "--reflections-every") {
+			// Round 86: the launcher's "Reflections every other frame". It reaches the renderer as
+			// KYTY_CUBE_EVERY (which, set by hand, wins), so the configuration stays as it was.
+			uint32_t every = 0;
+			if (!ParseUint32(value, every) || every < 1 || every > 8) {
+				::printf("invalid reflection cube interval (1 to 8): %s\n", value.c_str());
+				return false;
+			}
+			if (std::getenv("KYTY_CUBE_EVERY") == nullptr) {
+#if defined(_WIN32)
+				_putenv_s("KYTY_CUBE_EVERY", value.c_str());
+#else
+				setenv("KYTY_CUBE_EVERY", value.c_str(), 0);
+#endif
 			}
 		} else if (arg == "--vblank-frequency") {
 			if (!ParseUint32(value, options.config.vblank_frequency)) {

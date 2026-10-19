@@ -2341,6 +2341,7 @@ struct PipelineCache::ProgramCache {
 			if (const auto job = translating.find(lookup_key);
 			    job != translating.end() && !job->second->done.load(std::memory_order_acquire)) {
 				translation_skips++;
+				GpuPhases::Count(GpuPhases::Phase::TranslationSkip, 1);
 				Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": translating",
 				                                StageLabel(stage), params.hash);
 				return ShaderProgram {};
@@ -2402,6 +2403,7 @@ struct PipelineCache::ProgramCache {
 		std::vector<uint8_t> permutation_key;
 		std::vector<uint8_t> cached_permutation;
 		if (disk != nullptr) {
+			const GpuPhases::Scope disk_phase(GpuPhases::Phase::ShaderDisk);
 			Profiler::Phases disk_zone;
 			disk_zone.SetText("%s 0x%016" PRIx64, stage_name, params.hash);
 			KYTY_PROFILER_PHASE(disk_zone, "Shader disk cache", profiler::colors::CyanA700);
@@ -2467,6 +2469,7 @@ struct PipelineCache::ProgramCache {
 		}
 
 		// The whole compile as one zone on the timeline, its phases below it.
+		GpuPhases::Scope compile_phase(GpuPhases::Phase::ShaderCompile);
 		Profiler::Phases compile_zone;
 		compile_zone.SetText("%s 0x%016" PRIx64, stage_name, params.hash);
 		KYTY_PROFILER_PHASE(compile_zone, "Shader compile", profiler::colors::DeepOrangeA200);
@@ -2502,7 +2505,9 @@ struct PipelineCache::ProgramCache {
 			job->queued = std::chrono::steady_clock::now();
 			translating.emplace(lookup_key, job);
 			translators->Submit(std::move(job));
+			compile_phase.Cancel();
 			translation_skips++;
+			GpuPhases::Count(GpuPhases::Phase::TranslationSkip, 1);
 			Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": translating",
 			                                StageLabel(stage), params.hash);
 			return ShaderProgram {};
@@ -2642,12 +2647,13 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		if (g_async_translation) {
-			// KYTY_TRANSLATION_THREADS=<n> (default an eighth of the processors, 2 to 4; 2 before
-			// round 70).
+			// KYTY_TRANSLATION_THREADS=<n> (default a quarter of the processors, 2 to 8, since
+			// round 86; an eighth, 2 to 4, before; 2 before round 70). They work only while new
+			// shaders are translated, a first run's long stretch of skipped draws.
 			const char* value   = std::getenv("KYTY_TRANSLATION_THREADS");
 			const auto  threads = std::max<uint32_t>(
                 value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10))
-                                 : std::clamp(std::thread::hardware_concurrency() / 8u, 2u, 4u),
+                                 : std::clamp(std::thread::hardware_concurrency() / 4u, 2u, 8u),
 			    1u);
 			translators = std::make_unique<TranslationWorkers>(threads);
 			PipelineCacheLog("Shader translation: graphics shaders of 3D draws on {} worker threads",
@@ -4195,6 +4201,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	}
 
 	const auto defer = [&] {
+		GpuPhases::Count(GpuPhases::Phase::PipelineSkip, 1);
 		Profiler::Add(Profiler::Counter::SkippedPipelinePending);
 		Profiler::CommandZone::Annotate("skipped: pipeline compiling");
 		// Diagnostics: each pipeline whose draws are skipped, once (the first 128).
@@ -4263,7 +4270,10 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		cached->pending   = job;
 		Profiler::Add(Profiler::Counter::PipelinesPending);
 		m_compiler->Submit(job);
-		(void)m_compiler->Wait(*job, g_pipeline_wait);
+		{
+			const GpuPhases::Scope wait_phase(GpuPhases::Phase::PipelineWait);
+			(void)m_compiler->Wait(*job, g_pipeline_wait);
+		}
 		auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 		EXIT_IF(!inserted);
 		auto& pipeline = *iter->second;
@@ -4273,8 +4283,10 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 		return &pipeline;
 	}
-	const auto build_begin = std::chrono::steady_clock::now();
+	const auto       build_begin = std::chrono::steady_clock::now();
+	GpuPhases::Scope compile_phase(GpuPhases::Phase::PipelineCompile);
 	const auto result = CreateGraphicsPipeline(*build, m_driver_cache, &cached->pipeline);
+	compile_phase.End();
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	ReportGraphicsPipelineBuilt(vs_input_info.stage.program->shader_hash,
 	                            ps_active ? ps_input_info->stage.program->shader_hash : 0,
@@ -4311,7 +4323,8 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		Profiler::Phases zone;
 		zone.SetText("CS 0x%016" PRIx64, hash);
 		KYTY_PROFILER_PHASE(zone, "Compute pipeline build", profiler::colors::RedA100);
-		const auto begin = std::chrono::steady_clock::now();
+		const auto             begin = std::chrono::steady_clock::now();
+		const GpuPhases::Scope phase(GpuPhases::Phase::PipelineCompile);
 		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
 		ReportPipelineBuilt(Profiler::Counter::ComputePipelinesBuilt, "Compute", hash, 0, begin);
 	}

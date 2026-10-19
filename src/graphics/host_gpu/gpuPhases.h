@@ -71,6 +71,13 @@ enum class Phase : uint32_t {
 	SpecCheck,      // CommitBindings' check of specialization reads against the draw's writes
 	TessDraw,       // a tessellated draw, whole (inside Draw; round 78)
 	TessPrograms,   // its shaders (inside DrawPrograms)
+	// Round 86: the GPU thread's shader and pipeline work (ProgramCache::Get, PipelineCache).
+	ShaderDisk,      // a shader's records read from the shader disk cache (and decoded)
+	ShaderCompile,   // a translation and SPIR-V compile done on the GPU thread
+	PipelineWait,    // a wait for a pipeline compiling in the background
+	PipelineCompile, // a pipeline compiled on the GPU thread (small ones, compute ones)
+	TranslationSkip, // (a count only) a draw skipped while its shader translated
+	PipelineSkip,    // (a count only) a draw skipped while its pipeline compiled
 	Count
 };
 
@@ -79,6 +86,9 @@ constexpr size_t PhaseCount = static_cast<size_t>(Phase::Count);
 struct Totals {
 	std::array<uint64_t, PhaseCount> cycles {};
 	std::array<uint64_t, PhaseCount> count {};
+	// The longest single scope of each phase since the last report (round 86; the report resets
+	// it).
+	std::array<uint64_t, PhaseCount> longest {};
 };
 
 namespace Detail {
@@ -117,6 +127,9 @@ inline void Add(Phase phase, uint64_t cycles) noexcept {
 	const auto index = static_cast<size_t>(phase);
 	Detail::g_totals.cycles[index] += cycles;
 	Detail::g_totals.count[index]++;
+	if (cycles > Detail::g_totals.longest[index]) {
+		Detail::g_totals.longest[index] = cycles;
+	}
 }
 
 // Adds `n` to the count of `phase` without time (a count-only phase), on the GPU thread.
