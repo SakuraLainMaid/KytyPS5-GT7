@@ -2,6 +2,7 @@
 
 #include "common/logging/log.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/frameGraphQueries.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -287,6 +288,10 @@ void OnFrameBoundary(BufferCache& cache) {
 		LogBuffers(cache);
 		LogReadbacks(cache);
 		LogVerify(cache);
+		if (FrameGraphQueries::Pending()) {
+			cache.WaitForDiagnostics();
+			FrameGraphQueries::LogResults();
+		}
 		LOGF("FG 0 end capture %u (%zu shaders dumped)\n", g_capture, g_shaders.size());
 		g_buffers.clear();
 		g_readbacks.clear();

@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
+#include "graphics/host_gpu/renderer/frameGraphQueries.h"
 #include "graphics/host_gpu/renderer/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -2805,10 +2806,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 	LogDrawPhase(draw.Name(), "BeginRendering");
 	SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
+	FrameGraphQueries::PrepareDraw(m_context.GetGraphics().device, m_context.GetCommandScheduler(),
+	                               vk_buffer);
 	m_context.GetCommandScheduler().BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	GpuTiming::Before(m_context, buffer);
+	const int32_t samples_query = FrameGraphQueries::BeginDraw(vk_buffer);
 	int64_t gpu_zone = -1;
 	if (Profiler::g_counters) {
 		// The draw's program, as its GPU zone's name and its command zone's text.
@@ -2861,6 +2865,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    state.ps_active ? state.ps_input_info.stage.program->shader_hash
 	                    : vertex_stages.back().stage.program->shader_hash,
 	    static_cast<bool>(vertex_indirect_buffer) || static_cast<bool>(mesh_indirect_buffer));
+	FrameGraphQueries::EndDraw(vk_buffer, samples_query);
 	GpuProfiler::End(buffer, gpu_zone);
 	GpuTiming::AfterDraw(
 	    m_context, buffer,

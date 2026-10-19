@@ -7,6 +7,7 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/cache/bufferCachePages.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
@@ -107,12 +108,20 @@ public:
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
-			case MemoryUsage::Stream: return m_stream_buffer;
+			case MemoryUsage::Stream: return ActiveStream();
 			case MemoryUsage::Download: return m_download_buffer;
 			case MemoryUsage::DeviceLocal: return m_device_buffer;
 		}
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
+	// The ring per-draw copies go to: in cached host memory (round 92), or for the step
+	// stream:device the one in device memory.
+	[[nodiscard]] StreamBuffer& ActiveStream() noexcept {
+		return m_stream_device != nullptr && Bisect::StreamDevice() ? *m_stream_device
+		                                                            : m_stream_buffer;
+	}
+	// The tiler's: the usual ring whatever step runs (one taken at its start would stay).
+	[[nodiscard]] StreamBuffer& GetStreamRing() noexcept { return m_stream_buffer; }
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer*       GetGdsBuffer() noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer*       GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
@@ -461,6 +470,8 @@ private:
 	};
 	std::vector<UploadRead> m_upload_reads;
 	StreamBuffer                                       m_stream_buffer;
+	// For the step stream:device (made only when a step has it).
+	std::unique_ptr<StreamBuffer>                      m_stream_device;
 	StreamBuffer                                       m_download_buffer;
 	StreamBuffer                                       m_device_buffer;
 	TextureCache&                                      m_texture_cache;

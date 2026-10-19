@@ -363,8 +363,12 @@ private:
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
-	vk::PipelineCache             m_driver_cache = nullptr;
-	std::filesystem::path         m_driver_cache_path;
+	// The driver cache new pipelines go to, saved to m_driver_cache_path; round 92: and the older
+	// cache files that are full (read only: a pipeline one of them holds is created from it).
+	vk::PipelineCache              m_driver_cache = nullptr;
+	std::filesystem::path          m_driver_cache_path;
+	uint64_t                       m_driver_cache_loaded = 0; // bytes of it loaded (0: none)
+	std::vector<vk::PipelineCache> m_driver_older;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
@@ -417,9 +421,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
                             vk::PipelineCache                      driver_cache);
+// `older`: the full driver cache files, looked up first (round 92).
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
+                            std::span<const vk::PipelineCache> older = {});
 
 } // namespace Libs::Graphics
 

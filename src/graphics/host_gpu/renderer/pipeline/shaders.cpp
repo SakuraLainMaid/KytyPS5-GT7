@@ -761,7 +761,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache) {
+                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
+                            std::span<const vk::PipelineCache> older) {
 	EXIT_IF(compute_module == nullptr);
 
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
@@ -821,8 +822,29 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
 	const auto create_begin = std::chrono::steady_clock::now();
-	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
-	                                                &pipeline.pipeline);
+	// Round 92: the full cache files first, with lookups alone; a pipeline none holds is compiled
+	// into the cache that is saved.
+	result = vk::Result::ePipelineCompileRequired;
+	for (const auto cache: older) {
+		auto lookup = info;
+		lookup.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+		result =
+		    graphics.device.createComputePipelines(cache, 1, &lookup, nullptr, &pipeline.pipeline);
+		if (result == vk::Result::eSuccess && pipeline.pipeline != nullptr) {
+			break;
+		}
+		if (pipeline.pipeline != nullptr) {
+			graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+			pipeline.pipeline = nullptr;
+		}
+		if (result != vk::Result::ePipelineCompileRequired) {
+			break;
+		}
+	}
+	if (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) {
+		result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
+		                                                &pipeline.pipeline);
+	}
 	if (const auto create_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - create_begin)
 	                               .count();

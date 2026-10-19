@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/faultPages.h"
+#include "graphics/host_gpu/renderer/frameGraphQueries.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/timeline.h"
 #include "graphics/presentation/videoOut.h"
@@ -245,6 +246,7 @@ RenderContext::~RenderContext() {
 	FaultPages::Stop();
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
+	FrameGraphQueries::Shutdown();
 }
 
 void WarmUpLocalMemory(GraphicContext& graphics, CommandScheduler& scheduler);

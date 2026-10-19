@@ -4,13 +4,16 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include <array>
 #include <atomic>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -61,10 +64,11 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 } // namespace
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
+               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size, bool host_cached)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
       m_size(size) {
 	KYTY_PROFILER_FUNCTION();
+	const GpuPhases::Scope create_phase(GpuPhases::Phase::BufferCreate);
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
 
 	vk::BufferCreateInfo buffer_info {};
@@ -80,16 +84,31 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		buffer_info.pQueueFamilyIndices   = families.data();
 	}
 
+	// Buffers with device addresses (every game buffer) took dedicated memory, a kernel allocation
+	// each. Round 92 (from BryanKAdams' BryKytyPS5, 4068f4ac): up to SharedMax they share VMA's
+	// memory blocks; the BDA page table holds each page's own device address, so any placement
+	// works. KYTY_BUFFERS_DEDICATED=1 (or the step buffers:dedicated) gives each its own again.
+	static constexpr uint64_t SharedMax     = 64ull << 20u;
+	static const bool         all_dedicated = [] {
+        const char* value = std::getenv("KYTY_BUFFERS_DEDICATED");
+        return value != nullptr && value[0] == '1';
+	}();
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	const VmaAllocationCreateFlags bda_flag =
-	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+	    with_bda && (size > SharedMax || all_dedicated || Bisect::BuffersDedicated())
+	        ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT
+	        : 0;
 	VmaAllocationCreateInfo allocation_info {};
-	allocation_info.flags =
-	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
-	allocation_info.usage = AllocationUsage(usage);
-	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
-	                                     ? VkMemoryPropertyFlags {}
-	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	allocation_info.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag |
+	                        (host_cached ? VMA_ALLOCATION_CREATE_MAPPED_BIT |
+	                                           VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
+	                                     : AllocationFlags(usage));
+	allocation_info.usage =
+	    host_cached ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST : AllocationUsage(usage);
+	allocation_info.preferredFlags =
+	    usage == MemoryUsage::DeviceLocal ? VkMemoryPropertyFlags {}
+	    : host_cached ? VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT
+	                  : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
@@ -142,7 +161,8 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VkMemoryPropertyFlags properties = 0;
 	vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &properties);
-	m_coherent = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+	m_coherent   = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+	m_properties = properties;
 	if (allocation_result.pMappedData != nullptr) {
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
 		            static_cast<size_t>(size)};
@@ -261,8 +281,8 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 }
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-                           uint64_t size)
-    : Buffer(graphics, scheduler, usage, 0, AllFlags, size),
+                           uint64_t size, bool host_cached)
+    : Buffer(graphics, scheduler, usage, 0, AllFlags, size, host_cached),
       m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,

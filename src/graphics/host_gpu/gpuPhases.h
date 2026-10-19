@@ -88,6 +88,8 @@ enum class Phase : uint32_t {
 	              // with no walk: its submission had one, and no wait passed since or the game
 	              // wrote nothing since (the GPU thread's own stores alone)
 	WaitPassed,   // (a count only) a WAIT_REG_MEM that passed
+	// Round 92.
+	BufferCreate, // a Vulkan buffer made with its memory (Buffer's constructor)
 	Count
 };
 

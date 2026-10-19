@@ -1517,10 +1517,46 @@ struct PendingGraphicsPipeline {
 	uint64_t                               vs_hash      = 0;
 	uint64_t                               ps_hash      = 0;
 	vk::PipelineCache                      driver_cache = nullptr;
-	vk::Pipeline                           pipeline     = nullptr;
-	vk::Result                             result       = vk::Result::eSuccess;
-	std::atomic<bool>                      done {false};
+	// The full cache files to look it up in first (empty: the GPU thread did).
+	std::span<const vk::PipelineCache> older;
+	vk::Pipeline                       pipeline = nullptr;
+	vk::Result                         result   = vk::Result::eSuccess;
+	std::atomic<bool>                  done {false};
 };
+
+// Round 92: pipelines the full, read-only cache files gave (lookups alone), for the save's line.
+static std::atomic<uint64_t> g_older_file_hits {0};
+
+// Any thread: the pipeline from one of the full cache files that holds it (true), looking it up
+// alone (pipelineCreationCacheControl).
+static bool CreateFromOlderFiles(const GraphicsPipelineBuild&       build,
+                                 std::span<const vk::PipelineCache> older, vk::Pipeline* pipeline) {
+	for (const auto cache: older) {
+		const auto result = CreateGraphicsPipeline(build, cache, pipeline, true);
+		if (result == vk::Result::eSuccess && *pipeline != nullptr) {
+			g_older_file_hits.fetch_add(1, std::memory_order_relaxed);
+			return true;
+		}
+		if (*pipeline != nullptr) {
+			build.device.destroyPipeline(*pipeline, nullptr);
+			*pipeline = nullptr;
+		}
+		if (result != vk::Result::ePipelineCompileRequired) {
+			return false;
+		}
+	}
+	return false;
+}
+
+// Any thread: from the full cache files when one holds it, else through the cache that is saved.
+static vk::Result CreateThroughCacheFiles(const GraphicsPipelineBuild&       build,
+                                          std::span<const vk::PipelineCache> older,
+                                          vk::PipelineCache driver_cache, vk::Pipeline* pipeline) {
+	if (CreateFromOlderFiles(build, older, pipeline)) {
+		return vk::Result::eSuccess;
+	}
+	return CreateGraphicsPipeline(build, driver_cache, pipeline);
+}
 
 // Counts a finished pipeline build and puts it on the timeline (slow ones as a warning).
 static void ReportPipelineBuilt(Profiler::Counter counter, const char* kind, uint64_t first_hash,
@@ -1611,8 +1647,8 @@ private:
 				zone.SetText("VS 0x%016" PRIx64 " PS 0x%016" PRIx64, job->vs_hash, job->ps_hash);
 				KYTY_PROFILER_PHASE(zone, "PipelineCompiler::Compile", profiler::colors::DeepOrangeA200);
 				const auto begin = std::chrono::steady_clock::now();
-				job->result =
-				    CreateGraphicsPipeline(*job->build, job->driver_cache, &job->pipeline);
+				job->result = CreateThroughCacheFiles(*job->build, job->older, job->driver_cache,
+				                                      &job->pipeline);
 				ReportGraphicsPipelineBuilt(job->vs_hash, job->ps_hash, begin);
 				Profiler::Add(Profiler::Counter::PipelinesPending, -1);
 			}
@@ -3464,6 +3500,111 @@ PipelineCache::~PipelineCache() {
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
+	for (const auto cache: m_driver_older) {
+		m_graphics.device.destroyPipelineCache(cache, nullptr);
+	}
+	m_driver_older.clear();
+}
+
+// Round 92: the driver cache is kept in up to KYTY_PIPELINE_CACHE_FILES files (default 3). A
+// file of DriverCacheFullBytes or more takes no new pipelines: it is loaded read only, and a
+// pipeline it holds is created from it (the driver is asked to look it up alone,
+// pipelineCreationCacheControl). New pipelines go to the first file that is not full, the only one
+// saved, and only when it gained some. Before, one file took everything; once it reached the
+// 3.75 GiB a file may hold (after weeks of races) no new pipeline was kept, and every run compiled
+// them all again, behind black screens and skipped draws.
+constexpr uint64_t DriverCacheFullBytes = uint64_t {2048} << 20u;
+
+static uint32_t DriverCacheFiles(const GraphicContext& graphics) {
+	if (!graphics.pipeline_cache_control_enabled) {
+		return 1; // no lookups alone: one file, as before
+	}
+	const char* value = std::getenv("KYTY_PIPELINE_CACHE_FILES");
+	return value != nullptr && *value != '\0'
+	           ? std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u,
+	                                  8u)
+	           : 3u;
+}
+
+static std::filesystem::path DriverCacheFilePath(const std::string& title_id, uint32_t index) {
+	return std::filesystem::path("_PipelineCache") /
+	       (index == 0 ? title_id + ".bin" : fmt::format("{}.{}.bin", title_id, index));
+}
+
+// The marker of a file whose save was refused (it would have passed DriverCacheMaxBytes): the
+// next run takes it as full, and new pipelines go to the next file.
+static std::filesystem::path DriverCacheFullMarker(const std::filesystem::path& file_path) {
+	auto marker = file_path;
+	marker += ".full";
+	return marker;
+}
+
+enum class DriverCacheFile : uint8_t {
+	Missing,
+	Unreadable,   // it exists but could not be read: left alone, and not written
+	Incompatible, // another driver, device or a damaged file: written anew
+	Valid,
+};
+
+// A cache file's driver data (the reason it is not Valid is logged).
+static DriverCacheFile ReadDriverCacheFile(const std::filesystem::path& file_path,
+                                           const std::string&           signature,
+                                           std::vector<uint8_t>&        data) {
+	data.clear();
+	if (!Common::File::IsFileExisting(file_path)) {
+		return DriverCacheFile::Missing;
+	}
+	const auto path = Common::PathToString(file_path);
+	PipelineCacheLog("Vulkan pipeline cache: loading {}", path);
+	Common::File file(file_path, Common::File::Mode::Read);
+	if (file.IsInvalid()) {
+		PipelineCacheLog("Vulkan pipeline cache: {} could not be opened; not used, not written",
+		                 path);
+		return DriverCacheFile::Unreadable;
+	}
+	const auto file_size = file.Size();
+	if (file_size < signature.size() + sizeof(uint64_t) || file_size > DriverCacheMaxBytes) {
+		file.Close();
+		PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size: {} MB, the "
+		                 "limit is {} MB)",
+		                 path, file_size >> 20u, DriverCacheMaxBytes >> 20u);
+		return DriverCacheFile::Incompatible;
+	}
+	std::string cached_signature(signature.size(), '\0');
+	uint64_t    payload_hash   = 0;
+	uint32_t    signature_read = 0;
+	uint32_t    hash_read      = 0;
+	file.Read(cached_signature.data(), static_cast<uint32_t>(cached_signature.size()),
+	          &signature_read);
+	file.Read(&payload_hash, sizeof(payload_hash), &hash_read);
+	if (signature_read != cached_signature.size() || hash_read != sizeof(payload_hash)) {
+		file.Close();
+		PipelineCacheLog("Vulkan pipeline cache: {} could not be read; not used, not written",
+		                 path);
+		return DriverCacheFile::Unreadable;
+	}
+	if (cached_signature != signature) {
+		file.Close();
+		PipelineCacheLog(
+		    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)", path);
+		return DriverCacheFile::Incompatible;
+	}
+	data.resize(file_size - signature.size() - sizeof(payload_hash));
+	const auto payload_read = ReadInChunks(file, data.data(), data.size());
+	file.Close();
+	if (payload_read != data.size()) {
+		data.clear();
+		PipelineCacheLog("Vulkan pipeline cache: {} could not be read; not used, not written",
+		                 path);
+		return DriverCacheFile::Unreadable;
+	}
+	if (XXH3_64bits(data.data(), data.size()) != payload_hash) {
+		data.clear();
+		PipelineCacheLog(
+		    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)", path);
+		return DriverCacheFile::Incompatible;
+	}
+	return DriverCacheFile::Valid;
 }
 
 void PipelineCache::InitializeDriverCache() {
@@ -3476,63 +3617,69 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 
-	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
-	const auto path         = Common::PathToString(m_driver_cache_path);
-	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
-	if (cache_exists) {
-		PipelineCacheLog("Vulkan pipeline cache: loading {}", path);
-	} else {
-		PipelineCacheLog("Vulkan pipeline cache: initializing {}", path);
-	}
+	const auto signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+	const auto files     = DriverCacheFiles(m_graphics);
+	const auto create    = [this](const std::vector<uint8_t>& data, vk::PipelineCache* cache) {
+        vk::PipelineCacheCreateInfo info {};
+        info.initialDataSize = data.size();
+        info.pInitialData    = data.empty() ? nullptr : data.data();
+        return m_graphics.device.createPipelineCache(&info, nullptr, cache);
+	};
 	std::vector<uint8_t> initial_data;
-	if (cache_exists) {
-		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
-		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
-		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-		if (file_size >= signature.size() + sizeof(uint64_t) && file_size <= DriverCacheMaxBytes) {
-			std::string cached_signature(signature.size(), '\0');
-			uint64_t    payload_hash = 0;
-			initial_data.resize(file_size - signature.size() - sizeof(payload_hash));
-			uint32_t signature_read = 0;
-			uint32_t hash_read      = 0;
-			file.Read(cached_signature.data(), static_cast<uint32_t>(cached_signature.size()),
-			          &signature_read);
-			file.Read(&payload_hash, sizeof(payload_hash), &hash_read);
-			const auto payload_read = ReadInChunks(file, initial_data.data(), initial_data.size());
-			file.Close();
-			if (signature_read != cached_signature.size() || hash_read != sizeof(payload_hash) ||
-			    payload_read != initial_data.size() || cached_signature != signature ||
-			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
-				initial_data.clear();
-				PipelineCacheLog(
-				    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
-				    path);
-			}
-		} else {
-			file.Close();
-			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size: {} MB, "
-			                 "the limit is {} MB)",
-			                 path, file_size >> 20u, DriverCacheMaxBytes >> 20u);
+	uint32_t             write_index = files;
+	uint64_t             older_bytes = 0;
+	for (uint32_t index = 0; index < files; index++) {
+		const auto file_path = DriverCacheFilePath(title_id, index);
+		const auto state     = ReadDriverCacheFile(file_path, signature, initial_data);
+		if (state == DriverCacheFile::Unreadable) {
+			continue;
 		}
+		const bool valid = state == DriverCacheFile::Valid;
+		const bool full  = valid && (initial_data.size() >= DriverCacheFullBytes ||
+                                    Common::File::IsFileExisting(DriverCacheFullMarker(file_path)));
+		if (!full || index + 1 == files) {
+			// New pipelines go here (a missing or unusable file is written anew).
+			write_index         = index;
+			m_driver_cache_path = file_path;
+			if (!valid) {
+				PipelineCacheLog("Vulkan pipeline cache: initializing {}",
+				                 Common::PathToString(file_path));
+			}
+			break;
+		}
+		vk::PipelineCache older  = nullptr;
+		const auto        result = create(initial_data, &older);
+		if (result != vk::Result::eSuccess) {
+			PipelineCacheLog("Vulkan pipeline cache: driver rejected {} ({}); not used",
+			                 Common::PathToString(file_path), vk::to_string(result));
+			continue;
+		}
+		m_driver_older.push_back(older);
+		older_bytes += initial_data.size();
+		PipelineCacheLog("Vulkan pipeline cache: loaded {} bytes from {} ({} MB: full, read only)",
+		                 initial_data.size(), Common::PathToString(file_path),
+		                 initial_data.size() >> 20u);
 	}
+	if (write_index == files) {
+		// Every file is full or unreadable: new pipelines are kept for this run only.
+		initial_data.clear();
+	}
+	const auto path = write_index == files ? std::string("(no file: not saved)")
+	                                       : Common::PathToString(m_driver_cache_path);
 
-	vk::PipelineCacheCreateInfo create {};
-	create.initialDataSize = initial_data.size();
-	create.pInitialData    = initial_data.empty() ? nullptr : initial_data.data();
-	auto result = m_graphics.device.createPipelineCache(&create, nullptr, &m_driver_cache);
+	auto result = create(initial_data, &m_driver_cache);
 	if (result != vk::Result::eSuccess && !initial_data.empty()) {
 		PipelineCacheLog("Vulkan pipeline cache: driver rejected {} ({}); starting empty", path,
 		                 vk::to_string(result));
 		initial_data.clear();
-		create.initialDataSize = 0;
-		create.pInitialData    = nullptr;
-		result = m_graphics.device.createPipelineCache(&create, nullptr, &m_driver_cache);
+		result = create(initial_data, &m_driver_cache);
 	}
 	if (result != vk::Result::eSuccess) {
 		PipelineCacheLog("Vulkan pipeline cache: disabled ({})", vk::to_string(result));
 		m_driver_cache = nullptr;
 		return;
 	}
+	m_driver_cache_loaded = initial_data.size();
 	if (!initial_data.empty()) {
 		PipelineCacheLog(
 		    "Vulkan pipeline cache: loaded {} bytes from {} ({} MB of the {} MB a file "
@@ -3541,16 +3688,35 @@ void PipelineCache::InitializeDriverCache() {
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
+	PipelineCacheLog("Vulkan pipeline cache: new pipelines are kept in {} ({} files at most; {} "
+	                 "full files looked up first, {} MB; {} MB loaded in all)",
+	                 path, files, m_driver_older.size(), older_bytes >> 20u,
+	                 (older_bytes + initial_data.size()) >> 20u);
 }
 
 void PipelineCache::Save() {
 	m_program_cache->FlushDisk();
-	// No worker may use the driver cache once it is destroyed below; later pipelines are
+	// No worker may use the driver caches once they are destroyed below; later pipelines are
 	// compiled on the GPU thread (FinishPending).
 	if (m_compiler != nullptr) {
 		m_compiler->Stop();
 	}
+	if (!m_driver_older.empty()) {
+		PipelineCacheLog("Vulkan pipeline cache: {} pipelines this run came from the full files",
+		                 g_older_file_hits.load(std::memory_order_relaxed));
+		for (const auto cache: m_driver_older) {
+			m_graphics.device.destroyPipelineCache(cache, nullptr);
+		}
+		m_driver_older.clear();
+	}
 	if (m_driver_cache == nullptr) {
+		return;
+	}
+	if (m_driver_cache_path.empty()) {
+		PipelineCacheLog("Vulkan pipeline cache: every file is full or unreadable; the new "
+		                 "pipelines of this run are not saved");
+		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+		m_driver_cache = nullptr;
 		return;
 	}
 
@@ -3563,6 +3729,14 @@ void PipelineCache::Save() {
 		if (result != vk::Result::eSuccess || size == 0 ||
 		    size > std::numeric_limits<uint32_t>::max()) {
 			break;
+		}
+		if (size == m_driver_cache_loaded) {
+			// No pipeline was added: the file stays as it is (it was written at the exits before).
+			PipelineCacheLog("Vulkan pipeline cache: {} has no new pipelines; not written again",
+			                 Common::PathToString(m_driver_cache_path));
+			m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+			m_driver_cache = nullptr;
+			return;
 		}
 		payload.resize(size);
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
@@ -3584,8 +3758,12 @@ void PipelineCache::Save() {
 		// The next run would refuse a file this large and compile everything again (round 64's
 		// runs, after the file passed the old 1 GiB limit). The file already there stays.
 		PipelineCacheLog("Vulkan pipeline cache: {} MB is past the {} MB a file may hold; not "
-		                 "saved (the file from before stays)",
+		                 "saved (the file from before stays, and the next run takes it as full)",
 		                 payload.size() >> 20u, DriverCacheMaxBytes >> 20u);
+		Common::File marker;
+		if (marker.Create(DriverCacheFullMarker(m_driver_cache_path))) {
+			marker.Close();
+		}
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 		m_driver_cache = nullptr;
 		return;
@@ -3613,6 +3791,11 @@ void PipelineCache::Save() {
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
+	if (const auto marker = DriverCacheFullMarker(m_driver_cache_path);
+	    Common::File::IsFileExisting(marker)) {
+		std::error_code error;
+		std::filesystem::remove(marker, error);
+	}
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	m_driver_cache = nullptr;
 }
@@ -3741,8 +3924,11 @@ bool DepthTestedDraw(const HW::Context& context) {
 // frame it showed: 64 pipelines compiled on the GPU thread, 50 s of black screens in a session,
 // ~5 s at a time (2026-10-19). Such a draw may be skipped while its shaders translate and its
 // pipeline compiles, from its first frame: a picture drawn only once would miss what was skipped.
-// KYTY_DEFER_GBUFFER=0 (or KYTY_DEFER_REDRAWN=0, all of these rules) turns this off; the F8 step
-// gbuffer:sync too.
+// A pass into one target is left out: a picture rendered once (a preview, a thumbnail) would lose
+// what was skipped for good; a race start's rear-view mirror (one 1024x256 target, 4 pipelines,
+// 4.5 s) still compiles them at once, the first time only now that new pipelines are kept again
+// (round 92). KYTY_DEFER_GBUFFER=0 (or KYTY_DEFER_REDRAWN=0, all of these rules) turns this off;
+// the F8 step gbuffer:sync too.
 bool GbufferPassDraw(const HW::Context& context) {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_DEFER_GBUFFER");
@@ -4177,7 +4363,8 @@ bool PipelineCache::FinishPending(Pipeline& pipeline) {
 			return false;
 		}
 		// The workers stopped before this job started: compile it here.
-		job.result = CreateGraphicsPipeline(*job.build, m_driver_cache, &job.pipeline);
+		job.result =
+		    CreateThroughCacheFiles(*job.build, m_driver_older, m_driver_cache, &job.pipeline);
 		Profiler::Add(Profiler::Counter::PipelinesPending, -1);
 		job.done.store(true, std::memory_order_release);
 	}
@@ -4483,7 +4670,11 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		// driver about a second each: the waits took 2-4 s of every 10 s of a race on one.
 		const auto       probe_begin = std::chrono::steady_clock::now();
 		GpuPhases::Scope probe_phase(GpuPhases::Phase::PipelineProbe);
-		const auto result = CreateGraphicsPipeline(*build, m_driver_cache, &cached->pipeline, true);
+		// The full cache files first (round 92), then the one new pipelines go to.
+		const auto result =
+		    CreateFromOlderFiles(*build, m_driver_older, &cached->pipeline)
+		        ? vk::Result::eSuccess
+		        : CreateGraphicsPipeline(*build, m_driver_cache, &cached->pipeline, true);
 		probe_phase.End();
 		if (result == vk::Result::eSuccess && cached->pipeline != nullptr) {
 			GpuPhases::Count(GpuPhases::Phase::PipelineProbeHit, 1);
@@ -4513,6 +4704,9 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		auto job          = std::make_shared<PendingGraphicsPipeline>();
 		job->build        = std::move(build);
 		job->driver_cache = m_driver_cache;
+		if (!probed) {
+			job->older = m_driver_older;
+		}
 		job->vs_hash      = vs_hash;
 		job->ps_hash      = ps_hash;
 		cached->pending   = job;
@@ -4533,7 +4727,8 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	}
 	const auto       build_begin = std::chrono::steady_clock::now();
 	GpuPhases::Scope compile_phase(GpuPhases::Phase::PipelineCompile);
-	const auto result = CreateGraphicsPipeline(*build, m_driver_cache, &cached->pipeline);
+	const auto       result =
+	    CreateThroughCacheFiles(*build, m_driver_older, m_driver_cache, &cached->pipeline);
 	compile_phase.End();
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	ReportGraphicsPipelineBuilt(vs_hash, ps_hash, build_begin);
@@ -4598,7 +4793,8 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		KYTY_PROFILER_PHASE(zone, "Compute pipeline build", profiler::colors::RedA100);
 		const auto             begin = std::chrono::steady_clock::now();
 		const GpuPhases::Scope phase(GpuPhases::Phase::PipelineCompile);
-		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
+		                       m_driver_cache, m_driver_older);
 		ReportPipelineBuilt(Profiler::Counter::ComputePipelinesBuilt, "Compute", hash, 0, begin);
 	}
 

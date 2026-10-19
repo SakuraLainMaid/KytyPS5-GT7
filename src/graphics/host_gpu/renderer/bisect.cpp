@@ -93,6 +93,9 @@ struct Step {
 	// Round 91.
 	bool              gbuffer_sync    = false;
 	bool              depthread_old   = false;
+	// Round 92.
+	bool              stream_device     = false;
+	bool              buffers_dedicated = false;
 	float             tess_max    = 0.0f; // tess:max:<f>; 0: none
 	uint32_t          flush       = 0;    // flush:<n>; 0: the usual
 	int32_t           dflush          = -1;   // dflush:<n>; -1: the usual
@@ -366,6 +369,14 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "depthread:old") {
 		step.depthread_old = true;
+		return true;
+	}
+	if (action == "stream:device") {
+		step.stream_device = true;
+		return true;
+	}
+	if (action == "buffers:dedicated") {
+		step.buffers_dedicated = true;
 		return true;
 	}
 	if (action.starts_with("cube:")) {
@@ -1048,6 +1059,25 @@ bool GbufferSync() {
 bool DepthReadOld() {
 	const auto* step = Current();
 	return step != nullptr && step->depthread_old;
+}
+
+bool StreamDeviceConfigured() {
+	static const bool configured = [] {
+		const auto& steps = Steps();
+		return std::any_of(steps.begin(), steps.end(),
+		                   [](const Step& step) { return step.stream_device; });
+	}();
+	return configured;
+}
+
+bool StreamDevice() {
+	const auto* step = Current();
+	return step != nullptr && step->stream_device;
+}
+
+bool BuffersDedicated() {
+	const auto* step = Current();
+	return step != nullptr && step->buffers_dedicated;
 }
 
 bool WholeUnnormalizedViews() {

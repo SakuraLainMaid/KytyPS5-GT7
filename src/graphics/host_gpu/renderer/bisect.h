@@ -209,13 +209,20 @@
 //                addresses once a guest submission, as before round 90, instead of again after
 //                each wait on memory that passes in it (KYTY_BDA_WAIT_SYNC=0 for the whole run)
 // and, round 91:
-//   gbuffer:sync a G-buffer pass into a texture (two color targets of 256 texels or more each way,
-//                a depth test that writes depth) compiles its new pipelines on the GPU thread, as
-//                before round 91 when the target was small and not drawn every frame, instead of
-//                being skipped while they compile (KYTY_DEFER_GBUFFER=0 for the whole run)
+//   gbuffer:sync a 3D pass into a texture (color targets of 256 texels or more each way, a depth
+//                test that writes depth) compiles its new pipelines on the GPU thread, as before
+//                round 91 when the target was small and not drawn every frame, instead of being
+//                skipped while they compile (KYTY_DEFER_GBUFFER=0 for the whole run)
 //   depthread:old a draw that samples its depth target read-only binds it for the attachment
 //                alone first, as before round 91 (two barriers per draw), instead of for the
 //                attachment and a shader read at once
+// and, round 92 (from BryanKAdams' BryKytyPS5):
+//   stream:device the per-draw copies of small CPU-written buffers, flattened resource tables and
+//                shader data go to a ring in device memory (write-combined), as before, instead of
+//                the ring in cached host memory (KYTY_STREAM_DEVICE=1 for the whole run)
+//   buffers:dedicated a game buffer made while the step is on gets memory of its own, as before,
+//                instead of a place in a shared block when it is 64 MB or less
+//                (KYTY_BUFFERS_DEDICATED=1 for the whole run)
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -333,6 +340,11 @@ void RequestPicture(const std::string& name);
 // GPU thread: gbuffer:sync; depthread:old (round 91).
 [[nodiscard]] bool GbufferSync();
 [[nodiscard]] bool DepthReadOld();
+// Round 92: some step has stream:device (the device ring is made at the start for it); the
+// current one has it; the current one has buffers:dedicated.
+[[nodiscard]] bool StreamDeviceConfigured();
+[[nodiscard]] bool StreamDevice();
+[[nodiscard]] bool BuffersDedicated();
 
 } // namespace Libs::Graphics::Bisect
 

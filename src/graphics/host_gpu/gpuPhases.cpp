@@ -326,11 +326,12 @@ void ReportIfDue(uint64_t frames) {
 	};
 	line += fmt::format(" | {} ({:.1f} regions, {:.1f} protects each; {} after a wait in their "
 	                    "submission, {} draws or dispatches after CPU writes left to the last one; "
-	                    "{} waits on memory passed), {}",
+	                    "{} waits on memory passed), {}, {}",
 	                    counted("bda walks", Phase::BdaWalk), per_walk(Phase::BdaRegions),
 	                    per_walk(Phase::BdaProtects), count(Phase::BdaAfterWait),
 	                    count(Phase::BdaHeldBack), count(Phase::WaitPassed),
-	                    counted("spec checks", Phase::SpecCheck));
+	                    counted("spec checks", Phase::SpecCheck),
+	                    counted("buffers made", Phase::BufferCreate));
 	{
 		// The protection changes by the step they were made in, the costliest first (round 72).
 		std::array<size_t, PhaseCount + 1> order {};
