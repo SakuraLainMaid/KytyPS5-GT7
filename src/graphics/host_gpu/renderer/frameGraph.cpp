@@ -11,11 +11,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fmt/format.h>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <utility>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics::FrameGraph {
 
@@ -268,6 +271,24 @@ void Log(const char* format, ...) {
 	std::vsnprintf(text, sizeof(text), format, args);
 	va_end(args);
 	LOGF("FG %u %s\n", g_op, text);
+}
+
+std::string BytesHash(BufferCache& cache, uint64_t address, uint64_t size) {
+	size = std::min(size, HashBytes);
+	if (address == 0 || size == 0) {
+		return "-";
+	}
+	size = LibKernel::Memory::TryClampRangeSize(address, size);
+	// One buffer for the capture's thousands of hashes, not filled first.
+	static thread_local std::unique_ptr<uint8_t[]> scratch;
+	if (scratch == nullptr) {
+		scratch.reset(new uint8_t[HashBytes]);
+	}
+	if (size == 0 || !LibKernel::Memory::TryReadBacking(address, scratch.get(), size)) {
+		return "-";
+	}
+	return fmt::format("{:016x}{}", XXH3_64bits(scratch.get(), size),
+	                   cache.HasGpuDirtyBytes(address, size) ? " [G]" : "");
 }
 
 void NoteBuffer(uint64_t address, uint64_t size) {

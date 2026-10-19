@@ -502,7 +502,11 @@ void CommandProcessor::WaitDeDiff(uint32_t diff) {
 void CommandProcessor::WaitForRewind(bool valid) {
 	if (!valid) {
 		SuspendPm4();
+		return;
 	}
+	// The CPU let the GPU go on, as a WAIT_REG_MEM that passes (round 90).
+	g_guest_wait_seq.fetch_add(1, std::memory_order_relaxed);
+	GpuPhases::Count(GpuPhases::Phase::WaitPassed, 1);
 }
 
 void CommandProcessor::IncrementDe() {
@@ -558,8 +562,18 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		return;
 	}
 	// The wait passed: what the CPU wrote to its hot pages before it let the GPU go on (the
-	// next slice does this for a wait that suspends).
+	// next slice does this for a wait that suspends), and for shaders that read memory through
+	// addresses, a walk of what it wrote since the last one (round 90, RenderContext::PrepareBda).
 	m_renderer.RefreshHotPages();
+	g_guest_wait_seq.fetch_add(1, std::memory_order_relaxed);
+	GpuPhases::Count(GpuPhases::Phase::WaitPassed, 1);
+	if (FrameGraph::Logging()) {
+		FrameGraph::BeginOp();
+		FrameGraph::Log("wait 0x%012" PRIx64 " passed: function %u reference 0x%" PRIx64
+		                " mask 0x%" PRIx64 " (%u bytes)",
+		                reinterpret_cast<uint64_t>(addr), func, static_cast<uint64_t>(ref),
+		                static_cast<uint64_t>(mask), static_cast<uint32_t>(sizeof(T)));
+	}
 }
 
 template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, uint32_t, uint32_t,
@@ -715,6 +729,7 @@ void GuestGpu::ThreadRun(void* data) {
 	Common::PreferPerformanceCores("GPU thread");
 	Common::RegisterGpuSideThread("Thread_Gpu");
 	Profiler::t_gpu_thread = true;
+	t_guest_gpu_thread     = true;
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 	Common::PerfStats::Start();

@@ -65,6 +65,22 @@ uint64_t FaultBlockBytes() {
 	return Bisect::FaultBlocksOff() ? 0 : bytes;
 }
 
+// Round 90: whether a WAIT_REG_MEM that passed lets the walk for memory-reading shaders run again
+// in the same submission (PrepareBda). KYTY_BDA_WAIT_SYNC=0 (or the F8 step "bdasync:submission")
+// walks once a submission, as before.
+bool BdaSyncAtWaits() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BDA_WAIT_SYNC");
+		const bool  on    = value == nullptr || value[0] != '0';
+		LOGF("Memory-reading shaders: %s\n",
+		     on ? "the CPU's writes are synchronized again after each wait on memory that passes "
+		          "(KYTY_BDA_WAIT_SYNC=0: once a submission)"
+		        : "the CPU's writes are synchronized once a submission (KYTY_BDA_WAIT_SYNC=0)");
+		return on;
+	}();
+	return enabled && !Bisect::BdaSyncSubmission();
+}
+
 uint64_t NowMs() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 	                                 std::chrono::steady_clock::now().time_since_epoch())
@@ -555,14 +571,32 @@ void RenderContext::PrepareBda() {
 	// visible to all its commands, as on the console, and the GPU thread runs behind the game
 	// anyway. Per draw, the walk and the re-protection it triggers took ~38 % of the GPU thread
 	// on the title menu (21 -> 32 fps).
+	// Round 90: and once more after each wait on memory that passed in it (WAIT_REG_MEM): a game
+	// may write data after it submits and let the GPU go on past a wait once it is done (a
+	// crowd's vertex tables). Read through addresses from before the wait, such draws find what
+	// the memory held frames before (other draws' tables: objects where none are), and a colour
+	// pass misses its depth pass (people drawn black or see-through).
 	const auto epoch = g_cpu_dirty_epoch.load(std::memory_order_acquire);
 	if (epoch != m_bda_synced_epoch) {
 		const auto submission = g_guest_submission_seq.load(std::memory_order_relaxed);
+		const auto waits      = g_guest_wait_seq.load(std::memory_order_relaxed);
+		const auto writes     = g_cpu_write_epoch.load(std::memory_order_acquire);
 		if (submission == m_bda_synced_submission) {
-			m_fault_process_pending = true;
-			return;
+			// Again in the same submission only when a wait passed since the last walk and the
+			// game wrote since then (not the GPU thread alone: its labels, as one queue waiting
+			// for another's, would bring back a walk a draw).
+			const bool reopened =
+			    BdaSyncAtWaits() && waits != m_bda_synced_waits && writes != m_bda_synced_writes;
+			if (!reopened) {
+				GpuPhases::Count(GpuPhases::Phase::BdaHeldBack, 1);
+				m_fault_process_pending = true;
+				return;
+			}
+			GpuPhases::Count(GpuPhases::Phase::BdaAfterWait, 1);
 		}
 		m_bda_synced_submission = submission;
+		m_bda_synced_waits      = waits;
+		m_bda_synced_writes     = writes;
 	}
 	if (epoch != m_bda_synced_epoch) {
 		// The guest writes somewhere nearly all the time, so the epoch moves between most

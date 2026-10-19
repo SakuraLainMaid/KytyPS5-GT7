@@ -204,6 +204,10 @@
 // and, round 85:
 //   cube:<n>      the draws into a reflection cube (a color target of six square layers) run every
 //                nth frame only, n from 1 to 8 (KYTY_CUBE_EVERY for the whole run)
+// and, round 90:
+//   bdasync:submission the CPU's writes are synchronized for shaders that read memory through
+//                addresses once a guest submission, as before round 90, instead of again after
+//                each wait on memory that passes in it (KYTY_BDA_WAIT_SYNC=0 for the whole run)
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -316,6 +320,8 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] uint32_t CubeEvery();
 // Any thread: depth:equal-relaxed's bias in units of depth precision; 0 when off.
 [[nodiscard]] float DepthEqualRelaxed();
+// GPU thread: bdasync:submission.
+[[nodiscard]] bool BdaSyncSubmission();
 
 } // namespace Libs::Graphics::Bisect
 

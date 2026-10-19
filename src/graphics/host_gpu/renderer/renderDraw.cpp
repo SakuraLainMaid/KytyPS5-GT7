@@ -2172,7 +2172,8 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, const CommandRecorder
 static void LogFrameGraphDraw(RenderContext& context, const CommandBuffer& buffer,
                               const DrawCallInfo& draw, const DrawRenderState& state,
                               std::span<const ShaderVertexInputInfo> vertex_stages,
-                              vk::PrimitiveTopology                  topology) {
+                              vk::PrimitiveTopology                  topology,
+                              const DrawIndexBufferSource&           index_source) {
 	std::string stages;
 	for (const auto& stage: vertex_stages) {
 		stages += fmt::format(" {:016x}", stage.stage.program->shader_hash);
@@ -2254,6 +2255,66 @@ static void LogFrameGraphDraw(RenderContext& context, const CommandBuffer& buffe
 			};
 			FrameGraph::Log("  stencil front: %s", face(depth.stencil_front).c_str());
 			FrameGraph::Log("  stencil back: %s", face(depth.stencil_back).c_str());
+		}
+	}
+	// Round 90: what turns its positions into depth (clipping, the viewport, depth bias) and where
+	// its indices and vertices come from, so that two passes over the same geometry (a depth
+	// prepass and a colour pass testing for EQUAL) can be compared.
+	{
+		const auto& registers = buffer.GetRegisters();
+		const auto& clip      = registers.GetClipControl();
+		const auto& screen    = registers.GetScreenViewport();
+		const auto& viewport  = screen.viewports[0];
+		const auto& mode      = registers.GetModeControl();
+		const auto& poly      = registers.GetPolyOffset();
+		FrameGraph::Log(
+		    "  raster: clip disable %d dx %d z-clip off %d %d, vte 0x%x, viewport x %g "
+		    "%+g y %g %+g z %g %+g (%g to %g), cull %d%d front %d, poly offset %d%d "
+		    "(front %g %+g back %g %+g clamp %g, %d bits%s)",
+		    clip.clip_disable ? 1 : 0, clip.dx_clip_space ? 1 : 0, clip.min_z_clip_disable ? 1 : 0,
+		    clip.max_z_clip_disable ? 1 : 0, screen.transform_control, viewport.xscale,
+		    viewport.xoffset, viewport.yscale, viewport.yoffset, viewport.zscale, viewport.zoffset,
+		    viewport.zmin, viewport.zmax, mode.cull_front ? 1 : 0, mode.cull_back ? 1 : 0,
+		    mode.face ? 1 : 0, mode.poly_offset_front_enable ? 1 : 0,
+		    mode.poly_offset_back_enable ? 1 : 0, poly.front_scale, poly.front_offset,
+		    poly.back_scale, poly.back_offset, poly.clamp, -static_cast<int>(poly.neg_num_db_bits),
+		    poly.db_is_float_fmt ? " float" : "");
+		auto& cache = context.GetBufferCache();
+		if (draw.IsIndexed()) {
+			FrameGraph::Log(
+			    "  index: 0x%012" PRIx64 "+0x%" PRIx64 " %u bytes each, hash %s",
+			    index_source.address, index_source.size, index_source.guest_element_size,
+			    index_source.host_data != nullptr
+			        ? "(rewritten on the host)"
+			        : FrameGraph::BytesHash(cache, index_source.address, index_source.size)
+			              .c_str());
+		}
+		for (const auto& stage: vertex_stages) {
+			FrameGraph::Log("  %016" PRIx64 " inputs: %s, %d buffers, %d attributes, clip-space "
+			                "transform %d",
+			                stage.stage.program->shader_hash,
+			                stage.fetch_embedded   ? "fetched by the vertex input"
+			                : stage.fetch_external ? "fetched by an external fetch shader"
+			                                       : "read by the shader",
+			                stage.buffers_num, stage.resources_num,
+			                stage.clip_space.enabled ? 1 : 0);
+			for (int i = 0; i < stage.buffers_num && i < ShaderVertexInputInfo::RES_MAX; i++) {
+				const auto&    vb    = stage.buffers[i];
+				const uint64_t bytes = static_cast<uint64_t>(vb.stride) * vb.num_records;
+				FrameGraph::Log("    vb[%d] 0x%012" PRIx64 " stride %u records %u hash %s", i,
+				                vb.addr, vb.stride, vb.num_records,
+				                FrameGraph::BytesHash(cache, vb.addr, bytes).c_str());
+			}
+			for (int i = 0; i < stage.resources_num && i < ShaderVertexInputInfo::RES_MAX; i++) {
+				const auto& resource = stage.resources[i];
+				const auto& dst      = stage.resources_dst[i];
+				FrameGraph::Log("    attr[%d] v%d+%d from vb[%d] base 0x%012" PRIx64
+				                " stride %u format %u dst %03x%s",
+				                i, dst.register_start, dst.registers_num, dst.buffer_index,
+				                resource.Base48(), resource.Stride(),
+				                static_cast<uint32_t>(resource.RawFormat()), resource.DstSelXYZW(),
+				                resource.AddTid() ? " add-tid" : "");
+			}
 		}
 	}
 	const auto& shaders = buffer.GetShaders();
@@ -2338,7 +2399,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                              index_source.guest_element_size);
 	}
 	if (FrameGraph::Logging()) {
-		LogFrameGraphDraw(m_context, buffer, draw, state, vertex_stages, topology);
+		LogFrameGraphDraw(m_context, buffer, draw, state, vertex_stages, topology, index_source);
 	}
 	// KYTY_BISECT's tess:bit:<k> (round 82): the tessellated draws are numbered in their frame
 	// (the GPU thread's: between the suspend points it processes), and a step leaves out those

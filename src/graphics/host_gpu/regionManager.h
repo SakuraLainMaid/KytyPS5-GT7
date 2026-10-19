@@ -131,6 +131,20 @@ inline std::atomic<uint64_t> g_cpu_dirty_epoch {1};
 // Bumped by the GPU thread when it starts a guest submission (its first slice).
 inline std::atomic<uint64_t> g_guest_submission_seq {1};
 
+// Bumped by the GPU thread when a WAIT_REG_MEM or a rewind wait passes (round 90). What the CPU
+// wrote before it let the GPU go on is visible to the commands after the wait, as on the console,
+// so the walk for memory-reading shaders runs again after one (RenderContext::PrepareBda).
+inline std::atomic<uint64_t> g_guest_wait_seq {0};
+
+// Round 90: set on the GPU thread (GuestGpu::ThreadRun). The pages it makes CPU-dirty (its own
+// stores to guest memory: labels, WRITE_DATA, invalidations) are not the game's writes.
+inline thread_local bool t_guest_gpu_thread = false;
+
+// Round 90: bumped with g_cpu_dirty_epoch when pages become CPU-dirty on any other thread: the
+// game wrote them (a write fault, or a block released from write tracking). A wait the GPU
+// released itself (one queue waiting for another's label) then calls for no new walk.
+inline std::atomic<uint64_t> g_cpu_write_epoch {1};
+
 class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
@@ -180,6 +194,9 @@ public:
 			if constexpr (source == DirtySource::Cpu) {
 				NoteBdaPending();
 				g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+				if (!t_guest_gpu_thread) {
+					g_cpu_write_epoch.fetch_add(1, std::memory_order_release);
+				}
 			}
 		} else {
 			bits.UnsetRange(start, end);

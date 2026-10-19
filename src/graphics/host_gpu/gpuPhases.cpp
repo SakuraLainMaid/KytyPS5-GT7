@@ -324,9 +324,13 @@ void ReportIfDue(uint64_t frames) {
 	const auto per_walk = [&](Phase phase) {
 		return walks != 0 ? static_cast<double>(count(phase)) / static_cast<double>(walks) : 0.0;
 	};
-	line += fmt::format(" | {} ({:.1f} regions, {:.1f} protects each), {}",
+	line += fmt::format(" | {} ({:.1f} regions, {:.1f} protects each; {} after a wait in their "
+	                    "submission, {} draws or dispatches after CPU writes left to the last one; "
+	                    "{} waits on memory passed), {}",
 	                    counted("bda walks", Phase::BdaWalk), per_walk(Phase::BdaRegions),
-	                    per_walk(Phase::BdaProtects), counted("spec checks", Phase::SpecCheck));
+	                    per_walk(Phase::BdaProtects), count(Phase::BdaAfterWait),
+	                    count(Phase::BdaHeldBack), count(Phase::WaitPassed),
+	                    counted("spec checks", Phase::SpecCheck));
 	{
 		// The protection changes by the step they were made in, the costliest first (round 72).
 		std::array<size_t, PhaseCount + 1> order {};

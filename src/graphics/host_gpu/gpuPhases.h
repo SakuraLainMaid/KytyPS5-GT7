@@ -82,6 +82,12 @@ enum class Phase : uint32_t {
 	PipelineProbe,     // a lookup
 	PipelineProbeHit,  // (a count only) one the driver had: created at once
 	PipelineProbeMiss, // (a count only) one it did not have: compiled in the background
+	// Round 90: the walk for memory-reading shaders and the waits on memory (PrepareBda).
+	BdaAfterWait, // (a count only) a walk made again in a submission, after a wait passed in it
+	BdaHeldBack,  // (a count only) a memory-reading draw or dispatch after pages became CPU-dirty,
+	              // with no walk: its submission had one, and no wait passed since or the game
+	              // wrote nothing since (the GPU thread's own stores alone)
+	WaitPassed,   // (a count only) a WAIT_REG_MEM that passed
 	Count
 };
 

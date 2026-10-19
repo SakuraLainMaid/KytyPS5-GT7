@@ -550,6 +550,12 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 		}
 		ReadMemory(vaddr, size, true);
 	});
+	// Round 90: a write of the game's (the walk for memory-reading shaders after a wait looks for
+	// one, RenderContext::PrepareBda). A store to GPU-written bytes is made CPU-dirty on the GPU
+	// thread (ReadMemory), where it does not count by itself.
+	if (!t_guest_gpu_thread) {
+		g_cpu_write_epoch.fetch_add(1, std::memory_order_release);
+	}
 }
 
 bool BufferCache::ReleaseBlockForCpuWrite(uint64_t block, uint64_t size) {

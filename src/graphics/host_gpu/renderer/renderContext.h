@@ -112,6 +112,8 @@ private:
 	bool                      m_bda_logged = false;
 	uint64_t                  m_bda_synced_epoch      = 0;
 	uint64_t                  m_bda_synced_submission = 0;
+	uint64_t                  m_bda_synced_waits      = 0; // g_guest_wait_seq at that walk
+	uint64_t                  m_bda_synced_writes     = 0; // g_cpu_write_epoch at that walk
 	uint64_t                  m_hot_cleared_ms        = 0;
 
 	Common::Mutex                        m_interrupt_mutex;

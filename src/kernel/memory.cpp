@@ -92,9 +92,9 @@ static uint64_t DirectMemoryOverflowSize() {
 	static const uint64_t size = [] {
 		// 16 GB (round 89; 8 GB from round 82, 4 GB in round 81): the race's 5.3 GB pool did not
 		// fit in 4 GB when the game held a 2.3 GB block or two more than usual, and the game froze
-		// at the track menu. After several races in one session it held two 2.3 GB blocks and a
-		// 1.6 GB one past its memory while it loaded the next track (the previous track's, freed
-		// later), the pool did not fit in 8 GB either, and its loading screen never ended.
+		// at the track menu. Loading a track (the first one after the start too, about one load
+		// in ten), it still held two 2.3 GB blocks and a 1.6 GB one past its memory, the pool did
+		// not fit in 8 GB either, and its loading screen never ended.
 		uint64_t mb = 16384;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (const char* eager = std::getenv("KYTY_LAZY_COMMIT");

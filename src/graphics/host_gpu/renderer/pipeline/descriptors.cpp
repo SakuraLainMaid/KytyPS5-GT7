@@ -2374,10 +2374,13 @@ static void LogFrameGraphStage(RenderContext& context, const ShaderStageRuntime&
 	const char* stage    = FrameGraphStage(program.stage);
 	auto&       textures = context.GetTextureCache();
 	auto&       buffers  = context.GetBufferCache();
+	// Round 90: whether it reads memory through addresses (what the walk for such shaders keeps up
+	// to date, RenderContext::PrepareBda, and the buffer lines below do not show).
 	FrameGraph::Log(
-	    "  %s %016" PRIx64 ": %zu textures, %zu buffers, %zu user data, %zu bindless heaps", stage,
-	    program.shader_hash, program.info.images.size(), program.info.buffers.size(),
-	    snapshot.user_data.size(), snapshot.bindless_heaps.size());
+	    "  %s %016" PRIx64 ": %zu textures, %zu buffers, %zu user data, %zu bindless heaps%s",
+	    stage, program.shader_hash, program.info.images.size(), program.info.buffers.size(),
+	    snapshot.user_data.size(), snapshot.bindless_heaps.size(),
+	    program.info.uses_dma ? ", reads memory through addresses" : "");
 	for (size_t i = 0; i < prepared.images.size() && i < program.info.images.size(); i++) {
 		const auto& binding  = prepared.images[i];
 		const auto& resource = program.info.images[i];
@@ -2454,12 +2457,16 @@ static void LogFrameGraphStage(RenderContext& context, const ShaderStageRuntime&
 		const bool     cpu    = mapped != 0 && buffers.IsRegionCpuModified(r.Base48(), mapped);
 		const auto     writers =
             mapped != 0 && gpu ? BufferCache::GpuWritersOf(r.Base48(), mapped) : std::string();
+		// Round 90: and a hash of what a read-only one holds (FrameGraph::BytesHash).
+		const auto hash = mapped != 0 && !program.info.buffers[i].written
+		                      ? " hash " + FrameGraph::BytesHash(buffers, r.Base48(), mapped)
+		                      : std::string();
 		FrameGraph::Log("  %s buf[%zu] %s%s 0x%012" PRIx64 "+0x%" PRIx64 " (mapped 0x%" PRIx64
-		                ") stride %u records %u fmt %u [%c%c] writers %s",
+		                ") stride %u records %u fmt %u [%c%c] writers %s%s",
 		                stage, i, program.info.buffers[i].written ? "write" : "read",
 		                program.info.buffers[i].formatted ? " formatted" : "", r.Base48(), bytes,
 		                mapped, r.Stride(), r.NumRecords(), r.RawFormat(), gpu ? 'G' : '-',
-		                cpu ? 'C' : '-', writers.empty() ? "-" : writers.c_str());
+		                cpu ? 'C' : '-', writers.empty() ? "-" : writers.c_str(), hash.c_str());
 		if (mapped != 0) {
 			FrameGraph::NoteBuffer(r.Base48(), mapped);
 		}

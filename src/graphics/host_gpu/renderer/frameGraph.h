@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <string>
 
 namespace Libs::Graphics {
 class BufferCache;
@@ -44,6 +45,12 @@ uint32_t               BeginOp();
 // The capture running (or the last one): counted from 1.
 [[nodiscard]] uint32_t CaptureNumber();
 void                   Log(const char* format, ...) KYTY_FORMAT_PRINTF(1, 2);
+
+// Round 90: a hash of guest bytes as they are now, their first HashBytes ("-" when unreadable),
+// with " [G]" when the GPU wrote some of them (guest memory then lacks what it wrote): what a draw
+// reads, to compare two draws over the same data.
+inline constexpr uint64_t HashBytes = 256ull << 10u;
+[[nodiscard]] std::string BytesHash(BufferCache& cache, uint64_t address, uint64_t size);
 
 // Buffer contents shown after the frame: the first KeepBytes of each.
 inline constexpr uint64_t KeepBytes = 1024;
