@@ -1,12 +1,12 @@
 #ifndef UPDATE_CHECKER_H
 #define UPDATE_CHECKER_H
 
+#include <QByteArray>
 #include <QNetworkAccessManager>
 #include <QObject>
 #include <QString>
 #include <QUrl>
 
-class QByteArray;
 class QWidget;
 
 class UpdateChecker final: public QObject {
@@ -36,6 +36,8 @@ private:
 	// being consulted, so it can still be shown if the fallback request fails.
 	QString m_primary_tag;
 	QUrl    m_primary_page_url;
+	// The feed of a fork build (its repository's latest release), kept while it is fetched.
+	QByteArray m_fork_feed;
 };
 
 #endif // UPDATE_CHECKER_H
