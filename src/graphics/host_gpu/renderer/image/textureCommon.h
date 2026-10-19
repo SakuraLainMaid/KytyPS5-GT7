@@ -50,6 +50,9 @@ TextureUploadLayout    TextureCalcUploadLayout(Prospero::BufferFormat format, ui
                                                Prospero::TileMode tile_mode, uint64_t upload_size,
                                                bool volume_texture, const char* owner);
 std::vector<vk::BufferImageCopy> TextureBuildImageCopies(const TextureUploadLayout& layout);
+// Round 94: whether TextureGetSurfaceFormatInfo knows the format (it ends the emulator on one it
+// does not, which only a T# no texture has can carry).
+[[nodiscard]] bool TextureFormatKnown(Prospero::BufferFormat format);
 bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,
                               const TextureUploadLayout& layout, uint32_t levels,
                               std::vector<GpuTileInfo>& out_tile_infos);

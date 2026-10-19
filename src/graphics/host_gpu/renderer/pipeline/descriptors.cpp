@@ -1100,6 +1100,31 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto samples = multisampled ? 1u << last_level : 1u;
 	const auto depth          = static_cast<uint32_t>(descriptor.Depth()) + 1u;
 	const auto format         = descriptor.Format();
+	// Round 94: a format no texture has, a component selector no texture has, or a minimum LOD
+	// past the last mip (each an EXIT below): a heap entry of the bindless table read while the
+	// guest rewrote it (format 160 ended a race with bindless textures on, 2026-10-19), or a T#
+	// read after its reuse. Sampled as a null texture, as with a first mip past the last.
+	if (!TextureFormatKnown(format)) {
+		if (RejectBindlessTexture("format no texture has", address)) {
+			return {};
+		}
+		static std::atomic<uint32_t> reports {0};
+		return null_texture(reports, "of a format no texture has");
+	}
+	if (!storage && !IsValidImageSwizzle(descriptor.DstSelXYZW())) {
+		if (RejectBindlessTexture("component selector no texture has", address)) {
+			return {};
+		}
+		static std::atomic<uint32_t> reports {0};
+		return null_texture(reports, "with a component selector no texture has");
+	}
+	if (descriptor.MinLod() > last_level * 256u) {
+		if (RejectBindlessTexture("minimum LOD past the last mip", address)) {
+			return {};
+		}
+		static std::atomic<uint32_t> reports {0};
+		return null_texture(reports, "with its minimum LOD past the last mip");
+	}
 	const auto surface_format = TextureGetSurfaceFormatInfo(format);
 	const bool shader_conversion =
 	    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
@@ -1525,7 +1550,8 @@ static uint32_t BindlessBindingFor(const ShaderRecompiler::IR::ImageResource& re
 // ResolveTexture, which exits on descriptors a draw would never bind that way.
 static bool BindlessCompatible(const ShaderTextureResource& descriptor, uint32_t binding,
                                bool runtime = false) {
-	if (descriptor.IsNull()) {
+	// Round 94: a format no texture has, which TextureGetSurfaceFormatInfo would end on.
+	if (descriptor.IsNull() || !TextureFormatKnown(descriptor.Format())) {
 		return false;
 	}
 	const auto numeric_class = Prospero::SampledTextureNumericClass(descriptor.Format());

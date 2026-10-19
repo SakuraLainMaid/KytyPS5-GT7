@@ -622,32 +622,59 @@ static bool ExpandEveryTarget() {
 	return value;
 }
 
+// Round 94: the most words an expansion with every table target may have (ExpandShaderFunctions).
+static uint32_t EveryTargetWords() {
+	static const uint32_t value = [] {
+		const char* text = std::getenv("KYTY_CALL_EVERY_TARGET_WORDS");
+		return text != nullptr && *text != '\0'
+		           ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10))
+		           : 16384u;
+	}();
+	return value;
+}
+
+// Round 94: the SPIR-V words from which a compute pipeline compiles in the background
+// (PipelineCache::TryGetComputePipeline; KYTY_COMPUTE_BACKGROUND_WORDS, 0: none).
+static uint32_t ComputeBackgroundWords() {
+	static const uint32_t value = [] {
+		const char* text = std::getenv("KYTY_COMPUTE_BACKGROUND_WORDS");
+		return text != nullptr && *text != '\0'
+		           ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10))
+		           : 1000000u;
+	}();
+	return value;
+}
+
 // Round 93: a compute program that gives up leaves what an offline replay needs (the shader
 // batch tool's --replay mode) in shader-dumps/: the code it translated (expanded when it calls
-// functions), its user data and its stage's registers. The first 64 of a run, once for each
-// shader and code size (a second expansion of the same shader gets files of its own).
-static void DumpGaveUpCompute(uint64_t hash, std::span<const uint32_t> code,
-                              std::span<const uint32_t>     user_data,
-                              const ShaderComputeInputInfo& info, uint32_t failure_pc) {
+// functions), its user data and its stage's registers, as CS_<hash>_<words>.gaveup.{bin,txt}.
+// The first 64 of a run, once for each shader and code size (a second expansion of the same
+// shader gets files of its own). Round 94: and one whose SPIR-V has ComputeBackgroundWords or
+// more, as .big.{bin,txt}, to see offline what makes it so big.
+static void DumpComputeForReplay(const char* kind, uint64_t hash, std::span<const uint32_t> code,
+                                 std::span<const uint32_t>     user_data,
+                                 const ShaderComputeInputInfo& info, uint32_t failure_pc) {
 	static std::mutex                   mutex;
 	static std::unordered_set<uint64_t> dumped;
 	{
 		const std::lock_guard lock(mutex);
-		if (dumped.size() >= 64 || !dumped.insert(hash ^ (uint64_t {code.size()} << 40u)).second) {
+		const uint64_t        key = hash ^ (uint64_t {code.size()} << 40u) ^
+		                     (static_cast<uint64_t>(static_cast<uint8_t>(kind[0])) << 56u);
+		if (dumped.size() >= 64 || !dumped.insert(key).second) {
 			return;
 		}
 	}
 	std::error_code created;
 	std::filesystem::create_directories("shader-dumps", created);
 	char path[112];
-	std::snprintf(path, sizeof(path), "shader-dumps/CS_%016" PRIx64 "_%zu.gaveup.bin", hash,
-	              code.size());
+	std::snprintf(path, sizeof(path), "shader-dumps/CS_%016" PRIx64 "_%zu.%s.bin", hash,
+	              code.size(), kind);
 	if (FILE* file = std::fopen(path, "wb"); file != nullptr) {
 		std::fwrite(code.data(), sizeof(uint32_t), code.size(), file);
 		std::fclose(file);
 	}
-	std::snprintf(path, sizeof(path), "shader-dumps/CS_%016" PRIx64 "_%zu.gaveup.txt", hash,
-	              code.size());
+	std::snprintf(path, sizeof(path), "shader-dumps/CS_%016" PRIx64 "_%zu.%s.txt", hash,
+	              code.size(), kind);
 	FILE* file = std::fopen(path, "w");
 	if (file == nullptr) {
 		return;
@@ -2635,8 +2662,8 @@ struct PipelineCache::ProgramCache {
 		}
 		if (translated.unsupported) {
 			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-				DumpGaveUpCompute(params.hash, compile_code, user_data, input_info,
-				                  ShaderRecompiler::IR::LastResourceTrackingFailurePc());
+				DumpComputeForReplay("gaveup", params.hash, compile_code, user_data, input_info,
+				                     ShaderRecompiler::IR::LastResourceTrackingFailurePc());
 			}
 			if (!lookup_key.function_code.empty()) {
 				// A table target's inlined body the resource tracking could not follow: leave
@@ -2668,6 +2695,7 @@ struct PipelineCache::ProgramCache {
 					if (target == 0 && ExpandEveryTarget() &&
 					    ShaderRecompiler::Decoder::ShaderCallRuntimeRecords() &&
 					    (reported == nullptr || reported->empty()) &&
+					    !every_target_too_big.contains(params.hash) &&
 					    expand_every_target.insert(params.hash).second) {
 						LOGF("Shader function expansion hash=%016" PRIx64
 						     ": its translation gave up before the GPU reported any table target; "
@@ -2739,6 +2767,12 @@ struct PipelineCache::ProgramCache {
 			Profiler::Add(Profiler::Counter::SkippedGaveUp);
 			unsupported.insert(lookup_key);
 			return ShaderProgram {};
+		}
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			if (ComputeBackgroundWords() != 0 &&
+			    compiled.spirv.size() >= ComputeBackgroundWords()) {
+				DumpComputeForReplay("big", params.hash, compile_code, user_data, input_info, 0);
+			}
 		}
 		std::vector<uint8_t> permutation_payload;
 		if (disk != nullptr) {
@@ -2988,13 +3022,35 @@ struct PipelineCache::ProgramCache {
 				expand_every_target.erase(every);
 			}
 		}
-		const uint64_t expand_hash = expand_every_target.contains(params.hash) ? 0 : params.hash;
-		const bool     ok          = function_expander.Expand(
-            params.code, params.Base(), user_data,
-            [](uint64_t address, std::span<uint32_t> words) {
-                return ReadShaderGuestMemoryRaw(nullptr, address, words);
-            },
-            expanded, reason, wave_size, expand_hash, &summary);
+		const auto expand = [&](uint64_t expand_hash) {
+			return function_expander.Expand(
+			    params.code, params.Base(), user_data,
+			    [](uint64_t address, std::span<uint32_t> words) {
+				    return ReadShaderGuestMemoryRaw(nullptr, address, words);
+			    },
+			    expanded, reason, wave_size, expand_hash, &summary);
+		};
+		bool ok = false;
+		if (expand_every_target.contains(params.hash)) {
+			ok = expand(0);
+			// Round 94: an expansion with every target of more than KYTY_CALL_EVERY_TARGET_WORDS
+			// words (default 16384; 0: no limit) follows the reports again: 108 material functions
+			// of a table of 198 made one of 120,888 words, whose translation kept the GPU thread
+			// busy for good (the garage stopped).
+			if (ok && EveryTargetWords() != 0 && expanded.size() > EveryTargetWords()) {
+				LOGF("Shader function expansion hash=%016" PRIx64 ": with every table target it "
+				     "has %zu words, more than %u; it follows the reported targets again\n",
+				     params.hash, expanded.size(), EveryTargetWords());
+				expand_every_target.erase(params.hash);
+				every_target_too_big.insert(params.hash);
+				expanded.clear();
+				reason.clear();
+				summary.clear();
+				ok = expand(params.hash);
+			}
+		} else {
+			ok = expand(params.hash);
+		}
 		if (ok && expanded.empty() && summary.empty() && params.hash != 0) {
 			if (call_free.size() >= 65536) {
 				call_free.clear();
@@ -3032,8 +3088,10 @@ struct PipelineCache::ProgramCache {
 	std::shared_mutex                                              programs_mutex;
 	std::unordered_set<ProgramKey, ProgramKeyHash>                 unsupported;
 	ShaderRecompiler::Decoder::ShaderFunctionExpander             function_expander;
-	// Round 93: compute shaders expanded with every table target (ExpandEveryTarget).
+	// Round 93: compute shaders expanded with every table target (ExpandEveryTarget); round 94:
+	// and those whose expansion with every target was too big for it (EveryTargetWords).
 	std::unordered_set<uint64_t> expand_every_target;
+	std::unordered_set<uint64_t> every_target_too_big;
 	// Shaders the expander found to make no calls, by code address: the hash and size of the code
 	// it saw (round 82).
 	struct CallFreeCode {
@@ -3805,6 +3863,7 @@ void PipelineCache::Save() {
 	if (m_compiler != nullptr) {
 		m_compiler->Stop();
 	}
+	FinishBackgroundCompute();
 	if (!m_driver_older.empty()) {
 		PipelineCacheLog("Vulkan pipeline cache: {} pipelines this run came from the full files",
 		                 g_older_file_hits.load(std::memory_order_relaxed));
@@ -4909,5 +4968,103 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	EXIT_IF(!inserted);
 
 	return *iter->second;
+}
+
+struct PipelineCache::BackgroundCompute {
+	std::unique_ptr<Pipeline> pipeline;
+	// The program info the compile reads (its hash and wave size), copied: the program cache's
+	// entry is an element of a vector a later permutation of the same source may move.
+	ShaderRecompiler::IR::CompiledShaderInfo program;
+	ShaderComputeInputInfo                input_info {};
+	uint64_t                              hash  = 0;
+	uint32_t                              words = 0;
+	std::chrono::steady_clock::time_point begin;
+	uint64_t                              skipped = 0; // dispatches skipped meanwhile
+	std::atomic<bool>                     done {false};
+	std::thread                           thread;
+};
+
+PipelineCache::Pipeline*
+PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
+                                     const ShaderProgram&          compute_program) {
+	EXIT_IF(!compute_program);
+	if (auto iter = m_compute_pipelines.find(compute_program.id);
+	    iter != m_compute_pipelines.end()) {
+		return iter->second.get();
+	}
+	if (auto iter = m_compute_background.find(compute_program.id);
+	    iter != m_compute_background.end()) {
+		auto& job = *iter->second;
+		if (!job.done.load(std::memory_order_acquire)) {
+			job.skipped++;
+			return nullptr;
+		}
+		job.thread.join();
+		const auto seconds =
+		    std::chrono::duration<double>(std::chrono::steady_clock::now() - job.begin).count();
+		LOGF("Compute pipeline CS=0x%016" PRIx64 " (%u SPIR-V words) compiled in the background "
+		     "in %.1f s; %" PRIu64 " of its dispatches were skipped meanwhile\n",
+		     job.hash, job.words, seconds, job.skipped);
+		ReportPipelineBuilt(Profiler::Counter::ComputePipelinesBuilt, "Compute", job.hash, 0,
+		                    job.begin);
+		auto pipeline = std::move(job.pipeline);
+		m_compute_background.erase(iter);
+		auto [inserted_iter, inserted] =
+		    m_compute_pipelines.emplace(compute_program.id, std::move(pipeline));
+		EXIT_IF(!inserted);
+		return inserted_iter->second.get();
+	}
+	const auto threshold = ComputeBackgroundWords();
+	if (threshold == 0 || compute_program.spirv_words < threshold) {
+		return &GetComputePipeline(input_info, compute_program);
+	}
+	const auto hash =
+	    input_info.stage.program != nullptr ? input_info.stage.program->shader_hash : 0;
+	auto cached = std::make_unique<Pipeline>();
+	{
+		const GpuPhases::Scope phase(GpuPhases::Phase::PipelineCompile);
+		if (CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
+		                           m_driver_cache, m_driver_older, ComputeBuild::LookUp)) {
+			auto [iter, inserted] =
+			    m_compute_pipelines.emplace(compute_program.id, std::move(cached));
+			EXIT_IF(!inserted);
+			return iter->second.get();
+		}
+	}
+	auto job          = std::make_unique<BackgroundCompute>();
+	job->pipeline     = std::move(cached);
+	job->program                  = *input_info.stage.program;
+	job->input_info   = input_info;
+	job->input_info.stage.program = &job->program;
+	job->hash         = hash;
+	job->words        = compute_program.spirv_words;
+	job->begin        = std::chrono::steady_clock::now();
+	auto*      raw    = job.get();
+	const auto module = compute_program.module;
+	LOGF("Compute pipeline CS=0x%016" PRIx64 " (%u SPIR-V words) is compiled in the background; "
+	     "its dispatches are skipped until then\n",
+	     hash, compute_program.spirv_words);
+	// The driver cache stays until Save, which waits for this thread first.
+	raw->thread = std::thread([this, raw, module, cache = m_driver_cache] {
+		KYTY_PROFILER_THREAD("ComputePipelineCompile");
+		(void)CreatePipelineInternal(m_graphics, *raw->pipeline, raw->input_info, module, cache, {},
+		                             ComputeBuild::Compile);
+		raw->done.store(true, std::memory_order_release);
+	});
+	m_compute_background.emplace(compute_program.id, std::move(job));
+	return nullptr;
+}
+
+void PipelineCache::FinishBackgroundCompute() {
+	for (auto& [id, job]: m_compute_background) {
+		if (!job->done.load(std::memory_order_acquire)) {
+			LOGF("Compute pipeline CS=0x%016" PRIx64 " still compiles in the background: waiting "
+			     "for it\n",
+			     job->hash);
+		}
+		job->thread.join();
+		m_compute_pipelines.emplace(id, std::move(job->pipeline));
+	}
+	m_compute_background.clear();
 }
 } // namespace Libs::Graphics

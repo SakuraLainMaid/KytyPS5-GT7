@@ -924,10 +924,43 @@ void ReplayCompute(const std::filesystem::path& text_path) {
 	options.input_info      = stage_input;
 	options.wave_size       = info.wave_size;
 	options.non_fatal       = true;
-	options.bindless_images = true;
-	auto translated         = ShaderRecompiler::TranslateProgram(code, options);
-	std::printf("REPLAY\t%016" PRIx64 "\t%zu words\t%zu user data\t%s\n", hash, code.size(),
-	            user_data.size(), translated.unsupported ? "gave up" : "ok");
+	// KYTY_BATCH_NO_BINDLESS=1: as in a session with bindless textures off (the launcher's
+	// default), where an indexed T# table must be enumerated.
+	options.bindless_images = std::getenv("KYTY_BATCH_NO_BINDLESS") == nullptr;
+	auto       translated   = ShaderRecompiler::TranslateProgram(code, options);
+	const bool ok           = !translated.unsupported;
+	// The rest of the in-game path, as for a batch row: the SPIR-V and its size (a module the
+	// driver takes minutes to compile stalls the GPU thread), KYTY_BATCH_DUMP_DIR/replay/ with
+	// KYTY_BATCH_DUMP_ALL.
+	std::string spirv       = "-";
+	size_t      spirv_words = 0;
+	if (ok) {
+		const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+		ShaderRecompiler::IR::ResourceSnapshot       resources;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		const ShaderRecompiler::IR::SrtRuntime       runtime {
+		          .user_data                  = options.user_data,
+		          .shader_base                = reinterpret_cast<uint64_t>(code.data()),
+		          .read_memory                = ReadPatternMemory,
+		          .userdata                   = nullptr,
+		          .read_specialization_memory = ReadPatternMemory,
+        };
+		if (!ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization)) {
+			spirv = fmt::format("materialization failed (line {})",
+			                    ShaderRecompiler::IR::LastIndirectImageFailureLine());
+		} else {
+			auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options,
+			                                                 specialization, 0u);
+			spirv         = ValidateSpirv(compiled.spirv);
+			spirv_words   = compiled.spirv.size();
+			if (std::getenv("KYTY_BATCH_DUMP_ALL") != nullptr) {
+				DumpSpirv("replay", fmt::format("CS_{:016x}_{}", hash, code.size()), compiled.spirv,
+				          compiled.ir_dump, compiled.decoded_dump);
+			}
+		}
+	}
+	std::printf("REPLAY\t%016" PRIx64 "\t%zu words\t%zu user data\t%s\tspirv %s\t%zu words\n", hash,
+	            code.size(), user_data.size(), ok ? "ok" : "gave up", spirv.c_str(), spirv_words);
 }
 
 } // namespace

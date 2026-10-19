@@ -70,6 +70,13 @@ static bool EarlyDispatchSkip() {
 	return enabled;
 }
 
+// Round 94: a dispatch whose pipeline compiles in the background (TryGetComputePipeline).
+static void SkipDispatchWhileCompiling(uint64_t shader_hash) {
+	if (FrameGraph::Logging()) {
+		FrameGraph::Log("  not run: cs %016" PRIx64 " compiles in the background", shader_hash);
+	}
+}
+
 static void LogSkippedDispatch(const HW::ComputeShaderInfo& cs, const char* groups) {
 	static const uint32_t budget = [] {
 		const char* value = std::getenv("KYTY_LOG_SKIPPED_DISPATCHES");
@@ -1654,9 +1661,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	buffer.EndRendering();
 	GpuPhases::Scope pipeline_phase(GpuPhases::Phase::DispatchPipeline);
-	auto& pipeline =
-	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto*            pipeline_found =
+	    m_context.GetPipelineCache().TryGetComputePipeline(input_info, compute_program);
 	pipeline_phase.End();
+	if (pipeline_found == nullptr) {
+		SkipDispatchWhileCompiling(program.shader_hash);
+		ResetBindings();
+		return;
+	}
+	auto& pipeline = *pipeline_found;
 	auto& bindings = m_compute_bindings;
 	if (FrameGraph::Logging()) {
 		FrameGraph::Log("  cs %016" PRIx64 " groups %ux%ux%u threads %ux%ux%u", program.shader_hash,
@@ -1933,8 +1946,15 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	buffer.EndRendering();
 	GpuPhases::Scope pipeline_phase(GpuPhases::Phase::DispatchPipeline);
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto*            pipeline_found =
+	    m_context.GetPipelineCache().TryGetComputePipeline(input_info, compute_program);
 	pipeline_phase.End();
+	if (pipeline_found == nullptr) {
+		SkipDispatchWhileCompiling(input_info.stage.program->shader_hash);
+		ResetBindings();
+		return;
+	}
+	auto& pipeline = *pipeline_found;
 	auto& bindings = m_compute_bindings;
 	if (FrameGraph::Logging()) {
 		FrameGraph::Log("  cs %016" PRIx64 " threads %ux%ux%u",

@@ -176,6 +176,12 @@ vk::ComponentMapping TextureGetComponentMapping(uint32_t                        
 	return {resolve(0), resolve(1), resolve(2), resolve(3)};
 }
 
+bool TextureFormatKnown(Prospero::BufferFormat format) {
+	return ResolveHostFormat(Prospero::RemapTextureFormat(format),
+	                         Prospero::ChannelOrder::kStandard)
+	           .format != vk::Format::eUndefined;
+}
+
 SurfaceFormatInfo TextureGetSurfaceFormatInfo(Prospero::BufferFormat format) {
 	const auto backing_format = Prospero::RemapTextureFormat(format);
 	const auto host_format = ResolveHostFormat(backing_format, Prospero::ChannelOrder::kStandard);

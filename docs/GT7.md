@@ -25,7 +25,7 @@ the game. The user profile, audio and notification settings don't matter.
 | | Enable readback | Off |
 | | Enable tessellation support (experimental) | **On** |
 | | Auto-hide cursor | Off |
-| | Bindless textures (experimental) | Off |
+| | Bindless textures (experimental) | **On** |
 | | Skip shaders | Empty |
 | Compatibility | AMD CPU patch (experimental) | Off |
 | | Windows SysV red zone crash protection (experimental) | **On** |
@@ -79,6 +79,10 @@ zipped `_kyty.txt` log).
 - A crash when the emulator wrote a depth image back to memory while freeing it is fixed (seen in
   My First Gran Turismo with bindless textures on).
 - Races that need more memory than the game's own get up to 8 GB more room past it (4 GB before).
+- **Bindless textures are now the recommended setting** (launcher, game settings): it costs
+  nothing measurable in a race, and the ray tracing mode needs it (without it the reflection
+  passes of that mode never run). A texture slot the game is rewriting no longer ends the
+  emulator with "unknown format".
 
 Known problems in this build:
 

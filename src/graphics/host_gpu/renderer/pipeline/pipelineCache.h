@@ -320,8 +320,19 @@ public:
 	                                 const GraphicsPrograms& programs, PipelineDefer defer);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
+	// Round 94: as GetComputePipeline, but a pipeline of KYTY_COMPUTE_BACKGROUND_WORDS SPIR-V
+	// words or more (default 1,000,000; 0: none) that no driver cache holds is compiled on a
+	// thread of its own, and nullptr comes back until it is done: the dispatch is skipped. The
+	// driver took 110 s for one of 1.5 million words (a ray tracing material pass with its
+	// looping material functions inlined), with the emulated GPU stopped all along.
+	Pipeline* TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
+	                                const ShaderProgram&          compute_program);
 
 private:
+	struct BackgroundCompute;
+	// Waits for the compute pipelines still compiling in the background (Save: they compile into
+	// the driver cache).
+	void FinishBackgroundCompute();
 	struct ProgramCache;
 
 	// GetGraphicsPrograms' stage inputs from the registers (shared with DrawPrepDescribeGraphics;
@@ -372,6 +383,8 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	// Round 94: compute pipelines compiling on threads of their own, by program id.
+	std::unordered_map<uint64_t, std::unique_ptr<BackgroundCompute>> m_compute_background;
 	std::unique_ptr<PipelineCompiler>                       m_compiler;
 	uint64_t                                                m_deferred_draws = 0;
 	// Round 87: whether a new pipeline is first looked up in the driver's caches alone
@@ -421,11 +434,17 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
                             vk::PipelineCache                      driver_cache);
-// `older`: the full driver cache files, looked up first (round 92).
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+// How a compute pipeline is made (round 94): Full makes its layouts, looks it up in `older` (the
+// full driver cache files, round 92) and compiles it into driver_cache when they do not hold it;
+// LookUp makes its layouts and looks it up in `older` and in driver_cache, compiling nothing
+// (false when none holds it, the layouts kept); Compile compiles it into driver_cache, on any
+// thread, after a LookUp made its layouts.
+enum class ComputeBuild : uint8_t { Full, LookUp, Compile };
+bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
-                            std::span<const vk::PipelineCache> older = {});
+                            std::span<const vk::PipelineCache> older = {},
+                            ComputeBuild                       build = ComputeBuild::Full);
 
 } // namespace Libs::Graphics
 
