@@ -85,14 +85,17 @@ static bool                          g_flexible_memory_size_frozen = false;
 // the race did without, its next allocations failed, and it crashed on the null pointer one of
 // them returned (round 79 and 80 logs, the files it read the same in both). Such an allocation
 // is given room here instead, logged; the size the game is told does not change, so nothing it
-// plans by grows. KYTY_DMEM_OVERFLOW_MB (default 8192; 0: none, as before) sets the room. The
+// plans by grows. KYTY_DMEM_OVERFLOW_MB (default 16384; 0: none, as before) sets the room. The
 // backing behind it is reserved, not committed, until it is used; with KYTY_LAZY_COMMIT=0
 // (Windows commits the whole backing at boot) there is none unless KYTY_DMEM_OVERFLOW_MB asks.
 static uint64_t DirectMemoryOverflowSize() {
 	static const uint64_t size = [] {
-		// 8 GB (round 82; 4 GB in round 81): the race's 5.3 GB pool did not fit in 4 GB when the
-		// game held a 2.3 GB block or two more than usual, and the game froze at the track menu.
-		uint64_t mb = 8192;
+		// 16 GB (round 89; 8 GB from round 82, 4 GB in round 81): the race's 5.3 GB pool did not
+		// fit in 4 GB when the game held a 2.3 GB block or two more than usual, and the game froze
+		// at the track menu. After several races in one session it held two 2.3 GB blocks and a
+		// 1.6 GB one past its memory while it loaded the next track (the previous track's, freed
+		// later), the pool did not fit in 8 GB either, and its loading screen never ended.
+		uint64_t mb = 16384;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (const char* eager = std::getenv("KYTY_LAZY_COMMIT");
 		    eager != nullptr && eager[0] == '0') {

@@ -221,6 +221,11 @@ std::string Advance();
 [[nodiscard]] std::string TakePictureRequest();
 void                      ApplyPending();
 
+// Round 89: a picture of the next presented frame (into image-dumps, as F8's), with no step
+// change: F9 asks for one with its frame capture, so the capture comes with what the screen
+// showed. Any thread.
+void RequestPicture(const std::string& name);
+
 // GPU thread: what the step that is on asks for.
 [[nodiscard]] bool Active();
 // GPU thread: whether some step has tess:bit; that bit of the step that is on (-1 for none); the

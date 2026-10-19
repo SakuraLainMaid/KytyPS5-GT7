@@ -663,6 +663,13 @@ std::string Advance() {
 	return fmt::format("Bisect step {} of {}: {}", next, steps.size(), steps[next - 1].name);
 }
 
+void RequestPicture(const std::string& name) {
+	std::scoped_lock lock(g_pending_mutex);
+	if (g_picture.empty()) {
+		g_picture = name;
+	}
+}
+
 std::string TakePictureRequest() {
 	std::scoped_lock lock(g_pending_mutex);
 	std::string      picture;

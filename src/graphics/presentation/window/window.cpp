@@ -219,6 +219,9 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 				break;
 			case SDLK_F9:
 				if (!key.repeat) {
+					// With a picture of the screen (round 89): capture_<n>.jpg in image-dumps.
+					static uint32_t captures = 0;
+					Bisect::RequestPicture(fmt::format("capture_{:02}", ++captures));
 					FrameGraph::RequestCapture();
 				}
 				break;
