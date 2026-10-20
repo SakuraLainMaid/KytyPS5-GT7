@@ -401,6 +401,25 @@ std::string BytesHash(BufferCache& cache, uint64_t address, uint64_t size) {
 	return fmt::format("{:016x}{}{}", hash, gpu ? " [G]" : "", changed);
 }
 
+bool DumpsShaderMemory(uint64_t shader_hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> parsed;
+		const char*           text = std::getenv("KYTY_FG_DUMP_SHADERS");
+		while (text != nullptr && *text != '\0') {
+			char*      end   = nullptr;
+			const auto value = std::strtoull(text, &end, 16);
+			if (end == text) {
+				break;
+			}
+			parsed.push_back(value);
+			text = *end == ',' ? end + 1 : end;
+		}
+		return parsed;
+	}();
+	return Logging() && !hashes.empty() &&
+	       std::find(hashes.begin(), hashes.end(), shader_hash) != hashes.end();
+}
+
 void LogBytes(const char* label, uint64_t address, uint64_t size) {
 	if (!Logging() || address == 0 || size == 0 || !g_bytes_logged.insert(address).second) {
 		return;

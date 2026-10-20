@@ -18,6 +18,7 @@
 #include <span>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -390,6 +391,15 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	// Round 97: by shader hash, its last expansion whose compute pipeline is ready (the program id
+	// and the expanded code), run while a newer one compiles (GetComputeProgram); and the newer
+	// programs whose wait was logged.
+	struct ReadyExpansion {
+		uint64_t              id = 0;
+		std::vector<uint32_t> code;
+	};
+	std::unordered_map<uint64_t, ReadyExpansion> m_ready_expansions;
+	std::unordered_set<uint64_t>                 m_last_expansion_logged;
 	// Round 94: compute pipelines compiling on threads of their own, by program id.
 	std::unordered_map<uint64_t, std::unique_ptr<BackgroundCompute>> m_compute_background;
 	std::unique_ptr<PipelineCompiler>                       m_compiler;

@@ -2424,6 +2424,16 @@ static void LogFrameGraphDraw(RenderContext& context, const CommandBuffer& buffe
 				FrameGraph::Log("    vb[%d] 0x%012" PRIx64 " stride %u records %u hash %s", i,
 				                vb.addr, vb.stride, vb.num_records,
 				                FrameGraph::BytesHash(cache, vb.addr, bytes).c_str());
+				if (FrameGraph::DumpsShaderMemory(stage.stage.program->shader_hash)) {
+					FrameGraph::LogBytes(fmt::format("vb memory 0x{:012x}", vb.addr).c_str(),
+					                     vb.addr, bytes);
+				}
+			}
+			if (draw.IsIndexed() && index_source.host_data == nullptr &&
+			    FrameGraph::DumpsShaderMemory(stage.stage.program->shader_hash)) {
+				FrameGraph::LogBytes(
+				    fmt::format("index memory 0x{:012x}", index_source.address).c_str(),
+				    index_source.address, index_source.size);
 			}
 			for (int i = 0; i < stage.resources_num && i < ShaderVertexInputInfo::RES_MAX; i++) {
 				const auto& resource = stage.resources[i];

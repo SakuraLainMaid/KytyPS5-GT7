@@ -634,6 +634,16 @@ static uint32_t EveryTargetWords() {
 	return value;
 }
 
+// Round 97: KYTY_CALL_KEEP_LAST (default on): GetComputeProgram runs a shader's last ready
+// expansion while a newer one compiles in the background.
+static bool KeepLastExpansion() {
+	static const bool value = [] {
+		const char* text = std::getenv("KYTY_CALL_KEEP_LAST");
+		return text == nullptr || text[0] != '0';
+	}();
+	return value;
+}
+
 // Round 94: the SPIR-V words from which a compute pipeline compiles in the background
 // (PipelineCache::TryGetComputePipeline; KYTY_COMPUTE_BACKGROUND_WORDS, 0: none).
 static uint32_t ComputeBackgroundWords() {
@@ -2336,8 +2346,14 @@ struct PipelineCache::ProgramCache {
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		lookup_key.function_code.clear();
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-			ExpandShaderFunctions(params, user_data, input_info.wave_size,
-			                      lookup_key.function_code);
+			if (forced_function_code != nullptr) {
+				// Round 97: an earlier expansion of the shader, run while a newer one compiles
+				// (PipelineCache::GetComputeProgram).
+				lookup_key.function_code = *forced_function_code;
+			} else {
+				ExpandShaderFunctions(params, user_data, input_info.wave_size,
+				                      lookup_key.function_code);
+			}
 		}
 		if (unsupported.contains(lookup_key)) {
 			Profiler::Add(Profiler::Counter::SkippedGaveUp);
@@ -3220,6 +3236,8 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash>    programs;
+	// Round 97: set by GetComputeProgram for one Get: the expansion to use instead of expanding.
+	const std::vector<uint32_t>* forced_function_code = nullptr;
 	// Taken exclusively by the GPU thread when it inserts into programs (entries are never
 	// erased, so pointers to them stay valid), shared by the draw-prep scanner's lookups.
 	std::shared_mutex                                              programs_mutex;
@@ -4657,13 +4675,53 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	const auto        input_before     = input_info;
 	uint32_t          push_data_cursor = 0;
 	auto              program          = m_program_cache->Get(params, input_info, push_data_cursor);
 	if (program && DrawPrep::Enabled()) {
 		// Compute shaders join the known-good list with a vertex identity no draw has.
 		DrawPrep::NoteGoodPair(regs.cs_regs.data_addr, UINT64_MAX);
 	}
-	return program;
+	// Round 97: a shader with call expansions keeps running its last expansion whose pipeline is
+	// ready while a newer one, with more targets inlined, compiles in the background (a minute or
+	// more for the ray tracing mode's material passes). Before, its dispatches were skipped all
+	// that while, and the reflections they shade showed garbage (the rainbow came back whenever a
+	// new material appeared).
+	const auto& code = m_program_cache->lookup_key.function_code;
+	if (!program || params.hash == 0 || code.empty() || !KeepLastExpansion()) {
+		return program;
+	}
+	auto ready = m_ready_expansions.find(params.hash);
+	if (ready == m_ready_expansions.end() || ready->second.id == program.id ||
+	    TryGetComputePipeline(input_info, program) != nullptr) {
+		// Compiled now, found compiled, or nothing to run meanwhile.
+		if (m_compute_pipelines.contains(program.id)) {
+			auto& entry = m_ready_expansions[params.hash];
+			if (entry.id != program.id) {
+				entry.id   = program.id;
+				entry.code = code;
+			}
+		}
+		return program;
+	}
+	const auto newer                      = program;
+	input_info                            = input_before;
+	push_data_cursor                      = 0;
+	m_program_cache->forced_function_code = &ready->second.code;
+	auto earlier = m_program_cache->Get(params, input_info, push_data_cursor);
+	m_program_cache->forced_function_code = nullptr;
+	if (!earlier || !m_compute_pipelines.contains(earlier.id)) {
+		// Not runnable after all: the newer one, whose dispatches wait for its compile.
+		input_info       = input_before;
+		push_data_cursor = 0;
+		return m_program_cache->Get(params, input_info, push_data_cursor);
+	}
+	if (m_last_expansion_logged.insert(newer.id).second && m_last_expansion_logged.size() < 4096) {
+		LOGF("Compute shader %016" PRIx64 ": its earlier expansion runs while the newer one "
+		     "compiles\n",
+		     params.hash);
+	}
+	return earlier;
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {

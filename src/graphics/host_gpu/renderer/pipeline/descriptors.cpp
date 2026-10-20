@@ -2551,6 +2551,10 @@ static void LogFrameGraphStage(RenderContext& context, const ShaderStageRuntime&
 			                program.user_data_base + reg, program.user_data_base + reg + 1, address,
 			                buffers.HasGpuDirtyBytes(address, FrameGraph::KeepBytes) ? " [G]" : "");
 			FrameGraph::NoteBuffer(address, FrameGraph::KeepBytes);
+			if (FrameGraph::DumpsShaderMemory(program.shader_hash)) {
+				FrameGraph::LogBytes(fmt::format("{} memory 0x{:012x}", stage, address).c_str(),
+				                     address, 0x400u);
+			}
 		}
 	}
 	for (size_t reg = 0; reg + 4 <= user.size(); reg += 4) {

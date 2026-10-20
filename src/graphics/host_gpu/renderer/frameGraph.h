@@ -56,6 +56,11 @@ inline constexpr uint64_t HashBytes = 256ull << 10u;
 // logs guest bytes as they are now (up to 4 KB), as lines of the current operation: once a
 // capture for each range, and again after a BytesHash of it found them changed.
 void LogBytes(const char* label, uint64_t address, uint64_t size);
+// Round 97, diagnostics: KYTY_FG_DUMP_SHADERS=<shader hash>[,<hash>...] (hex): a capture logs, for
+// the draws of those shaders, the memory each of their user data pointers points at (0x400 bytes)
+// and, for vertex stages, their vertex and index buffers (up to 4 KB), once per address: what a
+// draw's vertex shader reads, to work its positions out offline.
+[[nodiscard]] bool DumpsShaderMemory(uint64_t shader_hash);
 
 // Buffer contents shown after the frame: the first KeepBytes of each.
 inline constexpr uint64_t KeepBytes = 1024;
