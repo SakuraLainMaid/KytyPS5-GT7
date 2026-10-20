@@ -2476,6 +2476,7 @@ static void LogFrameGraphStage(RenderContext& context, const ShaderStageRuntime&
 			return false;
 		};
 		if (binding.image_id && ImageDump::Enabled() &&
+		    ImageDump::WantedShader(program.shader_hash) &&
 		    ImageDump::Wanted(info.data.address, info.extent.width, info.extent.height,
 		                      info.resources.layers, info.IsDepth()) &&
 		    !(ImageDump::AllMips() && stage_writes(binding.image_id))) {

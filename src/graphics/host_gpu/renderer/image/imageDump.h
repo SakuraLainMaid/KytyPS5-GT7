@@ -21,7 +21,8 @@
 // Float colors are scaled so that the 99th percentile of the brightest channel is white, with a
 // 2.2 gamma; unorm and sRGB bytes are shown as they are, snorm from -1..1, integers against their
 // largest value, depth from its smallest to its largest value. Texels that are not finite are
-// magenta. The log gets a line for each file ("FG dump ...") with the scale and the counts.
+// magenta. The log gets a line for each file ("FG dump ...") with the scale and the counts (round
+// 100: and the texels whose channels are all zero).
 namespace Libs::Graphics::ImageDump {
 
 [[nodiscard]] bool Enabled();
@@ -31,6 +32,10 @@ namespace Libs::Graphics::ImageDump {
 [[nodiscard]] bool AllMips();
 [[nodiscard]] bool Wanted(uint64_t address, uint32_t width, uint32_t height, uint32_t layers,
                           bool depth);
+// Round 100: KYTY_DUMP_IMAGES_SHADERS=<hash>[,<hash>...] (16 hex digits each): only the bindings of
+// these shaders (any stage) dump the images they match, so a frame's chain of passes can be
+// followed without the passes in between using up the count. Unset: every shader's.
+[[nodiscard]] bool WantedShader(uint64_t shader_hash);
 // GPU thread, in a capture: whether to dump this image's content now (the first time this
 // capture, within the count).
 [[nodiscard]] bool Claim(uint32_t capture, uint64_t address, uint64_t content);

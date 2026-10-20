@@ -348,7 +348,7 @@ void Encode(const std::string& name, const std::string& description, const Layou
 	}
 
 	// The mapping to 0..1.
-	uint64_t             not_finite = 0, negative = 0;
+	uint64_t             not_finite = 0, negative = 0, zero = 0;
 	float                low = std::numeric_limits<float>::max(), high = -low;
 	std::array<float, 4> channel_max {};
 	std::vector<float>   brightness;
@@ -357,8 +357,10 @@ void Encode(const std::string& name, const std::string& description, const Layou
 	for (size_t i = 0; i < texels.size(); i++) {
 		const auto& v      = texels[i];
 		bool        finite = true;
+		bool        zeros  = true;
 		float       bright = 0.0f;
 		for (uint32_t c = 0; c < info.channels; c++) {
+			zeros = zeros && v[c] == 0.0f;
 			if (!std::isfinite(v[c])) {
 				finite = false;
 				continue;
@@ -369,6 +371,7 @@ void Encode(const std::string& name, const std::string& description, const Layou
 			low            = std::min(low, v[c]);
 			high           = std::max(high, v[c]);
 		}
+		zero += zeros ? 1u : 0u;
 		if (!finite) {
 			not_finite++;
 		} else if (info.kind == Kind::Float && bright > 0.0f && i % sample_every == 0) {
@@ -458,11 +461,12 @@ void Encode(const std::string& name, const std::string& description, const Layou
 	                      : info.kind == Kind::Snorm ? "snorm"
 	                                                 : "unorm";
 	LOGF("FG dump %s.png%s: %s; %u tile(s) of %ux%u (every %u texel(s)) as %ux%u; %s, scale %g, "
-	     "values %g..%g; %" PRIu64 " not finite (magenta), %" PRIu64 " negative\n",
+	     "values %g..%g; %" PRIu64 " not finite (magenta), %" PRIu64 " negative, %" PRIu64
+	     " all zero of %zu\n",
 	     name.c_str(), written ? "" : " (NOT WRITTEN)", description.c_str(), tiles, tile_w, tile_h,
 	     step, width, height, mapping, static_cast<double>(scale),
 	     static_cast<double>(low <= high ? low : 0.0f),
-	     static_cast<double>(low <= high ? high : 0.0f), not_finite, negative);
+	     static_cast<double>(low <= high ? high : 0.0f), not_finite, negative, zero, texels.size());
 }
 
 } // namespace
@@ -506,6 +510,42 @@ bool Wanted(uint64_t address, uint32_t width, uint32_t height, uint32_t layers, 
 		}
 	}
 	return false;
+}
+
+bool WantedShader(uint64_t shader_hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> result;
+		const char*           value = std::getenv("KYTY_DUMP_IMAGES_SHADERS");
+		if (value == nullptr) {
+			return result;
+		}
+		const std::string_view list(value);
+		size_t                 start = 0;
+		while (start < list.size()) {
+			const auto end  = std::min(list.find(',', start), list.size());
+			auto       text = std::string(list.substr(start, end - start));
+			start           = end + 1;
+			text.erase(std::remove(text.begin(), text.end(), ' '), text.end());
+			if (text.starts_with("0x") || text.starts_with("0X")) {
+				text = text.substr(2);
+			}
+			if (text.empty()) {
+				continue;
+			}
+			char*      end_ptr = nullptr;
+			const auto hash    = std::strtoull(text.c_str(), &end_ptr, 16);
+			if (end_ptr == nullptr || *end_ptr != '\0' || hash == 0) {
+				LOGF("ImageDump: KYTY_DUMP_IMAGES_SHADERS item \"%s\" is not understood\n",
+				     text.c_str());
+				continue;
+			}
+			result.push_back(hash);
+		}
+		LOGF("ImageDump: KYTY_DUMP_IMAGES_SHADERS: only the bindings of %zu shaders dump images\n",
+		     result.size());
+		return result;
+	}();
+	return hashes.empty() || std::find(hashes.begin(), hashes.end(), shader_hash) != hashes.end();
 }
 
 bool Claim(uint32_t capture, uint64_t address, uint64_t content) {
