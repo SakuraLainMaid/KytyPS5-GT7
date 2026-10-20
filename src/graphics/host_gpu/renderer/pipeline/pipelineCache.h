@@ -117,6 +117,8 @@ struct ShaderProgram {
 	vk::ShaderModule module = nullptr;
 	uint32_t         spirv_words = 0;
 	uint64_t         hash        = 0;
+	// Round 95: the code it was translated from is an expansion that inlined called functions.
+	bool inlined_calls = false;
 	// A pixel shader that reads its sample index, as one that runs once per pixel with the index
 	// reading 0 (SpirvWithoutSampleId); null otherwise. For NV mixed-sample draws.
 	vk::ShaderModule pixel_rate_module = nullptr;
@@ -321,10 +323,11 @@ public:
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 	// Round 94: as GetComputePipeline, but a pipeline of KYTY_COMPUTE_BACKGROUND_WORDS SPIR-V
-	// words or more (default 1,000,000; 0: none) that no driver cache holds is compiled on a
-	// thread of its own, and nullptr comes back until it is done: the dispatch is skipped. The
-	// driver took 110 s for one of 1.5 million words (a ray tracing material pass with its
-	// looping material functions inlined), with the emulated GPU stopped all along.
+	// words or more (default 1,000,000; 0: none; round 95: a tenth of that for an expansion that
+	// inlined called functions) that no driver cache holds is compiled on a thread of its own, and
+	// nullptr comes back until it is done: the dispatch is skipped. The driver took 110 s for one
+	// of 1.5 million words (a ray tracing material pass with its looping material functions
+	// inlined), with the emulated GPU stopped all along.
 	Pipeline* TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                                const ShaderProgram&          compute_program);
 

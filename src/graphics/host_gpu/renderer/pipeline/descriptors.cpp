@@ -1269,6 +1269,16 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else {
 		PopulateTextureMipLayout(desc.info);
 	}
+	// Round 94: a base layer past the image's layers (an EXIT in TextureViewInfo; "texture base
+	// layer is out of bounds" ended a race with bindless textures on, a heap entry again).
+	if (resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim3D &&
+	    descriptor.BaseArray5() >= desc.info.resources.layers) {
+		if (RejectBindlessTexture("base layer past its layers", address)) {
+			return {};
+		}
+		static std::atomic<uint32_t> reports {0};
+		return null_texture(reports, "with its base layer past its layers");
+	}
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);
 	desc.view_info.base_level = view_base;
@@ -1341,6 +1351,15 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
 	} else if (image->info.IsDepth()) {
+		// Round 94: a bindless heap entry the image it found cannot be viewed through (each an
+		// EXIT below) is left on its placeholder, as with the layout checks in ResolveTexture.
+		if ((storage || !(IsSupportedSampledDepthResource(resource) &&
+		                  IsSupportedDepthTextureEncoding(descriptor, resource.r128) &&
+		                  IsSupportedSampledDepthView(image->info.pixel_format, pixel_format,
+		                                              descriptor.DstSelXYZW()))) &&
+		    RejectBindlessTexture("a depth image it cannot view", descriptor.Base40())) {
+			return {};
+		}
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
@@ -1348,6 +1367,11 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
+		if (!IsSupportedSampledColorView(image->info.pixel_format, pixel_format,
+		                                 descriptor.DstSelXYZW()) &&
+		    RejectBindlessTexture("an image it cannot view", descriptor.Base40())) {
+			return {};
+		}
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}

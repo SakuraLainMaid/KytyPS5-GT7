@@ -38,6 +38,7 @@
 #include <bit>
 #include <cctype>
 #include <chrono>
+#include <cinttypes>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -2086,13 +2087,21 @@ struct PipelineCache::ProgramCache {
 		        .program = std::move(result.program).TakeCompiledInfo()};
 	}
 
+	// Round 95: whether the code being translated is an expansion that inlined called functions
+	// (ShaderProgram::inlined_calls): it is longer than the shader by more than the trap stubs of
+	// an expansion that inlines none.
+	[[nodiscard]] bool InlinedCalls(const ShaderParams& params) const {
+		return lookup_key.function_code.size() > params.code.size() + 64u;
+	}
+
 	// A compiled (or cached) permutation of the source: its module, bound for this stage.
 	template <typename InputInfo>
 	ShaderProgram AddPermutation(SourceEntry& source, const char* stage_name,
 	                             const ShaderRecompiler::CompileOptions&  options,
 	                             const std::vector<uint32_t>&             spirv,
 	                             ShaderRecompiler::IR::CompiledShaderInfo program,
-	                             InputInfo& input_info, uint32_t& push_data_cursor) {
+	                             InputInfo& input_info, uint32_t& push_data_cursor,
+	                             bool inlined_calls) {
 		Profiler::Phases phases;
 		phases.SetText("%s 0x%016" PRIx64, stage_name, options.shader_hash);
 		KYTY_PROFILER_PHASE(phases, "Shader: SPIR-V validate", profiler::colors::Blue300);
@@ -2139,6 +2148,7 @@ struct PipelineCache::ProgramCache {
 		                            .module            = module,
 		                            .spirv_words       = static_cast<uint32_t>(spirv.size()),
 		                            .hash              = options.shader_hash,
+		                            .inlined_calls     = inlined_calls,
 		                            .pixel_rate_module = pixel_rate_module,
 		                            .normalized_module = normalized_module,
 		                            .normalized_id     = normalized_module != nullptr ? ++next_shader_id : 0u},
@@ -2608,8 +2618,12 @@ struct PipelineCache::ProgramCache {
 					Profiler::Message(Profiler::MessageInfo,
 					                  "Shader from the disk cache: %s 0x%016" PRIx64 ", %zu SPIR-V words",
 					                  stage_name, params.hash, record.spirv.size());
+					if (!lookup_key.function_code.empty()) {
+						gave_up_call_shaders.erase(params.hash);
+					}
 					return AddPermutation(entry->second, stage_name, options, record.spirv,
-					                      std::move(record.program), input_info, push_data_cursor);
+					                      std::move(record.program), input_info, push_data_cursor,
+					                      InlinedCalls(params));
 				}
 			}
 		}
@@ -2674,6 +2688,13 @@ struct PipelineCache::ProgramCache {
 				    pc != UINT32_MAX
 				        ? function_expander.ExcludeFailedCallTarget(lookup_key.function_code, pc)
 				        : 0;
+				// Not kept for the next run either (SaveCallTargets): its expansion would give up
+				// again before the exclusion is learned.
+				if (target != 0) {
+					excluded_call_targets.insert(target);
+				} else {
+					gave_up_call_shaders.insert(params.hash);
+				}
 				static std::atomic<uint32_t> exclusion_reports {0};
 				if (target != 0 && exclusion_reports.fetch_add(1) < 64) {
 					LOGF("Shader function expansion hash=%016" PRIx64
@@ -2779,9 +2800,12 @@ struct PipelineCache::ProgramCache {
 			ShaderDiskCache::EncodePermutationRecord(compiled.spirv, compiled.program,
 			                                         permutation_payload);
 		}
+		if (!lookup_key.function_code.empty()) {
+			gave_up_call_shaders.erase(params.hash); // a later expansion of it translated
+		}
 		const auto handle = AddPermutation(entry->second, stage_name, options, compiled.spirv,
 		                                   std::move(compiled.program), input_info,
-		                                   push_data_cursor);
+		                                   push_data_cursor, InlinedCalls(params));
 		{
 			const auto us = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 			                                         std::chrono::steady_clock::now() - compile_begin)
@@ -2824,6 +2848,10 @@ struct PipelineCache::ProgramCache {
 				}
 			}
 		}
+		if (disk != nullptr) {
+			call_targets_path = disk->Directory() / "call_targets.txt";
+			LoadCallTargets();
+		}
 		if (g_async_translation) {
 			// KYTY_TRANSLATION_THREADS=<n> (default a quarter of the processors, 2 to 8, since
 			// round 86; an eighth, 2 to 4, before; 2 before round 70). They work only while new
@@ -2848,6 +2876,112 @@ struct PipelineCache::ProgramCache {
 			disk->Flush();
 			disk->LogTotals("saved");
 		}
+		SaveCallTargets();
+	}
+
+	// Round 95: the table call targets the GPU reported (ReportShaderCallMiss), kept between runs
+	// in the shader cache folder (call_targets.txt; KYTY_CALL_TARGETS_KEEP=0: neither read nor
+	// written). A shader's expansion inlines the targets reported so far, in their order, so
+	// targets that arrive in another order or batches make other expansions and other SPIR-V: a
+	// second visit to the garage compiled its ray tracing material passes again (a minute or more
+	// each) for other sets of the same materials. Reported again at the start, the targets of the
+	// earlier runs make the first expansion the last one of those runs, whose pipeline the
+	// driver's cache holds. Only targets without record data (runtime records) are kept: those
+	// specialized on a record follow data the game allocates anew.
+	static bool KeepCallTargets() {
+		static const bool value = [] {
+			const char* text = std::getenv("KYTY_CALL_TARGETS_KEEP");
+			return text == nullptr || text[0] != '0';
+		}();
+		return value;
+	}
+
+	void LoadCallTargets() {
+		if (!KeepCallTargets() || call_targets_path.empty()) {
+			return;
+		}
+		std::ifstream file(call_targets_path);
+		if (!file) {
+			return;
+		}
+		std::string line;
+		const auto  next_line = [&] {
+            if (!std::getline(file, line)) {
+                return false;
+            }
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            return true;
+		};
+		if (!next_line() || line != CallTargetsHeader) {
+			// Written anew at the end of the run (only this file's writer reads it).
+			PipelineCacheLog("Table call targets: {} is not one this build reads; it is written "
+			                 "anew",
+			                 Common::PathToString(call_targets_path));
+			return;
+		}
+		uint64_t targets = 0;
+		while (next_line() && targets < MaxKeptCallTargets) {
+			uint64_t hash   = 0;
+			uint64_t target = 0;
+			if (std::sscanf(line.c_str(), "%" SCNx64 " %" SCNx64, &hash, &target) != 2 ||
+			    hash == 0 || target == 0) {
+				continue;
+			}
+			(void)ShaderRecompiler::Decoder::ReportShaderCallMiss(hash, {target, 0u, 0u});
+			call_shaders.insert(hash);
+			targets++;
+		}
+		PipelineCacheLog("Table call targets: {} of {} shaders from earlier runs", targets,
+		                 call_shaders.size());
+	}
+
+	void SaveCallTargets() {
+		if (!KeepCallTargets() || call_targets_path.empty() || call_shaders.empty()) {
+			return;
+		}
+		std::vector<uint64_t> hashes(call_shaders.begin(), call_shaders.end());
+		std::sort(hashes.begin(), hashes.end());
+		std::string text    = std::string(CallTargetsHeader) + "\n";
+		uint64_t    targets = 0;
+		for (const auto hash: hashes) {
+			// A shader whose last expansion gave up outside any inlined body starts from no
+			// targets again, as before round 95 (from its last set it would give up at once).
+			const auto reported = gave_up_call_shaders.contains(hash)
+			                          ? nullptr
+			                          : ShaderRecompiler::Decoder::ShaderCallMissTargets(hash);
+			if (reported == nullptr) {
+				continue;
+			}
+			for (const auto& variant: *reported) {
+				if (variant.data0 != 0u || variant.data1 != 0u || targets >= MaxKeptCallTargets ||
+				    excluded_call_targets.contains(variant.target)) {
+					continue;
+				}
+				text += fmt::format("{:016x} {:016x}\n", hash, variant.target);
+				targets++;
+			}
+		}
+		auto temp_path = call_targets_path;
+		temp_path += ".tmp";
+		{
+			std::ofstream file(temp_path, std::ios::binary | std::ios::trunc);
+			file << text;
+			if (!file.flush()) {
+				PipelineCacheLog("Table call targets: failed to write {}",
+				                 Common::PathToString(temp_path));
+				return;
+			}
+		}
+		std::error_code error;
+		std::filesystem::rename(temp_path, call_targets_path, error);
+		if (error) {
+			PipelineCacheLog("Table call targets: failed to write {}",
+			                 Common::PathToString(call_targets_path));
+			return;
+		}
+		PipelineCacheLog("Table call targets: {} kept for the next run", targets);
 	}
 	~ProgramCache() {
 		for (const auto& [key, entry]: programs) {
@@ -3051,6 +3185,9 @@ struct PipelineCache::ProgramCache {
 		} else {
 			ok = expand(params.hash);
 		}
+		if (ok && !expanded.empty() && params.hash != 0 && call_shaders.size() < 65536) {
+			call_shaders.insert(params.hash);
+		}
 		if (ok && expanded.empty() && summary.empty() && params.hash != 0) {
 			if (call_free.size() >= 65536) {
 				call_free.clear();
@@ -3126,6 +3263,16 @@ struct PipelineCache::ProgramCache {
 	bool                                                        disk_verify  = false;
 	uint64_t                                                    disk_lookups = 0;
 	std::unique_ptr<ShaderDiskCache::Store>                     disk;
+	// Round 95: call_targets.txt in the shader cache folder, and the shaders whose table call
+	// targets go into it (LoadCallTargets, SaveCallTargets).
+	static constexpr const char* CallTargetsHeader  = "kyty table call targets 1";
+	static constexpr uint64_t    MaxKeptCallTargets = 65536;
+	std::filesystem::path        call_targets_path;
+	std::unordered_set<uint64_t> call_shaders;
+	// Targets an expansion left out after their inlined bodies failed resource tracking, and
+	// shaders whose expansion gave up outside any inlined body: not kept.
+	std::unordered_set<uint64_t> excluded_call_targets;
+	std::unordered_set<uint64_t> gave_up_call_shaders;
 	// Removes the disk cache's entries no build of this recompiler can read (PruneShaderCache).
 	std::jthread disk_pruner;
 	// Graphics translations in progress on the workers (KYTY_ASYNC_TRANSLATION), by program.
@@ -5015,7 +5162,12 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 		return inserted_iter->second.get();
 	}
 	const auto threshold = ComputeBackgroundWords();
-	if (threshold == 0 || compute_program.spirv_words < threshold) {
+	// Round 95: an expansion that inlined called functions from a tenth of that: one of 563,699
+	// words took the driver 15.6 s, one of 387,140 5.9 s (unexpanded shaders of 400,000 words
+	// compile in well under a second).
+	const auto background_from =
+	    compute_program.inlined_calls ? std::max<uint32_t>(threshold / 10u, 1u) : threshold;
+	if (threshold == 0 || compute_program.spirv_words < background_from) {
 		return &GetComputePipeline(input_info, compute_program);
 	}
 	const auto hash =

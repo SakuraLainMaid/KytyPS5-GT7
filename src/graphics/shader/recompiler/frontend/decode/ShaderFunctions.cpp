@@ -737,7 +737,7 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 	return true;
 }
 
-// A target of a table with record data (specialized or not) that has a loop is left to the miss
+// A target of a table with record data (specialized or not) that has a loop was left to the miss
 // path unless KYTY_CALL_LOOPS=1, which inlines it with its loops bounded (ShaderCallLoopCap).
 // Bounding the back edges was not enough: every garage visit and music rally load with them
 // inlined lost the device in GT7's material pass (2026-10-12). Its looping material functions use
@@ -749,11 +749,13 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 // (WaterfallFlag), the loops end at their headers once the budget is spent (BudgetLoopHeaders in
 // Translate.cpp), and a pointer outside guest memory no longer indexes past the page table
 // (DefineGetBdaPointer); whether that is enough is what KYTY_CALL_LOOPS=1 tests. On the miss
-// path the lanes that select one go unshaded (the unpainted cars).
+// path the lanes that select one go unshaded (the unpainted cars). Round 95: on by default
+// (KYTY_CALL_LOOPS=0 turns it off): with them inlined the ray tracing mode's garage shaded its
+// reflections, ten minutes and more without a device loss (round 94).
 std::atomic_bool& LoopingVariantsSwitch() {
 	static std::atomic_bool value = [] {
 		const char* text = std::getenv("KYTY_CALL_LOOPS");
-		return text != nullptr && text[0] == '1';
+		return text == nullptr || text[0] != '0';
 	}();
 	return value;
 }

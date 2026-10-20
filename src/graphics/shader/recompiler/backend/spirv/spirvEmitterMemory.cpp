@@ -1434,10 +1434,18 @@ void EmitShaderTrap(EmitterState& state, uint32_t pc, uint32_t code, uint32_t ta
 	const auto xor_ = [&](uint32_t a, uint32_t b) {
 		return Binary(state, spv::OpBitwiseXor, u32, a, b);
 	};
-	const auto hashed = mix(xor_(xor_(xor_(target_low, mix(target_high, 0x85ebca77u)),
-	                                  mix(data0, 0xc2b2ae3du)),
-	                             mix(data1, 0x27d4eb2fu)),
-	                        0x9e3779b1u);
+	// The shader is part of the key: material passes that call the same material function each
+	// report it. With the target and data alone, the pass that ran first in a frame took the
+	// slot, and every later one found its key there, "already reported": they never learned the
+	// function while the first trapped on it too, and their lanes that call it stayed on the
+	// miss path (unshaded reflections in the ray tracing mode).
+	const auto shader_word =
+	    static_cast<uint32_t>(state.program.shader_hash ^ (state.program.shader_hash >> 32u));
+	const auto hashed = mix(
+	    xor_(xor_(xor_(xor_(target_low, mix(target_high, 0x85ebca77u)), mix(data0, 0xc2b2ae3du)),
+	              mix(data1, 0x27d4eb2fu)),
+	         ConstantU32(state, shader_word * 0x165667b1u)),
+	    0x9e3779b1u);
 	const auto key = Binary(state, spv::OpBitwiseOr, u32, hashed, ConstantU32(state, 1));
 	const auto first = Binary(
 	    state, spv::OpShiftRightLogical, u32, hashed,

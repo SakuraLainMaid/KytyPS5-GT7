@@ -1512,8 +1512,8 @@ void CheckShaderFunctionTableVariants() {
   Require(name, "one selection tree", count(expanded, 0xbf068080u) == 0,
           "a dead incoming SCC still produced a second selection tree");
 
-  // A callee with a loop is left to the miss path; KYTY_CALL_LOOPS=1 inlines it
-  // between the loop-bound brackets.
+  // A callee with a loop is inlined between the loop-bound brackets (the default
+  // since round 95); KYTY_CALL_LOOPS=0 leaves it to the miss path.
   constexpr uint64_t callee_loop = 0x10001000ull;
   store(callee_loop, {EncodeVop1(0x01u, 0, InlineU32(1)), EncodeSopp(0x05u, 0xfffeu),
                       EncodeSop1(0x20u, 0, 14)});
@@ -1740,9 +1740,9 @@ void CheckShaderFunctionRuntimeRecords() {
   fill_records(20, 0xa000u, true);
   (void)ShaderRecompiler::Decoder::ReportShaderCallMiss(hash, {callee_loop, 0xa200u, 0x7u});
   absorb();
-  // Looping functions stay on the miss path by default (a fresh expander: the
-  // switch is not part of an expansion's key, as it never changes while the
-  // emulator runs).
+  // Looping functions on the miss path (KYTY_CALL_LOOPS=0; a fresh expander:
+  // the switch is not part of an expansion's key, as it never changes while
+  // the emulator runs).
   const u32 loop_body = EncodeSop2(0x01u, 20, 20, InlineU32(1));
   const bool loops_inlined =
       ShaderRecompiler::Decoder::ShaderCallLoopsInlined();

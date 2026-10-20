@@ -82,7 +82,11 @@ zipped `_kyty.txt` log).
 - **Bindless textures are now the recommended setting** (launcher, game settings): it costs
   nothing measurable in a race, and the ray tracing mode needs it (without it the reflection
   passes of that mode never run). A texture slot the game is rewriting no longer ends the
-  emulator with "unknown format".
+  emulator ("unknown format", "texture base layer is out of bounds").
+- **The ray tracing mode's reflections are shaded** (garage tested). The first visit compiles
+  the reflection passes in the background for a minute or more each; the car shows wrong
+  colours until they are done. Close the game normally afterwards: the compiled passes and the
+  materials they need are saved, and the next visit has them at once.
 
 Known problems in this build:
 
