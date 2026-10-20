@@ -1435,9 +1435,39 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	bindings.shared_memory = {storage.Handle(), 0, size};
 }
 
+// Round 99: a shader whose call is partitioned (ShaderCallPartition) runs once per partition,
+// each partition's lanes in its own dispatch; the first one also tells which partitions there are.
+// A partition whose program translates or compiles is skipped meanwhile (its lanes keep what the
+// last dispatch wrote there), as a dispatch is.
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
+	PipelineCache::ComputePartition partition;
+	DispatchDirectPart(submit_id, buffer, thread_group_x, thread_group_y, thread_group_z, mode,
+	                   &partition);
+	const auto targets = partition.targets;
+	for (size_t i = 1; i < targets.size(); i++) {
+		partition.target = targets[i];
+		DispatchDirectPart(submit_id, buffer, thread_group_x, thread_group_y, thread_group_z, mode,
+		                   &partition);
+	}
+}
+
+void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
+                                      uint32_t mode) {
+	PipelineCache::ComputePartition partition;
+	DispatchIndirectPart(submit_id, buffer, args_addr, mode, &partition);
+	const auto targets = partition.targets;
+	for (size_t i = 1; i < targets.size(); i++) {
+		partition.target = targets[i];
+		DispatchIndirectPart(submit_id, buffer, args_addr, mode, &partition);
+	}
+}
+
+void RenderExecutor::DispatchDirectPart(uint64_t submit_id, CommandBuffer& buffer,
+                                        uint32_t thread_group_x, uint32_t thread_group_y,
+                                        uint32_t thread_group_z, uint32_t mode,
+                                        PipelineCache::ComputePartition* partition) {
 	const GpuPhases::Scope dispatch_phase(GpuPhases::Phase::Dispatch);
 	const GpuPhases::OpStats op_stats(true);
 	EXIT_IF(buffer.IsInvalid());
@@ -1532,7 +1562,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		KYTY_PROFILER_BLOCK("Dispatch::GetComputeProgram");
 		const GpuPhases::Scope phase(GpuPhases::Phase::DispatchProgram);
 		compute_program =
-		    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+		    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info, partition);
+	}
+	if (FrameGraph::Logging() && partition != nullptr && !partition->targets.empty()) {
+		FrameGraph::Log("  partition for target 0x%012" PRIx64 " (%zu partitions)",
+		                partition->target != 0 ? partition->target : partition->targets.front(),
+		                partition->targets.size());
 	}
 	if (!compute_program) {
 		char groups[48];
@@ -1872,8 +1907,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ResetBindings();
 }
 
-void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
-                                      uint32_t mode) {
+void RenderExecutor::DispatchIndirectPart(uint64_t submit_id, CommandBuffer& buffer,
+                                          uint64_t args_addr, uint32_t mode,
+                                          PipelineCache::ComputePartition* partition) {
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0);
 	// The arguments are thread counts: IndirectDispatchGroups converts them on the GPU, and the
 	// shader bounds its threads by the counts it reads from the same memory.
@@ -1912,9 +1948,14 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	input_info.dispatch_thread_dimensions   = use_thread_dimensions;
 	input_info.dispatch_dimensions_indirect = use_thread_dimensions;
 	GpuPhases::Scope program_phase(GpuPhases::Phase::DispatchProgram);
-	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
-	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	const auto       compute_program = m_context.GetPipelineCache().GetComputeProgram(
+        cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info, partition);
 	program_phase.End();
+	if (FrameGraph::Logging() && partition != nullptr && !partition->targets.empty()) {
+		FrameGraph::Log("  partition for target 0x%012" PRIx64 " (%zu partitions)",
+		                partition->target != 0 ? partition->target : partition->targets.front(),
+		                partition->targets.size());
+	}
 	if (!compute_program) {
 		LogSkippedDispatch(cs_regs, "indirect");
 		if (FrameGraph::Logging()) {

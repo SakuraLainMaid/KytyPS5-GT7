@@ -72,7 +72,15 @@ U1 IREmitter::GetExec() {
 	return U1(Emit(ValueOpcode::GetExec));
 }
 
+U32 IREmitter::DroppedMaskWord(uint32_t word) {
+	const auto mask = Emit(ValueOpcode::Ballot, {GetGotoVariable(LaneDropVariable)});
+	return CompositeExtract(mask, word);
+}
+
 void IREmitter::SetExec(U1 value) {
+	if (lane_drop) {
+		value = LogicalAnd(value, LogicalNot(GetGotoVariable(LaneDropVariable)));
+	}
 	Emit(ValueOpcode::SetExec, {value});
 }
 
@@ -81,6 +89,9 @@ U32 IREmitter::GetExecLo() {
 }
 
 void IREmitter::SetExecLo(U32 value) {
+	if (lane_drop) {
+		value = BitwiseAnd(value, BitwiseNot(DroppedMaskWord(0)));
+	}
 	Emit(ValueOpcode::SetExecLo, {value});
 }
 
@@ -89,6 +100,9 @@ U32 IREmitter::GetExecHi() {
 }
 
 void IREmitter::SetExecHi(U32 value) {
+	if (lane_drop && lane_drop_wave64) {
+		value = BitwiseAnd(value, BitwiseNot(DroppedMaskWord(1)));
+	}
 	Emit(ValueOpcode::SetExecHi, {value});
 }
 

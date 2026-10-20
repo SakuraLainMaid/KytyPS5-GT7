@@ -17,12 +17,16 @@ using ShaderCodeReader = std::function<bool(uint64_t, std::span<uint32_t>)>;
 // s_trap instructions are no-ops, as on retail hardware; only this code reports a trap.
 constexpr uint32_t ShaderCallMissTrapCode = 0x7fu;
 
-// The expansion's miss trap names the scalar pair holding the missed target in the upper byte
-// of its immediate: simm16 = ShaderCallMissTrapCode | ((target_reg + 1) << 8). Zero there means
-// the trap does not name one. The trap reports s[target_reg .. target_reg + 3]: the target and
-// the pair after it (a specialized variant's data).
-constexpr uint32_t ShaderCallMissTrapImmediate(uint32_t target_reg) {
-	return ShaderCallMissTrapCode | (((target_reg + 1u) & 0xffu) << 8u);
+// The expansion's miss trap names the scalar pair holding the missed target in bits 8-14 of its
+// immediate: simm16 = ShaderCallMissTrapCode | ((target_reg + 1) << 8). Zero there means the trap
+// does not name one. The trap reports s[target_reg .. target_reg + 3]: the target and the pair
+// after it (a specialized variant's data). With ShaderCallMissDropFlag the trap also drops the
+// lanes that reach it: they leave EXEC for the rest of the wave, and no later write of EXEC
+// brings them back (a partitioned expansion, ShaderCallPartition).
+constexpr uint32_t ShaderCallMissDropFlag = 0x8000u;
+constexpr uint32_t ShaderCallMissTrapImmediate(uint32_t target_reg, bool drop = false) {
+	return ShaderCallMissTrapCode | (((target_reg + 1u) & 0x7fu) << 8u) |
+	       (drop ? ShaderCallMissDropFlag : 0u);
 }
 
 // Call-miss feedback. A table can hold more targets than one expansion can inline (GT7's material
@@ -73,6 +77,30 @@ uint32_t           ShaderCallLoopCap();
 // unless KYTY_RAY_HIT_CALLS=1 (RayHitCallsReturn in ShaderFunctions.cpp).
 uint32_t ShaderRayLoopCap();
 
+// Partitioned expansions (round 99; KYTY_CALL_PARTITIONS=0 turns them off): a shader whose one
+// call is a material table of runtime records is expanded once per target, each expansion
+// inlining that target alone, and dispatched once per expansion. The lanes that call another
+// target leave the wave at the call (ShaderCallMissDropFlag), so each lane runs its material in
+// exactly one of the dispatches, and the shader's stores are those of one dispatch with every
+// target inlined. The driver's compile time grows faster than linearly with a pipeline's size:
+// an expansion with every target of a garage material pass (9 million SPIR-V words) did not
+// finish compiling in ten minutes, one with one target takes seconds. Only shaders whose code
+// stays correct with lanes dropped there are partitioned (no LDS sharing, barriers, lane reads
+// or atomics outside the inlined bodies: PartitionableShader in ShaderFunctions.cpp).
+struct ShaderCallPartition {
+	// In: the target whose expansion to build; 0 for the first one.
+	uint64_t target = 0;
+	// Out: the targets of the shader's partitions (ascending), each one dispatch; one zero entry
+	// when the shader is partitioned but has no target yet (one dispatch whose lanes all leave at
+	// the call, reporting their targets); empty when the shader is not partitioned.
+	std::vector<uint64_t> targets;
+};
+bool ShaderCallPartitions();
+void SetShaderCallPartitions(bool value);
+// Diagnostics (shader_batch_tool --partition-check): why the code outside a shader's call keeps
+// it from being partitioned, or empty when it would be (its call permitting).
+std::string ShaderCallPartitionCheck(std::span<const uint32_t> code);
+
 // Expands scalar calls through immutable pointers or bounded scalar-buffer tables.
 // Table calls retain runtime selection and trap on targets outside the captured set.
 // Empty output means no calls; unresolved calls never discard guest instructions.
@@ -104,9 +132,12 @@ public:
 	// and a scene with new materials rebuilds only the shaders that call them. summary, when
 	// given, receives a line about a new expansion that leaves table targets out (empty
 	// otherwise).
+	// partition, when given: the shader's partitioned expansion for partition->target, if it is
+	// partitioned (partition->targets says so); the expansion with every target otherwise.
 	bool Expand(std::span<const uint32_t> code, uint64_t base, std::span<const uint32_t> user_data,
 	            const ShaderCodeReader& read, std::vector<uint32_t>& expanded, std::string& reason,
-	            uint32_t wave_size, uint64_t shader_hash, std::string* summary);
+	            uint32_t wave_size, uint64_t shader_hash, std::string* summary,
+	            ShaderCallPartition* partition = nullptr);
 	// The translation of an expansion this expander produced failed at `pc` (bytes into the
 	// expanded code): the table target whose inlined body holds pc is left out of later
 	// expansions, of every shader, and takes the miss path instead. Returns that target, or 0

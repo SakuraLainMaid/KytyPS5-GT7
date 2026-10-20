@@ -6,6 +6,7 @@
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
 
@@ -299,9 +300,16 @@ public:
 	bool DrawPrepDescribeCompute(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
 	                             const ShaderComputeInputInfo& input_info, DrawPrepInputs& inputs);
 	bool DrawPrepWalk(const DrawPrepInputs& inputs, DrawPrep::PacketResult& out);
+	// Round 99: `partition`, when given, asks for the program of the partition of
+	// partition->target (ShaderCallPartition: 0 for the first one) when the shader's call is
+	// partitioned, and receives every partition's target (empty when it is not partitioned); the
+	// dispatch then runs once per partition. A partition's program may come back empty while it
+	// translates or waits for its turn: that partition is skipped meanwhile.
+	using ComputePartition = ShaderRecompiler::Decoder::ShaderCallPartition;
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
-	                                ShaderComputeInputInfo&      input_info);
+	                                ShaderComputeInputInfo&      input_info,
+	                                ComputePartition*            partition = nullptr);
 	// Whether the shader at this address is on the skip list (--skip-shaders): its dispatches can
 	// be dropped before anything is prepared for them.
 	[[nodiscard]] static bool IsSkipListed(uint64_t shader_addr);
@@ -346,6 +354,9 @@ private:
 	// an expansion the newest ready one of its shader), and the one still compiling for a shader.
 	void                     ReapBackgroundCompute();
 	const BackgroundCompute* CompilingCompute(uint64_t shader_hash) const;
+	// Round 99: the expanded code of the shader's pipeline compiling in the background, or else of
+	// one waiting for a compile slot; null when neither.
+	const std::vector<uint32_t>* PendingExpansion(uint64_t shader_hash) const;
 	// Save, done with the driver cache: destroyed, or kept while background compiles use it.
 	void ReleaseDriverCache(size_t still_compiling);
 	struct ProgramCache;
@@ -418,6 +429,18 @@ private:
 	std::unordered_map<uint64_t, std::unique_ptr<BackgroundCompute>> m_compute_background;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>>          m_compute_waiting;
 	std::unordered_set<uint64_t>                                     m_compute_wait_logged;
+	// Round 99: the waiting programs' shaders and expanded code (PendingExpansion).
+	struct WaitingExpansion {
+		uint64_t              hash = 0;
+		std::vector<uint32_t> code;
+	};
+	std::unordered_map<uint64_t, WaitingExpansion> m_compute_waiting_expansions;
+	// Round 99: the shaders whose call is partitioned (by hash), their partitions' programs (by
+	// id: their pipelines compile alongside each other), and when the next new partition's SPIR-V
+	// may be made (GetComputeProgram).
+	std::unordered_set<uint64_t>                            m_partitioned_shaders;
+	std::unordered_set<uint64_t>                            m_partition_programs;
+	std::chrono::steady_clock::time_point                   m_partition_next_build {};
 	std::unique_ptr<PipelineCompiler>                       m_compiler;
 	uint64_t                                                m_deferred_draws = 0;
 	// Round 87: whether a new pipeline is first looked up in the driver's caches alone

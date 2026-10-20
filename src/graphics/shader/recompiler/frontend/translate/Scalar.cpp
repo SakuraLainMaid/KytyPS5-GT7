@@ -229,17 +229,31 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 			// Retail GPUs run with traps disabled, so a guest assert falls through. Only a
 			// shader-call target outside the expanded set reports a trap.
 			if (inst.src0.value == Decoder::ShaderCallMissTrapCode) {
-				// The expansion names the scalar pair holding the missed target in the upper
-				// byte (ShaderCallMissTrapImmediate); the trap reports the target.
-				const uint32_t named = (inst.raw[0] >> 8u) & 0xffu;
+				// The expansion names the scalar pair holding the missed target in bits 8-14
+				// (ShaderCallMissTrapImmediate); the trap reports the target.
+				const uint32_t           named = (inst.raw[0] >> 8u) & 0x7fu;
 				std::array<IR::Value, 4> words {IR::Value(0u), IR::Value(0u), IR::Value(0u),
 				                                IR::Value(0u)};
 				for (uint32_t word = 0; word < 4u; ++word) {
 					const uint32_t reg = named - 1u + word;
 					if (named != 0u && reg < 106u) words[word] = ReadScalarCode(reg);
 				}
-				ir.Emit(IR::ValueOpcode::ShaderTrap, {IR::Value(inst.pc), IR::Value(inst.src0.value),
-				                                      words[0], words[1], words[2], words[3]});
+				// The code keeps the drop flag: the report of a partitioned expansion's miss is
+				// keyed by its target alone (EmitShaderTrap).
+				const bool drop = (inst.raw[0] & Decoder::ShaderCallMissDropFlag) != 0u;
+				ir.Emit(IR::ValueOpcode::ShaderTrap,
+				        {IR::Value(inst.pc),
+				         IR::Value(inst.src0.value | (drop ? Decoder::ShaderCallMissDropFlag : 0u)),
+				         words[0], words[1], words[2], words[3]});
+				if (drop) {
+					// A partitioned expansion's miss: its lanes run their target in another
+					// partition's dispatch, and leave this one here (EnableLaneDrop).
+					const auto dropped = ir.GetGotoVariable(IR::LaneDropVariable);
+					ir.SetGotoVariable(IR::LaneDropVariable, ir.LogicalOr(dropped, ir.GetExec()));
+					ir.SetExec(IR::U1(IR::Value(false)));
+					ir.SetExecLo(IR::U32(IR::Value(0u)));
+					ir.SetExecHi(IR::U32(IR::Value(0u)));
+				}
 			} else {
 				EmitControlNop();
 			}

@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <array>
+#include <bit>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -230,7 +231,50 @@ uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	return result;
 }
 
-uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+namespace {
+
+// Whether an F32 operand is known to hold no denormal, so that flushing it changes nothing: a
+// constant that is not one, or what cannot be one (a legacy MAD's flushed result, a whole number
+// rounded or converted, a half converted up), through bit casts and selects of such values.
+bool KnownFlushedF32(const IR::Value& operand, uint32_t depth = 0) {
+	const auto value = operand.Resolve();
+	if (value.IsImmediate()) {
+		const auto bits = value.GetType() == IR::Type::F32
+		                      ? std::bit_cast<uint32_t>(value.F32Value())
+		                  : value.GetType() == IR::Type::U32 ? value.U32()
+		                                                     : 1u;
+		return (bits & 0x7f800000u) != 0u || (bits & 0x7fffffffu) == 0u;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || depth > 8u) {
+		return false;
+	}
+	switch (inst->GetOpcode()) {
+		case IR::ValueOpcode::FPMad32:
+		case IR::ValueOpcode::FPFloor32:
+		case IR::ValueOpcode::FPCeil32:
+		case IR::ValueOpcode::FPTrunc32:
+		case IR::ValueOpcode::FPRoundEven32:
+		case IR::ValueOpcode::ConvertF32S32:
+		case IR::ValueOpcode::ConvertF32U32:
+		case IR::ValueOpcode::ConvertF32F16: return true;
+		case IR::ValueOpcode::BitCastF32U32:
+		case IR::ValueOpcode::BitCastU32F32: return KnownFlushedF32(inst->Arg(0), depth + 1u);
+		case IR::ValueOpcode::SelectF32:
+		case IR::ValueOpcode::SelectU32:
+			return KnownFlushedF32(inst->Arg(1), depth + 1u) &&
+			       KnownFlushedF32(inst->Arg(2), depth + 1u);
+		default: return false;
+	}
+}
+
+} // namespace
+
+uint32_t EmitFPMad32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state = ctx.state;
+	const auto a     = ctx.Arg(inst, 0);
+	const auto b     = ctx.Arg(inst, 1);
+	const auto c     = ctx.Arg(inst, 2);
 	// Legacy MAD/MAC round and flush between multiply and add, irrespective of SP_DENORM. Round
 	// 98: under DenormFlushToZero, FMul and FAdd flush their denormal results themselves (and may
 	// flush denormal operands; NVIDIA's FTZ arithmetic does), which these shaders' float mode asks
@@ -242,14 +286,51 @@ uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 		state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
 		return sum;
 	}
-	a = EmitFlushF32DenormToSignedZero(state, a);
-	b = EmitFlushF32DenormToSignedZero(state, b);
-	c = EmitFlushF32DenormToSignedZero(state, c);
+	// Round 99: an operand known to hold no denormal (KnownFlushedF32) is not flushed again; a
+	// MAD's operands are often the results of MADs.
+	const auto known = [&](size_t index) { return KnownFlushedF32(inst.Arg(index)); };
+	if (!state.float_controls) {
+		// Without SignedZeroInfNanPreserve a product with zero may fold to +0: the flushes by
+		// the values' bits.
+		const auto flush = [&](uint32_t value, size_t index) {
+			return known(index) ? value : EmitFlushF32DenormToSignedZero(state, value);
+		};
+		const auto product = EmitFPMul32(state, flush(a, 0), flush(b, 1));
+		state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
+		const auto sum =
+		    EmitFPAdd32(state, EmitFlushF32DenormToSignedZero(state, product), flush(c, 2));
+		state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
+		return EmitFlushF32DenormToSignedZero(state, sum);
+	}
+	// Round 99: a flush selects the value or the value times zero (its signed zero; NaN for an
+	// infinity or a NaN), on whether it is at least the smallest normal in magnitude (false for a
+	// NaN). The product's three flushes are one test: a denormal factor makes the product the
+	// product times zero, as the flushed factor would (zero, or NaN times an infinity). The same
+	// result bit for bit, whether or not the host flushes denormals itself, in a third fewer words
+	// (MADs were a third of a material pass's SPIR-V).
+	const auto f32        = TypeF32(state);
+	const auto boolean    = TypeBool(state);
+	const auto min_normal = ConstantF32(state, 0x00800000u);
+	const auto normal     = [&](uint32_t value) {
+        return Binary(state, spv::OpFOrdGreaterThanEqual, boolean,
+		                  EmitGlsl<GLSLstd450FAbs, IR::Type::F32>(state, value), min_normal);
+	};
+	const auto flushed = [&](uint32_t value, uint32_t keep) {
+		return Select(state, f32, keep, value,
+		              Binary(state, spv::OpFMul, f32, value, ConstantF32Value(state, 0.0f)));
+	};
 	const auto product = EmitFPMul32(state, a, b);
 	state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
-	const auto sum = EmitFPAdd32(state, EmitFlushF32DenormToSignedZero(state, product), c);
+	auto keep = normal(product);
+	for (size_t index = 0; index < 2u; index++) {
+		if (!known(index)) {
+			keep = Binary(state, spv::OpLogicalAnd, boolean, keep, normal(index == 0 ? a : b));
+		}
+	}
+	const auto addend = known(2) ? c : flushed(c, normal(c));
+	const auto sum    = EmitFPAdd32(state, flushed(product, keep), addend);
 	state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
-	return EmitFlushF32DenormToSignedZero(state, sum);
+	return flushed(sum, normal(sum));
 }
 
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {

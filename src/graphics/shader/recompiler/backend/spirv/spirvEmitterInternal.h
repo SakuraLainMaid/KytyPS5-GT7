@@ -174,6 +174,18 @@ struct EmitterState {
 	uint32_t runtime_image_table_variable = 0;
 	// The buffer formats' layouts for formatted loads through GPU-selected V#s (a Private array).
 	uint32_t                   indirect_format_table                 = 0;
+	// Round 99: the texture formats' component classes for runtime images (a Private array,
+	// RuntimeImageNumericClass), and the runtime image lookups of the IR block being emitted, by
+	// T# and binding: another sample of the same T# in the block takes the lookup made for it.
+	uint32_t runtime_image_class_table = 0;
+	struct RuntimeImageLookup {
+		std::array<uint32_t, 8> dwords {};
+		uint32_t                binding       = 0;
+		uint32_t                numeric_class = 0;
+		uint32_t                slot          = 0;
+	};
+	const IR::Block*                runtime_image_lookups_block = nullptr;
+	std::vector<RuntimeImageLookup> runtime_image_lookups;
 	// The invocation's loop budget (LoopBudgetTick): a Private u32 holding what is left.
 	uint32_t                   loop_budget_variable                  = 0;
 	uint32_t                   runtime_image_requests_variable       = 0;
@@ -509,6 +521,9 @@ inline constexpr auto EmitTBufferSelectF32 =
 bool IsSignedFormatComponent(Format::ComponentType type);
 
 uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits);
+// As EmitUFloatToF32Bits for an unsigned float with a 5-bit exponent whose mantissa width (6 for
+// the 11-bit floats, 5 for the 10-bit ones) is known only at run time.
+uint32_t EmitUFloatToF32BitsRuntime(EmitterState& state, uint32_t raw, uint32_t mantissa_bits);
 
 uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                   uint32_t component, uint32_t raw);

@@ -957,10 +957,30 @@ static uint32_t RuntimeImageNumericClass(EmitterState&                  state,
 	}();
 	const auto format =
 	    EmitBitFieldUExtract(state, dwords[1], ConstantU32(state, 20), ConstantU32(state, 9));
-	const auto word = EmitIndexSwitch(
-	    state,
-	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), format, ConstantU32(state, 4)), 32u,
-	    TypeU32(state), [&](uint32_t index) { return ConstantU32(state, table[index]); });
+	// Round 99: a Private array, where a switch over its 32 words took ~300 SPIR-V words a sample.
+	if (state.runtime_image_class_table == 0) {
+		const auto array_type =
+		    state.builder.Type(spv::OpTypeArray, TypeU32(state),
+		                       ConstantU32(state, static_cast<uint32_t>(table.size())));
+		std::vector<uint32_t> operands;
+		operands.reserve(table.size());
+		for (const auto word: table) {
+			operands.push_back(ConstantU32(state, word));
+		}
+		const auto initializer = state.builder.Constant(spv::OpConstantComposite, array_type,
+		                                                std::span<const uint32_t>(operands));
+		state.runtime_image_class_table = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassPrivate, array_type), spv::StorageClassPrivate,
+		    initializer);
+		state.builder.AddName(state.runtime_image_class_table, "runtime_image_class_table");
+	}
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpAccessChain, TypePointer(state, spv::StorageClassPrivate, TypeU32(state)), pointer,
+	    state.runtime_image_class_table,
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), format, ConstantU32(state, 4)));
+	const auto word = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), word, pointer);
 	const auto shift =
 	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
 	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), format, ConstantU32(state, 15)),
@@ -1182,8 +1202,29 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			           RuntimeQueryDimensions(ctx, mem, *address, image.dimension, runtime_dwords));
 			return;
 		}
-		runtime_class       = RuntimeImageNumericClass(state, runtime_dwords);
-		state.bindless_slot = RuntimeImageSlot(ctx, image, runtime_dwords);
+		// Round 99: a T# its IR block looked up already takes that lookup (the material
+		// functions sample some textures more than once; each lookup is ~1,700 SPIR-V words).
+		// Within a block the earlier lookup's results dominate the later sample.
+		if (state.runtime_image_lookups_block != state.current_block) {
+			state.runtime_image_lookups_block = state.current_block;
+			state.runtime_image_lookups.clear();
+		}
+		const auto binding = RuntimeImageBinding(image);
+		const auto cached =
+		    std::find_if(state.runtime_image_lookups.begin(), state.runtime_image_lookups.end(),
+		                 [&](const auto& lookup) {
+			                 return lookup.binding == binding && lookup.dwords == runtime_dwords;
+		                 });
+		if (cached != state.runtime_image_lookups.end() &&
+		    state.program.stage == ShaderType::Compute) {
+			runtime_class       = cached->numeric_class;
+			state.bindless_slot = cached->slot;
+		} else {
+			runtime_class       = RuntimeImageNumericClass(state, runtime_dwords);
+			state.bindless_slot = RuntimeImageSlot(ctx, image, runtime_dwords);
+			state.runtime_image_lookups.push_back(
+			    {runtime_dwords, binding, runtime_class, state.bindless_slot});
+		}
 		if (op != IR::ValueOpcode::ImageRead) {
 			// Sampling reads the float array: a texture of another class samples the placeholder.
 			const auto slot = state.builder.AllocateId();

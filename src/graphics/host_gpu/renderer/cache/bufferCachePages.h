@@ -50,7 +50,9 @@ struct ShaderCallMissSlot {
 	uint32_t shader_hash_high = 0;
 	uint32_t reserved         = 0;
 };
-inline constexpr uint32_t kShaderCallMissSlots  = 256;
+// Round 99: 512 (was 256): a frame of the ray tracing mode reports a hundred targets or more,
+// the partitioned shaders' (ShaderCallPartition) each frame again.
+inline constexpr uint32_t kShaderCallMissSlots  = 512;
 inline constexpr uint32_t kShaderCallMissProbes = 8;
 static_assert(sizeof(ShaderCallMissSlot) == 32);
 

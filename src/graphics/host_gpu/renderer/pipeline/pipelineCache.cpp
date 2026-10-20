@@ -1809,6 +1809,11 @@ struct TranslationJob {
 	std::vector<uint32_t>                user_data;
 	ShaderVertexInputInfo                vertex {};
 	ShaderPixelInputInfo                 pixel {};
+	// Round 99: a compute shader's partition (ShaderCallPartition), which may be skipped while it
+	// translates; and where its resource tracking failed (UINT32_MAX: it did not), which the
+	// worker's thread knows.
+	ShaderComputeInputInfo                compute {};
+	uint32_t                              failure_pc = UINT32_MAX;
 	ShaderRecompiler::CompileOptions     options;
 	ShaderRecompiler::TranslateResult    result;
 	std::chrono::steady_clock::time_point queued;
@@ -1858,6 +1863,9 @@ private:
 				m_queue.pop_front();
 			}
 			job->result = ShaderRecompiler::TranslateProgram(job->code, job->options);
+			if (job->result.unsupported) {
+				job->failure_pc = ShaderRecompiler::IR::LastResourceTrackingFailurePc();
+			}
 			job->done.store(true, std::memory_order_release);
 		}
 	}
@@ -2660,6 +2668,40 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			if (call_partition != nullptr && !call_partition->targets.empty()) {
+				// Round 99: a partition's program (ShaderCallPartition) translates on the workers
+				// while its dispatch is skipped, as a 3D draw's shaders do: the other partitions
+				// run meanwhile. Its SPIR-V is made here, at most as often as
+				// GetComputeProgram's budget lets (partition_budget): a scene with new materials
+				// brings dozens of partitions at once.
+				if (translators != nullptr && !translating.contains(lookup_key)) {
+					auto job = std::make_shared<TranslationJob>();
+					job->code.assign(compile_code.begin(), compile_code.end());
+					job->user_data.assign(user_data.begin(), user_data.end());
+					job->options                    = options;
+					job->options.user_data          = job->user_data;
+					job->options.back_code          = {};
+					job->compute                    = input_info;
+					job->options.input_info.compute = &job->compute;
+					job->queued                     = std::chrono::steady_clock::now();
+					translating.emplace(lookup_key, job);
+					translators->Submit(std::move(job));
+					translation_skips++;
+					GpuPhases::Count(GpuPhases::Phase::TranslationSkip, 1);
+					Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": translating",
+					                                StageLabel(stage), params.hash);
+					return ShaderProgram {};
+				}
+				if (!partition_budget) {
+					Profiler::CommandZone::Annotate("skipped %s %016" PRIx64
+					                                ": its partition waits for its turn",
+					                                StageLabel(stage), params.hash);
+					return ShaderProgram {};
+				}
+				partition_built = true;
+			}
+		}
 		// The whole compile as one zone on the timeline, its phases below it.
 		GpuPhases::Scope compile_phase(GpuPhases::Phase::ShaderCompile);
 		Profiler::Phases compile_zone;
@@ -2667,6 +2709,9 @@ struct PipelineCache::ProgramCache {
 		KYTY_PROFILER_PHASE(compile_zone, "Shader compile", profiler::colors::DeepOrangeA200);
 		const auto compile_begin = std::chrono::steady_clock::now();
 		ShaderRecompiler::TranslateResult translated;
+		// Where the translation's resource tracking failed: on this thread, or on a worker's.
+		uint32_t failure_pc      = UINT32_MAX;
+		bool     translated_here = true;
 		if (const auto job = translating.find(lookup_key); job != translating.end()) {
 			// Done (the check above returned while it was not): take the worker's translation.
 			const auto waited = std::chrono::duration<double, std::milli>(
@@ -2677,7 +2722,9 @@ struct PipelineCache::ProgramCache {
 				     " draws skipped so far while translating\n",
 				     stage_name, params.hash, waited, translation_skips);
 			}
-			translated = std::move(job->second->result);
+			translated      = std::move(job->second->result);
+			failure_pc      = job->second->failure_pc;
+			translated_here = false;
 			translating.erase(job);
 		} else if (defer_translation && stage != ShaderType::Compute && translators != nullptr) {
 			auto job = std::make_shared<TranslationJob>();
@@ -2707,15 +2754,18 @@ struct PipelineCache::ProgramCache {
 			translated = ShaderRecompiler::TranslateProgram(compile_code, options);
 		}
 		if (translated.unsupported) {
+			if (translated_here) {
+				failure_pc = ShaderRecompiler::IR::LastResourceTrackingFailurePc();
+			}
 			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 				DumpComputeForReplay("gaveup", params.hash, compile_code, user_data, input_info,
-				                     ShaderRecompiler::IR::LastResourceTrackingFailurePc());
+				                     failure_pc);
 			}
 			if (!lookup_key.function_code.empty()) {
 				// A table target's inlined body the resource tracking could not follow: leave
 				// it out of the next expansion (it takes the miss path) instead of giving up
 				// the whole shader for every material.
-				const auto pc = ShaderRecompiler::IR::LastResourceTrackingFailurePc();
+				const auto pc = failure_pc;
 				const auto target =
 				    pc != UINT32_MAX
 				        ? function_expander.ExcludeFailedCallTarget(lookup_key.function_code, pc)
@@ -3194,7 +3244,8 @@ struct PipelineCache::ProgramCache {
 			    [](uint64_t address, std::span<uint32_t> words) {
 				    return ReadShaderGuestMemoryRaw(nullptr, address, words);
 			    },
-			    expanded, reason, wave_size, expand_hash, &summary);
+			    expanded, reason, wave_size, expand_hash, &summary,
+			    expand_hash != 0 ? call_partition : nullptr);
 		};
 		bool ok = false;
 		if (expand_every_target.contains(params.hash)) {
@@ -3235,8 +3286,8 @@ struct PipelineCache::ProgramCache {
 			                                 inlined != std::string::npos ? summary.substr(inlined)
 			                                                              : summary);
 			if (partial_logged.size() < 4096 && partial_logged.insert(key).second) {
-				LOGF("Shader function expansion hash=%016" PRIx64 ": partial: %s\n", params.hash,
-				     summary.c_str());
+				LOGF("Shader function expansion hash=%016" PRIx64 ": %s%s\n", params.hash,
+				     summary.starts_with("partition") ? "" : "partial: ", summary.c_str());
 			}
 		}
 		if (!ok) {
@@ -3254,6 +3305,11 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash>    programs;
 	// Round 97: set by GetComputeProgram for one Get: the expansion to use instead of expanding.
 	const std::vector<uint32_t>* forced_function_code = nullptr;
+	// Round 99: set by GetComputeProgram for one Get: the partition to expand
+	// (ShaderCallPartition), whether a new partition's SPIR-V may be made now, and whether it was.
+	ShaderRecompiler::Decoder::ShaderCallPartition* call_partition   = nullptr;
+	bool                                            partition_budget = false;
+	bool                                            partition_built  = false;
 	// Taken exclusively by the GPU thread when it inserts into programs (entries are never
 	// erased, so pointers to them stay valid), shared by the draw-prep scanner's lookups.
 	std::shared_mutex                                              programs_mutex;
@@ -4700,13 +4756,16 @@ struct PipelineCache::BackgroundCompute {
 	// m_ready_expansions once done.
 	std::vector<uint32_t> expansion;
 	uint64_t              serial = 0;
+	// Round 99: a partition's pipeline (GetComputeProgram), which takes half a compile slot.
+	bool                  partition = false;
 	std::atomic<bool>     done {false};
 	std::thread           thread;
 };
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
-                                               ShaderComputeInputInfo&      input_info) {
+                                               ShaderComputeInputInfo&      input_info,
+                                               ComputePartition*            partition) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
@@ -4714,6 +4773,41 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	const auto        input_before     = input_info;
 	uint32_t          push_data_cursor = 0;
 	const bool        keep_last        = KeepLastExpansion() && params.hash != 0;
+	if (partition != nullptr) {
+		partition->targets.clear();
+	}
+	// Round 99: a partition's program (ShaderCallPartition). The partitions' expansions never
+	// change (each inlines its target alone), so there is no earlier one to run meanwhile: a
+	// partition whose program translates or compiles is skipped. A new partition's SPIR-V takes
+	// the GPU thread up to a quarter of the time (m_partition_next_build).
+	const auto get_partition = [&]() {
+		const auto begin                  = std::chrono::steady_clock::now();
+		m_program_cache->call_partition   = partition;
+		m_program_cache->partition_budget = begin >= m_partition_next_build;
+		m_program_cache->partition_built  = false;
+		auto program = m_program_cache->Get(params, input_info, push_data_cursor);
+		m_program_cache->call_partition = nullptr;
+		if (m_program_cache->partition_built) {
+			const auto end         = std::chrono::steady_clock::now();
+			m_partition_next_build = end + (end - begin) * 3;
+		}
+		return program;
+	};
+	if (partition != nullptr && m_partitioned_shaders.contains(params.hash)) {
+		auto program = get_partition();
+		if (partition->targets.empty()) {
+			// Its call no longer partitions (the table call took another shape): the usual way
+			// from its next dispatch.
+			m_partitioned_shaders.erase(params.hash);
+		}
+		if (program) {
+			m_partition_programs.insert(program.id);
+			if (DrawPrep::Enabled()) {
+				DrawPrep::NoteGoodPair(regs.cs_regs.data_addr, UINT64_MAX);
+			}
+		}
+		return program;
+	}
 	if (keep_last) {
 		// Round 98: while one expansion of the shader compiles in the background, its newer ones
 		// (with the targets reported meanwhile) are neither translated nor compiled: the last
@@ -4721,16 +4815,33 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 		// translated once that compile is done. Each new expansion of a material pass took the GPU
 		// thread up to a second to translate (14 million SPIR-V words), and rt97 made 71.
 		ReapBackgroundCompute();
-		if (const auto* compiling = CompilingCompute(params.hash); compiling != nullptr) {
+		// Round 99: or waits for a compile slot (PendingExpansion). Only a dispatch of its
+		// program starts that compile (TryGetComputePipeline), and while it waits the dispatches
+		// run the ready one: each of them first tries again to start it.
+		const auto* pending = PendingExpansion(params.hash);
+		if (pending != nullptr && CompilingCompute(params.hash) == nullptr) {
+			// A copy: starting the compile takes the entry the pointer is into.
+			const std::vector<uint32_t> waiting_code = *pending;
+			m_program_cache->forced_function_code    = &waiting_code;
+			const auto waiting = m_program_cache->Get(params, input_info, push_data_cursor);
+			m_program_cache->forced_function_code = nullptr;
+			if (waiting) {
+				(void)TryGetComputePipeline(input_info, waiting, waiting_code);
+			}
+			input_info       = input_before;
+			push_data_cursor = 0;
+			pending          = PendingExpansion(params.hash);
+		}
+		if (pending != nullptr) {
 			const auto  ready = m_ready_expansions.find(params.hash);
-			const auto& held =
-			    ready != m_ready_expansions.end() ? ready->second.code : compiling->expansion;
+			const auto& held  = ready != m_ready_expansions.end() ? ready->second.code : *pending;
 			if (!held.empty()) {
 				m_program_cache->forced_function_code = &held;
 				auto program = m_program_cache->Get(params, input_info, push_data_cursor);
 				m_program_cache->forced_function_code = nullptr;
 				if (program && (m_compute_pipelines.contains(program.id) ||
-				                m_compute_background.contains(program.id))) {
+				                m_compute_background.contains(program.id) ||
+				                m_compute_waiting.contains(program.id))) {
 					if (DrawPrep::Enabled()) {
 						DrawPrep::NoteGoodPair(regs.cs_regs.data_addr, UINT64_MAX);
 					}
@@ -4741,10 +4852,22 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 			}
 		}
 	}
-	auto program = m_program_cache->Get(params, input_info, push_data_cursor);
+	auto program = partition != nullptr && params.hash != 0
+	                   ? get_partition()
+	                   : m_program_cache->Get(params, input_info, push_data_cursor);
 	if (program && DrawPrep::Enabled()) {
 		// Compute shaders join the known-good list with a vertex identity no draw has.
 		DrawPrep::NoteGoodPair(regs.cs_regs.data_addr, UINT64_MAX);
+	}
+	if (partition != nullptr && !partition->targets.empty()) {
+		m_partitioned_shaders.insert(params.hash);
+		LOGF("Compute shader %016" PRIx64 ": its call is partitioned, one dispatch per target "
+		     "(%zu so far)\n",
+		     params.hash, partition->targets.size());
+		if (program) {
+			m_partition_programs.insert(program.id);
+		}
+		return program;
 	}
 	// Round 97: a shader with call expansions keeps running its last expansion whose pipeline is
 	// ready while a newer one, with more targets inlined, compiles in the background (a minute or
@@ -5269,14 +5392,14 @@ void PipelineCache::ReapBackgroundCompute() {
 		job.thread.join();
 		const auto seconds =
 		    std::chrono::duration<double>(std::chrono::steady_clock::now() - job.begin).count();
-		LOGF("Compute pipeline CS=0x%016" PRIx64 " (%u SPIR-V words) compiled in the background "
+		LOGF("Compute pipeline CS=0x%016" PRIx64 " (%u SPIR-V words)%s compiled in the background "
 		     "in %.1f s; %" PRIu64 " of its dispatches were skipped meanwhile\n",
-		     job.hash, job.words, seconds, job.skipped);
+		     job.hash, job.words, job.partition ? ", a partition," : "", seconds, job.skipped);
 		ReportPipelineBuilt(Profiler::Counter::ComputePipelinesBuilt, "Compute", job.hash, 0,
 		                    job.begin);
-		if (job.hash != 0 && !job.expansion.empty()) {
+		if (job.hash != 0 && !job.expansion.empty() && !job.partition) {
 			// Newer than the shader's ready expansion: it runs from now on, until a newer one is
-			// ready (GetComputeProgram).
+			// ready (GetComputeProgram). A partition's is not one: it runs its target alone.
 			auto& ready = m_ready_expansions[job.hash];
 			if (ready.serial < job.serial) {
 				ready.id     = it->first;
@@ -5293,8 +5416,22 @@ const PipelineCache::BackgroundCompute*
 PipelineCache::CompilingCompute(uint64_t shader_hash) const {
 	for (const auto& [id, job]: m_compute_background) {
 		(void)id;
-		if (job->hash == shader_hash) {
+		// Round 99: partitions compile alongside each other, and none runs for the whole shader.
+		if (job->hash == shader_hash && !job->partition) {
 			return job.get();
+		}
+	}
+	return nullptr;
+}
+
+const std::vector<uint32_t>* PipelineCache::PendingExpansion(uint64_t shader_hash) const {
+	if (const auto* compiling = CompilingCompute(shader_hash); compiling != nullptr) {
+		return &compiling->expansion;
+	}
+	for (const auto& [id, waiting]: m_compute_waiting_expansions) {
+		(void)id;
+		if (waiting.hash == shader_hash && !waiting.code.empty()) {
+			return &waiting.code;
 		}
 	}
 	return nullptr;
@@ -5330,11 +5467,17 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 	const auto hash =
 	    input_info.stage.program != nullptr ? input_info.stage.program->shader_hash : 0;
 	std::unique_ptr<Pipeline> cached;
+	std::vector<uint32_t>     waiting_code;
 	if (auto waiting = m_compute_waiting.find(compute_program.id);
 	    waiting != m_compute_waiting.end()) {
 		// Looked up before, in no cache: its layouts are made.
 		cached = std::move(waiting->second);
 		m_compute_waiting.erase(waiting);
+		if (auto code = m_compute_waiting_expansions.find(compute_program.id);
+		    code != m_compute_waiting_expansions.end()) {
+			waiting_code = std::move(code->second.code);
+			m_compute_waiting_expansions.erase(code);
+		}
 	} else {
 		cached = std::make_unique<Pipeline>();
 		const GpuPhases::Scope phase(GpuPhases::Phase::PipelineCompile);
@@ -5351,10 +5494,32 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 	// shader with a ready expansion leaves one of them to the shaders with nothing to run.
 	const auto running   = m_compute_background.size();
 	const auto slots     = ComputeBackgroundThreads();
-	const bool same      = CompilingCompute(hash) != nullptr;
-	const bool has_ready = hash != 0 && m_ready_expansions.contains(hash);
-	if (same || running >= slots || (has_ready && slots > 1 && running + 1 >= slots)) {
+	// Round 99: the partitions of a shader (GetComputeProgram) compile alongside each other, and
+	// each takes half a slot: a partition inlines one material function, a fraction of the
+	// whole expansions the slots were sized for (rt97 ran out of memory with 27 of those).
+	const bool partition   = m_partition_programs.contains(compute_program.id);
+	const bool same        = !partition && CompilingCompute(hash) != nullptr;
+	const bool has_ready   = !partition && hash != 0 && m_ready_expansions.contains(hash);
+	uint32_t   used_halves = 0;
+	for (const auto& [id, job]: m_compute_background) {
+		(void)id;
+		used_halves += job->partition ? 1u : 2u;
+	}
+	const uint32_t halves  = partition ? 1u : 2u;
+	const bool     no_slot = used_halves + halves > 2u * slots;
+	// The expanded code goes with the program, whether the dispatch or GetComputeProgram asks.
+	if (expansion.empty() && !waiting_code.empty()) {
+		expansion = waiting_code;
+	}
+	if (same || no_slot || (has_ready && slots > 1 && used_halves + halves + 2u > 2u * slots)) {
 		m_compute_waiting.emplace(compute_program.id, std::move(cached));
+		if (hash != 0 && !partition && !expansion.empty()) {
+			// Round 99: its shader's newer expansions wait for it (GetComputeProgram), as they
+			// do while it compiles: rt-race98 translated eight ever larger ones on the GPU
+			// thread meanwhile, the largest for minutes.
+			m_compute_waiting_expansions[compute_program.id] = {
+			    hash, std::vector<uint32_t>(expansion.begin(), expansion.end())};
+		}
 		if (m_compute_wait_logged.size() < 4096 &&
 		    m_compute_wait_logged.insert(compute_program.id).second) {
 			LOGF("Compute pipeline CS=0x%016" PRIx64 " (%u SPIR-V words) waits to compile in the "
@@ -5374,11 +5539,20 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 	job->begin        = std::chrono::steady_clock::now();
 	job->expansion.assign(expansion.begin(), expansion.end());
 	job->serial       = ++m_expansion_serial;
+	job->partition    = partition;
 	auto*      raw    = job.get();
 	const auto module = compute_program.module;
-	LOGF("Compute pipeline CS=0x%016" PRIx64 " (%u SPIR-V words) is compiled in the background "
-	     "(%zu of %u running); until then its shader runs an earlier expansion, if one is ready\n",
-	     hash, compute_program.spirv_words, running + 1u, ComputeBackgroundThreads());
+	if (partition) {
+		LOGF("Compute pipeline CS=0x%016" PRIx64 " (%u SPIR-V words), a partition, is compiled in "
+		     "the background (%zu compiling, %u slots, a partition takes half of one); until then "
+		     "its partition's dispatch is skipped\n",
+		     hash, compute_program.spirv_words, running + 1u, ComputeBackgroundThreads());
+	} else {
+		LOGF("Compute pipeline CS=0x%016" PRIx64 " (%u SPIR-V words) is compiled in the "
+		     "background (%zu of %u running); until then its shader runs an earlier expansion, if "
+		     "one is ready\n",
+		     hash, compute_program.spirv_words, running + 1u, ComputeBackgroundThreads());
+	}
 	// The driver cache stays until Save, which waits for this thread first.
 	raw->thread = std::thread([this, raw, module, cache = m_driver_cache] {
 		KYTY_PROFILER_THREAD("ComputePipelineCompile");

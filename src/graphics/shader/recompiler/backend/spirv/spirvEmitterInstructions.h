@@ -161,7 +161,7 @@ inline constexpr auto EmitFPFma64 =
     EmitGlsl<GLSLstd450Fma, IR::Type::F64, uint32_t, uint32_t, uint32_t>;
 uint32_t              EmitFPRecip64(EmitterState& state, uint32_t arg0);
 uint32_t EmitFPFma32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
-uint32_t EmitFPMad32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
+uint32_t              EmitFPMad32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t EmitFPMin32(EmitterState& state, uint32_t arg0, uint32_t arg1);
 uint32_t EmitFPMax32(EmitterState& state, uint32_t arg0, uint32_t arg1);
 uint32_t EmitFPMin64(EmitterState& state, uint32_t arg0, uint32_t arg1);
@@ -200,9 +200,7 @@ inline constexpr auto EmitInstPrefetch = EmitVoid;
 void                  EmitBarrier(EmitterState& state);
 void                  EmitWaveLdsBarrier(EmitterState& state);
 void                  EmitStoreCompletion(EmitterState& state);
-void                  EmitShaderTrap(EmitterState& state, uint32_t pc, uint32_t code,
-                                     uint32_t target_low, uint32_t target_high, uint32_t data0,
-                                     uint32_t data1);
+void                  EmitShaderTrap(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitShaderProbe(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst);

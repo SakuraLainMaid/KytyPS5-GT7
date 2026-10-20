@@ -1714,9 +1714,20 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		return result;
 	}();
 	const auto& probes = ProbePoints();
+	// A partitioned call expansion drops the lanes of the targets other partitions run
+	// (ShaderCallMissDropFlag).
+	const bool lane_drop =
+	    std::any_of(decoded.instructions.begin(), decoded.instructions.end(), [](const auto& inst) {
+		    return inst.opcode == Decoder::Opcode::S_TRAP &&
+		           inst.src0.value == Decoder::ShaderCallMissTrapCode &&
+		           (inst.raw[0] & Decoder::ShaderCallMissDropFlag) != 0u;
+	    });
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
 		Translator translator(result, result.blocks[typed_index], vector_limit, flush_f32_inputs);
+		if (lane_drop) {
+			translator.EnableLaneDrop();
+		}
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {

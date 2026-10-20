@@ -18,6 +18,9 @@ public:
 	      flush_f32_inputs(flush_f32_inputs) {}
 
 	void TranslateInstruction(const Decoder::Instruction& inst);
+	// A program with a dropping call-miss trap (ShaderCallMissDropFlag): its lanes that reach
+	// one stay out of EXEC for the rest of the wave (IREmitter::SetLaneDrop).
+	void EnableLaneDrop() { ir.SetLaneDrop(true, program.wave_size == 64u); }
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
 	// header_cap, when not 0: a loop header that enters its body on a condition (one whose

@@ -1008,6 +1008,19 @@ int main(int argc, char* argv[]) {
 		ReplayCompute(argv[3]);
 		return 0;
 	}
+	if (folder == "--partition-check") {
+		// shader_batch_tool --partition-check <log> <code.bin>...: whether each shader's code
+		// would let its call be partitioned (ShaderCallPartition).
+		for (int arg = 3; arg < argc; arg++) {
+			const auto            bytes = ReadFile(argv[arg]);
+			std::vector<uint32_t> code(bytes.size() / 4u);
+			std::memcpy(code.data(), bytes.data(), code.size() * 4u);
+			const auto why = ShaderRecompiler::Decoder::ShaderCallPartitionCheck(code);
+			std::printf("PARTITION\t%s\t%s\n", argv[arg],
+			            why.empty() ? "partitionable" : why.c_str());
+		}
+		return 0;
+	}
 	if (folder == "--raw-cs") {
 		// shader_batch_tool --raw-cs <log> <code.bin> <user sgprs> <tgid
 		// letters> <threads x>

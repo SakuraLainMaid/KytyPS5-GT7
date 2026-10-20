@@ -242,6 +242,14 @@ public:
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode);
+	// Round 99: one dispatch of a shader whose call is partitioned runs once per partition
+	// (PipelineCache::GetComputeProgram): these run the partition of partition->target (0: the
+	// first), and receive every partition's target.
+	void DispatchDirectPart(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
+	                        uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+	                        PipelineCache::ComputePartition* partition);
+	void DispatchIndirectPart(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
+	                          uint32_t mode, PipelineCache::ComputePartition* partition);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	// Bindless heaps: register the draw's heaps, patch their regions, and once per frame resolve

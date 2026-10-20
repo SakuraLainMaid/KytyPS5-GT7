@@ -8,11 +8,22 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+// The goto variable a partitioned call expansion keeps its dropped lanes in
+// (ShaderCallMissDropFlag): the structurizer numbers its variables by node, far below this.
+constexpr uint32_t LaneDropVariable = 0xffff0000u;
+
 class IREmitter {
 public:
 	explicit IREmitter(Block* block);
 
 	void SetBlock(Block* block);
+
+	// Round 99: with lane drop on, every write of EXEC leaves out the lanes in LaneDropVariable
+	// (a partitioned call expansion's lanes that left at the call): none of them comes back.
+	void SetLaneDrop(bool enabled, bool wave64) {
+		lane_drop        = enabled;
+		lane_drop_wave64 = wave64;
+	}
 
 	Value Emit(ValueOpcode opcode, std::initializer_list<Value> args = {}, uint64_t flags = 0);
 
@@ -79,7 +90,11 @@ public:
 	U1  LogicalNot(U1 value);
 
 private:
-	Block* block = nullptr;
+	U32 DroppedMaskWord(uint32_t word);
+
+	Block* block            = nullptr;
+	bool   lane_drop        = false;
+	bool   lane_drop_wave64 = false;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -239,6 +240,8 @@ struct Call {
 	// loop bound (ShaderCallLoopBodyBegin).
 	bool                                              records = false;
 	std::vector<std::pair<ShaderCallVariant, size_t>> variants;
+	// The miss trap drops the lanes that reach it (CallSite::drop).
+	bool drop = false;
 };
 
 bool IsScalarLoad(Opcode opcode) {
@@ -406,6 +409,9 @@ struct CallSite {
 	// A ray tracing shader's hit call, which returns at once (RayHitCallsReturn): nothing is
 	// resolved for it.
 	bool null_callee = false;
+	// A partitioned expansion's table call (ShaderCallPartition): its miss trap drops the lanes
+	// that reach it (ShaderCallMissDropFlag).
+	bool drop = false;
 
 	// The table size (and a table call's distinct targets, which only the log uses) are left
 	// out: a table that grows (GT7 streams materials in) while offering the same variants keeps
@@ -415,7 +421,8 @@ struct CallSite {
 		       dynamic == other.dynamic && (dynamic || addresses == other.addresses) &&
 		       pinned == other.pinned && specialized == other.specialized &&
 		       records == other.records && variants == other.variants &&
-		       preferred == other.preferred && null_callee == other.null_callee;
+		       preferred == other.preferred && null_callee == other.null_callee &&
+		       drop == other.drop;
 	}
 };
 
@@ -916,6 +923,7 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 		st.candidates += site.variants.size();
 		call.specialized = site.specialized;
 		call.records                         = site.records || site.specialized;
+		call.drop                            = site.drop;
 		std::vector<CallSite::Variant> order = site.preferred;
 		for (const auto& variant: site.variants)
 			if (!std::binary_search(site.preferred.begin(), site.preferred.end(), variant))
@@ -1070,10 +1078,12 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 				// emitted once. The miss trap names the target pair, so the GPU can report the
 				// variant (the target and the pair after it).
 				const uint32_t miss_trap =
-				    0xbf920000u | ShaderCallMissTrapImmediate(call.source_reg);
+				    0xbf920000u | ShaderCallMissTrapImmediate(call.source_reg, call.drop);
 				// A miss reports the variant and returns as if the callee did nothing. It must not
 				// end the wave: inside the caller's waterfall loop that hung the GPU (the loop
-				// never retired the missing lanes), and the call's other lanes still need it.
+				// never retired the missing lanes), and the call's other lanes still need it. In
+				// a partitioned expansion it also drops its lanes (ShaderCallMissDropFlag): they
+				// run their target in another partition's dispatch.
 				const auto miss = [&]() {
 					result.push_back(miss_trap);
 					returns.push_back(static_cast<uint32_t>(result.size()));
@@ -1284,6 +1294,73 @@ void SelectTableTargets(std::vector<CallSite>&                sites,
 	}
 }
 
+// KYTY_CALL_PARTITIONS=0: no partitioned expansions (ShaderCallPartition), as before round 99.
+std::atomic_bool& PartitionsSwitch() {
+	static std::atomic_bool value = [] {
+		const char* text = std::getenv("KYTY_CALL_PARTITIONS");
+		return text == nullptr || text[0] != '0';
+	}();
+	return value;
+}
+
+// Why an instruction of the shader outside the inlined bodies could see lanes a partitioned
+// expansion dropped (ShaderCallPartition), or null: one that reads other lanes' values (DPP, lane
+// reads, LDS other than the per-lane spills of the call ABI, implicit derivatives), waits for them
+// (barriers), or whose effect would not be the same once per partition (atomics, messages). Its
+// lanes left the wave at the call in this dispatch and run in another one.
+const char* PartitionUnsafe(const Instruction& inst) {
+	if (inst.src0.dpp) return "DPP reads other lanes";
+	if (inst.gds) return "GDS is shared between dispatches";
+	if (inst.family == Family::DS && inst.opcode != Opcode::DS_READ_ADDTID_B32 &&
+	    inst.opcode != Opcode::DS_WRITE_ADDTID_B32) {
+		return "LDS shares data between lanes";
+	}
+	switch (inst.opcode) {
+		case Opcode::S_BARRIER: return "a barrier waits for the other lanes";
+		case Opcode::S_SENDMSG: return "a message";
+		case Opcode::V_READLANE_B32:
+		case Opcode::V_WRITELANE_B32:
+		case Opcode::V_PERMLANE16_B32:
+		case Opcode::V_PERMLANEX16_B32: return "a lane access reads other lanes";
+		// The level of detail from the lanes around it.
+		case Opcode::IMAGE_GET_LOD:
+		case Opcode::IMAGE_GATHER4_C:
+		case Opcode::IMAGE_GATHER4_C_O:
+		case Opcode::IMAGE_GATHER4H: return "an implicit level of detail reads other lanes";
+		case Opcode::IMAGE_SAMPLE:
+			return (inst.image_sample_flags & (ImageSampleFlagLod | ImageSampleFlagLevelZero |
+			                                   ImageSampleFlagDerivative | ImageSampleFlagCd)) == 0
+			           ? "an implicit level of detail reads other lanes"
+			           : nullptr;
+		default: break;
+	}
+	return magic_enum::enum_name(inst.opcode).find("ATOMIC") != std::string_view::npos
+	           ? "an atomic would run once per partition"
+	           : nullptr;
+}
+
+// A shader the expansion partitions (ShaderCallPartition): its one call is a table of runtime
+// records (a material table), and nothing outside the inlined bodies sees dropped lanes. Inside a
+// body every lane runs the same target, in the same dispatch.
+bool PartitionableSites(const std::vector<CallSite>& sites) {
+	if (sites.size() != 1u) return false;
+	const auto& site = sites.front();
+	return site.dynamic && site.records && !site.specialized && !site.null_callee;
+}
+
+// Empty when the code outside the bodies stays correct with lanes dropped at the call; why not
+// otherwise.
+std::string PartitionableCode(const ShaderAnalysis& analysis) {
+	for (const auto& inst: analysis.program.instructions) {
+		if (const char* why = PartitionUnsafe(inst); why != nullptr) {
+			char line[160];
+			std::snprintf(line, sizeof(line), "%s (pc 0x%x)", why, inst.pc);
+			return line;
+		}
+	}
+	return {};
+}
+
 std::string DescribeStats(const ExpansionStats& st, size_t words) {
 	char line[512];
 	std::snprintf(line, sizeof(line),
@@ -1444,12 +1521,32 @@ struct ShaderFunctionExpander::Impl {
 		ShaderAnalysis         analysis;
 		std::vector<Expansion> expansions; // most recent last
 		uint64_t               builds = 0;
+		// Partitioned expansions (ShaderCallPartition): the shader qualifies (once known), and
+		// the targets whose partition inlined nothing (their function is not expandable), left
+		// out of the partitions.
+		std::optional<std::string> unpartitionable; // why not (empty: it is partitioned)
+		std::set<uint64_t>         unpartitioned;
 	};
 	// GT7 dispatches one material shader over several tables a frame.
 	static constexpr size_t MaxExpansions = 32;
+	// A partitioned shader keeps an expansion per partition (and one per table it is dispatched
+	// over: the tables only change which partitions there are).
+	static constexpr size_t MaxPartitionExpansions = 1024;
 
 	std::unordered_map<uint64_t, Shader> shaders; // by code address
 	std::vector<uint32_t>                scratch;
+	// Round 99: the calls the last dispatch's first partition resolved (Expand), which its later
+	// partitions reuse.
+	struct PartitionContext {
+		bool                  valid       = false;
+		const uint32_t*       code        = nullptr;
+		uint64_t              base        = 0;
+		uint32_t              wave_size   = 0;
+		uint64_t              shader_hash = 0;
+		std::vector<uint32_t> user_data;
+		std::vector<CallSite> sites;
+		std::set<uint32_t>    dependencies;
+	} partition_context;
 	// Table targets whose bodies failed to translate (ExcludeFailedCallTarget), for every shader:
 	// GT7's shaders share their material functions.
 	std::set<uint64_t> excluded;
@@ -1499,6 +1596,25 @@ bool ShaderCallLoopsInlined() {
 
 void SetShaderCallLoopsInlined(bool value) {
 	LoopingVariantsSwitch().store(value, std::memory_order_relaxed);
+}
+
+bool ShaderCallPartitions() {
+	return PartitionsSwitch().load(std::memory_order_relaxed);
+}
+
+std::string ShaderCallPartitionCheck(std::span<const uint32_t> code) {
+	ShaderAnalysis analysis;
+	AnalyzeShader(code, analysis);
+	if (!analysis.has_calls) return "the shader makes no calls";
+	if (std::count_if(analysis.program.instructions.begin(), analysis.program.instructions.end(),
+	                  [](const auto& inst) { return IsCall(inst.raw[0]); }) != 1) {
+		return "the shader makes more than one call";
+	}
+	return PartitionableCode(analysis);
+}
+
+void SetShaderCallPartitions(bool value) {
+	PartitionsSwitch().store(value, std::memory_order_relaxed);
 }
 
 bool ReportShaderCallMiss(uint64_t shader_hash, const ShaderCallVariant& reported, bool* churned) {
@@ -1603,19 +1719,23 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
                                     std::span<const uint32_t> user_data,
                                     const ShaderCodeReader& read, std::vector<uint32_t>& expanded,
                                     std::string& reason, uint32_t wave_size, uint64_t shader_hash,
-                                    std::string* summary) {
+                                    std::string* summary, ShaderCallPartition* partition) {
 	expanded.clear();
 	reason.clear();
 	if (summary != nullptr) summary->clear();
+	const uint64_t requested_target = partition != nullptr ? partition->target : 0;
+	if (partition != nullptr) partition->targets.clear();
 	if (wave_size != 32u && wave_size != 64u) {
 		reason = "shader calls require a known wave size";
 		return false;
 	}
-	auto& shader = m_impl->shaders[reinterpret_cast<uint64_t>(code.data())];
+	auto& shader  = m_impl->shaders[reinterpret_cast<uint64_t>(code.data())];
+	auto& context = m_impl->partition_context;
 	if (shader.analysis.code.size() != code.size() ||
 	    !std::equal(code.begin(), code.end(), shader.analysis.code.begin())) {
 		shader = {};
 		AnalyzeShader(code, shader.analysis);
+		context.valid = false;
 	}
 	const auto& analysis = shader.analysis;
 	if (!analysis.has_calls) return true;
@@ -1626,15 +1746,38 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	std::vector<CallSite> sites;
 	std::set<uint32_t>    dependencies;
 	const bool            null_calls = RayHitCallsReturn(analysis);
-	if (null_calls) {
+	// Round 99: a dispatch's later partitions (a target asked for) take the calls its first one
+	// resolved: reading a material table of 1,600 records again for each of 40 partitions would be
+	// most of the dispatch's time, and the partitions see one table.
+	const bool reuse = partition != nullptr && requested_target != 0 && !null_calls &&
+	                   context.valid && context.code == code.data() && context.base == base &&
+	                   context.wave_size == wave_size && context.shader_hash == shader_hash &&
+	                   std::equal(user_data.begin(), user_data.end(), context.user_data.begin(),
+	                              context.user_data.end());
+	if (reuse) {
+		sites        = context.sites;
+		dependencies = context.dependencies;
+	} else if (null_calls) {
 		if (!NullCallSites(analysis, sites, reason)) return false;
 	} else {
 		if (!ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies,
 		                  reason)) {
+			context.valid = false;
 			return false;
 		}
 		const auto reported = shader_hash != 0 ? ShaderCallMissTargets(shader_hash) : nullptr;
 		SelectTableTargets(sites, reported.get(), shader_hash != 0 && RuntimeRecords());
+		context.valid = false;
+		if (partition != nullptr && PartitionableSites(sites)) {
+			context.valid       = true;
+			context.code        = code.data();
+			context.base        = base;
+			context.wave_size   = wave_size;
+			context.shader_hash = shader_hash;
+			context.user_data.assign(user_data.begin(), user_data.end());
+			context.sites        = sites;
+			context.dependencies = dependencies;
+		}
 	}
 	std::string drop_note;
 	if (shader_hash != 0 && !null_calls) {
@@ -1668,6 +1811,48 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 			}
 		}
 	}
+	// A partitioned expansion (ShaderCallPartition): the requested target alone, and the lanes
+	// that call another one dropped at the call. Its code depends on that target only, so a table
+	// that brings more targets adds partitions and leaves the others' programs as they are.
+	uint64_t partition_target = 0;
+	if (partition != nullptr && shader_hash != 0 && !null_calls && ShaderCallPartitions() &&
+	    PartitionableSites(sites)) {
+		const bool first_look = !shader.unpartitionable.has_value();
+		if (first_look) {
+			shader.unpartitionable = PartitionableCode(analysis);
+		}
+		if (!shader.unpartitionable->empty() && first_look) {
+			drop_note = "its material table call is not partitioned: " + *shader.unpartitionable;
+		}
+		if (shader.unpartitionable->empty()) {
+			auto& site    = sites.front();
+			auto& targets = partition->targets;
+			for (const auto& variant: site.variants) {
+				if (!m_impl->excluded.contains(variant.target) &&
+				    !shader.unpartitioned.contains(variant.target) &&
+				    (targets.empty() || targets.back() != variant.target)) {
+					targets.push_back(variant.target);
+				}
+			}
+			if (targets.empty()) {
+				// One dispatch whose lanes all report their targets and leave.
+				targets.push_back(0);
+			}
+			// A target asked for that has no partition now (it was excluded meanwhile) gets the
+			// expansion without targets, whose lanes all leave: not another target's, whose lanes
+			// would then run twice.
+			partition_target =
+			    requested_target == 0 ? targets.front()
+			    : std::binary_search(targets.begin(), targets.end(), requested_target)
+			        ? requested_target
+			        : 0;
+			site.variants.clear();
+			if (partition_target != 0) site.variants.push_back({partition_target, 0u, 0u});
+			site.preferred = site.variants;
+			site.drop      = true;
+		}
+	}
+	const bool partitioned = partition != nullptr && !partition->targets.empty();
 	for (const auto& expansion: shader.expansions) {
 		if (expansion.base == base && expansion.wave_size == wave_size &&
 		    expansion.user_data_count == user_data.size() && expansion.sites == sites &&
@@ -1696,7 +1881,25 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	                              wave_size, expansion.code, expansion.reason, &stats,
 	                              &expansion.bodies, &m_impl->excluded);
 	const auto builds = ++shader.builds;
-	if (summary != nullptr && expansion.ok && stats.Partial()) {
+	if (partitioned) {
+		if (expansion.ok && partition_target != 0 && stats.inlined == 0) {
+			// Its function is not expandable: no partition for it (its lanes leave every
+			// partition's dispatch at the call, as those of a target no report named yet).
+			shader.unpartitioned.insert(partition_target);
+			std::erase(partition->targets, partition_target);
+			if (partition->targets.empty()) partition->targets.push_back(0);
+		}
+		if (summary != nullptr && expansion.ok) {
+			char line[256];
+			std::snprintf(line, sizeof(line),
+			              "partition %s0x%016" PRIx64 " (%zu callee words, %zu expanded words%s%s)",
+			              partition_target != 0 ? "for target " : "without targets: ",
+			              partition_target, stats.callee_words, expansion.code.size(),
+			              stats.unreadable != 0 ? ", not expandable: " : "",
+			              stats.unreadable != 0 ? stats.first_unreadable.c_str() : "");
+			*summary = line;
+		}
+	} else if (summary != nullptr && expansion.ok && stats.Partial()) {
 		*summary = DescribeStats(stats, expansion.code.size());
 	}
 	if (summary != nullptr && expansion.ok && null_calls && builds == 1) {
@@ -1707,7 +1910,7 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	if (summary != nullptr && !drop_note.empty()) {
 		*summary += (summary->empty() ? "" : "; ") + drop_note;
 	}
-	if (summary != nullptr && builds >= 16 && (builds & (builds - 1)) == 0) {
+	if (summary != nullptr && !partitioned && builds >= 16 && (builds & (builds - 1)) == 0) {
 		// Each new expansion is a new program to translate and compile.
 		*summary += (summary->empty() ? "" : "; ") + std::to_string(builds) +
 		            " expansions built for this shader (call tables changing?)";
@@ -1715,7 +1918,8 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	MergeReads(expansion.reads);
 	expanded = expansion.code;
 	reason   = expansion.reason;
-	if (shader.expansions.size() >= Impl::MaxExpansions) {
+	if (shader.expansions.size() >=
+	    (partitioned ? Impl::MaxPartitionExpansions : Impl::MaxExpansions)) {
 		shader.expansions.erase(shader.expansions.begin());
 	}
 	shader.expansions.push_back(std::move(expansion));

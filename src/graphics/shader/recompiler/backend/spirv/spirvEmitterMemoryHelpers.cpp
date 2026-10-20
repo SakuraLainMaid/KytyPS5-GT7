@@ -431,6 +431,44 @@ uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits) {
 	return EmitBitcastF32ToU32(state, result);
 }
 
+uint32_t EmitUFloatToF32BitsRuntime(EmitterState& state, uint32_t raw, uint32_t mantissa_bits) {
+	const auto one           = ConstantU32(state, 1);
+	const auto mantissa_mask = EmitBinaryU32(
+	    state, spv::OpISub, EmitBinaryU32(state, spv::OpShiftLeftLogical, one, mantissa_bits), one);
+	const auto mantissa = EmitBinaryU32(state, spv::OpBitwiseAnd, raw, mantissa_mask);
+	const auto exponent =
+	    EmitBinaryU32(state, spv::OpBitwiseAnd,
+	                  EmitBinaryU32(state, spv::OpShiftRightLogical, raw, mantissa_bits),
+	                  ConstantU32(state, 0x1fu));
+	const auto exponent_bits = EmitBinaryU32(
+	    state, spv::OpShiftLeftLogical, EmitAddU32(state, exponent, ConstantU32(state, 127u - 15u)),
+	    ConstantU32(state, 23));
+	const auto mantissa_bits_32 =
+	    EmitBinaryU32(state, spv::OpShiftLeftLogical, mantissa,
+	                  EmitBinaryU32(state, spv::OpISub, ConstantU32(state, 23), mantissa_bits));
+	const auto normal = EmitBitcastU32ToF32(
+	    state, EmitBinaryU32(state, spv::OpBitwiseOr, exponent_bits, mantissa_bits_32));
+	const auto special = EmitBitcastU32ToF32(
+	    state,
+	    EmitBinaryU32(state, spv::OpBitwiseOr, ConstantU32(state, 0x7f800000u), mantissa_bits_32));
+	// A subnormal is mantissa * 2^(1 - 15 - mantissa_bits): the mantissa as a float, scaled by an
+	// exponent made directly (127 + 1 - 15 - mantissa_bits, always a normal float's).
+	const auto mantissa_f32 = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), mantissa_f32, mantissa);
+	const auto scale = EmitBitcastU32ToF32(
+	    state, EmitBinaryU32(state, spv::OpShiftLeftLogical,
+	                         EmitBinaryU32(state, spv::OpISub, ConstantU32(state, 127u + 1u - 15u),
+	                                       mantissa_bits),
+	                         ConstantU32(state, 23)));
+	const auto subnormal = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFMul, TypeF32(state), subnormal, mantissa_f32, scale);
+	const auto zero_exp    = EmitCompareU32Constant(state, spv::OpIEqual, exponent, 0);
+	const auto special_exp = EmitCompareU32Constant(state, spv::OpIEqual, exponent, 31);
+	const auto finite      = EmitTBufferSelectF32(state, zero_exp, subnormal, normal);
+	const auto result      = EmitTBufferSelectF32(state, special_exp, special, finite);
+	return EmitBitcastF32ToU32(state, result);
+}
+
 uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                   uint32_t component, uint32_t raw) {
 	const auto bits = info.component_bits[component];

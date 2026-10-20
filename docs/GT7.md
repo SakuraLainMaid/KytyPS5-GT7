@@ -83,13 +83,14 @@ zipped `_kyty.txt` log).
   nothing measurable in a race, and the ray tracing mode needs it (without it the reflection
   passes of that mode never run). A texture slot the game is rewriting no longer ends the
   emulator ("unknown format", "texture base layer is out of bounds").
-- **The ray tracing mode's reflections are shaded** (garage tested). The first visit compiles
-  the reflection passes in the background for a minute or more each; the car shows wrong
-  colours until they are done. Close the game normally afterwards: the compiled passes and the
-  materials they need are saved, and the next visit has them at once. At most three of these
-  passes compile at once, each new car material waits for its pass's compile under way, and the
-  passes are about a quarter smaller than before: compiling all of them at once could use up the
-  PC's memory and end the emulator ("out of memory").
+- **The ray tracing mode's reflections are shaded** (garage tested), and their materials have
+  their textures now: before, each of these textures was looked up as the same empty one, and
+  drew as a placeholder. Each reflection pass is compiled in parts, one for each car material,
+  in the background, and drawn once for each part: a pass with all of a car's materials in one
+  took the graphics driver many minutes, and in a ray-traced race preparing it froze the game for
+  minutes and kept it from closing. A material whose part is still compiling is missing from the
+  reflections until it is ready. Close the game normally afterwards: the compiled parts and the
+  materials they need are saved, and the next visit has them at once.
 - After updating to this build, the first session compiles every shader again (pop-in
   everywhere, once).
 

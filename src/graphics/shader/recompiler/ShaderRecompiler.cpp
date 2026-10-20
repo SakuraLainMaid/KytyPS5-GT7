@@ -861,6 +861,12 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 				                          : 0u;
 			} else if (op == IR::ValueOpcode::GetImageResource) {
 				const auto resource = inst.Flags<uint32_t>();
+				// Round 99: a runtime image's handle holds the T# the shader loaded, which its
+				// samples look up (RuntimeImageDwords): kept. Zeroed, every material texture of the
+				// ray tracing mode looked up the same T#, which no table entry holds.
+				if (resource < ir.info.images.size() && ir.info.images[resource].runtime) {
+					continue;
+				}
 				first = resource < ir.info.images.size() &&
 				                ir.info.images[resource].indirect_root == resource ? 1u : 0u;
 			} else if (op != IR::ValueOpcode::GetSamplerResource) {

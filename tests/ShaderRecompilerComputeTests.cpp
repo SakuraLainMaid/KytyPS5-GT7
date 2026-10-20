@@ -91,6 +91,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -2002,6 +2003,236 @@ size_t CountText(const std::string &text, const std::string &needle) {
     count++;
   }
   return count;
+}
+
+// Round 99: a material table of runtime records is partitioned (ShaderCallPartition): one
+// expansion per reported target, each inlining that target alone, whose miss trap drops the
+// lanes of the other targets (they run in another partition's dispatch).
+void CheckShaderFunctionPartitions() {
+  constexpr const char *name = "ShaderFunctionPartitions";
+  namespace Decoder = ShaderRecompiler::Decoder;
+  const bool runtime_records = Decoder::ShaderCallRuntimeRecords();
+  const bool partitions = Decoder::ShaderCallPartitions();
+  Decoder::SetShaderCallRuntimeRecords(true);
+  Decoder::SetShaderCallPartitions(true);
+  constexpr uint64_t callee_a = 0x10000000ull;
+  constexpr uint64_t callee_b = 0x10000100ull;
+  constexpr uint64_t srt = 0x20000000ull;
+  constexpr uint64_t table = 0x20000100ull;
+  std::map<uint64_t, u32> memory;
+  const auto store = [&](uint64_t address, std::initializer_list<u32> words) {
+    for (const auto word : words) {
+      memory[address] = word;
+      address += 4;
+    }
+  };
+  store(callee_a, {EncodeVop1(0x01u, 0, InlineU32(1)), EncodeSop1(0x20u, 0, 14)});
+  store(callee_b, {EncodeVop1(0x01u, 1, InlineU32(2)), EncodeSop1(0x20u, 0, 14)});
+  const auto fill_records = [&](u32 entries, u32 data) {
+    store(srt + 0x40, {u32(table), u32(table >> 32u), entries * 16u, 0u});
+    for (u32 e = 0; e < entries; ++e) {
+      const uint64_t target = (e % 2u) != 0u ? callee_b : callee_a;
+      store(table + e * 16u, {u32(target), u32(target >> 32u), data + e * 0x100u, 0x7u});
+    }
+  };
+  const Decoder::ShaderCodeReader read = [&](uint64_t address, std::span<uint32_t> words) {
+    for (size_t i = 0; i < words.size(); i++) {
+      const auto it = memory.find(address + i * 4u);
+      words[i] = it != memory.end() ? it->second : 0xbf810000u;
+    }
+    return true;
+  };
+  std::vector<u32> code{
+      EncodeSmem0(0x02u, 8, 0), EncodeSmem1(0x40u, 125), // s_load_dwordx4 s[8:11], s[0:1], 0x40
+      EncodeSMovB32(12, InlineU32(0)),                   // s_mov_b32 s12, 0
+      EncodeSopp(0x0cu, 0),                              // s_waitcnt
+      EncodeSop2(0x1eu, 13, 12, InlineU32(4)),           // s_lshl_b32 s13, s12, 4
+      EncodeSmem0(0x0au, 16, 4), EncodeSmem1(0, 13),     // s_buffer_load_dwordx4 s[16:19], s[8:11], s13
+      EncodeSopp(0x0cu, 0),                              // s_waitcnt
+      EncodeSMovB32(14, 16),                             // s_mov_b32 s14, s16
+      EncodeSMovB32(15, 17),                             // s_mov_b32 s15, s17
+      EncodeSMovB32(16, 18),                             // s_mov_b32 s16, s18
+      EncodeSMovB32(17, 19),                             // s_mov_b32 s17, s19
+      EncodeSop1(0x04u, 22, 126),                        // s_mov_b64 s[22:23], exec
+      EncodeSop1(0x21u, 14, 14),                         // s_swappc_b64 s[14:15], s[14:15]
+      EncodeSop1(0x04u, 126, 22),                        // s_mov_b64 exec, s[22:23]
+      EncodeSopp(0x08u, 1u),                             // s_cbranch_execz over the s_nop
+      EncodeSopp(0x00u, 0u),                             // s_nop 0
+      EncodeSop2(0x00u, 12, 12, InlineU32(1)),           // s_add_u32 s12, s12, 1
+      EncodeSopc(0x0au, 12, InlineU32(2)),               // s_cmp_lt_u32 s12, 2
+  };
+  const auto branch_word = static_cast<int32_t>(code.size());
+  code.push_back(EncodeSopp(0x05u, static_cast<u32>(4 - (branch_word + 1)) & 0xffffu));
+  AppendEnd(&code);
+  const std::array<u32, 2> user_data{u32(srt), u32(srt >> 32u)};
+  const auto count = [](const std::vector<u32> &words, u32 word) {
+    return std::count(words.begin(), words.end(), word);
+  };
+  const u32 body_a = EncodeVop1(0x01u, 0, InlineU32(1));
+  const u32 body_b = EncodeVop1(0x01u, 1, InlineU32(2));
+  const u32 plain_trap = 0xbf920000u | Decoder::ShaderCallMissTrapImmediate(14);
+  const u32 drop_trap = 0xbf920000u | Decoder::ShaderCallMissTrapImmediate(14, true);
+  Decoder::ShaderFunctionExpander expander;
+  std::string reason;
+  std::string summary;
+  std::vector<u32> expanded;
+  const uint64_t hash = 0x7ab1eaull;
+  const auto expand = [&](const std::vector<u32> &program, Decoder::ShaderCallPartition *partition,
+                          Decoder::ShaderFunctionExpander &with) {
+    return with.Expand(program, reinterpret_cast<uint64_t>(program.data()), user_data, read,
+                       expanded, reason, 64, hash, &summary, partition);
+  };
+  using Targets = std::vector<uint64_t>;
+  fill_records(300, 0x7000u);
+  Decoder::ShaderCallPartition partition;
+  bool ok = expand(code, &partition, expander);
+  Require(name, "no targets yet",
+          ok && partition.targets == Targets{0} && count(expanded, drop_trap) > 0 &&
+              count(expanded, plain_trap) == 0 && count(expanded, body_a) == 0 &&
+              count(expanded, body_b) == 0,
+          "a partitioned shader without reports did not expand to one dispatch that drops its "
+          "lanes at the call (" + reason + ")");
+  (void)Decoder::ReportShaderCallMiss(hash, {callee_a, 0x7000u, 0x7u});
+  (void)Decoder::ReportShaderCallMiss(hash, {callee_b, 0x7100u, 0x7u});
+  std::this_thread::sleep_for(std::chrono::milliseconds(350));
+  (void)Decoder::ShaderCallMissTargets(hash);
+  partition = {};
+  ok = expand(code, &partition, expander);
+  const auto first = expanded;
+  Require(name, "one target per partition",
+          ok && partition.targets == Targets{callee_a, callee_b} && count(expanded, body_a) == 1 &&
+              count(expanded, body_b) == 0 && count(expanded, drop_trap) > 0 &&
+              count(expanded, plain_trap) == 0,
+          "the first partition did not inline its target alone, with a dropping miss trap");
+  partition.target = callee_b;
+  ok = expand(code, &partition, expander);
+  Require(name, "the other partition",
+          ok && partition.targets == Targets{callee_a, callee_b} && count(expanded, body_a) == 0 &&
+              count(expanded, body_b) == 1 && count(expanded, drop_trap) > 0,
+          "the second partition did not inline the second target alone");
+  fill_records(300, 0x9000u);
+  partition = {};
+  ok = expand(code, &partition, expander);
+  Require(name, "new records, same partition", ok && expanded == first,
+          "records with new data changed a partition's code");
+  fill_records(1, 0xa000u);
+  partition = {};
+  ok = expand(code, &partition, expander);
+  Require(name, "the table's targets",
+          ok && partition.targets == Targets{callee_a} && expanded == first,
+          "a table naming one of the targets did not have its one partition, unchanged");
+  fill_records(300, 0x7000u);
+  ok = expand(code, nullptr, expander);
+  const auto whole = expanded;
+  Require(name, "unpartitioned expansion",
+          ok && count(expanded, body_a) == 1 && count(expanded, body_b) == 1 &&
+              count(expanded, plain_trap) > 0 && count(expanded, drop_trap) == 0,
+          "an expansion without a partition request did not inline every target with the "
+          "returning miss trap");
+  Decoder::SetShaderCallPartitions(false);
+  partition = {};
+  ok = expand(code, &partition, expander);
+  Require(name, "partitions off",
+          ok && partition.targets.empty() && expanded == whole,
+          "KYTY_CALL_PARTITIONS=0 still partitioned the shader");
+  Decoder::SetShaderCallPartitions(true);
+  {
+    // A shader that waits for its other lanes outside the bodies keeps one expansion.
+    auto unsafe = code;
+    unsafe.insert(unsafe.begin(), EncodeSopp(0x0au)); // s_barrier
+    Decoder::ShaderFunctionExpander fresh;
+    partition = {};
+    ok = expand(unsafe, &partition, fresh);
+    Require(name, "unsafe shader",
+            ok && partition.targets.empty() && count(expanded, body_a) == 1 &&
+                count(expanded, body_b) == 1 && count(expanded, drop_trap) == 0,
+            "a shader with a barrier outside the bodies was partitioned");
+  }
+  {
+    // The translation keeps a partition's dropped lanes out of EXEC: the restore after the call
+    // leaves them out (one ballot of the dropped lanes per write of EXEC's mask words).
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = 64;
+    compute.threads_num[1] = 1;
+    compute.threads_num[2] = 1;
+    compute.wave_size = 64;
+    ShaderRecompiler::CompileOptions options;
+    options.stage = ShaderType::Compute;
+    options.wave_size = 64;
+    options.dump_ir = false;
+    options.user_data = user_data;
+    options.input_info.compute = &compute;
+    // The lane drop's logic: the dropped lanes join a variable at the trap and leave EXEC where
+    // it is restored after the call. The constant folding turns the mask words into lane logic,
+    // so the translation with the dropping trap has more of it.
+    // The trap's code keeps the drop flag: the miss report is then keyed by its target alone.
+    const auto translate = [&](const std::vector<u32> &program) {
+      const auto translated = ShaderRecompiler::TranslateProgram(program, options);
+      size_t found = 0;
+      bool drop_code = false;
+      for (const auto *block : translated.program.blocks) {
+        for (const auto &inst : *block) {
+          const auto op = inst.GetOpcode();
+          found += op == ShaderRecompiler::IR::ValueOpcode::LogicalOr ||
+                           op == ShaderRecompiler::IR::ValueOpcode::LogicalAnd
+                       ? 1u
+                       : 0u;
+          if (op == ShaderRecompiler::IR::ValueOpcode::ShaderTrap &&
+              inst.Arg(1).Resolve().IsImmediate()) {
+            drop_code |= (inst.Arg(1).Resolve().U32() & Decoder::ShaderCallMissDropFlag) != 0u;
+          }
+        }
+      }
+      return std::tuple{!translated.unsupported, found, drop_code};
+    };
+    // The same partition with a miss trap that does not drop its lanes.
+    auto kept = first;
+    std::replace(kept.begin(), kept.end(), drop_trap, plain_trap);
+    const auto [kept_ok, kept_logic, kept_drop_code] = translate(kept);
+    const auto [part_ok, part_logic, part_drop_code] = translate(first);
+    Require(name, "drop flag in the trap's code", part_drop_code && !kept_drop_code,
+            "the translated miss trap does not tell whether it drops its lanes");
+    const auto compile = [&](const std::vector<u32> &program) {
+      auto translated = ShaderRecompiler::TranslateProgram(program, options);
+      auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+      ShaderRecompiler::IR::ResourceSnapshot resources;
+      ShaderRecompiler::IR::ResourceSpecialization specialization;
+      const ShaderRecompiler::IR::SrtRuntime runtime{
+          .user_data = options.user_data,
+          .shader_base = reinterpret_cast<uint64_t>(program.data()),
+          .read_memory =
+              +[](void *userdata, uint64_t address, std::span<u32> values) {
+                const auto &words = *static_cast<const std::map<uint64_t, u32> *>(userdata);
+                for (size_t i = 0; i < values.size(); i++) {
+                  const auto it = words.find(address + i * 4u);
+                  if (it == words.end()) return false;
+                  values[i] = it->second;
+                }
+                return true;
+              },
+          .userdata = &memory,
+      };
+      Require(name, "partition resources",
+              ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization),
+              "the partition's resources could not be materialized");
+      return ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+    };
+    Require(name, "lane drop translated",
+            kept_ok && part_ok && part_logic > kept_logic,
+            "the partition's writes of EXEC did not leave its dropped lanes out (" +
+                std::to_string(part_logic) + " lane operations, " + std::to_string(kept_logic) +
+                " when the trap does not drop them)");
+    // On a host with 64-lane subgroups and on one with 32 (each invocation two lanes).
+    for (const u32 host_subgroup : {64u, 32u}) {
+      compute.host_subgroup_size = host_subgroup;
+      const auto result = compile(first);
+      Require(name, "partition SPIR-V", !result.spirv.empty(), "the partition gave no SPIR-V");
+      ValidateSpirv(name, result.spirv);
+    }
+  }
+  Decoder::SetShaderCallPartitions(partitions);
+  Decoder::SetShaderCallRuntimeRecords(runtime_records);
+  std::printf("[host]    %-32s ok\n", name);
 }
 
 void CheckPixelParameterAliases() {
@@ -41818,6 +42049,7 @@ int main(int argc, char **argv) {
   CheckShaderFunctionTableCallInLoop();
   CheckShaderFunctionTableVariants();
   CheckShaderFunctionRuntimeRecords();
+  CheckShaderFunctionPartitions();
   CheckTenBitRenderTargetFormat();
   CheckDeadImageViewScrub();
   CheckPixelRateSampleIdVariant();
