@@ -70,10 +70,14 @@ static bool EarlyDispatchSkip() {
 	return enabled;
 }
 
-// Round 94: a dispatch whose pipeline compiles in the background (TryGetComputePipeline).
+// Round 94: a dispatch whose pipeline compiles in the background (TryGetComputePipeline), or
+// (round 105) one the driver could not build.
 static void SkipDispatchWhileCompiling(uint64_t shader_hash) {
 	if (FrameGraph::Logging()) {
-		FrameGraph::Log("  not run: cs %016" PRIx64 " compiles in the background", shader_hash);
+		FrameGraph::Log("  not run: cs %016" PRIx64
+		                " has no pipeline (it compiles in the background, or the driver could not "
+		                "build it)",
+		                shader_hash);
 	}
 }
 

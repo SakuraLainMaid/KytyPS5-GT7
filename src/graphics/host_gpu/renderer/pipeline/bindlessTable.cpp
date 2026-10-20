@@ -477,6 +477,11 @@ void BindlessTable::CreatePlaceholders(CommandScheduler& /*scheduler*/) {
 	// Transparent black by default. KYTY_BINDLESS_DEBUG_COLORS=1: slot 0 grey (not resident), slot
 	// 1 red (key outside its heap), slot 2 blue (pending), to see which case a surface is in.
 	const bool debug_colors = std::getenv("KYTY_BINDLESS_DEBUG_COLORS") != nullptr;
+	if (debug_colors) {
+		// Round 105: so a run's log shows the setting took effect.
+		LOGF("Bindless: placeholder textures in debug colours (KYTY_BINDLESS_DEBUG_COLORS): grey "
+		     "not resident, red outside its heap, blue pending\n");
+	}
 	const auto color        = [debug_colors](float r, float g, float b) {
         return debug_colors ? vk::ClearColorValue {std::array<float, 4> {r, g, b, 1.0f}}
 		                           : vk::ClearColorValue {std::array<float, 4> {0.0f, 0.0f, 0.0f, 0.0f}};

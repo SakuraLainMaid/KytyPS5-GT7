@@ -24,6 +24,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -2638,6 +2639,100 @@ void BufferCache::WaitForDiagnostics() {
 	const auto tick = m_scheduler.CurrentTick();
 	m_scheduler.Wait(tick);
 	m_scheduler.WaitPriorityOperations(tick);
+}
+
+void BufferCache::SnapshotForDiagnostics(uint64_t vaddr, uint64_t size, uint32_t op,
+                                         std::string label) {
+	// At most this many a capture (each a buffer of its own, up to KYTY_FG_DUMP_BYTES).
+	constexpr size_t MaxSnapshots = 256;
+	size &= ~uint64_t {3};
+	if (size == 0 || m_diagnostic_snapshots.size() >= MaxSnapshots ||
+	    !GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	// What the binding uploads first (FindBuffers runs after the stage's capture lines): the
+	// CPU's writes since the last upload, so the copy is what the dispatch reads.
+	if (!HasGpuDirtyBytes(vaddr, size)) {
+		SynchronizeBuffersInRange(vaddr, size);
+	}
+	PendingSnapshot pending;
+	pending.snapshot.address = vaddr;
+	pending.snapshot.op      = op;
+	pending.snapshot.label   = std::move(label);
+	pending.size             = size;
+	const Buffer* source     = nullptr;
+	if (auto it = m_buffers.upper_bound(vaddr); it != m_buffers.begin()) {
+		--it;
+		const auto& buffer = m_slot_buffers[it->second];
+		if (buffer.IsInBounds(vaddr, size)) {
+			source = &buffer;
+		}
+	}
+	if (source == nullptr) {
+		pending.snapshot.words.resize(size / 4u);
+		if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, pending.snapshot.words.data(), size)) {
+			pending.snapshot.words.clear();
+		}
+		m_diagnostic_snapshots.push_back(std::move(pending));
+		return;
+	}
+	pending.snapshot.from_gpu = true;
+	pending.copy  = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                                         vk::BufferUsageFlagBits::eTransferDst, size);
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto              native = command.Recorder();
+	vk::BufferMemoryBarrier before {};
+	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = source->Handle();
+	before.offset              = 0;
+	before.size                = source->Size();
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
+	                       nullptr);
+	const vk::BufferCopy copy {source->Offset(vaddr), 0, size};
+	native.copyBuffer(source->Handle(), pending.copy->Handle(), 1, &copy);
+	auto after          = before;
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	after.buffer        = pending.copy->Handle();
+	after.offset        = 0;
+	after.size          = size;
+	// The source goes back to what the dispatch after it reads or writes.
+	auto release          = before;
+	release.srcAccessMask = vk::AccessFlagBits::eTransferRead;
+	release.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	const std::array<vk::BufferMemoryBarrier, 2> done {after, release};
+	native.pipelineBarrier(
+	    vk::PipelineStageFlagBits::eTransfer,
+	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
+	    static_cast<uint32_t>(done.size()), done.data(), 0, nullptr);
+	m_diagnostic_snapshots.push_back(std::move(pending));
+}
+
+std::vector<BufferCache::DiagnosticSnapshot> BufferCache::TakeDiagnosticSnapshots() {
+	std::vector<DiagnosticSnapshot> result;
+	if (m_diagnostic_snapshots.empty()) {
+		return result;
+	}
+	WaitForDiagnostics();
+	result.reserve(m_diagnostic_snapshots.size());
+	for (auto& pending: m_diagnostic_snapshots) {
+		if (pending.copy != nullptr) {
+			pending.copy->Invalidate(0, pending.size);
+			const auto mapped = pending.copy->Mapped();
+			if (mapped.size() >= pending.size) {
+				pending.snapshot.words.resize(pending.size / 4u);
+				std::memcpy(pending.snapshot.words.data(), mapped.data(), pending.size);
+			}
+		}
+		result.push_back(std::move(pending.snapshot));
+	}
+	m_diagnostic_snapshots.clear();
+	return result;
 }
 
 bool BufferCache::IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const {

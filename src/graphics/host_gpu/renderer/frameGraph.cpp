@@ -158,7 +158,7 @@ bool LogWords(uint64_t address, uint64_t bytes, std::vector<uint32_t>& words, ui
 		LOGF("FG 0 buf 0x%012" PRIx64 "+0x%" PRIx64 ": not readable\n", address, bytes);
 		return false;
 	}
-	for (size_t row = 0; row < words.size(); row += 16) {
+	for (size_t row = 0; row < words.size() && lines < MaxBufferLines; row += 16) {
 		char   line[16 * 9 + 1] {};
 		size_t used = 0;
 		for (size_t k = row; k < std::min(words.size(), row + 16); k++) {
@@ -247,11 +247,45 @@ void LogRehash(BufferCache& cache) {
 	     g_hashed.size(), changed, gpu, gone, skipped);
 }
 
+// Round 105: the GPU's copies of the chosen dispatches' buffers as each dispatch found them
+// (BufferCache::SnapshotForDiagnostics): "FG 0 snapshot ..." then "FG 0 snap 0x<address> +0x<off>:
+// <words>" lines, 16 words a line.
+void LogSnapshots(BufferCache& cache) {
+	const auto snapshots = cache.TakeDiagnosticSnapshots();
+	if (snapshots.empty()) {
+		return;
+	}
+	LOGF("FG 0 snapshots: %zu buffers as the dispatches of the KYTY_FG_DUMP_SHADERS shaders found "
+	     "them\n",
+	     snapshots.size());
+	uint64_t lines = 0;
+	for (const auto& snapshot: snapshots) {
+		LOGF("FG 0 snapshot op %u %s 0x%012" PRIx64 "+0x%zx: %s\n", snapshot.op,
+		     snapshot.label.c_str(), snapshot.address, snapshot.words.size() * 4u,
+		     snapshot.words.empty() ? "not readable"
+		     : snapshot.from_gpu    ? "the GPU's copy before the dispatch ran"
+		                            : "guest memory (no cached buffer holds it all)");
+		for (size_t row = 0; row < snapshot.words.size() && lines < MaxBufferLines; row += 16) {
+			char   line[16 * 9 + 1] {};
+			size_t used = 0;
+			for (size_t k = row; k < std::min(snapshot.words.size(), row + 16); k++) {
+				used += static_cast<size_t>(
+				    std::snprintf(line + used, sizeof(line) - used, " %08x", snapshot.words[k]));
+			}
+			LOGF("FG 0 snap 0x%012" PRIx64 " +0x%03zx:%s\n", snapshot.address, row * 4u, line);
+			lines++;
+		}
+	}
+}
+
 void LogBuffers(BufferCache& cache) {
 	std::vector<std::pair<uint64_t, uint64_t>> ranges(g_buffers.begin(), g_buffers.end());
 	// The GPU's writes first (one wait for all of them).
 	cache.DownloadRangesForDiagnostics(ranges);
-	LOGF("FG 0 buffers: %zu, the first %" PRIu64 " bytes of each\n", ranges.size(), KeepBytes);
+	LOGF("FG 0 buffers: %zu, the first %" PRIu64
+	     " bytes of each (more of those KYTY_FG_DUMP_SHADERS "
+	     "shaders bind)\n",
+	     ranges.size(), KeepBytes);
 	std::vector<uint32_t> words;
 	uint64_t              lines = 0;
 	for (const auto& [address, bytes]: ranges) {
@@ -285,6 +319,7 @@ void OnFrameBoundary(BufferCache& cache) {
 		     g_truncated ? " (lines truncated)" : "");
 		// Before the buffers' downloads, which clear the marks of what the GPU wrote.
 		LogRehash(cache);
+		LogSnapshots(cache);
 		LogBuffers(cache);
 		LogReadbacks(cache);
 		LogVerify(cache);
@@ -444,6 +479,33 @@ void NoteBuffer(uint64_t address, uint64_t size) {
 		return;
 	}
 	const auto bytes = std::min(size, KeepBytes) & ~uint64_t {3};
+	if (bytes == 0) {
+		return;
+	}
+	if (const auto found = g_buffers.find(address); found != g_buffers.end()) {
+		found->second = std::max(found->second, bytes);
+		return;
+	}
+	if (g_buffers.size() < MaxBuffers) {
+		g_buffers.emplace(address, bytes);
+	}
+}
+
+uint64_t ChosenBufferBytes() {
+	static const uint64_t limit = [] {
+		const char* value = std::getenv("KYTY_FG_DUMP_BYTES");
+		const auto  bytes = value != nullptr ? std::strtoull(value, nullptr, 0) : 65536ull;
+		return std::clamp<uint64_t>(bytes, KeepBytes, 1ull << 20u);
+	}();
+	return limit;
+}
+
+void NoteChosenBuffer(uint64_t address, uint64_t size) {
+	const uint64_t limit = ChosenBufferBytes();
+	if (!Logging() || address == 0 || size == 0) {
+		return;
+	}
+	const auto bytes = std::min(size, limit) & ~uint64_t {3};
 	if (bytes == 0) {
 		return;
 	}

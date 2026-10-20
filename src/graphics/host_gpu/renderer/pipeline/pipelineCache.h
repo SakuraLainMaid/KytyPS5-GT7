@@ -253,6 +253,9 @@ public:
 		bool                    uses_bindless         = false;
 		// Set while a worker compiles `pipeline`; draws skip it until the compile finishes.
 		std::shared_ptr<PendingGraphicsPipeline> pending;
+		// Round 105: the driver could not build this compute pipeline (`pipeline` is null); its
+		// dispatches are skipped (TryGetComputePipeline).
+		bool build_failed = false;
 	};
 
 	struct GraphicsPrograms {

@@ -10,6 +10,8 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
+#include <cinttypes>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -555,6 +557,10 @@ public:
 		std::lock_guard lock(mutex);
 		return queue.empty();
 	}
+	size_t Size() const {
+		std::lock_guard lock(mutex);
+		return queue.size();
+	}
 	void Clear() {
 		std::lock_guard lock(mutex);
 		queue.clear();
@@ -849,6 +855,9 @@ public:
 			start_time_ms = ms;
 			clock_start   = std::chrono::steady_clock::now();
 			paused_extra  = {};
+			sync_stats       = {};
+			sync_stats.since = clock_start;
+			sync_logs        = 0;
 			paused        = paused_after_start;
 			pause_time    = clock_start;
 			seek_video_frame_pending =
@@ -906,6 +915,10 @@ public:
 		std::lock_guard  lock(mutex);
 		if (paused) {
 			paused_extra += std::chrono::steady_clock::now() - pause_time;
+			// Round 105: the sync report's next second starts now, not before the pause.
+			const auto since = std::chrono::steady_clock::now();
+			sync_stats       = {};
+			sync_stats.since = since;
 		}
 		paused                   = false;
 		seek_video_frame_pending = false;
@@ -993,7 +1006,20 @@ public:
 			return now == 0 || candidate.info.time_stamp + candidate.timestamp_offset <= now;
 		});
 		if (!frame) {
+			if (video_frames.Empty()) {
+				sync_stats.video_starved++;
+			} else {
+				sync_stats.video_early++;
+			}
+			LogSyncNoLock();
 			return false;
+		}
+		{
+			const uint64_t ts = frame->info.time_stamp + frame->timestamp_offset;
+			if (sync_stats.video_frames++ == 0) {
+				sync_stats.video_first_ms = ts;
+			}
+			sync_stats.video_last_ms = ts;
 		}
 		if (current_video) {
 			retired_video.push_back(std::move(current_video->buffer));
@@ -1008,6 +1034,7 @@ public:
 		if (deliver_seek_frame) {
 			seek_video_frame_pending = false;
 		}
+		LogSyncNoLock();
 		return true;
 	}
 	bool Audio(AvPlayerFrameInfo* out) {
@@ -1039,6 +1066,17 @@ public:
 		clock_start   = std::chrono::steady_clock::now();
 		paused_extra  = {};
 		RecordLoopBoundary(*current_audio);
+		{
+			const auto& audio    = current_audio->info.details.audio;
+			const auto  channels = std::max<uint32_t>(audio.channel_count, 1u);
+			if (sync_stats.audio_frames++ == 0) {
+				sync_stats.audio_first_ms = start_time_ms;
+			}
+			sync_stats.audio_last_ms = start_time_ms;
+			sync_stats.audio_samples += audio.size / (channels * sizeof(int16_t));
+			sync_stats.audio_rate = audio.sample_rate;
+		}
+		LogSyncNoLock();
 		return true;
 	}
 	std::optional<int32_t> TakeWarning() {
@@ -1056,6 +1094,45 @@ private:
 	bool DrainedNoLock() const {
 		return demux_eof && video_done && audio_done && video_frames.Empty() &&
 		       audio_frames.Empty();
+	}
+	// Round 105, issue 4 (videos and music out of sync, or silent): every second while playing,
+	// what the game took against the time that passed: the video frames shown and the polls that
+	// found none due (the next one not due yet, or none decoded), the audio frames taken and how
+	// much sound they hold (1.00x real time when the game plays it as it takes it), the clock (the
+	// last audio frame taken, plus the time since) and the newest video frame against it. Every
+	// second for the first minute after each start, then every tenth second.
+	void LogSyncNoLock() {
+		const auto now     = std::chrono::steady_clock::now();
+		const auto elapsed = std::chrono::duration<double>(now - sync_stats.since).count();
+		if (sync_stats.since == std::chrono::steady_clock::time_point {} || elapsed < 1.0) {
+			return;
+		}
+		if (sync_logs < 60u || sync_logs % 10u == 0) {
+			const double sound_ms =
+			    sync_stats.audio_rate != 0
+			        ? 1000.0 * static_cast<double>(sync_stats.audio_samples) / sync_stats.audio_rate
+			        : 0.0;
+			const auto clock = CurrentTimeNoLock();
+			LOGF("AvPlayer sync (%.1f s): video %u frames shown (%" PRIu64 " to %" PRIu64
+			     " ms), %u polls found the next not due, %u found none decoded | audio %u frames "
+			     "taken, %.0f ms of sound at %u Hz (%.2fx real time; %" PRIu64 " to %" PRIu64
+			     " ms) | clock %" PRIu64 " ms, newest video frame %+lld ms from it | queued %zu "
+			     "video, %zu audio frames | sync mode %u%s\n",
+			     elapsed, sync_stats.video_frames, sync_stats.video_first_ms,
+			     sync_stats.video_last_ms, sync_stats.video_early, sync_stats.video_starved,
+			     sync_stats.audio_frames, sound_ms, sync_stats.audio_rate,
+			     sound_ms / (1000.0 * elapsed), sync_stats.audio_first_ms, sync_stats.audio_last_ms,
+			     clock,
+			     sync_stats.video_frames != 0 ? static_cast<long long>(sync_stats.video_last_ms) -
+			                                        static_cast<long long>(clock)
+			                                  : 0ll,
+			     video_frames.Size(), audio_frames.Size(), sync_mode,
+			     audio_id ? "" : ", no audio stream");
+		}
+		sync_logs++;
+		const auto since = now;
+		sync_stats       = {};
+		sync_stats.since = since;
 	}
 	void RecordLoopBoundary(const ReadyFrame& frame) {
 		if (frame.timestamp_offset > last_output_loop_offset) {
@@ -1718,6 +1795,21 @@ private:
 	std::chrono::steady_clock::time_point    clock_start {};
 	std::chrono::steady_clock::time_point    pause_time {};
 	std::chrono::steady_clock::duration      paused_extra {};
+	struct SyncStats {
+		std::chrono::steady_clock::time_point since {};
+		uint32_t                              video_frames   = 0;
+		uint32_t                              video_early    = 0;
+		uint32_t                              video_starved  = 0;
+		uint64_t                              video_first_ms = 0;
+		uint64_t                              video_last_ms  = 0;
+		uint32_t                              audio_frames   = 0;
+		uint64_t                              audio_samples  = 0;
+		uint32_t                              audio_rate     = 0;
+		uint64_t                              audio_first_ms = 0;
+		uint64_t                              audio_last_ms  = 0;
+	};
+	SyncStats sync_stats {};
+	uint32_t  sync_logs = 0;
 };
 
 struct AvPlayerInternal {

@@ -65,6 +65,10 @@ void LogBytes(const char* label, uint64_t address, uint64_t size);
 // Buffer contents shown after the frame: the first KeepBytes of each.
 inline constexpr uint64_t KeepBytes = 1024;
 void                      NoteBuffer(uint64_t address, uint64_t size);
+// Round 105: a buffer a KYTY_FG_DUMP_SHADERS shader binds, shown after the frame (the GPU's writes
+// downloaded first) up to KYTY_FG_DUMP_BYTES (default 64 KB, at most 1 MB), whatever the draw.
+void                   NoteChosenBuffer(uint64_t address, uint64_t size);
+[[nodiscard]] uint64_t ChosenBufferBytes();
 // Whether the current operation's buffers are shown (dispatches and full-screen draws).
 void               SetShowBuffers(bool show);
 [[nodiscard]] bool ShowBuffers();

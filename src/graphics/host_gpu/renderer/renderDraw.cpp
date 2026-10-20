@@ -2213,19 +2213,20 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, const CommandRecorder
 	}
 }
 
-// Round 93, diagnostics (an F9 capture): a draw that tests depth for EQUAL without writing it
-// (a colour pass over its depth prepass) is drawn twice more after itself, its colour and stencil
-// writes off, each in an occlusion query (FrameGraphQueries::Kind): "as close or closer" with a
-// bias towards the camera, and without a depth test. Only a draw whose stages write no memory,
-// with its counts on the CPU (no GPU arguments, no mesh shader). The next draw sets its dynamic
-// state again.
+// Round 93, diagnostics (an F9 capture): a draw that tests depth for EQUAL (a colour pass over its
+// depth prepass) is drawn twice more after itself, its colour, stencil and depth writes off, each
+// in an occlusion query (FrameGraphQueries::Kind): "as close or closer" with a bias towards the
+// camera, and without a depth test. Only a draw whose stages write no memory, with its counts on
+// the CPU (no GPU arguments, no mesh shader). The next draw sets its dynamic state again. Round
+// 105: also one that writes depth too (the crowd's colour passes do; writing the depth it equals
+// changes nothing).
 static void DrawDepthEqualProbes(const HW::UserConfig& ucfg, const CommandRecorder& vk_buffer,
                                  const DrawCallInfo& draw, const DrawEmitInfo& emit,
                                  const DrawRenderState&                 state,
                                  std::span<const ShaderVertexInputInfo> vertex_stages,
                                  const RenderState&                     rendering) {
 	const auto& depth = state.depth_info;
-	if (!depth.image_id || !depth.depth_test_enable || depth.depth_write_enable ||
+	if (!depth.image_id || !depth.depth_test_enable ||
 	    depth.depth_compare_op != vk::CompareOp::eEqual) {
 		return;
 	}
@@ -2266,6 +2267,7 @@ static void DrawDepthEqualProbes(const HW::UserConfig& ucfg, const CommandRecord
 	if (depth.stencil_test_enable) {
 		vk_buffer.setStencilWriteMask(vk::StencilFaceFlagBits::eFrontAndBack, 0u);
 	}
+	vk_buffer.setDepthWriteEnable(VK_FALSE);
 	const bool reversed_z = ReversedDepth(depth);
 	for (const auto kind: {FrameGraphQueries::Kind::Close, FrameGraphQueries::Kind::Anywhere}) {
 		const bool close = kind == FrameGraphQueries::Kind::Close;
@@ -3293,6 +3295,12 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	emit.vertex_offset  = vertex_offset + args.base_vertex;
 	emit.first_instance = instance_offset;
 	emit.gpu_args_address = args.gpu_args_address;
+	if (FrameGraph::Logging()) {
+		// Round 105: which instances and vertices the draw takes (a crowd pass's people).
+		FrameGraph::Log("  offsets: first instance %u, vertex offset %d, index offset %u%s",
+		                emit.first_instance, emit.vertex_offset, ucfg.GetIndexOffset(),
+		                indirect ? " (the GPU's arguments)" : "");
+	}
 	LogWatchedDraw(draw, state, ucfg.GetIndexOffset(), args.base_vertex, 0, emit.vertex_offset,
 	               emit.first_instance, indirect);
 

@@ -2527,6 +2527,17 @@ static void LogFrameGraphStage(RenderContext& context, const ShaderStageRuntime&
 		}
 		if (mapped != 0) {
 			FrameGraph::NoteBuffer(r.Base48(), mapped);
+			if (FrameGraph::DumpsShaderMemory(program.shader_hash)) {
+				// Round 105: all of it, as it is after the frame (a crowd pass's instance list),
+				// and for a dispatch, the GPU's copy as the dispatch finds it (a transient list a
+				// later frame reuses is gone by the end of this one).
+				FrameGraph::NoteChosenBuffer(r.Base48(), mapped);
+				if (program.stage == ShaderType::Compute) {
+					buffers.SnapshotForDiagnostics(
+					    r.Base48(), std::min(mapped, FrameGraph::ChosenBufferBytes()),
+					    FrameGraph::CurrentOp(), fmt::format("cs buf[{}]", i));
+				}
+			}
 		}
 		if (mapped != 0 && !gpu && !program.info.buffers[i].written &&
 		    FrameGraph::VerifyEnabled()) {

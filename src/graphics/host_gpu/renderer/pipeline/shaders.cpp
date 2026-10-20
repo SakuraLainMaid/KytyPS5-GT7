@@ -3,6 +3,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/virtualMemory.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -20,9 +21,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
+#include <fmt/format.h>
 #include <limits>
 #include <memory>
 #include <span>
@@ -51,6 +55,59 @@ static bool DisableOptimizationFor(uint64_t shader_hash) {
 		return result;
 	}();
 	return std::ranges::find(hashes, shader_hash) != hashes.end();
+}
+
+// Round 105, a test of the path below: KYTY_FAIL_COMPUTE_PIPELINE="hash,hash,..." makes the
+// driver's build of these compute shaders' pipelines fail as if it ran out of memory.
+static bool FailComputePipelineFor(uint64_t shader_hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> result;
+		if (const char* value = std::getenv("KYTY_FAIL_COMPUTE_PIPELINE"); value != nullptr) {
+			std::string list(value);
+			size_t      start = 0;
+			while (start < list.size()) {
+				const auto end = std::min(list.find(',', start), list.size());
+				if (end > start) {
+					result.push_back(
+					    std::strtoull(list.substr(start, end - start).c_str(), nullptr, 16));
+				}
+				start = end + 1;
+			}
+		}
+		return result;
+	}();
+	return !hashes.empty() && std::ranges::find(hashes, shader_hash) != hashes.end();
+}
+
+// Round 105: a compute pipeline the graphics driver could not build no longer ends the emulator
+// (issue 3: "Not implemented (result != vk::Result::eSuccess)" after several races, a driver
+// failure the report did not name). Its dispatches are skipped from then on
+// (PipelineCache::Pipeline::build_failed); the log says which shader, the driver's answer and the
+// memory left, on the GPU and in the system's commit limit.
+static void ReportComputePipelineFailure(GraphicContext& graphics, uint64_t shader_hash,
+                                         vk::Result result, bool simulated) {
+	static std::atomic<uint32_t> reported {0};
+	const auto                   count = reported.fetch_add(1, std::memory_order_relaxed) + 1u;
+	if (count > 64u && !std::has_single_bit(count)) {
+		return;
+	}
+	const uint64_t device_mb =
+	    graphics.CanReportMemoryUsage() ? graphics.GetDeviceMemoryUsage() >> 20u : 0;
+	uint64_t   commit_limit = 0;
+	uint64_t   commit_free  = 0;
+	const bool commit       = Common::VirtualMemory::QueryCommit(commit_limit, commit_free);
+	const auto text         = fmt::format(
+        "Compute pipeline CS=0x{:016x}: the graphics driver could not build it"
+	            "{} (vkCreateComputePipelines returned {}; device memory in use: {} MB; system commit "
+	            "limit: {}). Its dispatches are skipped from now on, so what it draws or computes may "
+	            "be missing ({} so far)\n",
+        shader_hash, simulated ? " (KYTY_FAIL_COMPUTE_PIPELINE)" : "", vk::to_string(result),
+        device_mb,
+        commit ? fmt::format("{} MB free of {} MB", commit_free >> 20u, commit_limit >> 20u)
+	                   : std::string("unknown"),
+        count);
+	LOGF("%s", text.c_str());
+	std::fprintf(stderr, "%s", text.c_str());
 }
 
 // IDK: maybe we can remove it?
@@ -862,7 +919,20 @@ bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		     input_info.stage.program->shader_hash);
 		return false;
 	}
-	if (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) {
+	const uint64_t shader_hash =
+	    input_info.stage.program != nullptr ? input_info.stage.program->shader_hash : 0;
+	const bool simulated = FailComputePipelineFor(shader_hash);
+	if (simulated) {
+		if (pipeline.pipeline != nullptr) {
+			graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+			pipeline.pipeline = nullptr;
+		}
+		if (build == ComputeBuild::LookUp) {
+			// In no cache: the build that follows (in the background) fails.
+			return false;
+		}
+		result = vk::Result::eErrorOutOfHostMemory;
+	} else if (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) {
 		result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 		                                                &pipeline.pipeline);
 	}
@@ -876,13 +946,16 @@ bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	if (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) {
-		// Round 104: which shader, and the driver's answer, in the crash report (issue 3 had
-		// only the line of a check).
-		EXIT("the graphics driver could not build the pipeline of compute shader 0x%016" PRIx64
-		     ": vkCreateComputePipelines returned %s (device memory in use: %" PRIu64 " MB)\n",
-		     input_info.stage.program != nullptr ? input_info.stage.program->shader_hash : 0,
-		     vk::to_string(result).c_str(),
-		     graphics.CanReportMemoryUsage() ? graphics.GetDeviceMemoryUsage() >> 20u : 0);
+		if (result == vk::Result::eSuccess) {
+			result = vk::Result::eErrorUnknown;
+		}
+		if (pipeline.pipeline != nullptr) {
+			graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+			pipeline.pipeline = nullptr;
+		}
+		ReportComputePipelineFailure(graphics, shader_hash, result, simulated);
+		pipeline.build_failed = true;
+		return false;
 	}
 	return true;
 }

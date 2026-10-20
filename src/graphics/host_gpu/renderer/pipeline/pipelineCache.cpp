@@ -5407,12 +5407,15 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		KYTY_PROFILER_PHASE(zone, "Compute pipeline build", profiler::colors::RedA100);
 		const auto             begin = std::chrono::steady_clock::now();
 		const GpuPhases::Scope phase(GpuPhases::Phase::PipelineCompile);
-		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
-		                       m_driver_cache, m_driver_older);
-		ReportPipelineBuilt(Profiler::Counter::ComputePipelinesBuilt, "Compute", hash, 0, begin);
+		if (CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
+		                           m_driver_cache, m_driver_older)) {
+			ReportPipelineBuilt(Profiler::Counter::ComputePipelinesBuilt, "Compute", hash, 0,
+			                    begin);
+		}
 	}
 
-	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+	// Round 105: one the driver could not build is kept as such, and its dispatches skipped.
+	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr && !cached->build_failed);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
@@ -5431,6 +5434,17 @@ void PipelineCache::ReapBackgroundCompute() {
 		job.thread.join();
 		const auto seconds =
 		    std::chrono::duration<double>(std::chrono::steady_clock::now() - job.begin).count();
+		if (job.pipeline->build_failed) {
+			// Round 105: kept as failed (its dispatches skipped); the shader's ready expansion,
+			// if any, stays the one it runs.
+			LOGF("Compute pipeline CS=0x%016" PRIx64 " (%u SPIR-V words)%s failed to compile in "
+			     "the background after %.1f s; %" PRIu64 " of its dispatches were skipped "
+			     "meanwhile, and the rest are too\n",
+			     job.hash, job.words, job.partition ? ", a partition," : "", seconds, job.skipped);
+			m_compute_pipelines.emplace(it->first, std::move(job.pipeline));
+			it = m_compute_background.erase(it);
+			continue;
+		}
 		LOGF("Compute pipeline CS=0x%016" PRIx64 " (%u SPIR-V words)%s compiled in the background "
 		     "in %.1f s; %" PRIu64 " of its dispatches were skipped meanwhile\n",
 		     job.hash, job.words, job.partition ? ", a partition," : "", seconds, job.skipped);
@@ -5484,7 +5498,8 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 	ReapBackgroundCompute();
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
-		return iter->second.get();
+		// Round 105: the driver could not build it; its dispatches are skipped.
+		return iter->second->build_failed ? nullptr : iter->second.get();
 	}
 	if (auto iter = m_compute_background.find(compute_program.id);
 	    iter != m_compute_background.end()) {
@@ -5501,7 +5516,8 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 	const auto background_from =
 	    compute_program.inlined_calls ? std::max<uint32_t>(threshold / 10u, 1u) : threshold;
 	if (threshold == 0 || compute_program.spirv_words < background_from) {
-		return &GetComputePipeline(input_info, compute_program);
+		auto& built = GetComputePipeline(input_info, compute_program);
+		return built.build_failed ? nullptr : &built;
 	}
 	const auto hash =
 	    input_info.stage.program != nullptr ? input_info.stage.program->shader_hash : 0;

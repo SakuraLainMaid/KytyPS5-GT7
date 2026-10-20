@@ -302,6 +302,19 @@ public:
 	// Diagnostics, GPU thread: waits until the GPU is idle and every download it queued (images
 	// read back for the CPU too) has landed in guest memory.
 	void WaitForDiagnostics();
+	// Round 105, diagnostics (an F9 capture), GPU thread: the GPU's copy of [vaddr, vaddr + size)
+	// as it stands at this point of the command stream (before the dispatch being prepared runs),
+	// copied into a buffer of its own; guest memory as it is now when no cached buffer holds all
+	// of it. TakeDiagnosticSnapshots, after the frame, waits for the GPU and returns them.
+	struct DiagnosticSnapshot {
+		uint64_t              address  = 0;
+		uint32_t              op       = 0;
+		bool                  from_gpu = false;
+		std::string           label;
+		std::vector<uint32_t> words;
+	};
+	void SnapshotForDiagnostics(uint64_t vaddr, uint64_t size, uint32_t op, std::string label);
+	[[nodiscard]] std::vector<DiagnosticSnapshot> TakeDiagnosticSnapshots();
 
 	// Diagnostics: the guest shader whose bindings are being prepared on this thread, if any.
 	inline static thread_local uint64_t s_diag_shader_hash = 0;
@@ -423,6 +436,13 @@ private:
 	template <bool async>
 	void DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
 	                          uint64_t total_size);
+
+	struct PendingSnapshot {
+		DiagnosticSnapshot      snapshot;
+		uint64_t                size = 0;
+		std::unique_ptr<Buffer> copy;
+	};
+	std::vector<PendingSnapshot> m_diagnostic_snapshots;
 
 	GraphicContext&                                    m_graphics;
 	CommandScheduler&                                  m_scheduler;

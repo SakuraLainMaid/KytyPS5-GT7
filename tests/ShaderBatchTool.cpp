@@ -1021,6 +1021,20 @@ int main(int argc, char* argv[]) {
 		}
 		return 0;
 	}
+	if (folder == "--disasm") {
+		// shader_batch_tool --disasm <log> <code.bin>...: each shader's instructions as the
+		// decoder reads them (a capture's shader dumps, any stage).
+		for (int arg = 3; arg < argc; arg++) {
+			const auto            bytes = ReadFile(argv[arg]);
+			std::vector<uint32_t> code(bytes.size() / 4u);
+			std::memcpy(code.data(), bytes.data(), code.size() * 4u);
+			ShaderRecompiler::Decoder::Program program;
+			ShaderRecompiler::Decoder::DecodeProgram(code, program);
+			std::printf("DISASM\t%s\t%zu instructions\n%s", argv[arg], program.instructions.size(),
+			            ShaderRecompiler::Decoder::ProgramToString(program).c_str());
+		}
+		return 0;
+	}
 	if (folder == "--raw-cs") {
 		// shader_batch_tool --raw-cs <log> <code.bin> <user sgprs> <tgid
 		// letters> <threads x>
