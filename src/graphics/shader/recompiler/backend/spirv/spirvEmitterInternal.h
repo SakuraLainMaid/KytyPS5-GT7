@@ -83,6 +83,8 @@ struct SpirvRequirements {
 	// A compute ray tracing shader with bounded loops: its waves count their loops' rounds
 	// (RayLoopSlot, EmitRayLoopRounds).
 	bool ray_loop_rounds = false;
+	// ... with KYTY_PROBE <hash>@stuck points (ShaderStuckProbe, DefineStuckProbe).
+	bool stuck_probe = false;
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
@@ -198,6 +200,7 @@ struct EmitterState {
 	std::vector<const void*>   ray_loop_ticks;
 	uint32_t                   ray_loop_count_function               = 0;
 	uint32_t                   ray_loop_round_function               = 0;
+	uint32_t                   stuck_probe_function                  = 0;
 	uint32_t                   runtime_image_requests_variable       = 0;
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   main_func                             = 0;

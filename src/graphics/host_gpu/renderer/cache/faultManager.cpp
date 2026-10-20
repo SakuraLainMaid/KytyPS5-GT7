@@ -191,6 +191,50 @@ void ReportRayLoops(const uint8_t* area, uint64_t frame) {
 	}
 }
 
+std::mutex& StuckSampleMutex() {
+	static std::mutex mutex;
+	return mutex;
+}
+std::vector<StuckProbeSample>& StuckSamples() {
+	static std::vector<StuckProbeSample> samples;
+	return samples;
+}
+
+// Diagnostics (KYTY_PROBE <hash>@stuck): logs the samples of a fault-buffer read, every one of
+// the first 8 reads that have some, then one read's every 10 seconds, and keeps the first 64 for
+// the comparison with guest memory (TakeStuckProbeSamples).
+void ReportStuckSamples(const uint8_t* area) {
+	uint32_t count = 0;
+	std::memcpy(&count, area + offsetof(ShaderTrapArea, stuck_count), sizeof(count));
+	if (count == 0) return;
+	static uint32_t                              reads = 0;
+	static std::chrono::steady_clock::time_point last;
+	const auto                                   now = std::chrono::steady_clock::now();
+	const std::lock_guard                        lock(StuckSampleMutex());
+	const bool log = reads < 8 || now - last >= std::chrono::seconds(10);
+	if (log) {
+		reads++;
+		last = now;
+		LOGF("Stuck probe: %u waves reached %u rounds in a loop since the last read\n", count,
+		     kStuckProbeRounds);
+	}
+	for (uint32_t index = 0; index < std::min(count, kStuckProbeSamples); index++) {
+		StuckProbeSample sample;
+		std::memcpy(&sample, area + offsetof(ShaderTrapArea, stuck) + index * sizeof(sample),
+		            sizeof(sample));
+		if (StuckSamples().size() < 64) {
+			StuckSamples().push_back(sample);
+		}
+		if (!log) continue;
+		std::string text;
+		for (uint32_t value = 0; value < std::min(sample.count, kShaderProbeValues); value++) {
+			text += fmt::format(" [{}]=0x{:08x}", value, sample.values[value]);
+		}
+		LOGF("Stuck probe: shader %08x%08x loop 0x%04x point %u:%s\n", sample.shader_hash_high,
+		     sample.shader_hash_low, sample.loop_pc, sample.point, text.c_str());
+	}
+}
+
 size_t DownloadAreaSize(const GraphicContext& graphics) {
 	const auto& limits = graphics.physical_device_properties.limits;
 	const auto  alignment =
@@ -199,6 +243,11 @@ size_t DownloadAreaSize(const GraphicContext& graphics) {
 }
 
 } // namespace
+
+std::vector<StuckProbeSample> TakeStuckProbeSamples() {
+	const std::lock_guard lock(StuckSampleMutex());
+	return std::exchange(StuckSamples(), {});
+}
 
 FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler,
                            BufferCache& buffer_cache)
@@ -381,6 +430,7 @@ void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 		ReportProbes(mapped + PageFaultAreaSize);
 		ReportRayLoops(mapped + PageFaultAreaSize,
 		               m_graphics.presented_frames.load(std::memory_order_relaxed));
+		ReportStuckSamples(mapped + PageFaultAreaSize);
 		if (trap.claimed != 0 && report == nullptr) {
 			const auto  hash    = (uint64_t {trap.shader_hash_high} << 32) | trap.shader_hash_low;
 			const auto* pending = std::bit_cast<const uint64_t*>(mapped);

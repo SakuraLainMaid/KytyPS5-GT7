@@ -21,6 +21,10 @@ struct ShaderFaultReport {
 	ShaderTrapRecord trap;
 };
 
+// Diagnostics (KYTY_PROBE <hash>@stuck): the samples the fault-buffer reads found, for the GPU
+// thread to compare with guest memory (RenderContext::RunGarbageCollector, KYTY_PROBE_LIST).
+std::vector<StuckProbeSample> TakeStuckProbeSamples();
+
 class FaultManager {
 	static constexpr size_t MaxPendingFaults = 8;
 

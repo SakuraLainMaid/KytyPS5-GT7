@@ -167,7 +167,9 @@ struct ShaderProgram {
 [[nodiscard]] bool StageSamplersAllUnnormalized(const ShaderStageRuntime& stage);
 // KYTY_EXACT_FLOAT=1 (round 75, a test): every vertex, geometry and tessellation shader's module is
 // made from SpirvExactFloat's copy. The shader cache is unchanged; the driver compiles again.
+// KYTY_EXACT_FLOAT=<hash>[,<hash>...] (round 102): those shaders alone.
 [[nodiscard]] bool ExactFloatPositions();
+[[nodiscard]] bool ExactFloatShader(uint64_t shader_hash);
 
 // Everything vkCreateGraphicsPipelines reads for one graphics pipeline, owned in one place so the
 // driver compile can run on a worker thread (the structures point into each other: it stays

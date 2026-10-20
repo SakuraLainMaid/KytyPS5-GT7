@@ -101,6 +101,23 @@ struct RayLoopSlot {
 };
 static_assert(sizeof(RayLoopSlot) == 112 * sizeof(uint32_t));
 
+// Diagnostics (KYTY_PROBE <hash>@stuck:<registers>): the registers of a wave of a ray tracing
+// shader when its rounds in one of its bounded loops reach kStuckProbeRounds (waves that finish
+// stay far below). One lane of the wave claims a sample by the area's stuck_count; the host logs
+// the samples (FaultManager) and reads the guest memory they point at (KYTY_PROBE_LIST).
+inline constexpr uint32_t kStuckProbeRounds  = 1024;
+inline constexpr uint32_t kStuckProbeSamples = 32;
+struct StuckProbeSample {
+	uint32_t shader_hash_low  = 0;
+	uint32_t shader_hash_high = 0;
+	uint32_t loop_pc          = 0; // the loop's label (RayLoopSlot::pc)
+	uint32_t point            = 0; // the probe point
+	uint32_t count            = 0; // the values recorded
+	uint32_t reserved[3] {};
+	uint32_t values[kShaderProbeValues] {};
+};
+static_assert(sizeof(StuckProbeSample) == 80);
+
 struct ShaderTrapArea {
 	ShaderTrapRecord   record;
 	ShaderCallMissSlot misses[kShaderCallMissSlots];
@@ -113,6 +130,9 @@ struct ShaderTrapArea {
 	uint32_t           probe_reserved[15 - kShaderProbePoints] {};
 	ShaderProbeRecord  probes[kShaderProbeSlots];
 	RayLoopSlot        ray_loops[kRayLoopSlots];
+	uint32_t           stuck_count = 0;
+	uint32_t           stuck_reserved[3] {};
+	StuckProbeSample   stuck[kStuckProbeSamples];
 };
 static_assert(offsetof(ShaderTrapArea, misses) == sizeof(ShaderTrapRecord));
 static_assert(offsetof(ShaderTrapArea, probes) ==

@@ -1030,12 +1030,47 @@ std::vector<uint32_t> SpirvWithoutSampleId(std::span<const uint32_t> spirv) {
 	return out;
 }
 
-bool ExactFloatPositions() {
-	static const bool value = [] {
-		const char* text = std::getenv("KYTY_EXACT_FLOAT");
-		return text != nullptr && text[0] == '1';
+namespace {
+
+// KYTY_EXACT_FLOAT: "1" for every vertex-stage shader, or a comma-separated list of shader hashes
+// (hex) for those alone (round 102: the depth and colour passes of one mesh, without recompiling
+// every pipeline of a race).
+struct ExactFloatSetting {
+	bool                  all = false;
+	std::vector<uint64_t> hashes;
+};
+
+const ExactFloatSetting& ExactFloatSettingValue() {
+	static const ExactFloatSetting setting = [] {
+		ExactFloatSetting result;
+		const char*       text = std::getenv("KYTY_EXACT_FLOAT");
+		if (text == nullptr || text[0] == '\0') return result;
+		if (std::strcmp(text, "1") == 0) {
+			result.all = true;
+			return result;
+		}
+		while (text != nullptr && *text != '\0') {
+			char*      end  = nullptr;
+			const auto hash = std::strtoull(text, &end, 16);
+			if (end == text) break;
+			result.hashes.push_back(hash);
+			text = *end == ',' ? end + 1 : nullptr;
+		}
+		return result;
 	}();
-	return value;
+	return setting;
+}
+
+} // namespace
+
+bool ExactFloatPositions() {
+	const auto& setting = ExactFloatSettingValue();
+	return setting.all || !setting.hashes.empty();
+}
+
+bool ExactFloatShader(uint64_t shader_hash) {
+	const auto& setting = ExactFloatSettingValue();
+	return setting.all || std::ranges::find(setting.hashes, shader_hash) != setting.hashes.end();
 }
 
 std::vector<uint32_t> SpirvExactFloat(std::span<const uint32_t> spirv) {
@@ -2149,7 +2184,7 @@ struct PipelineCache::ProgramCache {
 		KYTY_PROFILER_PHASE(phases, "Shader: module create", profiler::colors::Blue300);
 		std::vector<uint32_t> exact;
 		if (options.stage != ShaderType::Pixel && options.stage != ShaderType::Compute &&
-		    ExactFloatPositions()) {
+		    ExactFloatShader(options.shader_hash)) {
 			exact = ExactFloatVariant(options, spirv);
 		}
 		const auto module = CompileSPV(exact.empty() ? spirv : exact, device);
@@ -3131,8 +3166,12 @@ struct PipelineCache::ProgramCache {
 		}
 		if (!exact_float_logged) {
 			exact_float_logged = true;
-			LOGF("Pipeline: KYTY_EXACT_FLOAT: vertex-stage shaders keep every float multiply and "
-			     "add apart, and their positions are invariant\n");
+			LOGF("Pipeline: KYTY_EXACT_FLOAT: %s keep every float multiply and add apart, and "
+			     "their positions are invariant\n",
+			     ExactFloatSettingValue().all ? "vertex-stage shaders"
+			                                  : fmt::format("the {} vertex-stage shaders listed",
+			                                                ExactFloatSettingValue().hashes.size())
+			                                        .c_str());
 		}
 		auto variant = SpirvExactFloat(spirv);
 		if (variant.empty()) {

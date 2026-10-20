@@ -785,8 +785,8 @@ void Translator::WriteCompareResult(const Decoder::Operand& operand, IR::U1 valu
 	WriteMask(operand, ir.LogicalAnd(ir.GetExec(), value));
 }
 
-void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
-                                    IR::BlockInfo& info, uint32_t header_cap, uint32_t loop_pc) {
+IR::U1 Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
+                                      IR::BlockInfo& info, uint32_t header_cap, uint32_t loop_pc) {
 	const auto native_condition = [&](CFG::BranchCondition kind) -> IR::U1 {
 		IR::U1 condition;
 		switch (kind) {
@@ -831,8 +831,9 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 			EXIT("block %u has no indirect branch selector", source.id);
 		}
 		ir.Emit(IR::ValueOpcode::ReferenceU32, {info.indirect_target});
-		return;
+		return {};
 	}
+	IR::U1 tick;
 	if (term.kind == CFG::TerminatorKind::ConditionalBranch) {
 		auto condition = term.expression != UINT32_MAX ? expression(expression, term.expression)
 		                                               : native_condition(term.condition);
@@ -840,13 +841,14 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 		// of the loop draws on the invocation's budget, and the loop ends at its merge once the
 		// budget is spent.
 		if (header_cap != 0u && term.loop_header && term.false_block == term.merge_block) {
-			condition = ir.LogicalAnd(condition,
-			                          IR::U1(ir.Emit(IR::ValueOpcode::LoopBudgetTick,
-			                                         {IR::Value(header_cap), IR::Value(loop_pc)})));
+			tick      = IR::U1(ir.Emit(IR::ValueOpcode::LoopBudgetTick,
+			                           {IR::Value(header_cap), IR::Value(loop_pc)}));
+			condition = ir.LogicalAnd(condition, tick);
 		}
 		info.condition = condition;
 		ir.Emit(IR::ValueOpcode::Reference, {condition});
 	}
+	return tick;
 }
 
 namespace {
@@ -1022,6 +1024,9 @@ struct ProbePoint {
 	uint64_t              hash   = 0;
 	uint32_t              pc     = 0;
 	bool                  writes = false; // <hash>@w: every instruction that writes memory
+	// <hash>@stuck: every bounded loop header of a ray tracing shader, for the waves whose rounds
+	// in the loop reach kStuckProbeRounds (ShaderStuckProbe).
+	bool                  stuck = false;
 	std::vector<uint32_t> registers;
 };
 
@@ -1124,7 +1129,9 @@ std::vector<uint32_t> WriteProbeRegisters(const Decoder::Instruction& inst) {
 // most 12; at most Translator::ProbePoints points)
 // records those registers of the active lanes after the instruction at pc; the host logs them
 // ("Shader probe:"). A point <hash>@w instead follows every instruction of the shader that writes
-// memory, each with its own registers (WriteProbeRegisters), the pcs telling them apart. The name
+// memory, each with its own registers (WriteProbeRegisters), the pcs telling them apart. A point
+// <hash>@stuck:<regs> records the registers at each bounded loop header of a ray tracing shader,
+// once for each wave whose rounds in that loop reach kStuckProbeRounds ("Stuck probe:"). The name
 // is written in two pieces so the shader cache's scan of switches (shader_cache_version.cmake)
 // leaves it out of the key of every shader: only the probed shaders change, and their source keys
 // carry the points (ShaderProbeKey).
@@ -1154,8 +1161,10 @@ const std::vector<ProbePoint>& ProbePoints() {
 				continue;
 			}
 			if (colon == std::string::npos || colon < at) continue;
-			point.pc = static_cast<uint32_t>(
-			    std::strtoul(item.substr(at + 1, colon - at - 1).c_str(), nullptr, 16));
+			point.stuck      = item.compare(at + 1, colon - at - 1, "stuck") == 0;
+			point.pc         = point.stuck ? 0u
+			                               : static_cast<uint32_t>(std::strtoul(
+                                         item.substr(at + 1, colon - at - 1).c_str(), nullptr, 16));
 			size_t reg_start = colon + 1;
 			while (reg_start < item.size() && point.registers.size() < 12u) {
 				auto reg_end = item.find(',', reg_start);
@@ -1774,7 +1783,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				if (probe.writes) {
 					const auto registers = WriteProbeRegisters(instruction);
 					if (!registers.empty()) translator.Probe(instruction.pc, point, registers);
-				} else if (probe.pc == instruction.pc) {
+				} else if (!probe.stuck && probe.pc == instruction.pc) {
 					translator.Probe(instruction.pc, point, probe.registers);
 				}
 			}
@@ -1792,9 +1801,17 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 		}
 		const auto loop_pc = loop_pcs.find(cfg_block.id);
-		translator.AddBranchCondition(
-		    cfg, cfg_block, result.block_info[typed_index], header_budget ? loop_cap : 0u,
-		    loop_pc != loop_pcs.end() ? loop_pc->second : cfg_block.start_pc);
+		const auto label   = loop_pc != loop_pcs.end() ? loop_pc->second : cfg_block.start_pc;
+		const auto tick    = translator.AddBranchCondition(
+            cfg, cfg_block, result.block_info[typed_index], header_budget ? loop_cap : 0u, label);
+		if (!tick.IsEmpty() && ray_tracing) {
+			for (uint32_t point = 0; point < probes.size(); point++) {
+				const auto& probe = probes[point];
+				if (probe.stuck && probe.hash == result.shader_hash) {
+					translator.StuckProbe(tick, label, point, probe.registers);
+				}
+			}
+		}
 	}
 	if (IR::IrValidationEnabled()) {
 		IR::ValidateProgram(result, false);
@@ -1812,7 +1829,10 @@ std::string ShaderProbeKey(uint64_t shader_hash) {
 	for (uint32_t point = 0; point < points.size(); point++) {
 		if (points[point].hash != shader_hash) continue;
 		key += std::to_string(point) + '@' +
-		       (points[point].writes ? std::string("w") : std::to_string(points[point].pc)) + ':';
+		       (points[point].writes  ? std::string("w")
+		        : points[point].stuck ? std::string("stuck")
+		                              : std::to_string(points[point].pc)) +
+		       ':';
 		for (const auto reg: points[point].registers) {
 			key += std::to_string(reg) + ',';
 		}

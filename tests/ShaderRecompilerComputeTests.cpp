@@ -38797,8 +38797,11 @@ void CheckResourcePlanHandoff() {
 // the point and records the registers into the fault buffer, in both emulated
 // wave halves; a write point (@w) follows each instruction that writes memory.
 constexpr uint64_t ProbeTestHash = 0x7ab1f0ull;
+// 7ab1f2: the ray tracing shader of CheckRayTracingHitCallsReturn, sampled at its loops' headers
+// for stuck waves (@stuck).
+constexpr uint64_t StuckProbeTestHash = 0x7ab1f2ull;
 constexpr const char *ProbeTestSetting =
-    "7ab1f0@8:v1,s2,s106,s107;7ab1f0@8:v1-v3;7ab1f0@w";
+    "7ab1f0@8:v1,s2,s106,s107;7ab1f0@8:v1-v3;7ab1f0@w;7ab1f2@stuck:s12,s13,s16";
 
 void SetProbeSetting() {
 #if defined(_WIN32)
@@ -38940,14 +38943,23 @@ void CheckRayTracingHitCallsReturn() {
   test.has_compute_info = true;
   test.compile_only = true;
   test.ir_counts = {{"BvhIntersect", 1}};
+  // Its waves count their loops' rounds, and the stuck probe samples them (ProbeTestSetting).
+  test.shader_hash = StuckProbeTestHash;
+  test.required_spirv = {"ray_loop_count", "ray_loop_round", "ray_loop_stuck",
+                         "OpGroupNonUniformElect"};
   for (const u32 subgroup : {32u, 64u}) {
     const auto compiled = CompileCase(test, subgroup);
     size_t ticks = 0;
+    size_t stuck = 0;
     for (const auto *block : compiled.program.blocks) {
       for (const auto &inst : *block) {
         ticks += inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::LoopBudgetTick ? 1u : 0u;
+        stuck += inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::ShaderStuckProbe ? 1u : 0u;
       }
     }
+    Require(name, "stuck probe", D::ShaderRayLoopCap() == 0u || stuck == ticks,
+            "a bounded loop header has no stuck probe (" + std::to_string(stuck) + " of " +
+                std::to_string(ticks) + ")");
     // Every loop its latch returns to enters its body on the budget.
     size_t loops = 0;
     bool headers_bounded = true;

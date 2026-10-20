@@ -1626,6 +1626,7 @@ void EmitShaderProbe(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 void DefineRayLoopRound(EmitterState& state);
+void DefineStuckProbe(EmitterState& state);
 
 // ray_loop_count(word, cap): one more in the given word of the shader's RayLoopSlot, which the
 // first call claims by the shader's key (and stores the shader and the loop budget, cap, in).
@@ -1709,6 +1710,7 @@ void DefineRayLoopCount(EmitterState& state) {
 	state.builder.AddFunction(spv::OpReturnValue, base);
 	state.builder.AddFunction(spv::OpFunctionEnd);
 	DefineRayLoopRound(state);
+	DefineStuckProbe(state);
 }
 
 // ray_loop_round(rounds, used, left, next, row, pc, cap): the wave's counts for one round of a
@@ -1811,6 +1813,114 @@ void DefineRayLoopRound(EmitterState& state) {
 	});
 	state.builder.AddFunction(spv::OpReturn);
 	state.builder.AddFunction(spv::OpFunctionEnd);
+}
+
+// ray_loop_stuck(rounds, label, point, count, values...): when the wave's rounds in the loop
+// are kStuckProbeRounds, one lane of it takes the next StuckProbeSample and records the values
+// there (KYTY_PROBE <hash>@stuck). A function for the same reason as ray_loop_round.
+void DefineStuckProbe(EmitterState& state) {
+	if (!state.requirements.stuck_probe) {
+		return;
+	}
+	const auto                   u32     = TypeU32(state);
+	const auto                   boolean = TypeBool(state);
+	constexpr uint32_t           params  = 4 + kShaderProbeValues;
+	std::array<uint32_t, params> types {};
+	std::array<uint32_t, params> args {};
+	types.fill(u32);
+	const auto signature =
+	    state.builder.Type(spv::OpTypeFunction, TypeVoid(state), std::span<const uint32_t>(types));
+	state.stuck_probe_function = state.builder.AllocateId();
+	state.builder.AddName(state.stuck_probe_function, "ray_loop_stuck");
+	state.builder.AddFunction(spv::OpFunction, TypeVoid(state), state.stuck_probe_function,
+	                          spv::FunctionControlMaskNone, signature);
+	for (auto& arg: args) {
+		arg = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionParameter, u32, arg);
+	}
+	EmitLabel(state, state.builder.AllocateId());
+	constexpr auto record_word = BufferCachePages::kNumPages / 8 / sizeof(uint32_t);
+	constexpr auto count_word  = static_cast<uint32_t>(
+        record_word + offsetof(ShaderTrapArea, stuck_count) / sizeof(uint32_t));
+	constexpr auto samples_word =
+	    static_cast<uint32_t>(record_word + offsetof(ShaderTrapArea, stuck) / sizeof(uint32_t));
+	constexpr auto sample_words =
+	    static_cast<uint32_t>(sizeof(StuckProbeSample) / sizeof(uint32_t));
+	constexpr auto word_of = [](size_t offset) {
+		return static_cast<uint32_t>(offset / sizeof(uint32_t));
+	};
+	const auto reached =
+	    Binary(state, spv::OpIEqual, boolean, args[0], ConstantU32(state, kStuckProbeRounds));
+	EmitIfCondition(state, reached, [&]() {
+		// As in ray_loop_round: every invocation of the wave's host subgroup is here.
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+		const auto elected = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformElect, boolean, elected,
+		                          ConstantU32(state, spv::ScopeSubgroup));
+		EmitIfCondition(state, elected, [&]() {
+			const auto index = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAtomicIAdd, u32, index,
+			                          FaultElementPointer(state, ConstantU32(state, count_word)),
+			                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0),
+			                          ConstantU32(state, 1));
+			const auto free = Binary(state, spv::OpULessThan, boolean, index,
+			                         ConstantU32(state, kStuckProbeSamples));
+			EmitIfCondition(state, free, [&]() {
+				const auto base = Binary(
+				    state, spv::OpIAdd, u32, ConstantU32(state, samples_word),
+				    Binary(state, spv::OpIMul, u32, index, ConstantU32(state, sample_words)));
+				const auto store = [&](uint32_t word, uint32_t value) {
+					state.builder.AddFunction(
+					    spv::OpStore,
+					    FaultElementPointer(
+					        state, Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, word))),
+					    value);
+				};
+				const auto hash = state.program.shader_hash;
+				store(word_of(offsetof(StuckProbeSample, shader_hash_low)),
+				      ConstantU32(state, static_cast<uint32_t>(hash)));
+				store(word_of(offsetof(StuckProbeSample, shader_hash_high)),
+				      ConstantU32(state, static_cast<uint32_t>(hash >> 32u)));
+				store(word_of(offsetof(StuckProbeSample, loop_pc)), args[1]);
+				store(word_of(offsetof(StuckProbeSample, point)), args[2]);
+				store(word_of(offsetof(StuckProbeSample, count)), args[3]);
+				for (uint32_t value = 0; value < kShaderProbeValues; value++) {
+					store(word_of(offsetof(StuckProbeSample, values)) + value, args[4 + value]);
+				}
+			});
+		});
+	});
+	state.builder.AddFunction(spv::OpReturn);
+	state.builder.AddFunction(spv::OpFunctionEnd);
+}
+
+void EmitShaderStuckProbe(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	// The scalars are the same in both emulated wave halves; the first half's lanes record.
+	if (ctx.half != 0 || state.stuck_probe_function == 0) {
+		return;
+	}
+	const auto* tick = inst.Arg(0).ResolveInstruction();
+	const auto  row  = std::ranges::find(state.ray_loop_ticks, static_cast<const void*>(tick));
+	if (tick == nullptr || row == state.ray_loop_ticks.end()) {
+		return;
+	}
+	const auto index    = std::min<size_t>(static_cast<size_t>(row - state.ray_loop_ticks.begin()),
+	                                       kRayLoopRows - 1u);
+	const auto variable = state.ray_loop_round_variables[index];
+	if (variable == 0) {
+		return;
+	}
+	const auto rounds = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), rounds, variable);
+	std::vector<uint32_t> operands {rounds};
+	for (uint32_t arg = 1; arg < 4u + kShaderProbeValues; arg++) {
+		operands.push_back(arg < 4u ? ConstantU32(state, inst.Arg(arg).Resolve().U32())
+		                            : ctx.Arg(inst, arg));
+	}
+	const auto call = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFunctionCall, TypeVoid(state), call,
+	                          state.stuck_probe_function, std::span<const uint32_t>(operands));
 }
 
 void EmitRayLoopRounds(EmitterState& state, const void* tick, uint32_t cap, uint32_t pc,

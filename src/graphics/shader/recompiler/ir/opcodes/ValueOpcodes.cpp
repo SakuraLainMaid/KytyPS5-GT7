@@ -92,6 +92,7 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::ReferenceU32:
 		case ValueOpcode::ShaderTrap:
 		case ValueOpcode::ShaderProbe:
+		case ValueOpcode::ShaderStuckProbe:
 		case ValueOpcode::LoopBudgetTick:
 		case ValueOpcode::SetAttribute:
 		case ValueOpcode::SetTessellationAttribute:

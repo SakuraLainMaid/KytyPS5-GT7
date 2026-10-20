@@ -202,6 +202,7 @@ void                  EmitWaveLdsBarrier(EmitterState& state);
 void                  EmitStoreCompletion(EmitterState& state);
 void                  EmitShaderTrap(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitShaderProbe(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitShaderStuckProbe(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);

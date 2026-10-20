@@ -712,8 +712,81 @@ static void DumpGuestMemory(GraphicContext& graphics, BufferCache& cache) {
 	}
 }
 
+// Diagnostics: KYTY_PROBE_LIST=<lo>,<hi>,<records>,<start>,<next>,<word0>,<word1> (indices into
+// the values of KYTY_PROBE <hash>@stuck samples) reads the list a stuck wave walks in guest
+// memory, with the GPU's writes downloaded first: a buffer whose V# has its base in values
+// <lo> and <hi> (the low 16 bits; the stride in bits 16-29 of <hi>) and its record count in
+// <records>, the list starting at the byte offset <start> (its low 3 bits cleared), and the wave
+// at the record before index <next>, which it read as <word0> and <word1>. It logs the list's
+// first records, whether guest memory holds what the wave read, and where the first record whose
+// second word has bit 31 set (the end of the list) is ("Stuck list:").
+static void AnalyzeStuckSamples(BufferCache& cache) {
+	static const std::vector<uint32_t> list = [] {
+		std::vector<uint32_t> indices;
+		const char*           value = std::getenv("KYTY_PROBE_LIST");
+		while (value != nullptr && *value != '\0' && indices.size() < 7) {
+			char* end = nullptr;
+			indices.push_back(static_cast<uint32_t>(std::strtoul(value, &end, 10)));
+			value = end != nullptr && *end == ',' ? end + 1 : nullptr;
+		}
+		return indices;
+	}();
+	auto samples = TakeStuckProbeSamples();
+	if (list.size() != 7 || samples.empty()) return;
+	static std::vector<std::pair<uint64_t, uint64_t>> seen;
+	for (const auto& sample: samples) {
+		if (seen.size() >= 24) return;
+		if (std::ranges::any_of(list, [&](uint32_t index) { return index >= sample.count; })) {
+			continue;
+		}
+		const auto value  = [&](uint32_t which) { return sample.values[list[which]]; };
+		const auto base   = value(0) | (uint64_t {value(1) & 0xffffu} << 32u);
+		const auto stride = std::max<uint32_t>((value(1) >> 16u) & 0x3fffu, 1u);
+		const auto start  = uint64_t {value(3) & ~7u};
+		const auto next   = uint64_t {value(4)};
+		if (std::ranges::find(seen, std::pair {base, start}) != seen.end()) continue;
+		seen.emplace_back(base, start);
+		// The list from its start to two records past the wave's, at most 1 MB.
+		const auto end  = std::max(start + 8u * stride, (next + 2u) * stride);
+		const auto size = std::min<uint64_t>(end > start ? end - start : 8u * stride, 1u << 20u);
+		std::vector<uint32_t> words((size + 3u) / 4u);
+		cache.DownloadRangeForDiagnostics(base + start, size);
+		const bool  read = LibKernel::Memory::TryReadBacking(base + start, words.data(), size);
+		std::string first;
+		for (uint64_t record = 0; read && record < 8u && (record * stride + 8u) <= size; record++) {
+			const auto at = record * stride / 4u;
+			first += fmt::format(" ({:08x} {:08x})", words[at], words[at + 1u]);
+		}
+		std::string ends = "none in the records read";
+		for (uint64_t record = 0; read && (record * stride + 8u) <= size; record++) {
+			if ((words[record * stride / 4u + 1u] & 0x80000000u) != 0u) {
+				ends = fmt::format("record {} (index {})", record, start / stride + record);
+				break;
+			}
+		}
+		std::string held = "outside the bytes read";
+		if (read && next >= 1u && (next - 1u) * stride >= start &&
+		    (next - 1u) * stride + 8u - start <= size) {
+			const auto at = ((next - 1u) * stride - start) / 4u;
+			held =
+			    fmt::format("{:08x} {:08x}{}", words[at], words[at + 1u],
+			                words[at] == value(5) && words[at + 1u] == value(6) ? " (the same)"
+			                                                                    : " (different)");
+		}
+		LOGF(
+		    "Stuck list: shader %08x%08x loop 0x%04x: buffer 0x%012" PRIx64
+		    " stride %u records %u, list at +0x%" PRIx64 " (index %" PRIu64
+		    "), the wave at index %" PRIu64
+		    " read %08x %08x; guest memory%s: there %s; the first records:%s; the list's end: %s\n",
+		    sample.shader_hash_high, sample.shader_hash_low, sample.loop_pc, base, stride, value(2),
+		    start, start / stride, next >= 1u ? next - 1u : 0u, value(5), value(6),
+		    read ? "" : " not readable", held.c_str(), first.c_str(), ends.c_str());
+	}
+}
+
 void RenderContext::RunGarbageCollector() {
 	DumpGuestMemory(GetGraphics(), m_buffer_cache);
+	AnalyzeStuckSamples(m_buffer_cache);
 	LogWatchedRereads(m_buffer_cache, GetGraphics().presented_frames.load(std::memory_order_relaxed));
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;

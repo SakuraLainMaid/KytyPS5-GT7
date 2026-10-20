@@ -97,10 +97,17 @@ zipped `_kyty.txt` log).
   showed nothing hit. A group may run 16384 rounds now. It costs frame rate in that mode (in the
   garage on the PC above, about 7 fps instead of 10); `KYTY_RAY_LOOP_CAP=4096` brings back the
   old limit. The log now reports how many rounds the groups run ("Ray loops:").
+- **Most spectators in the stands have their colour now**, and the red and white barrier that
+  was drawn wrong on the track is right. The list of people to draw is built with a GPU
+  instruction mode the emulator did not implement (DPP row share): the list came out with
+  overlapping entries, and the colour pass skipped the people whose entries it did not share
+  with the depth pass.
 - After updating to this build, the first session compiles every shader again (pop-in
   everywhere, once).
 
 Known problems in this build:
+
+- Some spectators are still drawn dark.
 
 - Ray tracing mode: some blocks remain in the reflections, and switching between the interior
   and exterior views in the garage can leave white glows, red pixels or blocky patches in the

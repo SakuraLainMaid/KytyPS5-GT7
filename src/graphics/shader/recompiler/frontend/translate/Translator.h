@@ -26,9 +26,9 @@ public:
 	// header_cap, when not 0: a loop header that enters its body on a condition (one whose
 	// rounds draw on the loop budget, BudgetLoopHeaders in Translate.cpp) does so only while the
 	// invocation has rounds left in its loops (header_cap of them to begin with). loop_pc labels
-	// the loop in the budget's counts (LoopBudgetTick).
-	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
-	                        IR::BlockInfo& info, uint32_t header_cap = 0, uint32_t loop_pc = 0);
+	// the loop in the budget's counts (LoopBudgetTick). Returns the budget tick, when there is one.
+	IR::U1 AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
+	                          IR::BlockInfo& info, uint32_t header_cap = 0, uint32_t loop_pc = 0);
 	// Diagnostics (KYTY_FORCE_PC): overwrites the first destination dwords of an instruction
 	// with constants after it is translated.
 	void ForceDestination(const Decoder::Instruction& inst, const std::vector<uint32_t>& values);
@@ -39,6 +39,10 @@ public:
 	static constexpr uint32_t ProbeScalar = 0x80000000u;
 	static constexpr uint32_t ProbePoints = 8; // kShaderProbePoints, bufferCachePages.h
 	void Probe(uint32_t pc, uint32_t point, std::span<const uint32_t> registers);
+	// Diagnostics (KYTY_PROBE <hash>@stuck): the registers at a bounded loop's header, after its
+	// budget tick, for the waves whose rounds in the loop reach kStuckProbeRounds.
+	void StuckProbe(const IR::U1& tick, uint32_t loop_pc, uint32_t point,
+	                std::span<const uint32_t> registers);
 
 private:
 	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);

@@ -95,6 +95,44 @@ void Translator::ForceVectorRegisters(uint32_t first, const std::vector<uint32_t
 	}
 }
 
+namespace {
+
+std::array<IR::Value, 12> ProbeValues(IR::IREmitter& ir, std::span<const uint32_t> registers) {
+	std::array<IR::Value, 12> values {};
+	for (size_t index = 0; index < values.size(); index++) {
+		values[index] = IR::Value(0u);
+		if (index >= registers.size()) continue;
+		const auto reg = registers[index];
+		if ((reg & Translator::ProbeScalar) != 0u) {
+			const auto sgpr = reg & ~Translator::ProbeScalar;
+			if (sgpr < IR::NumScalarRegs) {
+				values[index] = ir.GetScalarReg(static_cast<IR::ScalarReg>(sgpr));
+			} else if (sgpr == 106u) {
+				values[index] = ir.GetVccLo();
+			} else if (sgpr == 107u) {
+				values[index] = ir.GetVccHi();
+			} else if (sgpr == 124u) {
+				values[index] = ir.GetM0();
+			}
+		} else if (reg < IR::NumVectorRegs) {
+			values[index] = ir.GetVectorReg(static_cast<IR::VectorReg>(reg));
+		}
+	}
+	return values;
+}
+
+} // namespace
+
+void Translator::StuckProbe(const IR::U1& tick, uint32_t loop_pc, uint32_t point,
+                            std::span<const uint32_t> registers) {
+	const auto values = ProbeValues(ir, registers);
+	const auto count  = static_cast<uint32_t>(std::min<size_t>(registers.size(), values.size()));
+	ir.Emit(IR::ValueOpcode::ShaderStuckProbe,
+	        {tick, IR::Value(loop_pc), IR::Value(point), IR::Value(count), values[0], values[1],
+	         values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9],
+	         values[10], values[11]});
+}
+
 void Translator::Probe(uint32_t pc, uint32_t point, std::span<const uint32_t> registers) {
 	std::array<IR::Value, 12> values {};
 	for (size_t index = 0; index < values.size(); index++) {

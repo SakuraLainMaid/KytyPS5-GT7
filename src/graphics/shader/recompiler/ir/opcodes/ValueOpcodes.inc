@@ -10,6 +10,11 @@ VALUE_OPCODE(ShaderTrap, Void, U32, U32, U32, U32, U32, U32)
 // the values.
 VALUE_OPCODE(ShaderProbe, Void, U32, U1, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32,
              U32, U32)
+// Diagnostics (KYTY_PROBE <hash>@stuck): a loop header's budget tick, the loop's label, the probe
+// point, the value count, then the values: recorded once a wave's rounds in that loop reach
+// kStuckProbeRounds.
+VALUE_OPCODE(ShaderStuckProbe, Void, U1, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32,
+             U32, U32, U32)
 
 // Translation and register-state pseudo operations.
 VALUE_OPCODE(GetUserData, U32, ScalarReg)
