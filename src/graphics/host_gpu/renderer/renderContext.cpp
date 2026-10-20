@@ -815,20 +815,23 @@ static void DumpGuestMemory(GraphicContext& graphics, BufferCache& cache) {
 // first records, whether guest memory holds what the wave read, and where the first record whose
 // second word has bit 31 set (the end of the list) is ("Stuck list:").
 //
-// Round 103: first, for each of up to 4 such buffers (the V#'s whole range), its pages as the GPU
+// Round 103: first, for each of up to 8 such buffers (the V#'s whole range), its pages as the GPU
 // holds them against guest memory, with the tracker's state of each, its page table entries and
 // the history of its buffers and mappings (BufferCache::CompareWithGuest, "Stuck buffer"). With
 // KYTY_PROBE_LIST_HEAL=1 the pages that differ while the GPU wrote none of them are uploaded
 // again from guest memory, and the buffer is compared again 10 s later ("Stuck buffer ...
 // recheck").
 static uint64_t CompareStuckBuffer(RenderContext& context, BufferCache& cache, uint64_t base,
-                                   uint64_t size, const std::string& label, bool heal) {
-	const auto stale =
-	    cache.CompareWithGuest(base, size, label, heal, [&context](uint64_t vaddr, uint64_t bytes) {
-		    return context.IsMapped(vaddr, bytes);
-	    });
-	for (const auto& line: context.DescribeMappings(base, size, 24)) {
-		LOGF("%s: mappings: %s\n", label.c_str(), line.c_str());
+                                   uint64_t size, const std::string& label, bool heal,
+                                   bool quiet = false) {
+	const auto stale = cache.CompareWithGuest(
+	    base, size, label, heal,
+	    [&context](uint64_t vaddr, uint64_t bytes) { return context.IsMapped(vaddr, bytes); },
+	    quiet);
+	if (!quiet || stale != 0) {
+		for (const auto& line: context.DescribeMappings(base, size, 24)) {
+			LOGF("%s: mappings: %s\n", label.c_str(), line.c_str());
+		}
 	}
 	return stale;
 }
@@ -845,10 +848,14 @@ static void AnalyzeStuckSamples(RenderContext& context, BufferCache& cache) {
 		return indices;
 	}();
 	if (list.size() != 7) return;
+	// Round 104: a buffer is compared again when its waves are stuck again 3 s or more after its
+	// last comparison (an episode, such as one a change of view brings), up to 12 times.
 	struct Checked {
 		uint64_t base       = 0;
 		uint64_t size       = 0;
 		uint64_t recheck_ms = 0;
+		uint64_t last_ms    = 0;
+		uint32_t compares   = 1;
 	};
 	static std::vector<Checked> checked;
 	static const bool           heal = [] {
@@ -875,14 +882,25 @@ static void AnalyzeStuckSamples(RenderContext& context, BufferCache& cache) {
 		const auto stride = std::max<uint32_t>((value(1) >> 16u) & 0x3fffu, 1u);
 		const auto start  = uint64_t {value(3) & ~7u};
 		const auto next   = uint64_t {value(4)};
-		if (checked.size() < 4 && std::ranges::none_of(checked, [&](const Checked& entry) {
-			    return entry.base == base;
-		    })) {
+		auto       known =
+		    std::ranges::find_if(checked, [&](const Checked& entry) { return entry.base == base; });
+		if (known == checked.end() && checked.size() < 8) {
 			// Before anything below downloads or synchronizes the range.
 			const auto size  = uint64_t {stride} * value(2);
 			const auto stale = CompareStuckBuffer(
 			    context, cache, base, size, fmt::format("Stuck buffer 0x{:012x}", base), heal);
-			checked.push_back({base, size, heal && stale != 0 ? NowMs() + 10000u : 0u});
+			checked.push_back({base, size, heal && stale != 0 ? NowMs() + 10000u : 0u, NowMs()});
+		} else if (known != checked.end() && known->compares < 12 &&
+		           NowMs() >= known->last_ms + 3000u) {
+			known->compares++;
+			known->last_ms   = NowMs();
+			const auto stale = CompareStuckBuffer(
+			    context, cache, known->base, known->size,
+			    fmt::format("Stuck buffer 0x{:012x} again ({})", known->base, known->compares),
+			    heal, true);
+			if (heal && stale != 0) {
+				known->recheck_ms = NowMs() + 10000u;
+			}
 		}
 		if (seen.size() >= 24) continue;
 		if (std::ranges::find(seen, std::pair {base, start}) != seen.end()) continue;

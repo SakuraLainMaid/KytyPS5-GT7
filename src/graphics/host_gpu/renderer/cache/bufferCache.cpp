@@ -3099,7 +3099,8 @@ void BufferCache::MarkMappedPending(uint64_t vaddr, uint64_t size) noexcept {
 
 uint64_t BufferCache::CompareWithGuest(uint64_t vaddr, uint64_t size, const std::string& label,
                                        bool                                           heal,
-                                       const std::function<bool(uint64_t, uint64_t)>& mapped) {
+                                       const std::function<bool(uint64_t, uint64_t)>& mapped,
+                                       bool                                           quiet) {
 	if (size == 0 || m_scheduler.Current().IsInvalid()) {
 		return 0;
 	}
@@ -3280,6 +3281,11 @@ uint64_t BufferCache::CompareWithGuest(uint64_t vaddr, uint64_t size, const std:
 		while (j < pages && describe(info[j]) == text) {
 			j++;
 		}
+		const bool plain = info[i].covered && info[i].readable && info[i].differ == 0;
+		if (quiet && plain) {
+			i = j;
+			continue;
+		}
 		if (lines++ < 64) {
 			LOGF("%s: 0x%012" PRIx64 "..0x%012" PRIx64 " (%zu pages): %s\n", label.c_str(),
 			     first + (uint64_t {i} << CACHING_PAGEBITS),
@@ -3306,6 +3312,9 @@ uint64_t BufferCache::CompareWithGuest(uint64_t vaddr, uint64_t size, const std:
 		     "uploaded again from guest memory (%zu of their 4 KB pages were clean in the "
 		     "tracker)\n",
 		     label.c_str(), healable, made);
+	}
+	if (quiet && differing == 0) {
+		return healable;
 	}
 	// Where the buffers over the range came from.
 	BufferId previous {};

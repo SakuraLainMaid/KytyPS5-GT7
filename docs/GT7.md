@@ -39,8 +39,8 @@ the game. The user profile, audio and notification settings don't matter.
 
 ## In-game settings
 
-In the game's own graphics options, use the **performance (frame rate) mode, not the ray tracing
-(RT) mode**. The ray tracing mode isn't supported properly yet.
+In the game's own graphics options, use the **performance (frame rate) mode** for races. The ray
+tracing (RT) mode works in the garage now (see What's new); races in it are untested.
 
 ## Notes
 
@@ -56,6 +56,24 @@ update everything is compiled once more.
 
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
+
+## What's new (October 20, 2026)
+
+- **Ray tracing mode: the blocks in the reflections are gone, and it runs several times faster.**
+  The game unmaps the memory that holds the cars' ray tracing data and maps it again as it loads a
+  car, and the emulator could then keep an old copy of that data on the graphics card. Groups of
+  rays then walked lists that never ended until a limit stopped them: the blocks, and 1 to 3 fps.
+  In the garage the mode now runs at about 15 fps in the cockpit view and 25 or more outside, on
+  the PC above.
+- **The first visit in ray tracing mode compiles the reflections' materials** in the background:
+  a few minutes for a car seen for the first time. Until a material is ready, its reflections are
+  missing or flicker. Close the game normally afterwards so they are saved; the next visit has
+  them from the start.
+- **No more crash as some races load (Tokyo) or on the Mazda LM55 VGT's showroom page**
+  ("Not implemented ... user_clip_planes"): the game sets user clip planes, which the emulator
+  now draws without instead of stopping.
+- If the graphics driver fails to build a shader, the crash report names the shader and the
+  driver's answer.
 
 ## What's new (October 19, 2026)
 
@@ -109,12 +127,8 @@ Known problems in this build:
 
 - Some spectators are still drawn dark.
 
-- Ray tracing mode: some blocks remain in the reflections, and switching between the interior
-  and exterior views in the garage can leave white glows, red pixels or blocky patches in the
-  reflections for a while. The blocks are groups of rays whose walk through the car's ray
-  tracing data never ends: the emulator's graphics copy of part of that data holds zeros where
-  the game's memory holds it right (being investigated).
-- Tokyo, morning: the picture turns green at some tunnel exits, and fades back once past them.
+- Tokyo: at some times of day and weather the picture turns green at some tunnel exits and
+  under some overpasses, and fades back once past them.
 
 - Rarely, after several races in one session, a loading screen keeps spinning and never ends.
   Restart the game.

@@ -259,9 +259,12 @@ public:
 	// whether the GPU's bytes are guest memory's (or all zero). With `heal`, the pages whose
 	// bytes differ while the tracker holds no GPU-written byte of them are uploaded again from
 	// guest memory. Then the latest creations and collections of the buffers over the range.
-	// Returns how many pages differ that way.
+	// Returns how many pages differ that way. `quiet`: only the runs of pages that differ (or have
+	// no cached buffer, or no readable guest memory) are logged, and the history only when some
+	// differ.
 	uint64_t CompareWithGuest(uint64_t vaddr, uint64_t size, const std::string& label, bool heal,
-	                          const std::function<bool(uint64_t, uint64_t)>& mapped);
+	                          const std::function<bool(uint64_t, uint64_t)>& mapped,
+	                          bool                                           quiet = false);
 	// Diagnostics, GPU thread (drains the GPU; a second or more): every cached buffer as the GPU
 	// holds it against guest memory ("Buffer verify:"). Stale pages: those whose bytes differ
 	// while the tracker holds them clean (no 4 KB page of them CPU-dirty, GPU-written or hot),

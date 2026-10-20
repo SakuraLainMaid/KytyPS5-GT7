@@ -875,9 +875,15 @@ bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	}
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+	if (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) {
+		// Round 104: which shader, and the driver's answer, in the crash report (issue 3 had
+		// only the line of a check).
+		EXIT("the graphics driver could not build the pipeline of compute shader 0x%016" PRIx64
+		     ": vkCreateComputePipelines returned %s (device memory in use: %" PRIu64 " MB)\n",
+		     input_info.stage.program != nullptr ? input_info.stage.program->shader_hash : 0,
+		     vk::to_string(result).c_str(),
+		     graphics.CanReportMemoryUsage() ? graphics.GetDeviceMemoryUsage() >> 20u : 0);
+	}
 	return true;
 }
 

@@ -293,10 +293,6 @@ static void HwCtxIgnoreAaMaskRegister([[maybe_unused]] uint32_t cmd_offset,
 
 static void HwCtxIgnoreAlphaToMaskRegister([[maybe_unused]] uint32_t value) {}
 
-static void HwCtxIgnoreDisabledUserClipPlane(CommandProcessor& cp, uint32_t value) {
-	EXIT_NOT_IMPLEMENTED(value != 0 || cp.GetCtx().GetClipControl().user_clip_planes != 0);
-}
-
 static void HwCtxIgnoreDrawPayloadControl([[maybe_unused]] uint32_t value) {}
 
 static void HwCtxIgnoreObjprimIdControl([[maybe_unused]] uint32_t value) {}
@@ -3053,9 +3049,12 @@ void GraphicsInitJmpTablesCxIndirect() {
 		};
 	}
 
+	// Round 104: the user clip planes are kept (HW::Context::GetUserClipPlanes) instead of ending
+	// the emulator when one is not zero (seen as a new race loads and on a car's showroom page);
+	// the renderer draws without them (hw_check logs the draws that enable them).
 	for (auto cmd_offset = Pm4::PA_CL_UCP_0_X; cmd_offset <= Pm4::PA_CL_UCP_5_W; cmd_offset++) {
 		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-			HwCtxIgnoreDisabledUserClipPlane(cp, value);
+			cp.GetCtx().SetUserClipPlaneWord(cmd_offset - Pm4::PA_CL_UCP_0_X, value);
 		};
 	}
 

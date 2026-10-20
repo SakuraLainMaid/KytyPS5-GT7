@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 
+#include <array>
+
 namespace Libs::Graphics::HW {
 
 struct ColorBase {
@@ -818,6 +820,16 @@ public:
 	void SetBlendColor(const BlendColor& color) { m_blend_color = color; }
 	[[nodiscard]] const ClipControl& GetClipControl() const { return m_clip_control; }
 	void SetClipControl(const ClipControl& control) { m_clip_control = control; }
+	// PA_CL_UCP_0_X..PA_CL_UCP_5_W as written: the six user clip planes (x, y, z, w), which the
+	// renderer does not apply (hw_check logs them when PA_CL_CLIP_CNTL enables any).
+	void SetUserClipPlaneWord(uint32_t index, uint32_t value) {
+		if (index < m_user_clip_planes.size()) {
+			m_user_clip_planes[index] = value;
+		}
+	}
+	[[nodiscard]] const std::array<uint32_t, 24>& GetUserClipPlanes() const {
+		return m_user_clip_planes;
+	}
 	[[nodiscard]] const RenderControl& GetRenderControl() const { return m_render_control; }
 	void SetRenderControl(const RenderControl& control) { m_render_control = control; }
 	[[nodiscard]] const DepthRenderOverride& GetDepthRenderOverride() const {
@@ -913,6 +925,7 @@ private:
 	uint32_t        m_render_target_mask = 0;
 	ScreenViewport  m_screen_viewport;
 	ClipControl     m_clip_control;
+	std::array<uint32_t, 24> m_user_clip_planes {};
 	ColorControl    m_color_control;
 	ScanModeControl m_scan_mode_control;
 

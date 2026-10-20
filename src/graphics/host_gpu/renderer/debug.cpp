@@ -12,7 +12,9 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <fmt/format.h>
+#include <string>
 
 namespace Libs::Graphics {
 
@@ -380,13 +382,44 @@ static void ClipPrint(const char* func, const HW::ClipControl& c) {
 	     c.force_viewport_index_from_vs_enable ? "true" : "false");
 }
 
-static void ClipCheck(const HW::ClipControl& c) {
+static void ClipCheck(const HW::ClipControl& c, const std::array<uint32_t, 24>& planes) {
 	// dx_linear_attr_clip_enable preserves linear (noperspective) attributes at clip-generated
 	// vertices, which Vulkan provides as part of clipping and interpolation.
-	EXIT_NOT_IMPLEMENTED(c.user_clip_planes != 0 || c.user_clip_plane_mode != 0 ||
-	                     c.vertex_kill_any || c.user_clip_plane_negate_y ||
-	                     c.user_clip_plane_cull_only || c.cull_on_clipping_error_disable ||
+	EXIT_NOT_IMPLEMENTED(c.vertex_kill_any || c.cull_on_clipping_error_disable ||
 	                     c.force_viewport_index_from_vs_enable);
+	// Round 104: user clip planes are not applied: such a draw is drawn whole, and the first of
+	// each setting is logged with its planes (it ended the emulator before).
+	if (c.user_clip_planes != 0 || c.user_clip_plane_mode != 0 || c.user_clip_plane_negate_y ||
+	    c.user_clip_plane_cull_only) {
+		static std::atomic<uint32_t> logged {0};
+		static std::atomic<uint32_t> seen_mask {0};
+		const uint32_t key = (c.user_clip_planes & 0x3fu) | ((c.user_clip_plane_mode & 3u) << 6u) |
+		                     (c.user_clip_plane_negate_y ? 0x100u : 0u) |
+		                     (c.user_clip_plane_cull_only ? 0x200u : 0u);
+		const uint32_t bit = 1u << (key % 32u);
+		if ((seen_mask.fetch_or(bit, std::memory_order_relaxed) & bit) == 0 &&
+		    logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::string values;
+			for (uint32_t plane = 0; plane < 6; plane++) {
+				if ((c.user_clip_planes & (1u << plane)) == 0) {
+					continue;
+				}
+				values += fmt::format(" plane {}: (", plane);
+				for (uint32_t k = 0; k < 4; k++) {
+					float value = 0.0f;
+					std::memcpy(&value, &planes[plane * 4 + k], sizeof(value));
+					values += fmt::format("{}{}", k == 0 ? "" : " ", value);
+				}
+				values += ")";
+			}
+			LOGF("Clip: a draw enables user clip planes 0x%02x (mode %u%s%s), which are not "
+			     "applied: drawn whole;%s\n",
+			     c.user_clip_planes, c.user_clip_plane_mode,
+			     c.user_clip_plane_negate_y ? ", y negated" : "",
+			     c.user_clip_plane_cull_only ? ", cull only" : "",
+			     values.empty() ? " no plane enabled" : values.c_str());
+		}
+	}
 }
 
 static void RcPrint(const char* func, const HW::RenderControl& c) {
@@ -868,7 +901,7 @@ void hw_check(const CommandBuffer& buffer) {
 	log_phase("vp");
 	VpCheck(vp, smc);
 	log_phase("clip");
-	ClipCheck(c);
+	ClipCheck(c, hw.GetUserClipPlanes());
 	log_phase("rc");
 	RcCheck(rc);
 	log_phase("depth");
