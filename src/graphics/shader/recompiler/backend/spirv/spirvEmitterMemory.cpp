@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <span>
+#include <tuple>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
@@ -1622,6 +1623,230 @@ void EmitShaderProbe(ValueEmitContext& ctx, const IR::Inst& inst) {
 			}
 		});
 	});
+}
+
+void DefineRayLoopRound(EmitterState& state);
+
+// ray_loop_count(word, cap): one more in the given word of the shader's RayLoopSlot, which the
+// first call claims by the shader's key (and stores the shader and the loop budget, cap, in).
+// Returns the slot's first word in the fault buffer, or ~0 when the other shaders hold every slot.
+void DefineRayLoopCount(EmitterState& state) {
+	if (!state.requirements.ray_loop_rounds || state.fault_buffer_variable == 0) {
+		return;
+	}
+	const auto     u32         = TypeU32(state);
+	const auto     boolean     = TypeBool(state);
+	constexpr auto record_word = BufferCachePages::kNumPages / 8 / sizeof(uint32_t);
+	constexpr auto slots_word =
+	    static_cast<uint32_t>(record_word + offsetof(ShaderTrapArea, ray_loops) / sizeof(uint32_t));
+	constexpr auto slot_words = static_cast<uint32_t>(sizeof(RayLoopSlot) / sizeof(uint32_t));
+	constexpr auto word_of    = [](size_t offset) {
+        return static_cast<uint32_t>(offset / sizeof(uint32_t));
+	};
+	const auto hash               = state.program.shader_hash;
+	const auto shader_word        = static_cast<uint32_t>(hash ^ (hash >> 32u));
+	const auto key                = ConstantU32(state, (shader_word * 0x9e3779b1u) | 1u);
+	const auto signature          = state.builder.Type(spv::OpTypeFunction, u32, u32, u32);
+	state.ray_loop_count_function = state.builder.AllocateId();
+	state.builder.AddName(state.ray_loop_count_function, "ray_loop_count");
+	state.builder.AddFunction(spv::OpFunction, u32, state.ray_loop_count_function,
+	                          spv::FunctionControlMaskNone, signature);
+	const auto word = state.builder.AllocateId();
+	const auto cap  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFunctionParameter, u32, word);
+	state.builder.AddFunction(spv::OpFunctionParameter, u32, cap);
+	EmitLabel(state, state.builder.AllocateId());
+	const auto element = [&](uint32_t base, uint32_t offset) {
+		return FaultElementPointer(state, ConstantU32(state, base + offset));
+	};
+	// The slot at index, or the next ones when another shader holds it.
+	const auto attempt = [&](auto& self, uint32_t index) -> uint32_t {
+		const auto base        = slots_word + index * slot_words;
+		const auto key_pointer = element(base, word_of(offsetof(RayLoopSlot, key)));
+		const auto existing    = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicLoad, u32, existing, key_pointer,
+		                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0));
+		const auto mine = EmitValueOrDefaultIfCondition(
+		    state, Binary(state, spv::OpINotEqual, boolean, existing, key), boolean,
+		    ConstantBool(state, true), [&]() {
+			    const auto old = state.builder.AllocateId();
+			    state.builder.AddFunction(spv::OpAtomicCompareExchange, u32, old, key_pointer,
+			                              ConstantU32(state, spv::ScopeDevice),
+			                              ConstantU32(state, 0), ConstantU32(state, 0), key,
+			                              ConstantU32(state, 0));
+			    const auto won = Binary(state, spv::OpIEqual, boolean, old, ConstantU32(state, 0));
+			    EmitIfCondition(state, won, [&]() {
+				    state.builder.AddFunction(
+				        spv::OpStore,
+				        element(base, word_of(offsetof(RayLoopSlot, shader_hash_low))),
+				        ConstantU32(state, static_cast<uint32_t>(hash)));
+				    state.builder.AddFunction(
+				        spv::OpStore,
+				        element(base, word_of(offsetof(RayLoopSlot, shader_hash_high))),
+				        ConstantU32(state, static_cast<uint32_t>(hash >> 32u)));
+				    state.builder.AddFunction(
+				        spv::OpStore, element(base, word_of(offsetof(RayLoopSlot, cap))), cap);
+			    });
+			    return Binary(state, spv::OpLogicalOr, boolean, won,
+			                  Binary(state, spv::OpIEqual, boolean, old, key));
+		    });
+		if (index + 1u == kRayLoopSlots) {
+			return Select(state, u32, mine, ConstantU32(state, base), ConstantU32(state, ~0u));
+		}
+		return EmitValueOrDefaultIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, mine),
+		                                     u32, ConstantU32(state, base),
+		                                     [&]() { return self(self, index + 1u); });
+	};
+	const auto base = attempt(attempt, 0);
+	EmitIfCondition(
+	    state, Binary(state, spv::OpINotEqual, boolean, base, ConstantU32(state, ~0u)), [&]() {
+		    const auto count = state.builder.AllocateId();
+		    state.builder.AddFunction(
+		        spv::OpAtomicIAdd, u32, count,
+		        FaultElementPointer(state, Binary(state, spv::OpIAdd, u32, base, word)),
+		        ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0), ConstantU32(state, 1));
+	    });
+	state.builder.AddFunction(spv::OpReturnValue, base);
+	state.builder.AddFunction(spv::OpFunctionEnd);
+	DefineRayLoopRound(state);
+}
+
+// ray_loop_round(rounds, used, left, next, row, pc, cap): the wave's counts for one round of a
+// loop (EmitRayLoopRounds): rounds in the row's loop and in all loops (used), the tick's result
+// (left) and what is left after it (next). A function, so the loop header that calls it stays one
+// block (its branches would split the header from its OpLoopMerge).
+void DefineRayLoopRound(EmitterState& state) {
+	const auto u32       = TypeU32(state);
+	const auto boolean   = TypeBool(state);
+	const auto signature = state.builder.Type(spv::OpTypeFunction, TypeVoid(state), u32, u32,
+	                                          boolean, u32, u32, u32, u32);
+	state.ray_loop_round_function = state.builder.AllocateId();
+	state.builder.AddName(state.ray_loop_round_function, "ray_loop_round");
+	state.builder.AddFunction(spv::OpFunction, TypeVoid(state), state.ray_loop_round_function,
+	                          spv::FunctionControlMaskNone, signature);
+	std::array<uint32_t, 7> params {};
+	const std::array        types {u32, u32, boolean, u32, u32, u32, u32};
+	for (size_t index = 0; index < params.size(); index++) {
+		params[index] = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionParameter, types[index], params[index]);
+	}
+	const auto [rounds, used, left, next, row, pc, cap] = params;
+	EmitLabel(state, state.builder.AllocateId());
+	// A bucket's count: 1 (bucket 0), or 2^9 to 2^20 (buckets 1 to 12).
+	constexpr uint32_t first   = 1u << kRayLoopFirstPowerBucket;
+	constexpr uint32_t last    = first << (kRayLoopBuckets - 2u);
+	const auto         reaches = [&](uint32_t value) {
+        const auto one = Binary(state, spv::OpIEqual, boolean, value, ConstantU32(state, 1));
+        const auto power =
+            Binary(state, spv::OpIEqual, boolean,
+		                   Binary(state, spv::OpBitwiseAnd, u32, value,
+		                          Binary(state, spv::OpISub, u32, value, ConstantU32(state, 1))),
+		                   ConstantU32(state, 0));
+        const auto in_range =
+            Binary(state, spv::OpULessThanEqual, boolean,
+		                   Binary(state, spv::OpISub, u32, value, ConstantU32(state, first)),
+		                   ConstantU32(state, last - first));
+        return Binary(state, spv::OpLogicalAnd, boolean, left,
+		                      Binary(state, spv::OpLogicalOr, boolean, one,
+		                             Binary(state, spv::OpLogicalAnd, boolean, power, in_range)));
+	};
+	const auto bucket = [&](uint32_t value) {
+		// value - 1 of 2^k has k bits set: bucket k - 8.
+		const auto bits = Unary(state, spv::OpBitCount, u32,
+		                        Binary(state, spv::OpISub, u32, value, ConstantU32(state, 1)));
+		return Select(state, u32,
+		              Binary(state, spv::OpIEqual, boolean, value, ConstantU32(state, 1)),
+		              ConstantU32(state, 0),
+		              Binary(state, spv::OpISub, u32, bits,
+		                     ConstantU32(state, kRayLoopFirstPowerBucket - 1u)));
+	};
+	const auto     row_event = reaches(rounds);
+	const auto     all_event = reaches(used);
+	const auto     spent     = Binary(state, spv::OpLogicalAnd, boolean, left,
+	                                  Binary(state, spv::OpIEqual, boolean, next, ConstantU32(state, 0)));
+	const auto     any       = Binary(state, spv::OpLogicalOr, boolean,
+	                                  Binary(state, spv::OpLogicalOr, boolean, row_event, all_event), spent);
+	constexpr auto word_of   = [](size_t offset) {
+        return static_cast<uint32_t>(offset / sizeof(uint32_t));
+	};
+	const auto add = [&](uint32_t a, uint32_t b) { return Binary(state, spv::OpIAdd, u32, a, b); };
+	const auto count = [&](uint32_t word) {
+		const auto base = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionCall, u32, base, state.ray_loop_count_function,
+		                          word, cap);
+		return base;
+	};
+	EmitIfCondition(state, any, [&]() {
+		// The loops' branches are the wave's: every invocation of the host subgroup is here, and
+		// one counts the wave.
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+		const auto elected = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformElect, boolean, elected,
+		                          ConstantU32(state, spv::ScopeSubgroup));
+		EmitIfCondition(state, elected, [&]() {
+			const auto waves = ConstantU32(state, word_of(offsetof(RayLoopSlot, waves)));
+			EmitIfCondition(state, row_event, [&]() {
+				const auto row_first =
+				    Binary(state, spv::OpIMul, u32, row, ConstantU32(state, kRayLoopBuckets));
+				const auto base = count(add(add(waves, row_first), bucket(rounds)));
+				const auto first_round =
+				    Binary(state, spv::OpLogicalAnd, boolean,
+				           Binary(state, spv::OpIEqual, boolean, rounds, ConstantU32(state, 1)),
+				           Binary(state, spv::OpINotEqual, boolean, base, ConstantU32(state, ~0u)));
+				EmitIfCondition(state, first_round, [&]() {
+					const auto at =
+					    add(add(base, ConstantU32(state, word_of(offsetof(RayLoopSlot, pc)))), row);
+					state.builder.AddFunction(spv::OpStore, FaultElementPointer(state, at),
+					                          add(pc, ConstantU32(state, 1)));
+				});
+			});
+			EmitIfCondition(state, all_event, [&]() {
+				(void)count(add(add(waves, ConstantU32(state, kRayLoopRows * kRayLoopBuckets)),
+				                bucket(used)));
+			});
+			EmitIfCondition(state, spent, [&]() {
+				(void)count(add(ConstantU32(state, word_of(offsetof(RayLoopSlot, spent))), row));
+			});
+		});
+	});
+	state.builder.AddFunction(spv::OpReturn);
+	state.builder.AddFunction(spv::OpFunctionEnd);
+}
+
+void EmitRayLoopRounds(EmitterState& state, const void* tick, uint32_t cap, uint32_t pc,
+                       uint32_t left, uint32_t next) {
+	static_assert(std::tuple_size_v<decltype(state.ray_loop_round_variables)> == kRayLoopRows);
+	if (state.ray_loop_round_function == 0) {
+		return;
+	}
+	const auto u32 = TypeU32(state);
+	// The loop's row: the order the emission met its header's tick in (the last row takes the
+	// rest).
+	auto row = static_cast<uint32_t>(std::ranges::find(state.ray_loop_ticks, tick) -
+	                                 state.ray_loop_ticks.begin());
+	if (row == state.ray_loop_ticks.size()) {
+		state.ray_loop_ticks.push_back(tick);
+	}
+	row            = std::min(row, kRayLoopRows - 1u);
+	auto& variable = state.ray_loop_round_variables[row];
+	if (variable == 0) {
+		variable =
+		    state.builder.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, u32),
+		                                       spv::StorageClassPrivate, ConstantU32(state, 0));
+		state.builder.AddName(variable, "ray_loop_rounds");
+	}
+	// Straight-line code only: this is a loop header's block (DefineRayLoopRound).
+	const auto before = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, u32, before, variable);
+	const auto rounds = Select(
+	    state, u32, left, Binary(state, spv::OpIAdd, u32, before, ConstantU32(state, 1)), before);
+	state.builder.AddFunction(spv::OpStore, variable, rounds);
+	// The rounds of all the invocation's loops, this one included.
+	const auto used = Binary(state, spv::OpISub, u32, ConstantU32(state, cap), next);
+	const auto call = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpFunctionCall, TypeVoid(state), call, state.ray_loop_round_function, rounds, used,
+	    left, next, ConstantU32(state, row), ConstantU32(state, pc), ConstantU32(state, cap));
 }
 
 void DefineGetBdaPointer(EmitterState& state) {

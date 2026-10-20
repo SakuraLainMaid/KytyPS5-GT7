@@ -16,8 +16,9 @@ VALUE_OPCODE(GetUserData, U32, ScalarReg)
 VALUE_OPCODE(GetDispatchThreadExtent, U32, U32)
 VALUE_OPCODE(GetShaderBase, U64)
 VALUE_OPCODE(ReadClockRealtime64, U64)
-// The invocation's loop budget (argument: the bound): true and one less while some is left.
-VALUE_OPCODE(LoopBudgetTick, U1, U32)
+// The invocation's loop budget (arguments: the bound, the loop's label: the lowest pc of its
+// code): true and one less while some is left.
+VALUE_OPCODE(LoopBudgetTick, U1, U32, U32)
 VALUE_OPCODE(MeshDrawParameter, U32, U32)
 VALUE_OPCODE(MeshAllocate, Void, U32)
 VALUE_OPCODE(TessellationBase, U32, U32)

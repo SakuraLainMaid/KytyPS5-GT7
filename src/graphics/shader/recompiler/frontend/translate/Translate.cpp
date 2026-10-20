@@ -786,7 +786,7 @@ void Translator::WriteCompareResult(const Decoder::Operand& operand, IR::U1 valu
 }
 
 void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
-                                    IR::BlockInfo& info, uint32_t header_cap) {
+                                    IR::BlockInfo& info, uint32_t header_cap, uint32_t loop_pc) {
 	const auto native_condition = [&](CFG::BranchCondition kind) -> IR::U1 {
 		IR::U1 condition;
 		switch (kind) {
@@ -840,8 +840,9 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 		// of the loop draws on the invocation's budget, and the loop ends at its merge once the
 		// budget is spent.
 		if (header_cap != 0u && term.loop_header && term.false_block == term.merge_block) {
-			condition = ir.LogicalAnd(condition, IR::U1(ir.Emit(IR::ValueOpcode::LoopBudgetTick,
-			                                                    {IR::Value(header_cap)})));
+			condition = ir.LogicalAnd(condition,
+			                          IR::U1(ir.Emit(IR::ValueOpcode::LoopBudgetTick,
+			                                         {IR::Value(header_cap), IR::Value(loop_pc)})));
 		}
 		info.condition = condition;
 		ir.Emit(IR::ValueOpcode::Reference, {condition});
@@ -1313,6 +1314,24 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	}
 	const bool  header_budget = loop_cap != 0u && structured;
 	const auto& cfg           = header_budget ? budgeted : source_cfg;
+	// Each budgeted loop's label for the log (LoopBudgetTick): the lowest pc of the instructions
+	// in it, its header being a block the structurizer made more often than not.
+	std::unordered_map<uint32_t, uint32_t> loop_pcs;
+	if (header_budget) {
+		for (const auto& block: budgeted.blocks) {
+			const auto& term = block.terminator;
+			if (!term.loop_header || term.kind != CFG::TerminatorKind::ConditionalBranch ||
+			    term.false_block != term.merge_block) {
+				continue;
+			}
+			uint32_t lowest = UINT32_MAX;
+			for (const auto* member: LoopBlocks(budgeted, block)) {
+				if (member->inst_begin != member->inst_end)
+					lowest = std::min(lowest, member->start_pc);
+			}
+			loop_pcs.emplace(block.id, lowest != UINT32_MAX ? lowest : block.start_pc);
+		}
+	}
 
 	IR::Program result;
 	result.stage               = options.stage;
@@ -1772,8 +1791,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				}
 			}
 		}
-		translator.AddBranchCondition(cfg, cfg_block, result.block_info[typed_index],
-		                              header_budget ? loop_cap : 0u);
+		const auto loop_pc = loop_pcs.find(cfg_block.id);
+		translator.AddBranchCondition(
+		    cfg, cfg_block, result.block_info[typed_index], header_budget ? loop_cap : 0u,
+		    loop_pc != loop_pcs.end() ? loop_pc->second : cfg_block.start_pc);
 	}
 	if (IR::IrValidationEnabled()) {
 		IR::ValidateProgram(result, false);

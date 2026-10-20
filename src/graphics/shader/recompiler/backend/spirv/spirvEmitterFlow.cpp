@@ -1005,7 +1005,8 @@ uint32_t EmitGetShaderBase(ValueEmitContext& ctx) {
 // True, and one less in the budget, while the invocation has back edges left for the loops of
 // bracketed material bodies (Decoder::ShaderCallLoopCap): a Private variable, so every bounded
 // loop of the invocation draws on the same budget. Both emulated wave halves take the first
-// half's decision, as for a branch condition.
+// half's decision, as for a branch condition. A ray tracing shader's waves also count their
+// rounds (EmitRayLoopRounds).
 uint32_t EmitLoopBudgetTick(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ctx.half != 0 && ctx.other_half != nullptr) return ctx.other_half->Def(IR::Value(&inst));
 	auto& state = ctx.state;
@@ -1026,6 +1027,12 @@ uint32_t EmitLoopBudgetTick(ValueEmitContext& ctx, const IR::Inst& inst) {
 	           Binary(state, spv::OpISub, TypeU32(state), budget, ConstantU32(state, 1)),
 	           ConstantU32(state, 0));
 	state.builder.AddFunction(spv::OpStore, state.loop_budget_variable, next);
+	if (state.requirements.ray_loop_rounds) {
+		const auto cap = inst.Arg(0).Resolve();
+		const auto pc  = inst.Arg(1).Resolve();
+		EXIT_IF(!cap.IsImmediate() || !pc.IsImmediate());
+		EmitRayLoopRounds(state, &inst, cap.U32(), pc.U32(), left, next);
+	}
 	return left;
 }
 

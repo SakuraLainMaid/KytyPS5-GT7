@@ -378,6 +378,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::StoreCompletion: requirements.subgroup_barrier = true; break;
 				case IR::ValueOpcode::BvhIntersect: requirements.bvh = true; break;
+				case IR::ValueOpcode::LoopBudgetTick: requirements.ray_loop_rounds = true; break;
 				case IR::ValueOpcode::Ballot: requirements.subgroup_ballot = true; break;
 				case IR::ValueOpcode::ReadClockRealtime64: requirements.shader_clock = true; break;
 				case IR::ValueOpcode::DppMoveU32:
@@ -438,6 +439,9 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			}
 		}
 	}
+	// Bounded loops count their rounds in ray tracing compute shaders only.
+	requirements.ray_loop_rounds =
+	    requirements.ray_loop_rounds && requirements.bvh && program.stage == ShaderType::Compute;
 	if (requirements.function_lds && !function_lds_unbounded &&
 	    function_lds_bytes < 8192u * sizeof(uint32_t)) {
 		requirements.function_lds_dwords =

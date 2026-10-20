@@ -20,10 +20,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <utility>
 #include <fmt/format.h>
 #include <limits>
 #include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -105,6 +107,87 @@ void ReportProbes(const uint8_t* area) {
 		LOGF("Shader probe: point %u hash=%08x%08x pc=0x%x hit=%u%s\n",
 		     index / kShaderProbeSlotsPerPoint, record.shader_hash_high, record.shader_hash_low,
 		     record.pc, record.hit, text);
+	}
+}
+
+// The rounds the ray tracing shaders' waves ran in their bounded loops (RayLoopSlot), summed
+// over each fault-buffer read and logged every 5 seconds, a line per shader: how many waves
+// reached each count of rounds in each loop, and in how many their loop budget ran out.
+void ReportRayLoops(const uint8_t* area, uint64_t frame) {
+	struct Totals {
+		uint32_t cap = 0;
+		uint32_t pc[kRayLoopRows] {};
+		uint64_t spent[kRayLoopRows] {};
+		uint64_t waves[kRayLoopRows + 1][kRayLoopBuckets] {};
+		bool     counted = false;
+	};
+	static std::mutex                               mutex;
+	static std::vector<std::pair<uint64_t, Totals>> shaders;
+	static std::chrono::steady_clock::time_point    since       = std::chrono::steady_clock::now();
+	static uint64_t                                 since_frame = frame;
+	const std::lock_guard                           lock(mutex);
+	for (uint32_t index = 0; index < kRayLoopSlots; ++index) {
+		RayLoopSlot slot;
+		std::memcpy(&slot, area + offsetof(ShaderTrapArea, ray_loops) + index * sizeof(slot),
+		            sizeof(slot));
+		if (slot.key == 0) continue;
+		const auto hash = (uint64_t {slot.shader_hash_high} << 32u) | slot.shader_hash_low;
+		auto       it   = std::ranges::find(shaders, hash, &std::pair<uint64_t, Totals>::first);
+		if (it == shaders.end()) {
+			shaders.emplace_back(hash, Totals {});
+			it = shaders.end() - 1;
+		}
+		auto& totals = it->second;
+		totals.cap   = slot.cap != 0 ? slot.cap : totals.cap;
+		for (uint32_t row = 0; row < kRayLoopRows; ++row) {
+			if (slot.pc[row] != 0) totals.pc[row] = slot.pc[row];
+			totals.spent[row] += slot.spent[row];
+			for (uint32_t bucket = 0; bucket < kRayLoopBuckets; ++bucket) {
+				totals.waves[row][bucket] += slot.waves[row][bucket];
+			}
+		}
+		for (uint32_t bucket = 0; bucket < kRayLoopBuckets; ++bucket) {
+			totals.waves[kRayLoopRows][bucket] += slot.waves[kRayLoopRows][bucket];
+		}
+		totals.counted = true;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - since < std::chrono::seconds(5)) return;
+	const auto seconds = std::chrono::duration<double>(now - since).count();
+	const auto frames  = frame - since_frame;
+	since              = now;
+	since_frame        = frame;
+	for (auto& [hash, totals]: shaders) {
+		if (!totals.counted) continue;
+		const auto counts = [](const uint64_t(&waves)[kRayLoopBuckets]) {
+			std::string text;
+			for (const auto count: waves) {
+				text += fmt::format(" {}", count);
+			}
+			return text;
+		};
+		std::string loops;
+		std::string spent;
+		for (uint32_t row = 0; row < kRayLoopRows; ++row) {
+			if (totals.pc[row] == 0 && totals.waves[row][0] == 0) continue;
+			const auto label = totals.pc[row] != 0 ? fmt::format("0x{:04x}", totals.pc[row] - 1u)
+			                                       : std::string("?");
+			loops += fmt::format("; loop {}{}:{}", label,
+			                     row + 1u == kRayLoopRows ? " and later ones" : "",
+			                     counts(totals.waves[row]));
+			spent +=
+			    fmt::format("{} {} in loop {}", spent.empty() ? "" : ",", totals.spent[row], label);
+		}
+		LOGF("Ray loops: shader %016" PRIx64 ", budget %u rounds, the last %.1f s (%" PRIu64
+		     " frames): waves that reached 1 512 1K 2K 4K 8K 16K 32K 64K 128K 256K 512K 1M "
+		     "rounds%s; all loops:%s; budget spent:%s\n",
+		     hash, totals.cap, seconds, frames, loops.c_str(),
+		     counts(totals.waves[kRayLoopRows]).c_str(), spent.empty() ? " none" : spent.c_str());
+		// The next window starts from zero; the loops keep their pcs.
+		Totals next;
+		next.cap = totals.cap;
+		std::memcpy(next.pc, totals.pc, sizeof(next.pc));
+		totals = next;
 	}
 }
 
@@ -296,6 +379,8 @@ void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 		std::memcpy(&trap, mapped + PageFaultAreaSize, sizeof(trap));
 		ReportCallMisses(mapped + PageFaultAreaSize + offsetof(ShaderTrapArea, misses));
 		ReportProbes(mapped + PageFaultAreaSize);
+		ReportRayLoops(mapped + PageFaultAreaSize,
+		               m_graphics.presented_frames.load(std::memory_order_relaxed));
 		if (trap.claimed != 0 && report == nullptr) {
 			const auto  hash    = (uint64_t {trap.shader_hash_high} << 32) | trap.shader_hash_low;
 			const auto* pending = std::bit_cast<const uint64_t*>(mapped);

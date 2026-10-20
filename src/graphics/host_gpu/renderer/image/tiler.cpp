@@ -2,6 +2,8 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
+#include "gpu_tiler_shaders/gpu_tiler_color_transform_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_demote_d16_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_depth_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_promote_d16_spv.h"
@@ -13,16 +15,16 @@
 #include "gpu_tiler_shaders/gpu_tiler_standard4_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_standard64_3d_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_standard64_spv.h"
-#include "gpu_tiler_shaders/gpu_tiler_color_transform_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/image.h"
-#include "graphics/host_gpu/renderer/commandRecorder.h"
 
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cinttypes>
 #include <cstring>
 #include <limits>
 
@@ -137,16 +139,29 @@ void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_ca
 		if (slice_bytes == 0) {
 			slice_bytes = minimum_slice;
 		}
-		uint64_t linear_used = 0;
-		uint64_t bytes       = 0;
-		EXIT_NOT_IMPLEMENTED((info.depth > 1 && slice_bytes < minimum_slice) ||
-		                     !checked_multiply(info.depth - 1u, slice_bytes, bytes) ||
-		                     !checked_add(linear_used, bytes, linear_used) ||
-		                     !checked_multiply(info.height - 1u, pitch_bytes, bytes) ||
-		                     !checked_add(linear_used, bytes, linear_used) ||
-		                     !checked_multiply(info.width, info.bytes_per_element, bytes) ||
-		                     !checked_add(linear_used, bytes, linear_used) ||
-		                     linear_used > info.linear_size || slice_bytes > UINT32_MAX);
+		uint64_t   linear_used = 0;
+		uint64_t   bytes       = 0;
+		const bool linear_fits = !((info.depth > 1 && slice_bytes < minimum_slice) ||
+		                           !checked_multiply(info.depth - 1u, slice_bytes, bytes) ||
+		                           !checked_add(linear_used, bytes, linear_used) ||
+		                           !checked_multiply(info.height - 1u, pitch_bytes, bytes) ||
+		                           !checked_add(linear_used, bytes, linear_used) ||
+		                           !checked_multiply(info.width, info.bytes_per_element, bytes) ||
+		                           !checked_add(linear_used, bytes, linear_used) ||
+		                           linear_used > info.linear_size || slice_bytes > UINT32_MAX);
+		if (!linear_fits) {
+			// The values the check found wrong (a crash saving a livery reached it).
+			LOGF("TileManager: the linear image does not fit its buffer: %s, %ux%ux%u pitch %u, "
+			     "%u bytes an element, slice %" PRIu64 " bytes (at least %" PRIu64 "), %" PRIu64
+			     " bytes needed of %" PRIu64 " at offset %" PRIu64 " (capacity %" PRIu64
+			     "); tiled %" PRIu64 " bytes at offset %" PRIu64 " (capacity %" PRIu64
+			     "), family %u, tail %d\n",
+			     tile ? "tiling" : "detiling", info.width, info.height, info.depth, info.pitch,
+			     info.bytes_per_element, slice_bytes, minimum_slice, linear_used, info.linear_size,
+			     info.linear_offset, linear_capacity, info.tiled_size, info.tiled_offset,
+			     tiled_capacity, static_cast<uint32_t>(info.family), info.tail ? 1 : 0);
+		}
+		EXIT_NOT_IMPLEMENTED(!linear_fits);
 
 		const uint64_t columns =
 		    (static_cast<uint64_t>(tiled_width) + block.block_width - 1u) / block.block_width;

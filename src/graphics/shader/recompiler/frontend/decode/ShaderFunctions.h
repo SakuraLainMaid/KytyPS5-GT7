@@ -71,10 +71,13 @@ constexpr uint32_t ShaderCallLoopBodyEnd   = 0xbf80c0dfu;
 uint32_t           ShaderCallLoopCap();
 // A ray tracing shader (one with IMAGE_BVH_INTERSECT_RAY) runs this many rounds of its loops per
 // invocation, all its loops together, and then leaves each loop at its header
-// (KYTY_RAY_LOOP_CAP, 4096 by default; 0 leaves them unbounded; BudgetLoopHeaders in
+// (KYTY_RAY_LOOP_CAP, 16384 by default; 0 leaves them unbounded; BudgetLoopHeaders in
 // Translate.cpp): its traversal follows node data, and a node list the emulator reads as zero
 // (memory it does not have) never ends. Its calls are its hit functions, which return at once
-// unless KYTY_RAY_HIT_CALLS=1 (RayHitCallsReturn in ShaderFunctions.cpp).
+// unless KYTY_RAY_HIT_CALLS=1 (RayHitCallsReturn in ShaderFunctions.cpp). Round 101: 16384 (4096
+// before). The garage's reflection traversal walks the BVH once for a whole wave of 64 rays, and
+// with 4096 its waves stopped short in many tiles of 16x8 rays (the blocks in the reflections).
+// Its waves count their rounds (RayLoopSlot), and the host logs them ("Ray loops:").
 uint32_t ShaderRayLoopCap();
 
 // Partitioned expansions (round 99; KYTY_CALL_PARTITIONS=0 turns them off): a shader whose one

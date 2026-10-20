@@ -80,6 +80,9 @@ struct SpirvRequirements {
 	bool coherent_buffers             = false;
 	bool float64                      = false;
 	bool shader_clock                 = false;
+	// A compute ray tracing shader with bounded loops: its waves count their loops' rounds
+	// (RayLoopSlot, EmitRayLoopRounds).
+	bool ray_loop_rounds = false;
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
@@ -188,6 +191,13 @@ struct EmitterState {
 	std::vector<RuntimeImageLookup> runtime_image_lookups;
 	// The invocation's loop budget (LoopBudgetTick): a Private u32 holding what is left.
 	uint32_t                   loop_budget_variable                  = 0;
+	// The rounds the invocation ran in each row's loops (RayLoopSlot), Private u32s, the rows'
+	// loop budget ticks in the order the emission met them, and the functions that count a wave
+	// in its shader's slot (DefineRayLoopCount, DefineRayLoopRound).
+	std::array<uint32_t, 6>    ray_loop_round_variables {};
+	std::vector<const void*>   ray_loop_ticks;
+	uint32_t                   ray_loop_count_function               = 0;
+	uint32_t                   ray_loop_round_function               = 0;
 	uint32_t                   runtime_image_requests_variable       = 0;
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   main_func                             = 0;
@@ -615,6 +625,13 @@ uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
 void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
+void DefineRayLoopCount(EmitterState& state);
+// LoopBudgetTick of a ray tracing shader (requirements.ray_loop_rounds): counts the invocation's
+// rounds in the tick's loop (labeled pc), and its wave in the shader's RayLoopSlot as it reaches
+// each bucket, or spends its budget there (left, next: the tick's result and what is left after
+// it).
+void     EmitRayLoopRounds(EmitterState& state, const void* tick, uint32_t cap, uint32_t pc,
+                           uint32_t left, uint32_t next);
 void DefineBvhIntersect(EmitterState& state);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
 uint32_t ConstantDeviceAddress(EmitterState& state, uint64_t value);

@@ -1580,7 +1580,7 @@ uint32_t ShaderCallLoopCap() {
 uint32_t ShaderRayLoopCap() {
 	static const uint32_t value = [] {
 		const char* text = std::getenv("KYTY_RAY_LOOP_CAP");
-		if (text == nullptr || text[0] == '\0') return 4096u;
+		if (text == nullptr || text[0] == '\0') return 16384u;
 		return static_cast<uint32_t>(std::strtoul(text, nullptr, 10));
 	}();
 	return value;

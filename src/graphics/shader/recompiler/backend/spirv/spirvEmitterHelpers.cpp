@@ -115,6 +115,17 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& fla
 	if (control == 0x141u) {
 		return EmitDppMirrorTargetLane(state, subid, true);
 	}
+	// ROW_SHARE (GFX10): every lane reads lane (control & 15) of its row of 16. It fell through
+	// to the lane itself before: a wave prefix sum that spreads a row's total with it (the
+	// instance list of the crowd) added each lane's own partial sum instead.
+	if (control >= 0x150u && control <= 0x15fu) {
+		const auto target = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), target,
+		                          Binary(state, spv::OpBitwiseAnd, TypeU32(state), subid,
+		                                 ConstantU32(state, 0xfffffff0u)),
+		                          ConstantU32(state, control & 0xfu));
+		return {target, ConstantBool(state, true)};
+	}
 	if (control >= 0x160u && control <= 0x16fu) {
 		const auto target = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpBitwiseXor, TypeU32(state), target, subid,

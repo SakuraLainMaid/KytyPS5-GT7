@@ -91,13 +91,20 @@ zipped `_kyty.txt` log).
   minutes and kept it from closing. A material whose part is still compiling is missing from the
   reflections until it is ready. Close the game normally afterwards: the compiled parts and the
   materials they need are saved, and the next visit has them at once.
+- **Fewer blocks in the ray tracing mode's reflections.** The reflections trace their rays in
+  groups of 64 that walk the scene together, and the emulator stopped a group after 4096 rounds
+  of that walk (a guard against one that never ends); a whole 16x8 block of the reflection then
+  showed nothing hit. A group may run 16384 rounds now. It costs frame rate in that mode (in the
+  garage on the PC above, about 7 fps instead of 10); `KYTY_RAY_LOOP_CAP=4096` brings back the
+  old limit. The log now reports how many rounds the groups run ("Ray loops:").
 - After updating to this build, the first session compiles every shader again (pop-in
   everywhere, once).
 
 Known problems in this build:
 
-- Ray tracing mode: switching between the interior and exterior views in the garage can leave
-  white wheels, red pixels or blocky patches in the reflections for a while.
+- Ray tracing mode: some blocks remain in the reflections, and switching between the interior
+  and exterior views in the garage can leave white glows, red pixels or blocky patches in the
+  reflections for a while.
 
 - Rarely, after several races in one session, a loading screen keeps spinning and never ends.
   Restart the game.

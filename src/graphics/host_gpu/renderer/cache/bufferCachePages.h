@@ -77,6 +77,30 @@ inline constexpr uint32_t kShaderProbeSlots  = kShaderProbePoints * kShaderProbe
 inline constexpr uint32_t kShaderProbeValues = 12;
 static_assert(sizeof(ShaderProbeRecord) == 80);
 
+// The rounds the waves of ray tracing shaders run in their bounded loops (LoopBudgetTick,
+// EmitRayLoopRounds in spirvEmitterMemory.cpp). A shader claims a slot by its key (a hash of its
+// shader hash with bit 0 set). Its loops take rows by the order the emission meets their
+// headers (the last row takes every later loop), labeled by the lowest pc of their code, and a
+// last row counts the rounds of all its loops together, which the loop budget bounds. A row's
+// bucket 0 counts the waves that ran the loop at all, bucket b the waves that reached 2^(8+b)
+// rounds in it (512, 1024, ... 2^20). One lane of a host subgroup (one wave of the guest's) counts.
+// The host logs them (FaultManager).
+inline constexpr uint32_t kRayLoopSlots            = 4;
+inline constexpr uint32_t kRayLoopRows             = 6;
+inline constexpr uint32_t kRayLoopBuckets          = 13;
+inline constexpr uint32_t kRayLoopFirstPowerBucket = 9; // bucket 1 is 2^9 rounds
+struct RayLoopSlot {
+	uint32_t key              = 0;
+	uint32_t shader_hash_low  = 0;
+	uint32_t shader_hash_high = 0;
+	uint32_t cap              = 0;   // the loop budget, rounds a wave
+	uint32_t pc[kRayLoopRows] {};    // each row's loop label (its lowest pc) plus 1 (0: no loop)
+	uint32_t spent[kRayLoopRows] {}; // the waves whose budget ran out in the row's loop
+	uint32_t waves[kRayLoopRows + 1][kRayLoopBuckets] {}; // the last row: all loops together
+	uint32_t reserved[5] {};
+};
+static_assert(sizeof(RayLoopSlot) == 112 * sizeof(uint32_t));
+
 struct ShaderTrapArea {
 	ShaderTrapRecord   record;
 	ShaderCallMissSlot misses[kShaderCallMissSlots];
@@ -88,6 +112,7 @@ struct ShaderTrapArea {
 	uint32_t           ray_faults = 0;
 	uint32_t           probe_reserved[15 - kShaderProbePoints] {};
 	ShaderProbeRecord  probes[kShaderProbeSlots];
+	RayLoopSlot        ray_loops[kRayLoopSlots];
 };
 static_assert(offsetof(ShaderTrapArea, misses) == sizeof(ShaderTrapRecord));
 static_assert(offsetof(ShaderTrapArea, probes) ==

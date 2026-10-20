@@ -25,9 +25,10 @@ public:
 	                            uint32_t component_count, const ShaderBufferResource& resource);
 	// header_cap, when not 0: a loop header that enters its body on a condition (one whose
 	// rounds draw on the loop budget, BudgetLoopHeaders in Translate.cpp) does so only while the
-	// invocation has rounds left in its loops (header_cap of them to begin with).
+	// invocation has rounds left in its loops (header_cap of them to begin with). loop_pc labels
+	// the loop in the budget's counts (LoopBudgetTick).
 	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
-	                        IR::BlockInfo& info, uint32_t header_cap = 0);
+	                        IR::BlockInfo& info, uint32_t header_cap = 0, uint32_t loop_pc = 0);
 	// Diagnostics (KYTY_FORCE_PC): overwrites the first destination dwords of an instruction
 	// with constants after it is translated.
 	void ForceDestination(const Decoder::Instruction& inst, const std::vector<uint32_t>& values);
