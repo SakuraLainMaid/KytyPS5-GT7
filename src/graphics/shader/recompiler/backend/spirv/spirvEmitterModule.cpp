@@ -945,6 +945,10 @@ void DefineModule(EmitterState& state) {
 		state.builder.AddExecutionMode(state.main_func,
 		                               spv::ExecutionModeSignedZeroInfNanPreserve, 32u);
 	}
+	if (state.denorm_flush_f32) {
+		state.builder.RequireCapability(spv::CapabilityDenormFlushToZero);
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDenormFlushToZero, 32u);
+	}
 	if (state.requirements.float64) {
 		EXIT_NOT_IMPLEMENTED(state.program.stage == ShaderType::Compute &&
 		                     state.input_info.compute->float_mode != 0xc0);

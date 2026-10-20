@@ -125,6 +125,10 @@ struct EmitterState {
 	// SignedZeroInfNanPreserve for 32-bit floats: NaN-aware GLSL.std.450 operations (NMin, NMax,
 	// OpIsNan) then have the defined results the guest's IEEE instructions need.
 	const bool float_controls = !FloatControlsDisabled(program.shader_hash);
+	// Round 98: DenormFlushToZero for 32 bits (HostFloatFeatures): FMul and FAdd flush their
+	// denormal results, so EmitFPMad32 leaves out its explicit flushes, which were about a third
+	// of the instructions of the ray tracing material passes.
+	bool                                             denorm_flush_f32        = false;
 	uint32_t                                         lane_count              = 1;
 	// Execution scope of the barriers that keep one guest wave's LDS accesses in order across
 	// host invocations (WaveLdsScope in SpirvEmitter.cpp); 0 when none are emitted.

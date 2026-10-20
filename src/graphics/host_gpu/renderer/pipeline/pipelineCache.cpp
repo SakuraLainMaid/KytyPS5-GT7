@@ -656,6 +656,22 @@ static uint32_t ComputeBackgroundWords() {
 	return value;
 }
 
+// Round 98: how many compute pipelines compile in the background at once
+// (KYTY_COMPUTE_BACKGROUND_THREADS, 1 to 16, default 3), one per shader. Without a limit, a run in
+// the ray tracing mode started 71 compiles of material passes of up to 14 million SPIR-V words,
+// each new expansion of a shader while the older ones still compiled: up to 27 compiled at once,
+// ordinary pipelines took up to 36 s meanwhile, memory ran out and the driver ended the emulator.
+static uint32_t ComputeBackgroundThreads() {
+	static const uint32_t value = [] {
+		const char* text = std::getenv("KYTY_COMPUTE_BACKGROUND_THREADS");
+		if (text == nullptr || *text == '\0') {
+			return 3u;
+		}
+		return static_cast<uint32_t>(std::clamp(std::strtoul(text, nullptr, 10), 1ul, 16ul));
+	}();
+	return value;
+}
+
 // Round 93: a compute program that gives up leaves what an offline replay needs (the shader
 // batch tool's --replay mode) in shader-dumps/: the code it translated (expanded when it calls
 // functions), its user data and its stage's registers, as CS_<hash>_<words>.gaveup.{bin,txt}.
@@ -3829,6 +3845,7 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	destroy(m_compute_waiting);
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
@@ -4668,6 +4685,25 @@ bool PipelineCache::IsSkipListed(uint64_t shader_addr) {
 	return SkipShaderRequested(ShaderDeclaredHash(shader_addr));
 }
 
+// Round 94: a compute pipeline compiling on a thread of its own (TryGetComputePipeline).
+struct PipelineCache::BackgroundCompute {
+	std::unique_ptr<Pipeline> pipeline;
+	// The program info the compile reads (its hash and wave size), copied: the program cache's
+	// entry is an element of a vector a later permutation of the same source may move.
+	ShaderRecompiler::IR::CompiledShaderInfo program;
+	ShaderComputeInputInfo                   input_info {};
+	uint64_t                                 hash  = 0;
+	uint32_t                                 words = 0;
+	std::chrono::steady_clock::time_point    begin;
+	uint64_t                                 skipped = 0; // dispatches skipped meanwhile
+	// Round 98: the expanded code (empty when not given) and the start order, for
+	// m_ready_expansions once done.
+	std::vector<uint32_t> expansion;
+	uint64_t              serial = 0;
+	std::atomic<bool>     done {false};
+	std::thread           thread;
+};
+
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info) {
@@ -4677,7 +4713,35 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	const auto        input_before     = input_info;
 	uint32_t          push_data_cursor = 0;
-	auto              program          = m_program_cache->Get(params, input_info, push_data_cursor);
+	const bool        keep_last        = KeepLastExpansion() && params.hash != 0;
+	if (keep_last) {
+		// Round 98: while one expansion of the shader compiles in the background, its newer ones
+		// (with the targets reported meanwhile) are neither translated nor compiled: the last
+		// ready one runs, or the dispatch waits for the one compiling, and the newest expansion is
+		// translated once that compile is done. Each new expansion of a material pass took the GPU
+		// thread up to a second to translate (14 million SPIR-V words), and rt97 made 71.
+		ReapBackgroundCompute();
+		if (const auto* compiling = CompilingCompute(params.hash); compiling != nullptr) {
+			const auto  ready = m_ready_expansions.find(params.hash);
+			const auto& held =
+			    ready != m_ready_expansions.end() ? ready->second.code : compiling->expansion;
+			if (!held.empty()) {
+				m_program_cache->forced_function_code = &held;
+				auto program = m_program_cache->Get(params, input_info, push_data_cursor);
+				m_program_cache->forced_function_code = nullptr;
+				if (program && (m_compute_pipelines.contains(program.id) ||
+				                m_compute_background.contains(program.id))) {
+					if (DrawPrep::Enabled()) {
+						DrawPrep::NoteGoodPair(regs.cs_regs.data_addr, UINT64_MAX);
+					}
+					return program;
+				}
+				input_info       = input_before;
+				push_data_cursor = 0;
+			}
+		}
+	}
+	auto program = m_program_cache->Get(params, input_info, push_data_cursor);
 	if (program && DrawPrep::Enabled()) {
 		// Compute shaders join the known-good list with a vertex identity no draw has.
 		DrawPrep::NoteGoodPair(regs.cs_regs.data_addr, UINT64_MAX);
@@ -4688,20 +4752,24 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	// that while, and the reflections they shade showed garbage (the rainbow came back whenever a
 	// new material appeared).
 	const auto& code = m_program_cache->lookup_key.function_code;
-	if (!program || params.hash == 0 || code.empty() || !KeepLastExpansion()) {
+	if (!program || code.empty() || !keep_last) {
 		return program;
 	}
-	auto ready = m_ready_expansions.find(params.hash);
-	if (ready == m_ready_expansions.end() || ready->second.id == program.id ||
-	    TryGetComputePipeline(input_info, program) != nullptr) {
-		// Compiled now, found compiled, or nothing to run meanwhile.
-		if (m_compute_pipelines.contains(program.id)) {
-			auto& entry = m_ready_expansions[params.hash];
-			if (entry.id != program.id) {
-				entry.id   = program.id;
-				entry.code = code;
-			}
+	// Round 98: the expanded code goes with a background compile it starts (TryGetComputePipeline).
+	const bool runnable = TryGetComputePipeline(input_info, program, code) != nullptr;
+	auto       ready    = m_ready_expansions.find(params.hash);
+	if (runnable) {
+		// Compiled now, or found compiled: the shader's newest ready expansion.
+		if (ready == m_ready_expansions.end() || ready->second.id != program.id) {
+			auto& entry  = m_ready_expansions[params.hash];
+			entry.id     = program.id;
+			entry.serial = ++m_expansion_serial;
+			entry.code   = code;
 		}
+		return program;
+	}
+	if (ready == m_ready_expansions.end() || ready->second.id == program.id) {
+		// Nothing to run meanwhile: its dispatches wait for the compile.
 		return program;
 	}
 	const auto newer                      = program;
@@ -5191,34 +5259,12 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	return *iter->second;
 }
 
-struct PipelineCache::BackgroundCompute {
-	std::unique_ptr<Pipeline> pipeline;
-	// The program info the compile reads (its hash and wave size), copied: the program cache's
-	// entry is an element of a vector a later permutation of the same source may move.
-	ShaderRecompiler::IR::CompiledShaderInfo program;
-	ShaderComputeInputInfo                input_info {};
-	uint64_t                              hash  = 0;
-	uint32_t                              words = 0;
-	std::chrono::steady_clock::time_point begin;
-	uint64_t                              skipped = 0; // dispatches skipped meanwhile
-	std::atomic<bool>                     done {false};
-	std::thread                           thread;
-};
-
-PipelineCache::Pipeline*
-PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
-                                     const ShaderProgram&          compute_program) {
-	EXIT_IF(!compute_program);
-	if (auto iter = m_compute_pipelines.find(compute_program.id);
-	    iter != m_compute_pipelines.end()) {
-		return iter->second.get();
-	}
-	if (auto iter = m_compute_background.find(compute_program.id);
-	    iter != m_compute_background.end()) {
-		auto& job = *iter->second;
+void PipelineCache::ReapBackgroundCompute() {
+	for (auto it = m_compute_background.begin(); it != m_compute_background.end();) {
+		auto& job = *it->second;
 		if (!job.done.load(std::memory_order_acquire)) {
-			job.skipped++;
-			return nullptr;
+			++it;
+			continue;
 		}
 		job.thread.join();
 		const auto seconds =
@@ -5228,12 +5274,49 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 		     job.hash, job.words, seconds, job.skipped);
 		ReportPipelineBuilt(Profiler::Counter::ComputePipelinesBuilt, "Compute", job.hash, 0,
 		                    job.begin);
-		auto pipeline = std::move(job.pipeline);
-		m_compute_background.erase(iter);
-		auto [inserted_iter, inserted] =
-		    m_compute_pipelines.emplace(compute_program.id, std::move(pipeline));
-		EXIT_IF(!inserted);
-		return inserted_iter->second.get();
+		if (job.hash != 0 && !job.expansion.empty()) {
+			// Newer than the shader's ready expansion: it runs from now on, until a newer one is
+			// ready (GetComputeProgram).
+			auto& ready = m_ready_expansions[job.hash];
+			if (ready.serial < job.serial) {
+				ready.id     = it->first;
+				ready.serial = job.serial;
+				ready.code   = std::move(job.expansion);
+			}
+		}
+		m_compute_pipelines.emplace(it->first, std::move(job.pipeline));
+		it = m_compute_background.erase(it);
+	}
+}
+
+const PipelineCache::BackgroundCompute*
+PipelineCache::CompilingCompute(uint64_t shader_hash) const {
+	for (const auto& [id, job]: m_compute_background) {
+		(void)id;
+		if (job->hash == shader_hash) {
+			return job.get();
+		}
+	}
+	return nullptr;
+}
+
+PipelineCache::Pipeline*
+PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
+                                     const ShaderProgram&          compute_program,
+                                     std::span<const uint32_t>     expansion) {
+	EXIT_IF(!compute_program);
+	ReapBackgroundCompute();
+	if (auto iter = m_compute_pipelines.find(compute_program.id);
+	    iter != m_compute_pipelines.end()) {
+		return iter->second.get();
+	}
+	if (auto iter = m_compute_background.find(compute_program.id);
+	    iter != m_compute_background.end()) {
+		// GetComputeProgram's own look (with the expansion) is not a dispatch.
+		if (expansion.empty()) {
+			iter->second->skipped++;
+		}
+		return nullptr;
 	}
 	const auto threshold = ComputeBackgroundWords();
 	// Round 95: an expansion that inlined called functions from a tenth of that: one of 563,699
@@ -5246,8 +5329,14 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 	const auto hash =
 	    input_info.stage.program != nullptr ? input_info.stage.program->shader_hash : 0;
-	auto cached = std::make_unique<Pipeline>();
-	{
+	std::unique_ptr<Pipeline> cached;
+	if (auto waiting = m_compute_waiting.find(compute_program.id);
+	    waiting != m_compute_waiting.end()) {
+		// Looked up before, in no cache: its layouts are made.
+		cached = std::move(waiting->second);
+		m_compute_waiting.erase(waiting);
+	} else {
+		cached = std::make_unique<Pipeline>();
 		const GpuPhases::Scope phase(GpuPhases::Phase::PipelineCompile);
 		if (CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
 		                           m_driver_cache, m_driver_older, ComputeBuild::LookUp)) {
@@ -5257,6 +5346,24 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 			return iter->second.get();
 		}
 	}
+	// Round 98: one compile per shader at a time, and ComputeBackgroundThreads in all; the
+	// program waits meanwhile (GetComputeProgram runs the shader's ready expansion, if any). A
+	// shader with a ready expansion leaves one of them to the shaders with nothing to run.
+	const auto running   = m_compute_background.size();
+	const auto slots     = ComputeBackgroundThreads();
+	const bool same      = CompilingCompute(hash) != nullptr;
+	const bool has_ready = hash != 0 && m_ready_expansions.contains(hash);
+	if (same || running >= slots || (has_ready && slots > 1 && running + 1 >= slots)) {
+		m_compute_waiting.emplace(compute_program.id, std::move(cached));
+		if (m_compute_wait_logged.size() < 4096 &&
+		    m_compute_wait_logged.insert(compute_program.id).second) {
+			LOGF("Compute pipeline CS=0x%016" PRIx64 " (%u SPIR-V words) waits to compile in the "
+			     "background: %s\n",
+			     hash, compute_program.spirv_words,
+			     same ? "another expansion of it compiles" : "the other compiles run");
+		}
+		return nullptr;
+	}
 	auto job          = std::make_unique<BackgroundCompute>();
 	job->pipeline     = std::move(cached);
 	job->program                  = *input_info.stage.program;
@@ -5265,11 +5372,13 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 	job->hash         = hash;
 	job->words        = compute_program.spirv_words;
 	job->begin        = std::chrono::steady_clock::now();
+	job->expansion.assign(expansion.begin(), expansion.end());
+	job->serial       = ++m_expansion_serial;
 	auto*      raw    = job.get();
 	const auto module = compute_program.module;
-	LOGF("Compute pipeline CS=0x%016" PRIx64 " (%u SPIR-V words) is compiled in the background; "
-	     "its dispatches are skipped until then\n",
-	     hash, compute_program.spirv_words);
+	LOGF("Compute pipeline CS=0x%016" PRIx64 " (%u SPIR-V words) is compiled in the background "
+	     "(%zu of %u running); until then its shader runs an earlier expansion, if one is ready\n",
+	     hash, compute_program.spirv_words, running + 1u, ComputeBackgroundThreads());
 	// The driver cache stays until Save, which waits for this thread first.
 	raw->thread = std::thread([this, raw, module, cache = m_driver_cache] {
 		KYTY_PROFILER_THREAD("ComputePipelineCompile");

@@ -329,14 +329,23 @@ public:
 	// nullptr comes back until it is done: the dispatch is skipped. The driver took 110 s for one
 	// of 1.5 million words (a ray tracing material pass with its looping material functions
 	// inlined), with the emulated GPU stopped all along.
+	// Round 98: `expansion`, the program's expanded code (GetComputeProgram), goes with a
+	// background compile, so that the finished pipeline becomes its shader's ready expansion even
+	// when a newer one is asked for by then. At most KYTY_COMPUTE_BACKGROUND_THREADS compile at
+	// once (default 3), one per shader.
 	Pipeline* TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
-	                                const ShaderProgram&          compute_program);
+	                                const ShaderProgram&          compute_program,
+	                                std::span<const uint32_t>     expansion = {});
 
 private:
 	struct BackgroundCompute;
 	// Waits up to `budget` for the compute pipelines still compiling in the background (Save:
 	// they compile into the driver cache); returns how many still compile.
 	size_t FinishBackgroundCompute(std::chrono::milliseconds budget);
+	// Round 98: takes in the background compiles that are done (their pipelines become usable, and
+	// an expansion the newest ready one of its shader), and the one still compiling for a shader.
+	void                     ReapBackgroundCompute();
+	const BackgroundCompute* CompilingCompute(uint64_t shader_hash) const;
 	// Save, done with the driver cache: destroyed, or kept while background compiles use it.
 	void ReleaseDriverCache(size_t still_compiling);
 	struct ProgramCache;
@@ -394,14 +403,21 @@ private:
 	// Round 97: by shader hash, its last expansion whose compute pipeline is ready (the program id
 	// and the expanded code), run while a newer one compiles (GetComputeProgram); and the newer
 	// programs whose wait was logged.
+	// Round 98: `serial` orders them (a finished background compile replaces an older one only).
 	struct ReadyExpansion {
-		uint64_t              id = 0;
+		uint64_t              id     = 0;
+		uint64_t              serial = 0;
 		std::vector<uint32_t> code;
 	};
 	std::unordered_map<uint64_t, ReadyExpansion> m_ready_expansions;
 	std::unordered_set<uint64_t>                 m_last_expansion_logged;
-	// Round 94: compute pipelines compiling on threads of their own, by program id.
+	uint64_t                                     m_expansion_serial = 0;
+	// Round 94: compute pipelines compiling on threads of their own, by program id. Round 98: the
+	// programs no driver cache held that wait for a compile slot (with the layouts their lookup
+	// made, so they are not looked up again), and those whose wait was logged.
 	std::unordered_map<uint64_t, std::unique_ptr<BackgroundCompute>> m_compute_background;
+	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>>          m_compute_waiting;
+	std::unordered_set<uint64_t>                                     m_compute_wait_logged;
 	std::unique_ptr<PipelineCompiler>                       m_compiler;
 	uint64_t                                                m_deferred_draws = 0;
 	// Round 87: whether a new pipeline is first looked up in the driver's caches alone

@@ -21,6 +21,17 @@ struct HostImageFeatures {
 void              SetHostImageFeatures(const HostImageFeatures& features);
 HostImageFeatures GetHostImageFeatures();
 
+// Optional floating-point controls of the device, set once by the device layer.
+struct HostFloatFeatures {
+	// shaderDenormFlushToZeroFloat32, settable apart from the other widths: a compute shader whose
+	// float mode flushes 32-bit denormals (FLOAT_MODE bits 4 and 5 clear) declares
+	// DenormFlushToZero for 32 bits, and its legacy MAD/MAC need no explicit flushes.
+	bool denorm_flush_f32 = false;
+};
+
+void              SetHostFloatFeatures(const HostFloatFeatures& features);
+HostFloatFeatures GetHostFloatFeatures();
+
 // S_MEMREALTIME counts at 100 MHz. The emitter reads the device clock (OpReadClockKHR, device
 // scope) and shifts it right by this many bits to approach that rate. The device layer sets it
 // from the device's clock rate: 3 for a 1 GHz clock (NVIDIA, the default), 0 for a 100 MHz one

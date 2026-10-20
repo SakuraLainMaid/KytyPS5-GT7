@@ -86,7 +86,12 @@ zipped `_kyty.txt` log).
 - **The ray tracing mode's reflections are shaded** (garage tested). The first visit compiles
   the reflection passes in the background for a minute or more each; the car shows wrong
   colours until they are done. Close the game normally afterwards: the compiled passes and the
-  materials they need are saved, and the next visit has them at once.
+  materials they need are saved, and the next visit has them at once. At most three of these
+  passes compile at once, each new car material waits for its pass's compile under way, and the
+  passes are about a quarter smaller than before: compiling all of them at once could use up the
+  PC's memory and end the emulator ("out of memory").
+- After updating to this build, the first session compiles every shader again (pop-in
+  everywhere, once).
 
 Known problems in this build:
 

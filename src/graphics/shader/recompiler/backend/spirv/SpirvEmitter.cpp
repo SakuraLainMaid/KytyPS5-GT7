@@ -489,6 +489,7 @@ uint32_t WaveLdsScope(const IR::Program& program, const ShaderWorkgroupInputInfo
 }
 
 std::atomic_bool     g_image_min_lod {false};
+std::atomic_bool     g_denorm_flush_f32 {false};
 std::atomic_uint32_t g_device_clock_shift {3};
 std::atomic_bool     g_coherent_load_acquire {false};
 } // namespace
@@ -521,6 +522,14 @@ HostImageFeatures GetHostImageFeatures() {
 	return {.min_lod = g_image_min_lod.load(std::memory_order_relaxed)};
 }
 
+void SetHostFloatFeatures(const HostFloatFeatures& features) {
+	g_denorm_flush_f32.store(features.denorm_flush_f32, std::memory_order_relaxed);
+}
+
+HostFloatFeatures GetHostFloatFeatures() {
+	return {.denorm_flush_f32 = g_denorm_flush_f32.load(std::memory_order_relaxed)};
+}
+
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
                                   ShaderStageInputInfo input_info) {
 	using namespace Emitter;
@@ -549,6 +558,12 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	if (program.stage == ShaderType::Mesh) {
 		state.mesh_passes = std::max(input_info.vertex->mesh.passes, 1u);
 	}
+	// Round 98: FLOAT_MODE bits 4 and 5 clear flush 32-bit denormal inputs and outputs, what
+	// DenormFlushToZero does.
+	state.denorm_flush_f32 = state.float_controls && GetHostFloatFeatures().denorm_flush_f32 &&
+	                         program.stage == ShaderType::Compute &&
+	                         input_info.compute != nullptr &&
+	                         (input_info.compute->float_mode & 0x30u) == 0u;
 	state.wave_lds_scope = WaveLdsScope(program, workgroup, state.lane_count);
 	DefineModule(state);
 	EmitProgram(state);

@@ -231,7 +231,17 @@ uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 }
 
 uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
-	// Legacy MAD/MAC round and flush between multiply and add, irrespective of SP_DENORM.
+	// Legacy MAD/MAC round and flush between multiply and add, irrespective of SP_DENORM. Round
+	// 98: under DenormFlushToZero, FMul and FAdd flush their denormal results themselves (and may
+	// flush denormal operands; NVIDIA's FTZ arithmetic does), which these shaders' float mode asks
+	// for anyway.
+	if (state.denorm_flush_f32) {
+		const auto product = EmitFPMul32(state, a, b);
+		state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
+		const auto sum = EmitFPAdd32(state, product, c);
+		state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
+		return sum;
+	}
 	a = EmitFlushF32DenormToSignedZero(state, a);
 	b = EmitFlushF32DenormToSignedZero(state, b);
 	c = EmitFlushF32DenormToSignedZero(state, c);

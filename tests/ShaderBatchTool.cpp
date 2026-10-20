@@ -25,6 +25,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/shader.h"
@@ -994,6 +995,10 @@ int main(int argc, char* argv[]) {
 #ifdef _WIN32
 	AddVectoredExceptionHandler(1, ReportCrash);
 #endif
+	// As on NVIDIA (vulkanWindow.cpp): DenormFlushToZero for 32 bits where the float mode flushes
+	// them. KYTY_BATCH_NO_DENORM_FLUSH=1: the explicit flushes instead.
+	ShaderRecompiler::Spirv::SetHostFloatFeatures(
+	    {.denorm_flush_f32 = std::getenv("KYTY_BATCH_NO_DENORM_FLUSH") == nullptr});
 
 	if (folder == "--replay") {
 		// shader_batch_tool --replay <log> <CS_hash_words.gaveup.txt>

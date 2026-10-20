@@ -698,6 +698,7 @@ std::vector<uint8_t> SessionKey(const SessionInfo& session) {
 	key.Put(ShaderRecompiler::Spirv::GetCoherentLoadAcquire());
 	key.Put(ShaderRecompiler::Spirv::GetDeviceClockShift());
 	key.Put(ShaderRecompiler::Spirv::GetHostImageFeatures().min_lod);
+	key.Put(ShaderRecompiler::Spirv::GetHostFloatFeatures().denorm_flush_f32);
 	// Every KYTY_* switch named in the recompiler's sources, with its value.
 	for (const auto name: ShaderDiskCacheVersion::RecompilerSwitches) {
 		if (name.empty()) {

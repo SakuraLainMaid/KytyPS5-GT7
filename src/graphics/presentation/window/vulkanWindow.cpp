@@ -673,6 +673,22 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	ShaderRecompiler::Spirv::SetHostImageFeatures({.min_lod = shader_resource_min_lod});
 	LOGF("Vulkan shaderResourceMinLod (IMAGE_SAMPLE*_CL): %s\n",
 	     shader_resource_min_lod ? "true" : "false");
+	// Round 98: DenormFlushToZero for 32-bit floats in the compute shaders whose float mode
+	// flushes them, where the device can set it apart from the other widths
+	// (KYTY_DENORM_FLUSH=0: not used; the explicit flushes as before).
+	{
+		const char* setting      = std::getenv("KYTY_DENORM_FLUSH");
+		const bool  wanted       = setting == nullptr || setting[0] != '0';
+		const auto  independence = float_controls.denormBehaviorIndependence;
+		const bool  separate_f32 = independence == vk::ShaderFloatControlsIndependence::eAll ||
+		                          independence == vk::ShaderFloatControlsIndependence::e32BitOnly;
+		const bool supported     = float_controls.shaderDenormFlushToZeroFloat32 == VK_TRUE;
+		const bool flush_to_zero = wanted && supported && separate_f32;
+		ShaderRecompiler::Spirv::SetHostFloatFeatures({.denorm_flush_f32 = flush_to_zero});
+		LOGF("Vulkan shaderDenormFlushToZeroFloat32: %s, independence %s: %s\n",
+		     supported ? "true" : "false", vk::to_string(independence).c_str(),
+		     flush_to_zero ? "used" : (wanted ? "not usable" : "off (KYTY_DENORM_FLUSH=0)"));
+	}
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.dualSrcBlend                         = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;
