@@ -28,6 +28,52 @@ void MemoryTracker::MarkBdaPending(uint64_t vaddr, uint64_t size) noexcept {
 	}
 }
 
+size_t MemoryTracker::TrackRegions(uint64_t vaddr, uint64_t size) {
+	ValidateRange(vaddr, size);
+	size_t created = 0;
+	for (uint64_t index = vaddr / TRACKER_REGION_SIZE;
+	     index <= (vaddr + size - 1) / TRACKER_REGION_SIZE; index++) {
+		if (m_regions[index].load(std::memory_order_acquire) == nullptr) {
+			(void)GetOrCreateRegion(index);
+			created++;
+		}
+	}
+	return created;
+}
+
+bool MemoryTracker::IsBdaPending(uint64_t vaddr) const noexcept {
+	if (vaddr >= TRACKER_ADDRESS_SIZE) {
+		return false;
+	}
+	const uint64_t index = vaddr / TRACKER_REGION_SIZE;
+	return ((m_bda_pending[index / 64].load(std::memory_order_acquire) >> (index % 64)) & 1u) != 0;
+}
+
+size_t MemoryTracker::RedirtyForMap(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	size_t dirtied = 0;
+	Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		dirtied += manager->DirtyCleanIn(manager->GetCpuAddr() + offset, bytes);
+	});
+	return dirtied;
+}
+
+MemoryTracker::PageStates MemoryTracker::DescribePages(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	PageStates states;
+	Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		const auto       counts = manager->CountPages(manager->GetCpuAddr() + offset, bytes);
+		states.present +=
+		    (offset % TRACKER_PAGE_SIZE + bytes + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE;
+		states.cpu += counts.cpu;
+		states.gpu += counts.gpu;
+		states.hot += counts.hot;
+	});
+	return states;
+}
+
 void MemoryTracker::CollectCpuDirtyRuns(uint64_t vaddr, uint64_t size,
                                         std::vector<std::pair<uint64_t, uint64_t>>& runs) {
 	CheckNotInUploadCallback();

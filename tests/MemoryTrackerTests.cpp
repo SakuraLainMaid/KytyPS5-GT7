@@ -1218,6 +1218,63 @@ void TestBdaPendingRegions() {
   Release(memory);
 }
 
+void TestRedirtyForMap() {
+  // A new buffer's regions (MemoryTracker::TrackRegions), and memory mapped
+  // again (MemoryTracker::RedirtyForMap): its clean pages become
+  // CPU-dirty, GPU-written ones stay as they are, and its region is pending
+  // for the BDA walk again, also when its pages were CPU-dirty already.
+  // DescribePages counts the pages by state.
+  constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  // The tracker's pages in a host page.
+  const auto per = page_size / Libs::Graphics::TRACKER_PAGE_SIZE;
+  auto *memory = AllocateFixedGuestRange(region_size, 0x400000);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto take = [&] {
+    std::vector<uint64_t> taken;
+    tracker.TakeBdaPending([&](uint64_t region) { taken.push_back(region); });
+    return taken;
+  };
+  // TrackRegions (a new cached buffer's regions): created all CPU-dirty and
+  // pending, once.
+  Check(tracker.DescribePages(address, page_size).present == 0 &&
+            tracker.TrackRegions(address, region_size) == 1,
+        "TrackRegions did not create the missing region");
+  Check(tracker.DescribePages(address, page_size * 8).cpu == 8 * per &&
+            tracker.IsBdaPending(address),
+        "a region TrackRegions created was not CPU-dirty and pending");
+  Check(tracker.TrackRegions(address, region_size) == 0,
+        "TrackRegions created a region that existed");
+  tracker.ForEachUploadRange(
+      address, page_size * 8, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  (void)take();
+  auto states = tracker.DescribePages(address, page_size * 8);
+  Check(states.present == 8 * per && states.cpu == 0 && states.gpu == 0 &&
+            states.hot == 0,
+        "uploaded pages were not described as clean");
+  Check(!tracker.IsBdaPending(address), "a taken region was still pending");
+
+  tracker.MarkRegionAsGpuModified(address + page_size * 2, page_size);
+  const auto dirtied = tracker.RedirtyForMap(address, page_size * 8);
+  states = tracker.DescribePages(address, page_size * 8);
+  Check(dirtied == 7 * per && states.cpu == 7 * per && states.gpu == per,
+        "a map did not make the clean pages (only) CPU-dirty");
+  Check(tracker.IsBdaPending(address) && take().size() == 1,
+        "a map did not make its region pending");
+  Check(tracker.RedirtyForMap(address, page_size * 2) == 0 &&
+            tracker.IsBdaPending(address),
+        "a map over CPU-dirty pages did not make their region pending again");
+  (void)take();
+
+  tracker.UnmarkRegionAsGpuModified(address + page_size * 2, page_size);
+  tracker.MarkRegionAsCpuModified(address, region_size);
+  tracker.UntrackMemory(address, region_size);
+  Release(memory);
+}
+
 void TestUploadDoesNotSerializeDisjointRegion() {
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
@@ -1621,6 +1678,7 @@ int main(int argc, char **argv) {
   TestRegionBitmapHint();
   TestDirtyRegionWalk();
   TestBdaPendingRegions();
+  TestRedirtyForMap();
   TestImageZoneStamps();
   TestUploadDoesNotSerializeDisjointRegion();
   TestDownloadDoesNotSerializeDisjointRegion();

@@ -360,6 +360,45 @@ public:
 	}
 	[[nodiscard]] size_t HotCount() const noexcept { return m_hot_count; }
 
+	// Memory mapped again (RenderContext::MapMemory, KYTY_MAP_REDIRTY): the pages of
+	// [vaddr, vaddr + size) that are neither CPU-dirty nor GPU-written become CPU-dirty, since the
+	// mapping brought bytes no write fault announced; and the region is pending for the next BDA
+	// walk when any page of the range is CPU-dirty, since a walk while the range was unmapped can
+	// take the region's pending bit without synchronizing it. How many pages became CPU-dirty.
+	size_t DirtyCleanIn(uint64_t vaddr, uint64_t size) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		RegionBits pages;
+		pages.SetRange(start, end);
+		auto dirty = pages & ~m_gpu_dirty;
+		dirty &= ~m_cpu_dirty;
+		const auto count = dirty.Count();
+		if (count != 0) {
+			m_cpu_dirty |= dirty;
+			StoreSummary<DirtySource::Cpu>(true);
+			UpdateCpuProtection();
+		}
+		if (count != 0 || RegionBits(m_cpu_dirty, start, end).Any()) {
+			NoteBdaPending();
+			g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+			if (!t_guest_gpu_thread) {
+				g_cpu_write_epoch.fetch_add(1, std::memory_order_release);
+			}
+		}
+		return count;
+	}
+
+	// Diagnostics: the CPU-dirty, GPU-written and hot pages of [vaddr, vaddr + size).
+	struct PageCounts {
+		size_t cpu = 0;
+		size_t gpu = 0;
+		size_t hot = 0;
+	};
+	[[nodiscard]] PageCounts CountPages(uint64_t vaddr, uint64_t size) const {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		return {RegionBits(m_cpu_dirty, start, end).Count(),
+		        RegionBits(m_gpu_dirty, start, end).Count(), RegionBits(m_hot, start, end).Count()};
+	}
+
 	TrackingSpinLock lock;
 	// Whether the tracker lists this region as holding hot pages (MemoryTracker's hot mutex).
 	bool in_hot_list = false;

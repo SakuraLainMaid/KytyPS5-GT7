@@ -74,6 +74,23 @@ public:
 	// walk that synchronized every buffer of a region leaves CPU-dirty only the pages no buffer
 	// covers, so until one of those happens the next walks have nothing to do there.
 	void MarkBdaPending(uint64_t vaddr, uint64_t size) noexcept;
+	// Creates the tracker regions of the range that do not exist yet: all CPU-dirty and pending
+	// for the next BDA walk, as every new region. How many it created.
+	size_t TrackRegions(uint64_t vaddr, uint64_t size);
+	// Diagnostics: whether the region of `vaddr` is pending for the next BDA walk.
+	[[nodiscard]] bool IsBdaPending(uint64_t vaddr) const noexcept;
+	// Memory mapped again (RegionManager::DirtyCleanIn): its clean pages become CPU-dirty and its
+	// regions with CPU-dirty pages pending for the next BDA walk; how many pages became CPU-dirty.
+	// Only regions that exist (a new one starts CPU-dirty and pending).
+	size_t RedirtyForMap(uint64_t vaddr, uint64_t size);
+	// Diagnostics: the pages of the range, by state (a region that does not exist counts none).
+	struct PageStates {
+		size_t present = 0; // pages in regions that exist
+		size_t cpu     = 0;
+		size_t gpu     = 0;
+		size_t hot     = 0;
+	};
+	[[nodiscard]] PageStates DescribePages(uint64_t vaddr, uint64_t size);
 	// Calls func(region address) for each pending region, which is pending no more.
 	template <typename Func>
 	void TakeBdaPending(Func&& func) {

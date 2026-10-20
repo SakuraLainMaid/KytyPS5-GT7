@@ -111,7 +111,10 @@ Known problems in this build:
 
 - Ray tracing mode: some blocks remain in the reflections, and switching between the interior
   and exterior views in the garage can leave white glows, red pixels or blocky patches in the
-  reflections for a while.
+  reflections for a while. The blocks are groups of rays whose walk through the car's ray
+  tracing data never ends: the emulator's graphics copy of part of that data holds zeros where
+  the game's memory holds it right (being investigated).
+- Tokyo, morning: the picture turns green at some tunnel exits, and fades back once past them.
 
 - Rarely, after several races in one session, a loading screen keeps spinning and never ends.
   Restart the game.

@@ -17,7 +17,9 @@
 #include "kernel/eventQueue.h"
 
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <vector>
 
 namespace Libs::VideoOut {
@@ -82,6 +84,10 @@ public:
 	}
 	void               PrepareBda();
 	void               RunGarbageCollector();
+	// Diagnostics: the latest changes to the mapped ranges over [vaddr, vaddr + size) (at most
+	// `count`, the latest last), one line each, with the frame they happened in.
+	[[nodiscard]] std::vector<std::string> DescribeMappings(uint64_t vaddr, uint64_t size,
+	                                                        size_t count) const;
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -106,6 +112,20 @@ private:
 	BindlessTable             m_bindless_table;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
+	// Diagnostics (DescribeMappings): the latest MapMemory and UnmapMemory calls.
+	enum class MapEventKind : uint8_t { Map, Unmap };
+	struct MapEvent {
+		uint64_t     frame     = 0;
+		uint64_t     vaddr     = 0;
+		uint64_t     size      = 0;
+		uint64_t     redirtied = 0; // KYTY_MAP_REDIRTY: pages the map made CPU-dirty
+		MapEventKind kind      = MapEventKind::Map;
+	};
+	void NoteMapEvent(MapEventKind kind, uint64_t vaddr, uint64_t size, uint64_t redirtied);
+	mutable std::mutex        m_map_events_mutex;
+	std::vector<MapEvent>     m_map_events;
+	size_t                    m_map_events_next  = 0;
+	uint64_t                  m_map_events_total = 0;
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;

@@ -513,9 +513,98 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+// KYTY_MAP_REDIRTY (round 103): what MapMemory does for the range it maps for the GPU. By default
+// its tracker regions become pending for the BDA walk again (BufferCache::MarkMappedPending): a
+// walk while the range was unmapped (between the unmap that precedes a map and the map) can take
+// their pending bit without synchronizing them, and their CPU-dirty pages stay writable, so no
+// write fault marks them again. "1" also makes its clean pages CPU-dirty
+// (BufferCache::RedirtyMapped), for bytes a mapping brings that no write fault announced (a new
+// view of direct memory with data in it, a buffer that covered the range while it was unmapped and
+// read zeros there). "0" does neither, as before round 103.
+enum class MapRedirtyMode : uint8_t { Off, Pending, Full };
+static MapRedirtyMode MapRedirty() {
+	static const MapRedirtyMode mode = [] {
+		const char* value = std::getenv("KYTY_MAP_REDIRTY");
+		if (value == nullptr || value[0] == '\0') {
+			return MapRedirtyMode::Pending;
+		}
+		return value[0] == '1'   ? MapRedirtyMode::Full
+		       : value[0] == '0' ? MapRedirtyMode::Off
+		                         : MapRedirtyMode::Pending;
+	}();
+	return mode;
+}
+
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
-	std::lock_guard lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.Add(vaddr, size);
+	{
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.Add(vaddr, size);
+	}
+	uint64_t   redirtied = 0;
+	const auto mode      = MapRedirty();
+	if (mode == MapRedirtyMode::Pending && GuestRange {vaddr, size}.Valid()) {
+		m_buffer_cache.MarkMappedPending(vaddr, size);
+	} else if (mode == MapRedirtyMode::Full && GuestRange {vaddr, size}.Valid()) {
+		redirtied = m_buffer_cache.RedirtyMapped(vaddr, size);
+		m_buffer_cache.MarkMappedPending(vaddr, size);
+		static std::atomic<uint64_t> maps {0};
+		static std::atomic<uint64_t> pages {0};
+		const auto                   n = maps.fetch_add(1, std::memory_order_relaxed) + 1;
+		const auto total = pages.fetch_add(redirtied, std::memory_order_relaxed) + redirtied;
+		if (std::has_single_bit(n)) {
+			LOGF("Map redirty: %" PRIu64 " maps so far made %" PRIu64
+			     " clean pages CPU-dirty (KYTY_MAP_REDIRTY); the latest 0x%016" PRIx64 "+0x%" PRIx64
+			     ", %" PRIu64 " pages\n",
+			     n, total, vaddr, size, redirtied);
+		}
+	}
+	NoteMapEvent(MapEventKind::Map, vaddr, size, redirtied);
+}
+
+void RenderContext::NoteMapEvent(MapEventKind kind, uint64_t vaddr, uint64_t size,
+                                 uint64_t redirtied) {
+	constexpr size_t Capacity = 65536;
+	const MapEvent   event {.frame = m_graphics.presented_frames.load(std::memory_order_relaxed),
+	                        .vaddr = vaddr,
+	                        .size  = size,
+	                        .redirtied = redirtied,
+	                        .kind      = kind};
+	std::lock_guard  lock(m_map_events_mutex);
+	if (m_map_events.size() < Capacity) {
+		m_map_events.push_back(event);
+	} else {
+		m_map_events[m_map_events_next] = event;
+	}
+	m_map_events_next = (m_map_events_next + 1) % Capacity;
+	m_map_events_total++;
+}
+
+std::vector<std::string> RenderContext::DescribeMappings(uint64_t vaddr, uint64_t size,
+                                                         size_t count) const {
+	constexpr size_t         Capacity = 65536;
+	std::vector<std::string> lines;
+	std::lock_guard          lock(m_map_events_mutex);
+	size_t                   matching = 0;
+	for (size_t k = m_map_events.size(); k-- > 0;) {
+		const auto  index = m_map_events.size() < Capacity ? k : (m_map_events_next + k) % Capacity;
+		const auto& event = m_map_events[index];
+		if (event.vaddr >= vaddr + size || event.vaddr + event.size <= vaddr) {
+			continue;
+		}
+		if (matching++ < count) {
+			lines.insert(
+			    lines.begin(),
+			    fmt::format("frame {} {} 0x{:012x}+0x{:x}{}", event.frame,
+			                event.kind == MapEventKind::Map ? "map" : "unmap", event.vaddr,
+			                event.size,
+			                event.redirtied != 0
+			                    ? fmt::format(" ({} pages made CPU-dirty)", event.redirtied)
+			                    : std::string {}));
+		}
+	}
+	lines.push_back(fmt::format("{} map and unmap calls over the range among the last {} of {}",
+	                            matching, m_map_events.size(), m_map_events_total));
+	return lines;
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -539,6 +628,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			return;
 		}
 	}
+	NoteMapEvent(MapEventKind::Unmap, vaddr, size, 0);
 	const auto unmap = [this, vaddr, size] {
 		if (m_command_scheduler.Active()) {
 			const auto tick = m_command_scheduler.CurrentTick();
@@ -589,7 +679,10 @@ void RenderContext::PrepareBda() {
 			// for another's, would bring back a walk a draw).
 			const bool reopened =
 			    BdaSyncAtWaits() && waits != m_bda_synced_waits && writes != m_bda_synced_writes;
-			if (!reopened) {
+			// Round 103: and when a new buffer brought tracker regions (BufferCache::
+			// TakeNewRegions): what it covers there is uploaded by a walk alone, and the shaders
+			// of this submission read it from now on.
+			if (!reopened && !m_buffer_cache.TakeNewRegions()) {
 				GpuPhases::Count(GpuPhases::Phase::BdaHeldBack, 1);
 				m_fault_process_pending = true;
 				return;
@@ -618,6 +711,7 @@ void RenderContext::PrepareBda() {
 		}
 		GpuPhases::Count(GpuPhases::Phase::BdaProtects,
 		                 GpuPhases::CountOf(GpuPhases::Phase::Protect) - protects);
+		(void)m_buffer_cache.TakeNewRegions(); // this walk visits them
 		m_bda_synced_epoch = epoch;
 	}
 	m_fault_process_pending = true;
@@ -720,7 +814,26 @@ static void DumpGuestMemory(GraphicContext& graphics, BufferCache& cache) {
 // at the record before index <next>, which it read as <word0> and <word1>. It logs the list's
 // first records, whether guest memory holds what the wave read, and where the first record whose
 // second word has bit 31 set (the end of the list) is ("Stuck list:").
-static void AnalyzeStuckSamples(BufferCache& cache) {
+//
+// Round 103: first, for each of up to 4 such buffers (the V#'s whole range), its pages as the GPU
+// holds them against guest memory, with the tracker's state of each, its page table entries and
+// the history of its buffers and mappings (BufferCache::CompareWithGuest, "Stuck buffer"). With
+// KYTY_PROBE_LIST_HEAL=1 the pages that differ while the GPU wrote none of them are uploaded
+// again from guest memory, and the buffer is compared again 10 s later ("Stuck buffer ...
+// recheck").
+static uint64_t CompareStuckBuffer(RenderContext& context, BufferCache& cache, uint64_t base,
+                                   uint64_t size, const std::string& label, bool heal) {
+	const auto stale =
+	    cache.CompareWithGuest(base, size, label, heal, [&context](uint64_t vaddr, uint64_t bytes) {
+		    return context.IsMapped(vaddr, bytes);
+	    });
+	for (const auto& line: context.DescribeMappings(base, size, 24)) {
+		LOGF("%s: mappings: %s\n", label.c_str(), line.c_str());
+	}
+	return stale;
+}
+
+static void AnalyzeStuckSamples(RenderContext& context, BufferCache& cache) {
 	static const std::vector<uint32_t> list = [] {
 		std::vector<uint32_t> indices;
 		const char*           value = std::getenv("KYTY_PROBE_LIST");
@@ -731,11 +844,29 @@ static void AnalyzeStuckSamples(BufferCache& cache) {
 		}
 		return indices;
 	}();
+	if (list.size() != 7) return;
+	struct Checked {
+		uint64_t base       = 0;
+		uint64_t size       = 0;
+		uint64_t recheck_ms = 0;
+	};
+	static std::vector<Checked> checked;
+	static const bool           heal = [] {
+        const char* value = std::getenv("KYTY_PROBE_LIST_HEAL");
+        return value != nullptr && value[0] == '1';
+	}();
+	for (auto& entry: checked) {
+		if (entry.recheck_ms != 0 && NowMs() >= entry.recheck_ms) {
+			entry.recheck_ms = 0;
+			(void)CompareStuckBuffer(context, cache, entry.base, entry.size,
+			                         fmt::format("Stuck buffer 0x{:012x} recheck", entry.base),
+			                         false);
+		}
+	}
 	auto samples = TakeStuckProbeSamples();
-	if (list.size() != 7 || samples.empty()) return;
+	if (samples.empty()) return;
 	static std::vector<std::pair<uint64_t, uint64_t>> seen;
 	for (const auto& sample: samples) {
-		if (seen.size() >= 24) return;
 		if (std::ranges::any_of(list, [&](uint32_t index) { return index >= sample.count; })) {
 			continue;
 		}
@@ -744,6 +875,16 @@ static void AnalyzeStuckSamples(BufferCache& cache) {
 		const auto stride = std::max<uint32_t>((value(1) >> 16u) & 0x3fffu, 1u);
 		const auto start  = uint64_t {value(3) & ~7u};
 		const auto next   = uint64_t {value(4)};
+		if (checked.size() < 4 && std::ranges::none_of(checked, [&](const Checked& entry) {
+			    return entry.base == base;
+		    })) {
+			// Before anything below downloads or synchronizes the range.
+			const auto size  = uint64_t {stride} * value(2);
+			const auto stale = CompareStuckBuffer(
+			    context, cache, base, size, fmt::format("Stuck buffer 0x{:012x}", base), heal);
+			checked.push_back({base, size, heal && stale != 0 ? NowMs() + 10000u : 0u});
+		}
+		if (seen.size() >= 24) continue;
 		if (std::ranges::find(seen, std::pair {base, start}) != seen.end()) continue;
 		seen.emplace_back(base, start);
 		// The list from its start to two records past the wave's, at most 1 MB.
@@ -784,9 +925,43 @@ static void AnalyzeStuckSamples(BufferCache& cache) {
 	}
 }
 
+// Diagnostics: KYTY_VERIFY_BUFFERS=<seconds> (at least 10) compares every cached buffer with guest
+// memory that often, the first time that long after the first frames ("Buffer verify:",
+// BufferCache::VerifyCacheWithGuest): pages the GPU holds otherwise while the tracker holds them
+// clean, and CPU-dirty pages the BDA walk will not upload. KYTY_VERIFY_BUFFERS_HEAL=1 uploads
+// them again.
+static void VerifyBuffers(RenderContext& context, BufferCache& cache) {
+	static const uint64_t period_ms = [] {
+		const char* value   = std::getenv("KYTY_VERIFY_BUFFERS");
+		const auto  seconds = value != nullptr ? std::strtoull(value, nullptr, 10) : 0u;
+		return seconds == 0 ? uint64_t {0} : std::max<uint64_t>(seconds, 10u) * 1000u;
+	}();
+	if (period_ms == 0) {
+		return;
+	}
+	static const bool heal = [] {
+		const char* value = std::getenv("KYTY_VERIFY_BUFFERS_HEAL");
+		return value != nullptr && value[0] == '1';
+	}();
+	static uint64_t next_ms = 0;
+	const auto      now     = NowMs();
+	if (next_ms == 0) {
+		next_ms = now + period_ms;
+		return;
+	}
+	if (now < next_ms) {
+		return;
+	}
+	(void)cache.VerifyCacheWithGuest(heal, [&context](uint64_t vaddr, uint64_t bytes) {
+		return context.IsMapped(vaddr, bytes);
+	});
+	next_ms = NowMs() + period_ms;
+}
+
 void RenderContext::RunGarbageCollector() {
 	DumpGuestMemory(GetGraphics(), m_buffer_cache);
-	AnalyzeStuckSamples(m_buffer_cache);
+	VerifyBuffers(*this, m_buffer_cache);
+	AnalyzeStuckSamples(*this, m_buffer_cache);
 	LogWatchedRereads(m_buffer_cache, GetGraphics().presented_frames.load(std::memory_order_relaxed));
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;

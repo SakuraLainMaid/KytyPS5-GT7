@@ -73,6 +73,16 @@ void BufferCache::Unregister(BufferId id) {
 	ChangeRegister<false>(id);
 }
 
+// KYTY_BUFFER_REGIONS=0: a new cached buffer leaves the tracker regions under it to their first
+// use, as before round 103 (ChangeRegister).
+static bool BufferRegions() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BUFFER_REGIONS");
+		return value == nullptr || !(value[0] == '0' && value[1] == '\0');
+	}();
+	return enabled;
+}
+
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
 	auto& buffer = m_slot_buffers[id];
@@ -93,6 +103,32 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
+		// Round 103: the tracker regions under it exist from now on. The BDA walk
+		// (SynchronizeBdaPending) only reaches regions that exist, and a region is created by
+		// the tracker's first use of it (a binding's synchronization, a fault's MakeResident). A
+		// buffer that a merge or a stream leap extended over memory no such use had reached held
+		// zeros there that nothing uploaded, while shaders read it through addresses without a
+		// fault (the page table names the buffer). A new region is all CPU-dirty and pending, so
+		// the next walk uploads what the buffer covers of it. KYTY_BUFFER_REGIONS=0 leaves them
+		// to their first use, as before.
+		if (BufferRegions()) {
+			if (const auto created =
+			        m_memory_tracker.TrackRegions(buffer.CpuAddress(), buffer.Size());
+			    created != 0) {
+				m_new_regions = true;
+				static std::atomic<uint64_t> buffers {0};
+				static std::atomic<uint64_t> regions {0};
+				const auto n     = buffers.fetch_add(1, std::memory_order_relaxed) + 1;
+				const auto total = regions.fetch_add(created, std::memory_order_relaxed) + created;
+				if (n <= 8 || std::has_single_bit(n)) {
+					LOGF("BufferCache: buffer 0x%016" PRIx64 "+0x%" PRIx64 " covers %zu tracker "
+					     "regions no use had created: created for the BDA walk to upload (%" PRIu64
+					     " buffers, %" PRIu64 " regions so far; KYTY_BUFFER_REGIONS=0 turns this "
+					     "off)\n",
+					     buffer.CpuAddress(), buffer.Size(), created, n, total);
+				}
+			}
+		}
 		// The BDA walk synchronizes it (the CPU-dirty pages it covers may have none over them
 		// until now).
 		m_memory_tracker.MarkBdaPending(buffer.CpuAddress(), buffer.Size());
@@ -1400,6 +1436,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 		m_write_ticks.Assign(overlap.CpuAddress(), overlap.CpuAddress() + overlap.Size(),
 		                     m_scheduler.CurrentTick());
 	}
+	NoteBufferEvent(BufferEventKind::Joined, overlap);
 	DeleteBuffer(overlap_id);
 }
 
@@ -1445,11 +1482,14 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
 	                     overlap.end - overlap.begin);
+	uint32_t absorbed = 0;
 	for (auto it = overlap.first; it != overlap.last;) {
 		const auto old_id = (it++)->second;
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
+		absorbed++;
 	}
 	Register(id);
+	NoteBufferEvent(BufferEventKind::Created, m_slot_buffers[id], vaddr, size, absorbed);
 	return id;
 }
 
@@ -2708,11 +2748,13 @@ void BufferCache::RunGarbageCollector() {
 			}
 			m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+			NoteBufferEvent(BufferEventKind::Collected, buffer);
 			DeleteBuffer(id);
 		} else if (dirty) {
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+			NoteBufferEvent(BufferEventKind::Collected, buffer);
 			DeleteBuffer(id);
 		}
 		gc_deleted++;
@@ -2762,6 +2804,7 @@ void BufferCache::RunGarbageCollector() {
 			EXIT("BufferCache: garbage collection retained GPU ownership\n");
 		}
 		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+		NoteBufferEvent(BufferEventKind::Collected, buffer);
 		Unregister(id);
 		m_slot_buffers.erase(id);
 	}
@@ -3009,6 +3052,500 @@ void BufferCache::TraceContents(uint64_t vaddr, uint64_t size, const std::string
 		});
 		return; // the first cached buffer over the range
 	}
+}
+
+void BufferCache::NoteBufferEvent(BufferEventKind kind, const Buffer& buffer, uint64_t request,
+                                  uint64_t request_size, uint32_t absorbed) {
+	constexpr size_t  Capacity = 16384;
+	const BufferEvent event {.frame   = m_graphics.presented_frames.load(std::memory_order_relaxed),
+	                         .address = buffer.CpuAddress(),
+	                         .size    = buffer.Size(),
+	                         .request = request,
+	                         .request_size = request_size,
+	                         .absorbed     = absorbed,
+	                         .kind         = kind};
+	if (m_buffer_events.size() < Capacity) {
+		m_buffer_events.push_back(event);
+	} else {
+		m_buffer_events[m_buffer_events_next] = event;
+	}
+	m_buffer_events_next = (m_buffer_events_next + 1) % Capacity;
+	m_buffer_events_total++;
+	if (kind == BufferEventKind::Created) {
+		m_buffer_origins[event.address] = event;
+	} else {
+		m_buffer_origins.erase(event.address);
+	}
+}
+
+size_t BufferCache::RedirtyMapped(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return 0;
+	}
+	if (m_known_fill_count.load(std::memory_order_relaxed) != 0) {
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		ForgetFills(vaddr, size);
+	}
+	return m_memory_tracker.RedirtyForMap(vaddr, size);
+}
+
+void BufferCache::MarkMappedPending(uint64_t vaddr, uint64_t size) noexcept {
+	m_memory_tracker.MarkBdaPending(vaddr, size);
+	g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+	if (!t_guest_gpu_thread) {
+		g_cpu_write_epoch.fetch_add(1, std::memory_order_release);
+	}
+}
+
+uint64_t BufferCache::CompareWithGuest(uint64_t vaddr, uint64_t size, const std::string& label,
+                                       bool                                           heal,
+                                       const std::function<bool(uint64_t, uint64_t)>& mapped) {
+	if (size == 0 || m_scheduler.Current().IsInvalid()) {
+		return 0;
+	}
+	const auto first = vaddr & ~(CACHING_PAGESIZE - 1u);
+	const auto last =
+	    Common::AlignUp(vaddr + std::min<uint64_t>(size, 64ull << 20u), CACHING_PAGESIZE);
+	if (first == 0 || !GuestRange {first, last - first}.Valid()) {
+		return 0;
+	}
+	const auto bytes = last - first;
+	const auto pages = static_cast<size_t>(bytes >> CACHING_PAGEBITS);
+	struct PageInfo {
+		BufferId                  buffer {};
+		bool                      covered    = false; // a cached buffer is over the page
+		bool                      owner      = false; // the page table names a buffer
+		bool                      owner_same = false; // ... the one over the page
+		bool                      mapped     = false;
+		bool                      pending    = false;
+		bool                      readable   = false;
+		bool                      changed    = false; // the tracker's state changed meanwhile
+		MemoryTracker::PageStates states;
+		uint64_t                  expected   = 0; // the BDA page table entry the buffer wrote
+		uint64_t                  entry      = 0;
+		size_t                    differ     = 0; // words
+		size_t                    gpu_zero   = 0;
+		size_t                    guest_zero = 0;
+	};
+	std::vector<PageInfo> info(pages);
+	auto download = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                                         AllFlags, bytes);
+	auto table    = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                                         AllFlags, pages * sizeof(vk::DeviceAddress));
+	if (download->Mapped().data() == nullptr || table->Mapped().data() == nullptr) {
+		return 0;
+	}
+	auto&      command = m_scheduler.Current();
+	const auto copy    = [&](Buffer& target, const Buffer& source, uint64_t source_offset,
+                          uint64_t target_offset, uint64_t count) {
+        target.CopyFrom(command, source, source_offset, target_offset, count,
+		                   vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eHostRead,
+		                   vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		                   vk::AccessFlagBits::eHostRead);
+	};
+	auto it = m_buffers.upper_bound(first);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < last; ++it) {
+		const auto& buffer = m_slot_buffers[it->second];
+		const auto  start  = std::max(buffer.CpuAddress(), first);
+		const auto  finish = std::min(buffer.CpuAddress() + buffer.Size(), last);
+		if (start >= finish) {
+			continue;
+		}
+		copy(*download, buffer, buffer.Offset(start), start - first, finish - start);
+		for (auto page = start; page < finish; page += CACHING_PAGESIZE) {
+			auto& entry    = info[(page - first) >> CACHING_PAGEBITS];
+			entry.buffer   = it->second;
+			entry.covered  = true;
+			entry.expected = buffer.BufferDeviceAddress() + (page - buffer.CpuAddress());
+		}
+	}
+	copy(*table, m_bda_pagetable_buffer, PageIndex(first) * sizeof(vk::DeviceAddress), 0,
+	     pages * sizeof(vk::DeviceAddress));
+	for (const auto* target: {download.get(), table.get()}) {
+		vk::BufferMemoryBarrier barrier {};
+		barrier.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.buffer              = target->Handle();
+		barrier.offset              = 0;
+		barrier.size                = VK_WHOLE_SIZE;
+		command.Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                                   vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
+		                                   &barrier, 0, nullptr);
+	}
+	// The CPU side as the copies see it: the uploads recorded so far run before them.
+	for (size_t i = 0; i < pages; i++) {
+		const auto  page  = first + (uint64_t {i} << CACHING_PAGEBITS);
+		auto&       entry = info[i];
+		const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+		entry.owner       = owner != nullptr && *owner;
+		entry.owner_same  = entry.owner && entry.covered && *owner == entry.buffer;
+		entry.states      = m_memory_tracker.DescribePages(page, CACHING_PAGESIZE);
+		entry.pending     = m_memory_tracker.IsBdaPending(page);
+		entry.mapped      = mapped && mapped(page, CACHING_PAGESIZE);
+	}
+	const auto tick = m_scheduler.CurrentTick();
+	m_scheduler.Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
+	download->Invalidate(0, bytes);
+	table->Invalidate(0, pages * sizeof(vk::DeviceAddress));
+
+	std::vector<uint32_t> guest(CACHING_PAGESIZE / sizeof(uint32_t));
+	const auto*           held_bytes = download->Mapped().data();
+	// stale: differing while the tracker holds them clean (or in no region); waiting: differing
+	// while CPU-dirty, an upload is due; healable: either of them.
+	size_t covered = 0, differing = 0, zero = 0, stale = 0, waiting = 0, written = 0;
+	for (size_t i = 0; i < pages; i++) {
+		const auto page  = first + (uint64_t {i} << CACHING_PAGEBITS);
+		auto&      entry = info[i];
+		std::memcpy(&entry.entry, table->Mapped().data() + i * sizeof(vk::DeviceAddress),
+		            sizeof(vk::DeviceAddress));
+		if (!entry.covered) {
+			continue;
+		}
+		covered++;
+		entry.readable =
+		    Libs::LibKernel::Memory::TryReadBacking(page, guest.data(), CACHING_PAGESIZE) ||
+		    Libs::LibKernel::Memory::TryReadSparseBacking(page, guest.data(), CACHING_PAGESIZE);
+		if (!entry.readable) {
+			continue;
+		}
+		const auto* held = reinterpret_cast<const uint32_t*>(held_bytes + (page - first));
+		for (size_t word = 0; word < guest.size(); word++) {
+			entry.differ += held[word] != guest[word] ? 1u : 0u;
+			entry.gpu_zero += held[word] == 0u ? 1u : 0u;
+			entry.guest_zero += guest[word] == 0u ? 1u : 0u;
+		}
+		const auto after = m_memory_tracker.DescribePages(page, CACHING_PAGESIZE);
+		entry.changed    = after.cpu != entry.states.cpu || after.gpu != entry.states.gpu;
+		if (entry.differ != 0) {
+			differing++;
+			zero += entry.gpu_zero == guest.size() ? 1u : 0u;
+			if (entry.states.gpu != 0) {
+				written++;
+			} else if (!entry.changed) {
+				stale += entry.states.cpu == 0 && entry.states.hot == 0 ? 1u : 0u;
+				waiting += entry.states.cpu != 0 ? 1u : 0u;
+			}
+		}
+	}
+	LOGF("%s: 0x%012" PRIx64 "+0x%" PRIx64 ", %zu pages of 16 KB: %zu with a cached buffer, %zu of "
+	     "them differ from guest memory (%zu the GPU holds as zeros): %zu STALE (clean in the "
+	     "tracker, or in no tracker region), %zu CPU-dirty (an upload is due), %zu GPU-written; "
+	     "shader stores through addresses: %s\n",
+	     label.c_str(), vaddr, size, pages, covered, differing, zero, stale, waiting, written,
+	     AddressWritesSeen() ? "seen" : "none");
+	const auto describe = [&](const PageInfo& entry) {
+		if (!entry.covered) {
+			return fmt::format("no cached buffer | page table: {} | BDA entry: {} | mapped: {}",
+			                   entry.owner ? "names one" : "none",
+			                   entry.entry == 0 ? "none" : "SET", entry.mapped ? "yes" : "no");
+		}
+		const auto& buffer = m_slot_buffers[entry.buffer];
+		std::string compare;
+		if (!entry.readable) {
+			compare = "guest memory not readable";
+		} else if (entry.differ == 0) {
+			compare = "the same as guest memory";
+		} else {
+			compare = fmt::format("DIFFER from guest memory{}",
+			                      entry.gpu_zero == guest.size() ? " (the GPU holds zeros)" : "");
+		}
+		return fmt::format(
+		    "buffer 0x{:012x}+0x{:x} | page table: {} | BDA entry: {} | tracker: {} of 4 pages "
+		    "CPU-dirty, {} GPU-written, {} hot{}{} | pending: {} | mapped: {} | {}{}",
+		    buffer.CpuAddress(), buffer.Size(),
+		    entry.owner_same ? "this buffer"
+		    : entry.owner    ? "ANOTHER buffer"
+		                     : "NONE",
+		    entry.entry == entry.expected ? "right"
+		    : entry.entry == 0            ? "EMPTY"
+		                                  : "WRONG",
+		    entry.states.cpu, entry.states.gpu, entry.states.hot,
+		    entry.states.present == 0 ? ", no tracker region" : "",
+		    entry.changed ? ", changed during the check" : "", entry.pending ? "yes" : "no",
+		    entry.mapped ? "yes" : "no", compare,
+		    entry.differ != 0 && entry.differ != guest.size()
+		        ? fmt::format(" ({} of 4096 words)", entry.differ)
+		        : std::string {});
+	};
+	size_t lines = 0;
+	for (size_t i = 0; i < pages;) {
+		const auto text = describe(info[i]);
+		size_t     j    = i + 1;
+		while (j < pages && describe(info[j]) == text) {
+			j++;
+		}
+		if (lines++ < 64) {
+			LOGF("%s: 0x%012" PRIx64 "..0x%012" PRIx64 " (%zu pages): %s\n", label.c_str(),
+			     first + (uint64_t {i} << CACHING_PAGEBITS),
+			     first + (uint64_t {j} << CACHING_PAGEBITS), j - i, text.c_str());
+		}
+		i = j;
+	}
+	if (lines > 64) {
+		LOGF("%s: %zu more runs of pages not logged\n", label.c_str(), lines - 64);
+	}
+	const auto healable = stale + waiting;
+	if (heal && healable != 0) {
+		size_t made = 0;
+		for (size_t i = 0; i < pages; i++) {
+			const auto& entry = info[i];
+			if (entry.covered && entry.readable && entry.differ != 0 && entry.states.gpu == 0 &&
+			    !entry.changed) {
+				const auto page = first + (uint64_t {i} << CACHING_PAGEBITS);
+				made += RedirtyMapped(page, CACHING_PAGESIZE);
+				SynchronizeBuffersInRange(page, CACHING_PAGESIZE);
+			}
+		}
+		LOGF("%s: heal (KYTY_PROBE_LIST_HEAL): the %zu differing pages the GPU did not write "
+		     "uploaded again from guest memory (%zu of their 4 KB pages were clean in the "
+		     "tracker)\n",
+		     label.c_str(), healable, made);
+	}
+	// Where the buffers over the range came from.
+	BufferId previous {};
+	for (const auto& entry: info) {
+		if (!entry.covered || entry.buffer == previous) {
+			continue;
+		}
+		previous           = entry.buffer;
+		const auto& buffer = m_slot_buffers[entry.buffer];
+		const auto  origin = m_buffer_origins.find(buffer.CpuAddress());
+		if (origin == m_buffer_origins.end() || origin->second.size != buffer.Size()) {
+			LOGF("%s: buffer 0x%012" PRIx64 "+0x%" PRIx64 " was created before the history\n",
+			     label.c_str(), buffer.CpuAddress(), buffer.Size());
+			continue;
+		}
+		LOGF("%s: buffer 0x%012" PRIx64 "+0x%" PRIx64 " was created at frame %" PRIu64
+		     " for 0x%012" PRIx64 "+0x%" PRIx64 ", taking over %u buffers\n",
+		     label.c_str(), buffer.CpuAddress(), buffer.Size(), origin->second.frame,
+		     origin->second.request, origin->second.request_size, origin->second.absorbed);
+	}
+	std::vector<const BufferEvent*> events;
+	for (size_t k = 0; k < m_buffer_events.size(); k++) {
+		const auto  index = m_buffer_events.size() < 16384 ? k : (m_buffer_events_next + k) % 16384;
+		const auto& event = m_buffer_events[index];
+		if (event.address < last && event.address + event.size > first) {
+			events.push_back(&event);
+		}
+	}
+	const auto shown = std::min<size_t>(events.size(), 16);
+	for (size_t k = events.size() - shown; k < events.size(); k++) {
+		const auto& event = *events[k];
+		LOGF("%s: history: frame %" PRIu64 " %s 0x%012" PRIx64 "+0x%" PRIx64 "\n", label.c_str(),
+		     event.frame,
+		     event.kind == BufferEventKind::Created  ? "created"
+		     : event.kind == BufferEventKind::Joined ? "joined into a newer buffer"
+		                                             : "collected",
+		     event.address, event.size);
+	}
+	LOGF("%s: %zu buffer events over the range among the last %zu of %" PRIu64 "\n", label.c_str(),
+	     events.size(), m_buffer_events.size(), m_buffer_events_total);
+	return healable;
+}
+
+uint64_t BufferCache::VerifyCacheWithGuest(bool                                           heal,
+                                           const std::function<bool(uint64_t, uint64_t)>& mapped) {
+	if (m_scheduler.Current().IsInvalid()) {
+		return 0;
+	}
+	constexpr uint64_t Chunk = 64ull << 20u;
+	auto download = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                                         AllFlags, Chunk);
+	if (download->Mapped().data() == nullptr) {
+		return 0;
+	}
+	struct Piece {
+		uint64_t address        = 0;
+		uint64_t size           = 0;
+		uint64_t offset         = 0; // in the download buffer
+		uint64_t buffer_address = 0;
+		uint64_t buffer_size    = 0;
+	};
+	struct Run {
+		uint64_t begin          = 0;
+		uint64_t end            = 0;
+		uint64_t buffer_address = 0;
+		uint64_t buffer_size    = 0;
+		bool     zero           = false;
+		bool     mapped         = false;
+		bool     untracked      = false; // no tracker region
+	};
+	std::vector<Piece>                     pieces;
+	std::vector<MemoryTracker::PageStates> states; // each page of the pieces, in order
+	std::vector<Run>                       stale_runs;
+	std::vector<Run>                       lost_runs;
+	std::vector<uint32_t>                  guest(CACHING_PAGESIZE / sizeof(uint32_t));
+	uint64_t scanned = 0, clean = 0, stale = 0, stale_zero = 0, stale_unmapped = 0, lost = 0,
+	         changed = 0, unreadable = 0, healed = 0, used = 0, untracked = 0, untracked_stale = 0;
+	const auto add_run = [](std::vector<Run>& runs, const Piece& piece, uint64_t page, bool zero,
+	                        bool in_mapped, bool no_region) {
+		if (!runs.empty() && runs.back().end == page &&
+		    runs.back().buffer_address == piece.buffer_address && runs.back().zero == zero &&
+		    runs.back().mapped == in_mapped && runs.back().untracked == no_region) {
+			runs.back().end += CACHING_PAGESIZE;
+			return;
+		}
+		runs.push_back({page, page + CACHING_PAGESIZE, piece.buffer_address, piece.buffer_size,
+		                zero, in_mapped, no_region});
+	};
+	Common::Timer timer;
+	timer.Start();
+	const auto flush = [&] {
+		if (pieces.empty()) {
+			return;
+		}
+		vk::BufferMemoryBarrier barrier {};
+		barrier.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.buffer              = download->Handle();
+		barrier.offset              = 0;
+		barrier.size                = VK_WHOLE_SIZE;
+		m_scheduler.Current().Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                                                 vk::PipelineStageFlagBits::eHost, {}, 0,
+		                                                 nullptr, 1, &barrier, 0, nullptr);
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.Wait(tick);
+		m_scheduler.WaitPriorityOperations(tick);
+		download->Invalidate(0, used);
+		size_t index = 0;
+		for (const auto& piece: pieces) {
+			for (uint64_t at = 0; at < piece.size; at += CACHING_PAGESIZE, index++) {
+				const auto  page   = piece.address + at;
+				const auto& before = states[index];
+				// A page in no tracker region counts as CPU-dirty, but no BDA walk uploads it.
+				const bool no_region = before.present == 0;
+				if (page == 0 || before.cpu != 0 || before.gpu != 0 || before.hot != 0) {
+					continue;
+				}
+				if (no_region) {
+					untracked++;
+				} else {
+					clean++;
+				}
+				if (!Libs::LibKernel::Memory::TryReadBacking(page, guest.data(),
+				                                             CACHING_PAGESIZE) &&
+				    !Libs::LibKernel::Memory::TryReadSparseBacking(page, guest.data(),
+				                                                   CACHING_PAGESIZE)) {
+					unreadable++;
+					continue;
+				}
+				const auto* held = download->Mapped().data() + piece.offset + at;
+				if (std::memcmp(held, guest.data(), CACHING_PAGESIZE) == 0) {
+					continue;
+				}
+				const auto after = m_memory_tracker.DescribePages(page, CACHING_PAGESIZE);
+				if (after.present != before.present || after.cpu != 0 || after.gpu != 0 ||
+				    after.hot != 0) {
+					changed++;
+					continue;
+				}
+				const bool zero      = std::all_of(held, held + CACHING_PAGESIZE,
+				                                   [](uint8_t byte) { return byte == 0; });
+				const bool in_mapped = mapped && mapped(page, CACHING_PAGESIZE);
+				stale++;
+				stale_zero += zero ? 1u : 0u;
+				stale_unmapped += in_mapped ? 0u : 1u;
+				untracked_stale += no_region ? 1u : 0u;
+				add_run(stale_runs, piece, page, zero, in_mapped, no_region);
+				if (heal) {
+					healed += RedirtyMapped(page, CACHING_PAGESIZE) != 0 ? 1u : 0u;
+					SynchronizeBuffersInRange(page, CACHING_PAGESIZE);
+				}
+			}
+		}
+		pieces.clear();
+		states.clear();
+		used = 0;
+	};
+	std::vector<std::pair<uint64_t, BufferId>> buffers(m_buffers.begin(), m_buffers.end());
+	for (const auto& [address, id]: buffers) {
+		if (IsBufferInvalid(id)) {
+			continue;
+		}
+		const auto& buffer = m_slot_buffers[id];
+		for (uint64_t offset = 0; offset < buffer.Size();) {
+			const auto bytes = std::min(buffer.Size() - offset, Chunk - used);
+			download->CopyFrom(m_scheduler.Current(), buffer, offset, used, bytes,
+			                   vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eHostRead,
+			                   vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+			                   vk::AccessFlagBits::eHostRead);
+			const Piece piece {buffer.CpuAddress() + offset, bytes, used, buffer.CpuAddress(),
+			                   buffer.Size()};
+			pieces.push_back(piece);
+			for (uint64_t at = 0; at < bytes; at += CACHING_PAGESIZE) {
+				const auto page = piece.address + at;
+				// Guest page 0 is never tracked (CreateBuffer).
+				states.push_back(page == 0
+				                     ? MemoryTracker::PageStates {}
+				                     : m_memory_tracker.DescribePages(page, CACHING_PAGESIZE));
+				if (states.back().cpu != 0 && !m_memory_tracker.IsBdaPending(page) && mapped &&
+				    mapped(page, CACHING_PAGESIZE)) {
+					lost++;
+					add_run(lost_runs, piece, page, false, true, false);
+				}
+			}
+			used += bytes;
+			offset += bytes;
+			scanned += bytes;
+			if (used == Chunk) {
+				flush();
+			}
+		}
+	}
+	flush();
+	if (heal && lost != 0) {
+		// After the scan, so that its later pages are judged as they were.
+		for (const auto& run: lost_runs) {
+			m_memory_tracker.MarkBdaPending(run.begin, run.end - run.begin);
+		}
+		g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+	}
+	LOGF("Buffer verify: %zu buffers, %" PRIu64 " MB in %.1f s: %" PRIu64
+	     " pages of 16 KB clean in the tracker and %" PRIu64 " in no tracker region, %" PRIu64
+	     " of them STALE (the GPU's bytes differ from guest memory; %" PRIu64
+	     " in no tracker region, %" PRIu64 " all zeros, %" PRIu64
+	     " outside the mapped ranges); %" PRIu64
+	     " LOST pages (CPU-dirty in mapped regions the BDA walk is not pending for); %" PRIu64
+	     " changed during the check, %" PRIu64
+	     " not readable; shader stores through addresses (which no range records): %s\n",
+	     buffers.size(), scanned >> 20u, timer.GetTimeS(), clean, untracked, stale, untracked_stale,
+	     stale_zero, stale_unmapped, lost, changed, unreadable,
+	     AddressWritesSeen() ? "SEEN, a stale page may hold them" : "none");
+	for (size_t i = 0; i < std::min<size_t>(stale_runs.size(), 24); i++) {
+		const auto& run = stale_runs[i];
+		LOGF("Buffer verify: stale 0x%012" PRIx64 "+0x%" PRIx64 " (%" PRIu64
+		     " pages) in buffer 0x%012" PRIx64 "+0x%" PRIx64 ", the GPU holds %s, %s, %s\n",
+		     run.begin, run.end - run.begin, (run.end - run.begin) >> CACHING_PAGEBITS,
+		     run.buffer_address, run.buffer_size, run.zero ? "zeros" : "other bytes",
+		     run.mapped ? "mapped" : "NOT mapped",
+		     run.untracked ? "in NO tracker region" : "clean in the tracker");
+	}
+	for (size_t i = 0; i < std::min<size_t>(lost_runs.size(), 8); i++) {
+		const auto& run = lost_runs[i];
+		LOGF("Buffer verify: lost 0x%012" PRIx64 "+0x%" PRIx64 " in buffer 0x%012" PRIx64
+		     "+0x%" PRIx64 "\n",
+		     run.begin, run.end - run.begin, run.buffer_address, run.buffer_size);
+	}
+	if (stale_runs.size() > 24 || lost_runs.size() > 8) {
+		LOGF("Buffer verify: %zu stale runs and %zu lost runs in all\n", stale_runs.size(),
+		     lost_runs.size());
+	}
+	if (heal && (stale != 0 || lost != 0)) {
+		LOGF("Buffer verify: heal (KYTY_VERIFY_BUFFERS_HEAL): %" PRIu64
+		     " stale pages uploaded again (%" PRIu64
+		     " had clean 4 KB pages to make CPU-dirty), %" PRIu64
+		     " lost pages made pending for the BDA walk\n",
+		     stale, healed, lost);
+	}
+	return stale;
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

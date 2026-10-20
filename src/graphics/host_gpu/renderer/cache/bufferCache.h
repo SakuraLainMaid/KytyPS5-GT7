@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/cache/writeTicks.h"
 
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <shared_mutex>
@@ -250,6 +251,37 @@ public:
 	// holds it once the commands recorded so far have run, logged as "<prefix> ..." when the copy
 	// lands: its words (the first 64), and how many of them are not finite as floats.
 	void TraceContents(uint64_t vaddr, uint64_t size, const std::string& prefix);
+	// Diagnostics, GPU thread (drains the GPU): the whole 16 KB pages of [vaddr, vaddr + size), at
+	// most 64 MB, as the cached buffers over them hold them, against guest memory, before anything
+	// is synchronized; logged as "<label> ..." by runs of pages in the same state: the tracker's
+	// (CPU-dirty, GPU-written, hot, pending for the BDA walk), whether `mapped` holds the page,
+	// the buffer over it and whether the page table and the BDA page table name that buffer, and
+	// whether the GPU's bytes are guest memory's (or all zero). With `heal`, the pages whose
+	// bytes differ while the tracker holds no GPU-written byte of them are uploaded again from
+	// guest memory. Then the latest creations and collections of the buffers over the range.
+	// Returns how many pages differ that way.
+	uint64_t CompareWithGuest(uint64_t vaddr, uint64_t size, const std::string& label, bool heal,
+	                          const std::function<bool(uint64_t, uint64_t)>& mapped);
+	// Diagnostics, GPU thread (drains the GPU; a second or more): every cached buffer as the GPU
+	// holds it against guest memory ("Buffer verify:"). Stale pages: those whose bytes differ
+	// while the tracker holds them clean (no 4 KB page of them CPU-dirty, GPU-written or hot),
+	// which no synchronization corrects, or while they lie in no tracker region, which only a
+	// binding's synchronization uploads (the BDA walk visits regions that exist). Lost pages:
+	// CPU-dirty ones inside `mapped` in tracker regions the BDA walk is not pending for, which it
+	// does not upload. With `heal`, the stale pages are uploaded again and the lost ones made
+	// pending. Returns the stale pages.
+	uint64_t VerifyCacheWithGuest(bool heal, const std::function<bool(uint64_t, uint64_t)>& mapped);
+	// Memory mapped again (RenderContext::MapMemory, KYTY_MAP_REDIRTY): its clean pages become
+	// CPU-dirty, and its tracker regions with CPU-dirty pages pending for the next BDA walk
+	// (MemoryTracker::RedirtyForMap). Any thread. How many pages became CPU-dirty.
+	size_t RedirtyMapped(uint64_t vaddr, uint64_t size);
+	// Memory mapped again (RenderContext::MapMemory): its tracker regions are pending for the next
+	// BDA walk, and the walk runs. Any thread, lock-free.
+	void MarkMappedPending(uint64_t vaddr, uint64_t size) noexcept;
+	// Whether a buffer registered since the last call created tracker regions (ChangeRegister),
+	// which only a BDA walk uploads: RenderContext::PrepareBda then walks again within a
+	// submission. GPU thread.
+	[[nodiscard]] bool TakeNewRegions() noexcept { return std::exchange(m_new_regions, false); }
 	// Same, but visits only the tracker regions that may hold CPU-dirty pages.
 	void                            SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
 	// The BDA walk (RenderContext::PrepareBda): the cached buffers over the CPU-dirty pages of the
@@ -318,6 +350,26 @@ private:
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
+	// Diagnostics (CompareWithGuest): the latest creations of cached buffers, and their deletions
+	// as joined into a newer one or collected, GPU thread only.
+	enum class BufferEventKind : uint8_t { Created, Joined, Collected };
+	struct BufferEvent {
+		uint64_t        frame        = 0;
+		uint64_t        address      = 0;
+		uint64_t        size         = 0;
+		uint64_t        request      = 0; // created: the range asked for
+		uint64_t        request_size = 0;
+		uint32_t        absorbed     = 0; // created: the buffers it took over
+		BufferEventKind kind         = BufferEventKind::Created;
+	};
+	void NoteBufferEvent(BufferEventKind kind, const Buffer& buffer, uint64_t request = 0,
+	                     uint64_t request_size = 0, uint32_t absorbed = 0);
+	std::vector<BufferEvent> m_buffer_events;
+	size_t                   m_buffer_events_next  = 0;
+	uint64_t                 m_buffer_events_total = 0;
+	// The creation of every live buffer, by its address.
+	std::map<uint64_t, BufferEvent> m_buffer_origins;
+	bool                            m_new_regions = false; // TakeNewRegions
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
 	void                   Register(BufferId id);
 	void                   Unregister(BufferId id);
