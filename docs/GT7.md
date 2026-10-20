@@ -39,8 +39,11 @@ the game. The user profile, audio and notification settings don't matter.
 
 ## In-game settings
 
-In the game's own graphics options, use the **performance (frame rate) mode** for races. The ray
-tracing (RT) mode works in the garage now (see What's new); races in it are untested.
+In the game's own graphics options, use the **performance (frame rate) mode**.
+
+The ray tracing (RT) mode works much better in this build (see What's new), but it is **not
+recommended yet**: its reflections still flicker a little and look a bit jagged, and races in it
+are untested. It needs **Bindless textures** on in the launcher.
 
 ## Notes
 
@@ -59,21 +62,50 @@ zipped `_kyty.txt` log).
 
 ## What's new (October 20, 2026)
 
-- **Ray tracing mode: the blocks in the reflections are gone, and it runs several times faster.**
-  The game unmaps the memory that holds the cars' ray tracing data and maps it again as it loads a
-  car, and the emulator could then keep an old copy of that data on the graphics card. Groups of
-  rays then walked lists that never ended until a limit stopped them: the blocks, and 1 to 3 fps.
-  In the garage the mode now runs at about 15 fps in the cockpit view and 25 or more outside, on
+After updating to this build, the first session compiles every shader again (pop-in everywhere,
+once).
+
+Ray tracing mode (still not recommended, see Known problems):
+
+- **The blocks in the reflections are gone, and the mode runs several times faster.** The game
+  unmaps the memory that holds the cars' ray tracing data and maps it again as it loads a car,
+  and the emulator could then keep an old copy of that data on the graphics card. Groups of rays
+  then walked lists that never ended until a limit stopped them: the blocks, and 1 to 3 fps. In
+  the garage the mode now runs at about 15 fps in the cockpit view and 25 or more outside, on
   the PC above.
-- **The first visit in ray tracing mode compiles the reflections' materials** in the background:
-  a few minutes for a car seen for the first time. Until a material is ready, its reflections are
-  missing or flicker. Close the game normally afterwards so they are saved; the next visit has
-  them from the start.
-- **No more crash as some races load (Tokyo) or on the Mazda LM55 VGT's showroom page**
-  ("Not implemented ... user_clip_planes"): the game sets user clip planes, which the emulator
+- **The reflections are shaded and have their textures.** Their material passes never ran
+  before, and their textures were all looked up as the same empty one.
+- **The first visit compiles the reflections' materials** in the background: a few minutes for a
+  car seen for the first time. Until a material is ready, its reflections are missing or flicker.
+  Close the game normally afterwards so they are saved; the next visit has them from the start.
+- Closing the game in this mode no longer hangs ("not responding"): it waits at most 20 seconds
+  for materials still compiling, and those compile again next time.
+
+Crashes and hangs:
+
+- **No more crash as some races load (Tokyo), or on the Mazda LM55 VGT's showroom page**
+  ("Not implemented ... user_clip_planes"). The game sets user clip planes, which the emulator
   now draws without instead of stopping.
-- If the graphics driver fails to build a shader, the crash report names the shader and the
+- **A loading screen that never ended is fixed** (about one track load in ten, the first one
+  after the start too). The game needed more room past its own memory than the emulator gave
+  it: 16 GB now, 8 GB before.
+- With bindless textures on, a texture slot the game is rewriting no longer ends the emulator
+  ("unknown format", "texture base layer is out of bounds").
+- If the graphics driver fails to build a shader, the crash report now names the shader and the
   driver's answer.
+
+Graphics and shaders:
+
+- **Most spectators in the stands have their colour now**, and the red and white barrier that
+  was drawn wrong on the track is right. The list of people to draw is built with a GPU
+  instruction mode the emulator did not implement (DPP row share).
+- **Bindless textures are now the recommended setting** (launcher, game settings). It costs
+  nothing measurable in a race, and the ray tracing mode needs it.
+- **Compiled shaders are saved again once the cache is big.** The graphics driver's shader cache
+  file had reached the 3.75 GB a file may hold, and after that nothing new was saved, so every
+  session compiled the same shaders again. It is now kept in up to three files.
+- The car views shown before an event no longer go black for a long time (up to 50 seconds in a
+  session) while their shaders compile: they compile in the background.
 
 ## What's new (October 19, 2026)
 
@@ -97,43 +129,25 @@ zipped `_kyty.txt` log).
 - A crash when the emulator wrote a depth image back to memory while freeing it is fixed (seen in
   My First Gran Turismo with bindless textures on).
 - Races that need more memory than the game's own get up to 8 GB more room past it (4 GB before).
-- **Bindless textures are now the recommended setting** (launcher, game settings): it costs
-  nothing measurable in a race, and the ray tracing mode needs it (without it the reflection
-  passes of that mode never run). A texture slot the game is rewriting no longer ends the
-  emulator ("unknown format", "texture base layer is out of bounds").
-- **The ray tracing mode's reflections are shaded** (garage tested), and their materials have
-  their textures now: before, each of these textures was looked up as the same empty one, and
-  drew as a placeholder. Each reflection pass is compiled in parts, one for each car material,
-  in the background, and drawn once for each part: a pass with all of a car's materials in one
-  took the graphics driver many minutes, and in a ray-traced race preparing it froze the game for
-  minutes and kept it from closing. A material whose part is still compiling is missing from the
-  reflections until it is ready. Close the game normally afterwards: the compiled parts and the
-  materials they need are saved, and the next visit has them at once.
-- **Fewer blocks in the ray tracing mode's reflections.** The reflections trace their rays in
-  groups of 64 that walk the scene together, and the emulator stopped a group after 4096 rounds
-  of that walk (a guard against one that never ends); a whole 16x8 block of the reflection then
-  showed nothing hit. A group may run 16384 rounds now. It costs frame rate in that mode (in the
-  garage on the PC above, about 7 fps instead of 10); `KYTY_RAY_LOOP_CAP=4096` brings back the
-  old limit. The log now reports how many rounds the groups run ("Ray loops:").
-- **Most spectators in the stands have their colour now**, and the red and white barrier that
-  was drawn wrong on the track is right. The list of people to draw is built with a GPU
-  instruction mode the emulator did not implement (DPP row share): the list came out with
-  overlapping entries, and the colour pass skipped the people whose entries it did not share
-  with the depth pass.
-- After updating to this build, the first session compiles every shader again (pop-in
-  everywhere, once).
 
-Known problems in this build:
+## Known problems
 
+- **Ray tracing mode:** the reflections still flicker a little and look a bit jagged, most of all
+  right after switching between the cockpit and outside views, and the wheels can show white
+  patches after such a switch. The data the reflections read is right now; the cause is still
+  being looked into.
 - Some spectators are still drawn dark.
-
-- Tokyo: at some times of day and weather the picture turns green at some tunnel exits and
-  under some overpasses, and fades back once past them.
-
-- Rarely, after several races in one session, a loading screen keeps spinning and never ends.
-  Restart the game.
+- Tokyo: at some times of day and weather the picture turns green at some tunnel exits and under
+  some overpasses, and fades back once past them.
+- A crash after several races in one session
+  ([issue 3](https://github.com/usa-ratt/KytyPS5-GT7/issues/3)) is not fixed yet. If it happens
+  to you, please add this build's crash report to that issue: it now says which shader failed and
+  why.
+- In-game videos and music can play out of sync, or not at all
+  ([issue 4](https://github.com/usa-ratt/KytyPS5-GT7/issues/4)). Not looked into yet.
 - Once, in a race on a new track in the chase view, most of the track disappeared after it had
   loaded (cars and some objects stayed); switching to the cockpit view and back brought it back.
+- If a loading screen still never ends, please open an issue with the log.
 
 ## Current state
 
