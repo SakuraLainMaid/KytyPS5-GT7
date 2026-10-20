@@ -3793,6 +3793,11 @@ void PipelineCache::WaitForPipeline(const PendingGraphicsPipeline& job) {
 
 PipelineCache::~PipelineCache() {
 	Save();
+	(void)FinishBackgroundCompute(std::chrono::hours(24));
+	for (const auto cache: m_driver_cache_parked) {
+		m_graphics.device.destroyPipelineCache(cache, nullptr);
+	}
+	m_driver_cache_parked.clear();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
@@ -4010,7 +4015,12 @@ void PipelineCache::Save() {
 	if (m_compiler != nullptr) {
 		m_compiler->Stop();
 	}
-	FinishBackgroundCompute();
+	// Round 96: a bounded wait. The emulator ends with quick_exit after this, without tearing the
+	// device down, so a compile still running may go on into a driver cache that is kept (not
+	// destroyed) until then; its pipeline is compiled again next run. Before, closing waited for
+	// every compile, minutes for the ray tracing mode's material passes, while the window showed
+	// "not responding".
+	const auto still_compiling = FinishBackgroundCompute(std::chrono::seconds(20));
 	if (!m_driver_older.empty()) {
 		PipelineCacheLog("Vulkan pipeline cache: {} pipelines this run came from the full files",
 		                 g_older_file_hits.load(std::memory_order_relaxed));
@@ -4025,8 +4035,7 @@ void PipelineCache::Save() {
 	if (m_driver_cache_path.empty()) {
 		PipelineCacheLog("Vulkan pipeline cache: every file is full or unreadable; the new "
 		                 "pipelines of this run are not saved");
-		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-		m_driver_cache = nullptr;
+		ReleaseDriverCache(still_compiling);
 		return;
 	}
 
@@ -4044,8 +4053,7 @@ void PipelineCache::Save() {
 			// No pipeline was added: the file stays as it is (it was written at the exits before).
 			PipelineCacheLog("Vulkan pipeline cache: {} has no new pipelines; not written again",
 			                 Common::PathToString(m_driver_cache_path));
-			m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-			m_driver_cache = nullptr;
+			ReleaseDriverCache(still_compiling);
 			return;
 		}
 		payload.resize(size);
@@ -4074,8 +4082,7 @@ void PipelineCache::Save() {
 		if (marker.Create(DriverCacheFullMarker(m_driver_cache_path))) {
 			marker.Close();
 		}
-		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-		m_driver_cache = nullptr;
+		ReleaseDriverCache(still_compiling);
 		return;
 	}
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
@@ -4106,7 +4113,16 @@ void PipelineCache::Save() {
 		std::error_code error;
 		std::filesystem::remove(marker, error);
 	}
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+	ReleaseDriverCache(still_compiling);
+}
+
+void PipelineCache::ReleaseDriverCache(size_t still_compiling) {
+	if (still_compiling == 0) {
+		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+	} else {
+		// A background compile still uses it (FinishBackgroundCompute, the destructor's wait).
+		m_driver_cache_parked.push_back(m_driver_cache);
+	}
 	m_driver_cache = nullptr;
 }
 
@@ -5207,16 +5223,45 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 	return nullptr;
 }
 
-void PipelineCache::FinishBackgroundCompute() {
-	for (auto& [id, job]: m_compute_background) {
-		if (!job->done.load(std::memory_order_acquire)) {
-			LOGF("Compute pipeline CS=0x%016" PRIx64 " still compiles in the background: waiting "
-			     "for it\n",
-			     job->hash);
-		}
-		job->thread.join();
-		m_compute_pipelines.emplace(id, std::move(job->pipeline));
+size_t PipelineCache::FinishBackgroundCompute(std::chrono::milliseconds budget) {
+	if (m_compute_background.empty()) {
+		return 0;
 	}
-	m_compute_background.clear();
+	const auto deadline = std::chrono::steady_clock::now() + budget;
+	size_t     waiting  = 0;
+	for (const auto& [id, job]: m_compute_background) {
+		(void)id;
+		waiting += job->done.load(std::memory_order_acquire) ? 0u : 1u;
+	}
+	if (waiting != 0) {
+		const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(budget).count();
+		::printf("Closing: waiting up to %lld s for %zu shader pipeline(s) still compiling in the "
+		         "background, to keep them for the next run...\n",
+		         static_cast<long long>(seconds), waiting);
+		LOGF("Compute pipelines: %zu still compile in the background; waiting up to %lld s\n",
+		     waiting, static_cast<long long>(seconds));
+	}
+	for (auto it = m_compute_background.begin(); it != m_compute_background.end();) {
+		auto& job = *it->second;
+		while (!job.done.load(std::memory_order_acquire) &&
+		       std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		}
+		if (!job.done.load(std::memory_order_acquire)) {
+			++it;
+			continue;
+		}
+		job.thread.join();
+		m_compute_pipelines.emplace(it->first, std::move(job.pipeline));
+		it = m_compute_background.erase(it);
+	}
+	if (!m_compute_background.empty()) {
+		::printf("Closing: %zu shader pipeline(s) still compiling are not kept; they compile again "
+		         "next run\n",
+		         m_compute_background.size());
+		LOGF("Compute pipelines: %zu still compiling are not kept (they compile again next run)\n",
+		     m_compute_background.size());
+	}
+	return m_compute_background.size();
 }
 } // namespace Libs::Graphics

@@ -400,6 +400,35 @@ static bool ReversedDepth(const RenderDepthInfo& depth) {
 	return found != reversed.end() ? found->second : depth.depth_clear_value == 0.0f;
 }
 
+// Round 96, diagnostics: KYTY_EQUAL_ALWAYS=<vertex shader hash>[,<hash>...] (hex): a draw of one
+// of those vertex shaders that tests depth for EQUAL tests nothing instead, without writing
+// depth, so its pixels show on screen wherever its geometry lands. The crowd's colour passes
+// pass none of the samples their depth prepass drew (round 93's probes), so the spectators keep
+// no colour (dark shapes in the stands); this shows whether their geometry lands elsewhere, or
+// lands right with a depth a little apart.
+static bool EqualTestedNothing(uint64_t vs_hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> parsed;
+		const char*           text = std::getenv("KYTY_EQUAL_ALWAYS");
+		while (text != nullptr && *text != '\0') {
+			char*      end   = nullptr;
+			const auto value = std::strtoull(text, &end, 16);
+			if (end == text) {
+				break;
+			}
+			parsed.push_back(value);
+			text = *end == ',' ? end + 1 : end;
+		}
+		if (!parsed.empty()) {
+			LOGF("Render: KYTY_EQUAL_ALWAYS: draws of %zu vertex shaders that test depth for "
+			     "EQUAL test nothing\n",
+			     parsed.size());
+		}
+		return parsed;
+	}();
+	return !hashes.empty() && std::ranges::find(hashes, vs_hash) != hashes.end();
+}
+
 static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandRecorder& vk_buffer,
                                      const ShaderVertexInputInfo& vs_input_info,
                                      const RenderDepthInfo& depth, const RenderState& rendering) {
@@ -472,11 +501,16 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandR
 	const bool  relax_step  = relax_units > 0.0f;
 	const bool  reversed_z  = relax_step && ReversedDepth(depth);
 	const bool  relax_equal = relax_step && depth.depth_compare_op == vk::CompareOp::eEqual;
+	const bool  equal_always = depth.depth_test_enable &&
+	                          depth.depth_compare_op == vk::CompareOp::eEqual &&
+	                          EqualTestedNothing(vs_input_info.stage.program->shader_hash);
 	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthWriteEnable(depth.depth_write_enable && !relax_equal ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthCompareOp(!relax_equal ? depth.depth_compare_op
-	                            : reversed_z ? vk::CompareOp::eGreaterOrEqual
-	                                         : vk::CompareOp::eLessOrEqual);
+	vk_buffer.setDepthWriteEnable(
+	    depth.depth_write_enable && !relax_equal && !equal_always ? VK_TRUE : VK_FALSE);
+	vk_buffer.setDepthCompareOp(equal_always   ? vk::CompareOp::eAlways
+	                            : !relax_equal ? depth.depth_compare_op
+	                            : reversed_z   ? vk::CompareOp::eGreaterOrEqual
+	                                           : vk::CompareOp::eLessOrEqual);
 
 	const auto& mode              = ctx.GetModeControl();
 	const auto& poly_offset       = ctx.GetPolyOffset();

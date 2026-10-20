@@ -90,6 +90,9 @@ zipped `_kyty.txt` log).
 
 Known problems in this build:
 
+- Ray tracing mode: switching between the interior and exterior views in the garage can leave
+  white wheels, red pixels or blocky patches in the reflections for a while.
+
 - Rarely, after several races in one session, a loading screen keeps spinning and never ends.
   Restart the game.
 - Once, in a race on a new track in the chase view, most of the track disappeared after it had

@@ -333,9 +333,11 @@ public:
 
 private:
 	struct BackgroundCompute;
-	// Waits for the compute pipelines still compiling in the background (Save: they compile into
-	// the driver cache).
-	void FinishBackgroundCompute();
+	// Waits up to `budget` for the compute pipelines still compiling in the background (Save:
+	// they compile into the driver cache); returns how many still compile.
+	size_t FinishBackgroundCompute(std::chrono::milliseconds budget);
+	// Save, done with the driver cache: destroyed, or kept while background compiles use it.
+	void ReleaseDriverCache(size_t still_compiling);
 	struct ProgramCache;
 
 	// GetGraphicsPrograms' stage inputs from the registers (shared with DrawPrepDescribeGraphics;
@@ -383,6 +385,8 @@ private:
 	std::filesystem::path          m_driver_cache_path;
 	uint64_t                       m_driver_cache_loaded = 0; // bytes of it loaded (0: none)
 	std::vector<vk::PipelineCache> m_driver_older;
+	// Round 96: driver caches Save let go of while background compiles still used them.
+	std::vector<vk::PipelineCache> m_driver_cache_parked;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
