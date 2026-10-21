@@ -56,8 +56,23 @@ bool RegisterPacketIsSane(uint32_t opcode, uint32_t header, const uint32_t* body
 		}
 		case Pm4::IT_SET_SH_REG: {
 			const auto offset = body[0];
-			return offset == Pm4::SH_NOP ||
-			       in_file(offset, Pm4::SH_NUM, g_hw_sh_func, g_hw_sh_indirect_func);
+			if (offset == Pm4::SH_NOP) return true;
+			if (!in_file(offset, Pm4::SH_NUM, g_hw_sh_func, g_hw_sh_indirect_func)) return false;
+			// Round 112: every register the packet writes. The SH handlers are each set for every
+			// register they take (the compute ones, a stage's user data) and end the emulator on
+			// one past them ("unsupported compute SH register 0x22b", at a license test's retry
+			// prompt); the generic one takes the registers that have an indirect handler.
+			const auto direct = g_hw_sh_func[offset];
+			if (direct == nullptr) return true;
+			const bool generic = direct == g_hw_sh_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS];
+			for (uint32_t i = 0; i < num_values; i++) {
+				const auto reg = offset + i;
+				if (reg >= Pm4::SH_NUM) return false;
+				if (generic ? g_hw_sh_indirect_func[reg] == nullptr : g_hw_sh_func[reg] != direct) {
+					return false;
+				}
+			}
+			return true;
 		}
 		case Pm4::IT_SET_UCONFIG_REG:
 		case Pm4::IT_SET_UCONFIG_REG_INDEX: {
@@ -478,6 +493,13 @@ void DrawPrepScanner::Scan(const Item& item) {
 		if (!CopyStream(reinterpret_cast<uint64_t>(guest), dwords, words)) {
 			return false;
 		}
+		// Round 112: a copy made after the GPU thread had run a later submission's draw may hold
+		// what the game wrote over this one's memory once the GPU was done with it (garbage
+		// packets, which the handlers end the emulator on).
+		std::atomic_thread_fence(std::memory_order_acquire);
+		if (DrawPrep::GpuProgress(m_queue).seq > item.seq) {
+			return false;
+		}
 		cursor = {std::span<const uint32_t>(words.data(), words.size()), guest};
 		return true;
 	};
@@ -485,8 +507,8 @@ void DrawPrepScanner::Scan(const Item& item) {
 		// Its registers are unknown here: the queue's register copy is unreliable until a reset.
 		m_state->tainted = true;
 		DrawPrep::Add(DrawPrep::Counter::TaintIndirect);
-		LogScanStopped("a command buffer it could not copy", header,
-		               reinterpret_cast<uint64_t>(guest));
+		LogScanStopped("a command buffer it could not copy, or one the GPU thread had passed",
+		               header, reinterpret_cast<uint64_t>(guest));
 	};
 	std::vector<Cursor> stack(1);
 	if (!copy(0, item.commands.data(), item.commands.size(), stack[0])) {

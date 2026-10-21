@@ -979,13 +979,18 @@ public:
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
+	// The page tracker's protections (ProtectGuestHostMemory). Round 112: only memory with
+	// backing, the memory the GPU can use; the program's code, stacks and runtime memory (private
+	// mappings) keep their own. A GPU buffer the game pointed at the start of its code (at an exit
+	// to the menu after a license test) made that code page read-only, then writable without
+	// execute, and every thread calling through it faulted on it for good: a freeze.
 	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
 
 		std::lock_guard lock(m_mutex);
-		return ProtectMappedUnlocked(vaddr, size, mode);
+		return ProtectMappedUnlocked(vaddr, size, mode, true);
 	}
 
 	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
@@ -1204,7 +1209,8 @@ private:
 		return (value & (m_granularity - 1u)) == 0;
 	}
 
-	bool ProtectMappedUnlocked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+	bool ProtectMappedUnlocked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
+	                           bool backing_only = false) {
 		const auto end = vaddr + size;
 		auto       it  = m_mapped.upper_bound(vaddr);
 		if (it != m_mapped.begin()) {
@@ -1214,6 +1220,19 @@ private:
 			const auto& region      = it->second;
 			const auto  range_start = std::max(vaddr, region.vaddr);
 			const auto  range_end   = std::min(end, region.vaddr + region.size);
+			if (backing_only && region.type != MappingType::Backing) {
+				if (range_start < range_end) {
+					static std::atomic<uint32_t> reported {0};
+					if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+						LOGF(
+						    "Page tracking: left the protection of private memory (program code, a "
+						    "stack) at 0x%016" PRIx64 "+0x%" PRIx64
+						    " alone (a GPU buffer over it)\n",
+						    range_start, range_end - range_start);
+					}
+				}
+				continue;
+			}
 			if (range_start < range_end &&
 			    !VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
 				return false;
