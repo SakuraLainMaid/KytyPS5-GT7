@@ -725,6 +725,24 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 		counts.depthStencilAttachmentSamples = vulkan_sample_count(build.rendering.depth_samples);
 		counts.pNext                         = build.rendering_info.pNext;
 		build.rendering_info.pNext           = &counts;
+		// Round 108: through NV mixed samples, color sample i takes raster sample i's coverage
+		// alone (TRUNCATE), as the PS5's color buffer sees only the samples exposed to it. With
+		// the default (MERGE) a pixel whose raster samples two triangles of one blended mesh
+		// share blends twice: lines along the mesh's edges.
+		const auto raster_samples = static_cast<uint32_t>(build.multisampling.rasterizationSamples);
+		if (graphics.mixed_attachment_samples == GraphicContext::MixedAttachmentSamples::Nv &&
+		    graphics.CoverageTruncate(raster_samples, build.rendering.depth_samples,
+		                              build.rendering.color_samples)) {
+			build.coverage_reduction.coverageReductionMode = vk::CoverageReductionModeNV::eTruncate;
+			build.coverage_reduction.pNext                 = build.multisampling.pNext;
+			build.multisampling.pNext                      = &build.coverage_reduction;
+			static std::atomic_bool logged                 = false;
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				LOGF("Pipeline: NV mixed samples (raster %u, depth %u, color %u): coverage "
+				     "reduction TRUNCATE\n",
+				     raster_samples, build.rendering.depth_samples, build.rendering.color_samples);
+			}
+		}
 	}
 	pipeline_info.pNext                          = &build.rendering_info;
 	pipeline_info.stageCount                     = shader_stage_count;

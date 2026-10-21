@@ -193,9 +193,10 @@ struct PageManager::Impl {
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
 		const GpuPhases::Scope phase(GpuPhases::Phase::Protect);
-		GpuPhases::NoteProtect(size, mode == Common::VirtualMemory::Mode::NoAccess ? 0u
-		                             : mode == Common::VirtualMemory::Mode::Read   ? 1u
-		                                                                           : 2u);
+		GpuPhases::NoteProtect(vaddr, size,
+		                       mode == Common::VirtualMemory::Mode::NoAccess ? 0u
+		                       : mode == Common::VirtualMemory::Mode::Read   ? 1u
+		                                                                     : 2u);
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));

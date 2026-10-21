@@ -323,6 +323,9 @@ void RequestPicture(const std::string& name);
 // PagedRangeSet directly).
 [[nodiscard]] bool FlipCheckOld();
 [[nodiscard]] bool BdaProtectOld();
+// Round 108: yield:off, graphics streams do not stop for compute submissions
+// (GuestGpu::ComputeYield).
+[[nodiscard]] bool ComputeYieldOff();
 [[nodiscard]] bool ListResetOff();
 // Any thread: scanwave:old; drawstate:old; refresh:old; expand:old (backing:locked is applied to
 // the kernel's memory, LibKernel::Memory::SetBackingCopyLocked).

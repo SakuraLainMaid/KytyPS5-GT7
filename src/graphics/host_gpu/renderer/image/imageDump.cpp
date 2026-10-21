@@ -334,6 +334,7 @@ void Encode(const std::string& name, const std::string& description, const Layou
 
 	// The texels shown, decoded.
 	std::vector<std::array<float, 4>> texels(static_cast<size_t>(tile_w) * tile_h * tiles);
+	uint64_t                          unread = 0; // round 108: past the bytes read (shown as 0)
 	for (uint32_t t = 0; t < tiles; t++) {
 		for (uint32_t y = 0; y < tile_h; y++) {
 			const uint64_t row = t * layout.tile_pitch + y * layout.row_pitch;
@@ -342,6 +343,8 @@ void Encode(const std::string& name, const std::string& description, const Layou
 				auto&          texel = texels[(static_cast<size_t>(t) * tile_h + y) * tile_w + x];
 				if (at + layout.texel_bytes <= bytes.size()) {
 					Decode(layout.format, bytes.data() + at, texel.data());
+				} else {
+					unread++;
 				}
 			}
 		}
@@ -376,6 +379,24 @@ void Encode(const std::string& name, const std::string& description, const Layou
 			not_finite++;
 		} else if (info.kind == Kind::Float && bright > 0.0f && i % sample_every == 0) {
 			brightness.push_back(bright);
+		}
+	}
+	// Round 108: the tiles (an array's layers) whose texels shown are all zero, by layer number.
+	uint32_t    zero_tiles = 0;
+	std::string zero_list;
+	if (tiles > 1) {
+		const size_t per_tile = static_cast<size_t>(tile_w) * tile_h;
+		for (uint32_t t = 0; t < tiles; t++) {
+			bool all = true;
+			for (size_t i = 0; i < per_tile && all; i++) {
+				const auto& v = texels[static_cast<size_t>(t) * per_tile + i];
+				for (uint32_t c = 0; c < info.channels; c++) {
+					all = all && v[c] == 0.0f;
+				}
+			}
+			if (all && zero_tiles++ < 32) {
+				zero_list += (zero_list.empty() ? "" : ",") + std::to_string(t);
+			}
 		}
 	}
 	float scale = 1.0f;
@@ -460,13 +481,19 @@ void Encode(const std::string& name, const std::string& description, const Layou
 	                      : info.kind == Kind::Uint  ? "integers against their largest"
 	                      : info.kind == Kind::Snorm ? "snorm"
 	                                                 : "unorm";
+	const std::string unread_note =
+	    unread == 0 ? std::string()
+	                : "; " + std::to_string(unread) + " texels past the " +
+	                      std::to_string(bytes.size()) + " bytes read (shown as zero)";
 	LOGF("FG dump %s.png%s: %s; %u tile(s) of %ux%u (every %u texel(s)) as %ux%u; %s, scale %g, "
 	     "values %g..%g; %" PRIu64 " not finite (magenta), %" PRIu64 " negative, %" PRIu64
-	     " all zero of %zu\n",
+	     " all zero of %zu; %u tile(s) all zero%s%s%s%s\n",
 	     name.c_str(), written ? "" : " (NOT WRITTEN)", description.c_str(), tiles, tile_w, tile_h,
 	     step, width, height, mapping, static_cast<double>(scale),
 	     static_cast<double>(low <= high ? low : 0.0f),
-	     static_cast<double>(low <= high ? high : 0.0f), not_finite, negative, zero, texels.size());
+	     static_cast<double>(low <= high ? high : 0.0f), not_finite, negative, zero, texels.size(),
+	     zero_tiles, zero_list.empty() ? "" : " (", zero_list.c_str(),
+	     zero_list.empty() ? "" : (zero_tiles > 32 ? ", ...)" : ")"), unread_note.c_str());
 }
 
 } // namespace

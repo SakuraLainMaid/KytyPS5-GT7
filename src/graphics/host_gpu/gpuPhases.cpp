@@ -364,6 +364,39 @@ void ReportIfDue(uint64_t frames) {
 		}
 	}
 	{
+		// Round 108: the blocks protected most, with what the changes made their pages.
+		auto&                                                     blocks = Detail::g_protect_blocks;
+		std::vector<std::pair<uint64_t, std::array<uint32_t, 3>>> sorted(blocks.begin(),
+		                                                                 blocks.end());
+		const auto total = [](const std::array<uint32_t, 3>& modes) {
+			return static_cast<uint64_t>(modes[0]) + modes[1] + modes[2];
+		};
+		const auto shown = std::min<size_t>(sorted.size(), 10);
+		std::partial_sort(
+		    sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(shown), sorted.end(),
+		    [&](const auto& a, const auto& b) { return total(a.second) > total(b.second); });
+		std::string churn;
+		for (size_t k = 0; k < shown; k++) {
+			const auto& [block, modes] = sorted[k];
+			churn += fmt::format("{}0x{:x} {} ({} no access, {} read-only, {} writable)",
+			                     k == 0 ? "" : ", ", block << 16u, total(modes), modes[0], modes[1],
+			                     modes[2]);
+		}
+		if (!churn.empty()) {
+			line += fmt::format(" | protect churn, {} blocks of 64 KB, the most: {}", sorted.size(),
+			                    churn);
+		}
+		blocks.clear();
+	}
+	if (Detail::g_yields != 0) {
+		// Round 108: graphics streams stopped for compute work, and how far they ran first.
+		line += fmt::format(" | compute yields {} ({:.0f} packets before each)", Detail::g_yields,
+		                    static_cast<double>(Detail::g_yield_packets) /
+		                        static_cast<double>(Detail::g_yields));
+		Detail::g_yields        = 0;
+		Detail::g_yield_packets = 0;
+	}
+	{
 		// Round 81: the guest bytes uploaded to the GPU by the step they were uploaded in, the
 		// most first (CPU writes made since a range was last uploaded; a frame's share with
 		// the frames below).

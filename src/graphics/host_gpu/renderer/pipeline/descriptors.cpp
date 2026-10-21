@@ -2533,10 +2533,24 @@ static void LogFrameGraphStage(RenderContext& context, const ShaderStageRuntime&
 				// and for a dispatch, the GPU's copy as the dispatch finds it (a transient list a
 				// later frame reuses is gone by the end of this one).
 				FrameGraph::NoteChosenBuffer(r.Base48(), mapped);
-				if (program.stage == ShaderType::Compute) {
+				// Round 108: a draw's stages too (the GPU's copy of a table a pixel shader reads,
+				// against the guest bytes after the frame).
+				const bool compute = program.stage == ShaderType::Compute;
+				// A draw's: once a capture for each range (a pass draws with the same table
+				// hundreds of times).
+				static uint32_t                                snapshot_capture = 0;
+				static std::set<std::pair<uint64_t, uint64_t>> snapshot_ranges;
+				if (snapshot_capture != FrameGraph::CaptureNumber()) {
+					snapshot_capture = FrameGraph::CaptureNumber();
+					snapshot_ranges.clear();
+				}
+				if (compute || (!program.info.buffers[i].written &&
+				                snapshot_ranges.emplace(r.Base48(), mapped).second)) {
 					buffers.SnapshotForDiagnostics(
 					    r.Base48(), std::min(mapped, FrameGraph::ChosenBufferBytes()),
-					    FrameGraph::CurrentOp(), fmt::format("cs buf[{}]", i));
+					    FrameGraph::CurrentOp(), fmt::format("{} buf[{}]", stage, i));
+				}
+				if (compute) {
 					// Round 106: and what it wrote, right after it.
 					if (program.info.buffers[i].written) {
 						FrameGraph::NoteWrittenForSnapshot(

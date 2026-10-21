@@ -46,10 +46,55 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 namespace Libs::Network {
+
+// Round 108: what the game would download (the dealer's car photos, say). The emulator gives the
+// game no network, so each request is answered with an error; each distinct one is logged once.
+// A query is left out: it can hold a sign-in token.
+void NoteGameRequest(const char* api, const char* method, const char* base, const char* url,
+                     const char* answer) {
+	static std::mutex                      mutex;
+	static std::unordered_set<std::string> seen;
+	constexpr size_t                       MaxRequests = 1024;
+
+	std::string address = (url != nullptr ? url : "");
+	if (base != nullptr && address.find("://") == std::string::npos) {
+		address = std::string(base) + address;
+	}
+	const auto query     = address.find_first_of("?#");
+	const bool had_query = (query != std::string::npos);
+	if (had_query) {
+		address.resize(query);
+	}
+	const auto key = fmt::format("{} {} {}", api != nullptr ? api : "-",
+	                             method != nullptr ? method : "-", address);
+
+	std::lock_guard lock(mutex);
+	if (seen.size() >= MaxRequests || !seen.insert(key).second) {
+		return;
+	}
+	LOGF("Net request: %s%s: %s (%zu distinct so far)\n", key.c_str(), had_query ? "?..." : "",
+	     answer != nullptr ? answer : "-", seen.size());
+}
+
+void NoteGameLookup(const char* hostname) {
+	static std::mutex                      mutex;
+	static std::unordered_set<std::string> seen;
+	constexpr size_t                       MaxHosts = 256;
+
+	if (hostname == nullptr) {
+		return;
+	}
+	std::lock_guard lock(mutex);
+	if (seen.size() >= MaxHosts || !seen.insert(hostname).second) {
+		return;
+	}
+	LOGF("Net lookup: %s (%zu distinct so far)\n", hostname, seen.size());
+}
 
 class Network {
 public:
@@ -553,6 +598,8 @@ Network::Id Network::HttpCreateRequestWithURL2(Id conn_id, const char* method, c
 	Common::LockGuard lock(m_mutex);
 
 	if (method != nullptr && url != nullptr && url[0] != '\0' && HttpValidConnection(conn_id)) {
+		NoteGameRequest("http", method, m_connections[conn_id.GetId()].url.c_str(), url,
+		                "sending it times out (the emulator gives the game no network)");
 		HttpRequest cn(m_connections[conn_id.GetId()]);
 		cn.used   = true;
 		cn.method = std::string(method);
@@ -1438,6 +1485,8 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 	     "\t retry    = %d\n"
 	     "\t flags    = 0x%08x\n",
 	     rid, hostname != nullptr ? hostname : "<null>", timeout, retry, flags);
+
+	NoteGameLookup(hostname);
 
 	(void)timeout;
 	(void)retry;

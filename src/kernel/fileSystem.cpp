@@ -21,13 +21,40 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <random>
+#include <string>
 #include <system_error>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::LibKernel::FileSystem {
 
 LIB_NAME("libkernel", "libkernel");
+
+// Round 108: each path the game looked for that is not there, and each file it opened, logged
+// once, so a short report shows what a screen reads (the dealer's car photos, say).
+static void NoteGuestPath(bool found, const char* call, const char* path) {
+	static std::mutex                      mutex;
+	static std::unordered_set<std::string> missing;
+	static std::unordered_set<std::string> opened;
+	constexpr size_t                       MaxMissing = 1024;
+	constexpr size_t                       MaxOpened  = 4096;
+
+	if (path == nullptr) {
+		return;
+	}
+	std::lock_guard lock(mutex);
+	auto&           seen = (found ? opened : missing);
+	if (seen.size() >= (found ? MaxOpened : MaxMissing) || !seen.insert(path).second) {
+		return;
+	}
+	if (found) {
+		LOGF("File opened: %s (%zu distinct files so far)\n", path, seen.size());
+	} else {
+		LOGF("File not found: %s %s (%zu distinct paths so far)\n", call, path, seen.size());
+	}
+}
 
 constexpr int      DESCRIPTOR_MIN = 3;
 constexpr uint64_t DIR_BLOCK_SIZE = 512;
@@ -466,6 +493,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	file->real_name = g_mount_points->ResolvePath(file->name);
 	if (file->real_name.empty()) {
 		g_files->DeleteDescriptor(descriptor);
+		NoteGuestPath(false, "open", path);
 		return KERNEL_ERROR_ENOENT;
 	}
 	if (Common::IsArchivePath(file->real_name) &&
@@ -486,6 +514,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	// A missing path opened without O_CREAT is ENOENT
 	if (!creat && !dir_exist && !file_exist) {
 		g_files->DeleteDescriptor(descriptor);
+		NoteGuestPath(false, "open", path);
 		return KERNEL_ERROR_ENOENT;
 	}
 
@@ -546,6 +575,9 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	}
 
 	file->opened = true;
+	if (!file->directory) {
+		NoteGuestPath(true, "open", path);
+	}
 	return descriptor;
 }
 
@@ -908,6 +940,7 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 	const auto info = Common::File::GetInfo(real_file_name);
 	if (!info) {
 		LOGF("\t file not found\n");
+		NoteGuestPath(false, "stat", path);
 		return KERNEL_ERROR_ENOENT;
 	}
 
@@ -1307,6 +1340,7 @@ int KYTY_SYSV_ABI KernelCheckReachability(const char* path) {
 		return OK;
 	}
 
+	NoteGuestPath(false, "reachability", path);
 	return KERNEL_ERROR_ENOENT;
 }
 

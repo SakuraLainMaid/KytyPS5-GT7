@@ -101,6 +101,8 @@ struct Step {
 	int32_t           dflush          = -1;   // dflush:<n>; -1: the usual
 	uint32_t          gpu_frames  = 0;    // gputime:<n>
 	int64_t           readback_kb = -1; // -1: the usual window
+	// Round 108.
+	bool              yield_off = false;
 	std::string       cpu_set;          // empty: as at the start
 	std::string       name;             // for the screen and the picture's file name
 	std::string       text;             // name and actions, for the log
@@ -297,6 +299,10 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "unorm:old") {
 		step.unorm_old = true;
+		return true;
+	}
+	if (action == "yield:off") {
+		step.yield_off = true;
 		return true;
 	}
 	if (action == "drawprep:notess") {
@@ -1004,6 +1010,11 @@ bool FlipCheckOld() {
 bool BdaProtectOld() {
 	const auto* step = Current();
 	return step != nullptr && step->bdaprotect_old;
+}
+
+bool ComputeYieldOff() {
+	const auto* step = Current();
+	return step != nullptr && step->yield_off;
 }
 
 bool ListResetOff() {

@@ -835,6 +835,22 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		create_info.pNext                    = &address_binding;
 		LOGF("Vulkan address binding report: enabled\n");
 	}
+	vk::PhysicalDeviceCoverageReductionModeFeaturesNV coverage_reduction {};
+	if (HasExtension(device_extensions, VK_NV_COVERAGE_REDUCTION_MODE_EXTENSION_NAME)) {
+		vk::PhysicalDeviceCoverageReductionModeFeaturesNV supported_reduction {};
+		vk::PhysicalDeviceFeatures2                       reduction_query {};
+		reduction_query.pNext = &supported_reduction;
+		physical_device.getFeatures2(&reduction_query);
+		if (supported_reduction.coverageReductionMode) {
+			coverage_reduction.coverageReductionMode = VK_TRUE;
+			coverage_reduction.pNext                 = const_cast<void*>(create_info.pNext);
+			create_info.pNext                        = &coverage_reduction;
+		} else {
+			graphics.coverage_truncate_combinations.clear();
+		}
+		LOGF("Vulkan coverage reduction mode feature: %s\n",
+		     supported_reduction.coverageReductionMode ? "enabled" : "unsupported");
+	}
 	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
 	if (HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 		vk::PhysicalDeviceFaultFeaturesEXT supported_fault {};
@@ -1332,6 +1348,54 @@ void WindowContext::CreateVulkan() {
 		                        VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME);
 			graphic_ctx.mixed_attachment_samples = MixedSamples::Nv;
+			// Round 108: color coverage from the color sample's own raster sample (TRUNCATE).
+			const char* reduction = std::getenv("KYTY_COVERAGE_REDUCTION");
+			const bool  merge     = reduction != nullptr && std::strcmp(reduction, "merge") == 0;
+			if (!merge &&
+			    HasExtension(available_extensions, VK_NV_COVERAGE_REDUCTION_MODE_EXTENSION_NAME) &&
+			    VULKAN_HPP_DEFAULT_DISPATCHER
+			            .vkGetPhysicalDeviceSupportedFramebufferMixedSamplesCombinationsNV !=
+			        nullptr) {
+				const auto combinations = EnumerateVulkan<vk::FramebufferMixedSamplesCombinationNV>(
+				    "vkGetPhysicalDeviceSupportedFramebufferMixedSamplesCombinationsNV",
+				    [&](uint32_t* count, vk::FramebufferMixedSamplesCombinationNV* values) {
+					    return graphic_ctx.physical_device
+					        .getSupportedFramebufferMixedSamplesCombinationsNV(count, values);
+				    });
+				std::string list;
+				for (const auto& combination: combinations) {
+					if (combination.coverageReductionMode !=
+					    vk::CoverageReductionModeNV::eTruncate) {
+						continue;
+					}
+					// The depth/stencil and color counts are masks of the counts allowed.
+					const auto raster = static_cast<uint32_t>(combination.rasterizationSamples);
+					const auto depths = static_cast<uint32_t>(combination.depthStencilSamples);
+					const auto colors = static_cast<uint32_t>(combination.colorSamples);
+					graphic_ctx.coverage_truncate_combinations.push_back({raster, depths, colors});
+					list += fmt::format(" {}/0x{:x}/0x{:x}", raster, depths, colors);
+				}
+				if (!graphic_ctx.coverage_truncate_combinations.empty()) {
+					// The extension only with its feature (VulkanCreateDevice turns that on).
+					vk::PhysicalDeviceCoverageReductionModeFeaturesNV supported_reduction {};
+					vk::PhysicalDeviceFeatures2                       reduction_query {};
+					reduction_query.pNext = &supported_reduction;
+					graphic_ctx.physical_device.getFeatures2(&reduction_query);
+					if (supported_reduction.coverageReductionMode) {
+						device_extensions.push_back(VK_NV_COVERAGE_REDUCTION_MODE_EXTENSION_NAME);
+					} else {
+						graphic_ctx.coverage_truncate_combinations.clear();
+						list += " (not used: the device lacks the coverageReductionMode feature)";
+					}
+				}
+				LOGF("Vulkan coverage reduction TRUNCATE (raster samples/depth masks/color "
+				     "masks):%s\n",
+				     list.empty() ? " none" : list.c_str());
+			} else {
+				LOGF("Vulkan coverage reduction: MERGE%s\n",
+				     merge ? " (KYTY_COVERAGE_REDUCTION=merge)"
+				           : " (no VK_NV_coverage_reduction_mode)");
+			}
 		}
 		LOGF("Vulkan mixed attachment samples: %s\n",
 		     graphic_ctx.mixed_attachment_samples == MixedSamples::Amd  ? "AMD"

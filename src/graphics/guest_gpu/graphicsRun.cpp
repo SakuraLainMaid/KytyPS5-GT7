@@ -36,6 +36,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -720,9 +721,37 @@ void GuestGpu::Enqueue(Submission submission) {
 			m_draw_prep->EnqueueReset(submission.queue_id);
 		}
 	}
+	const bool compute = submission.type == SubmissionType::Compute;
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
+	if (compute) {
+		m_compute_enqueued.fetch_add(1, std::memory_order_relaxed);
+	}
 	m_work_available.Signal();
+}
+
+uint32_t GuestGpu::ComputeYieldMicroseconds() {
+	static const uint32_t microseconds = [] {
+		constexpr uint32_t Default = 500;
+		const char*        value   = std::getenv("KYTY_COMPUTE_YIELD");
+		uint32_t           result  = Default;
+		if (value != nullptr &&
+		    (std::strcmp(value, "off") == 0 || std::strcmp(value, "false") == 0)) {
+			result = 0;
+		} else if (value != nullptr && value[0] >= '0' && value[0] <= '9') {
+			result = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+		}
+		if (result == 0) {
+			LOGF("GPU thread: graphics streams do not stop for compute submissions "
+			     "(KYTY_COMPUTE_YIELD)\n");
+		} else {
+			LOGF("GPU thread: graphics streams stop between packets for compute submissions, "
+			     "after %u us (KYTY_COMPUTE_YIELD)\n",
+			     result);
+		}
+		return result;
+	}();
+	return Bisect::ComputeYieldOff() ? 0u : microseconds;
 }
 
 void GuestGpu::WaitForIdle() {
@@ -847,7 +876,20 @@ void GuestGpu::ThreadRun(void* data) {
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
-			submission.blocked = true;
+			// Round 108: a slice that ran packets may have written what the other queues' blocked
+			// fronts wait for (a label), so they are tried again before the all-blocked wait.
+			if (submission.progressed) {
+				for (auto& queue: gpu->m_queues) {
+					if (!queue.empty()) {
+						queue.front().blocked = false;
+					}
+				}
+			}
+			// A stream that stopped for compute work (round 108) goes on once that has run: the
+			// queues after this one come first (m_next_queue).
+			submission.blocked    = !submission.yielded;
+			submission.yielded    = false;
+			submission.progressed = false;
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
 		} else {
@@ -898,6 +940,7 @@ bool GuestGpu::Process(Submission& submission) {
 	switch (submission.type) {
 		case SubmissionType::Graphics: {
 			submission.command_execution.SetPrepSeq(submission.prep_seq, submission.queue_id);
+			submission.command_execution.AllowYield(ComputeYieldMicroseconds(), ComputeEnqueued());
 			bool progressed = false;
 			submission.constant_complete |= submission.constant_commands.empty();
 			for (;;) {
@@ -917,10 +960,15 @@ bool GuestGpu::Process(Submission& submission) {
 				}
 				progressed |= round_progress;
 				complete = submission.command_complete && submission.constant_complete;
+				if (!submission.command_complete && submission.command_execution.Yielded()) {
+					submission.yielded = true;
+					break;
+				}
 				if (complete || !round_progress) {
 					break;
 				}
 			}
+			submission.progressed = progressed;
 			if (progressed) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
@@ -948,7 +996,8 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
-			if (submission.command_execution.MadeProgress()) {
+			submission.progressed = submission.command_execution.MadeProgress();
+			if (submission.progressed) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
 				}
@@ -1030,6 +1079,15 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		m_renderer.GetBufferCache().WritesRecorded();
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
+			// Round 108: compute work arrived while this graphics stream ran (AllowYield).
+			constexpr uint32_t YieldAfterPackets = 32;
+			if (execution.m_yield_us != 0 && execution.m_yield_packets >= YieldAfterPackets &&
+			    g_gpu_state->ComputeEnqueued() != execution.m_yield_mark &&
+			    execution.YieldTimeReached()) {
+				execution.m_yielded = true;
+				GpuPhases::NoteYield(execution.m_yield_packets);
+				return;
+			}
 		}
 		auto& cursor = execution.m_buffer_stack.back();
 		EXIT_IF(cursor.offset_dw > cursor.commands.size());
@@ -1149,6 +1207,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
+		execution.m_yield_packets++;
 		if (!execution.m_next_buffer.empty()) {
 			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
 			if (execution.m_chain) {

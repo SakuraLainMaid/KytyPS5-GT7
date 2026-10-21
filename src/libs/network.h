@@ -8,6 +8,14 @@ namespace Libs::Network {
 void Initialize();
 void Shutdown();
 
+// Each distinct request the game makes, logged once ("Net request: ..."): the API, the method,
+// the address up to its query (base goes in front of an address with no scheme), and what the
+// emulator answered.
+void NoteGameRequest(const char* api, const char* method, const char* base, const char* url,
+                     const char* answer);
+// Each distinct host name the game looks up, logged once ("Net lookup: ...").
+void NoteGameLookup(const char* hostname);
+
 struct Lifecycle {
 	static constexpr const char* name       = "Network";
 	static constexpr auto        initialize = Libs::Network::Initialize;

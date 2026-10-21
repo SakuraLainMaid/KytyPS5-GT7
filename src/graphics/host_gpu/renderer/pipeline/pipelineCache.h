@@ -194,6 +194,7 @@ struct GraphicsPipelineBuild {
 	vk::PipelineRasterizationStateCreateInfo                              rasterizer {};
 	vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT            provoking_vertex {};
 	vk::PipelineMultisampleStateCreateInfo                                multisampling {};
+	vk::PipelineCoverageReductionStateCreateInfoNV                        coverage_reduction {};
 	std::array<vk::PipelineColorBlendAttachmentState, RENDER_COLOR_ATTACHMENTS_MAX> color_blend {};
 	std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX>                  color_write_enable {};
 	vk::PipelineColorWriteCreateInfoEXT                                   color_write {};

@@ -5,6 +5,8 @@
 #include "stb_image.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cinttypes>
 #include <cstddef>
 #include <cstring>
 
@@ -220,10 +222,8 @@ static int32_t KYTY_SYSV_ABI PngDecCreate(const PngDecCreateParam* param, void* 
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI PngDecDecode(void* handle, const PngDecDecodeParam* param,
-                                          PngDecImageInfo* image_info) {
-	PRINT_NAME();
-
+static int32_t PngDecDecodeImage(void* handle, const PngDecDecodeParam* param,
+                                 PngDecImageInfo* image_info, PngHeaderInfo* header_out) {
 	if (handle == nullptr) {
 		return PNG_DEC_ERROR_INVALID_HANDLE;
 	}
@@ -252,6 +252,7 @@ static int32_t KYTY_SYSV_ABI PngDecDecode(void* handle, const PngDecDecodeParam*
 	}
 
 	FillImageInfo(header, image_info);
+	*header_out = header;
 
 	const uint32_t min_pitch = header.width * 4u;
 	const uint32_t pitch     = (param->image_pitch == 0 ? min_pitch : param->image_pitch);
@@ -316,6 +317,39 @@ static int32_t KYTY_SYSV_ABI PngDecDecode(void* handle, const PngDecDecodeParam*
 	return (header.width > 32767u || header.height > 32767u
 	            ? 0
 	            : static_cast<int32_t>((header.width << 16u) | header.height));
+}
+
+static int32_t KYTY_SYSV_ABI PngDecDecode(void* handle, const PngDecDecodeParam* param,
+                                          PngDecImageInfo* image_info) {
+	PRINT_NAME();
+
+	PngHeaderInfo header {};
+	const int32_t result = PngDecDecodeImage(handle, param, image_info, &header);
+
+	// Round 108: what the game decodes (the first 16 pictures and the first 64 failures), so a
+	// picture that never shows can be told from one that failed to decode.
+	static std::atomic<uint32_t> decoded {0};
+	static std::atomic<uint32_t> failed {0};
+	constexpr uint32_t           MaxDecodedLogged = 16;
+	constexpr uint32_t           MaxFailedLogged  = 64;
+	if (result < 0) {
+		const auto count = failed.fetch_add(1) + 1;
+		if (count <= MaxFailedLogged) {
+			LOGF("PngDec: decode %u failed with 0x%08" PRIx32 " (%" PRIu32 "x%" PRIu32
+			     ", colour space %u, depth %u, %" PRIu32 " bytes)\n",
+			     count, static_cast<uint32_t>(result), header.width, header.height,
+			     static_cast<unsigned>(header.color_space), static_cast<unsigned>(header.bit_depth),
+			     param != nullptr ? param->png_mem_size : 0u);
+		}
+	} else {
+		const auto count = decoded.fetch_add(1) + 1;
+		if (count <= MaxDecodedLogged) {
+			LOGF("PngDec: decode %u: %" PRIu32 "x%" PRIu32 ", colour space %u, depth %u\n", count,
+			     header.width, header.height, static_cast<unsigned>(header.color_space),
+			     static_cast<unsigned>(header.bit_depth));
+		}
+	}
+	return result;
 }
 
 static int32_t KYTY_SYSV_ABI PngDecDelete(void* handle) {

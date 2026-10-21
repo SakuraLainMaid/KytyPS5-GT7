@@ -64,6 +64,17 @@ public:
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
 
+	// Round 108: compute queue submissions enqueued so far (any thread). A graphics stream the GPU
+	// thread runs stops between packets once one more arrived (ComputeYieldMicroseconds), so
+	// compute work the game sends to run beside its graphics, and often waits for, is not held
+	// behind the rest of a long graphics submission.
+	[[nodiscard]] uint64_t ComputeEnqueued() const noexcept {
+		return m_compute_enqueued.load(std::memory_order_relaxed);
+	}
+	// How long a graphics stream runs before it may stop, in microseconds (KYTY_COMPUTE_YIELD,
+	// 500 if unset); 0 when KYTY_COMPUTE_YIELD=0 or KYTY_BISECT's yield:off turns it off.
+	[[nodiscard]] static uint32_t ComputeYieldMicroseconds();
+
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;
 	static constexpr uint32_t QueuesPerComputePipe = 8;
@@ -84,6 +95,8 @@ private:
 		bool                      command_complete  = false;
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
+		bool                      yielded           = false; // stopped for compute (round 108)
+		bool                      progressed        = false; // the last slice ran packets
 		uint64_t                  flip_request_id   = 0;
 		uint64_t                  prep_seq          = 0; // draw prep: graphics submission number
 	};
@@ -102,6 +115,7 @@ private:
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
+	std::atomic<uint64_t>                          m_compute_enqueued {0};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;

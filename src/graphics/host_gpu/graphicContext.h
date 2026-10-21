@@ -126,6 +126,22 @@ struct GraphicContext {
 	// color <= depth, with rasterization at the depth count.
 	enum class MixedAttachmentSamples : uint8_t { None, Amd, Nv };
 	MixedAttachmentSamples             mixed_attachment_samples              = MixedAttachmentSamples::None;
+	// Round 108: the raster sample count and the depth/stencil and color sample count masks
+	// VK_NV_coverage_reduction_mode takes TRUNCATE with (as the device lists them): color sample i
+	// is covered by raster sample i alone, as the PS5's color
+	// buffer sees only the samples exposed to it. Without it, NV merges the raster samples into
+	// the color sample: two triangles sharing an edge then both blend into the pixels along it.
+	// Empty: MERGE (KYTY_COVERAGE_REDUCTION=merge, or no such support).
+	std::vector<std::array<uint32_t, 3>> coverage_truncate_combinations;
+	[[nodiscard]] bool CoverageTruncate(uint32_t raster, uint32_t depth, uint32_t color) const {
+		for (const auto& combination: coverage_truncate_combinations) {
+			if (combination[0] == raster && (combination[1] & depth) != 0 &&
+			    (combination[2] & color) != 0) {
+				return true;
+			}
+		}
+		return false;
+	}
 	bool                               shader_image_int64_atomics_enabled    = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;

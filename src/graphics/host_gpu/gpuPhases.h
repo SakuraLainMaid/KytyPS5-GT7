@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <unordered_map>
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -151,15 +152,47 @@ inline void Count(Phase phase, uint64_t n) noexcept {
 	}
 }
 
-// A page protection change of `bytes` to `mode` (0 no access, 1 read-only, 2 read-write), charged
-// to the step a Protect scope would charge it to, on the GPU thread (round 80).
-inline void NoteProtect(uint64_t bytes, uint32_t mode) noexcept {
+namespace Detail {
+// Round 108: page protection changes by 64 KB block since the last report, by mode (GPU thread):
+// the blocks whose pages are protected over and over (the GPU writes them and the CPU touches
+// them, or the CPU writes them and the GPU reads them, every frame). At most 65536 blocks.
+inline std::unordered_map<uint64_t, std::array<uint32_t, 3>> g_protect_blocks;
+inline void NoteProtectBlock(uint64_t vaddr, uint32_t mode) noexcept {
+	const auto block = vaddr >> 16u;
+	auto       it    = g_protect_blocks.find(block);
+	if (it == g_protect_blocks.end()) {
+		if (g_protect_blocks.size() >= 65536u) {
+			return;
+		}
+		it = g_protect_blocks.emplace(block, std::array<uint32_t, 3> {}).first;
+	}
+	it->second[mode < 2u ? mode : 2u]++;
+}
+// Round 108: graphics streams stopped for compute work, and the packets they ran first.
+inline uint64_t g_yields        = 0;
+inline uint64_t g_yield_packets = 0;
+} // namespace Detail
+
+// Round 108: a graphics stream stopped for compute work after `packets` packets (the report's
+// "compute yields"; GPU thread).
+inline void NoteYield(uint32_t packets) noexcept {
+	if (Detail::t_on) {
+		Detail::g_yields++;
+		Detail::g_yield_packets += packets;
+	}
+}
+
+// A page protection change of `bytes` at `vaddr` to `mode` (0 no access, 1 read-only, 2
+// read-write), charged to the step a Protect scope would charge it to, on the GPU thread (round
+// 80).
+inline void NoteProtect(uint64_t vaddr, uint64_t bytes, uint32_t mode) noexcept {
 	if (!Detail::t_on) {
 		return;
 	}
 	const auto step = static_cast<size_t>(Detail::t_step);
 	Detail::g_protect_pages[step] += (bytes + 4095u) >> 12u;
 	Detail::g_protect_modes[step][mode < 2u ? mode : 2u]++;
+	Detail::NoteProtectBlock(vaddr, mode);
 }
 
 // An upload of `bytes` of guest memory in `copies` copies, charged to the step as a page

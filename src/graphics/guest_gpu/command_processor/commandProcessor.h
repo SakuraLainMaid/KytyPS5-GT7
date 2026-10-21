@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <chrono>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -32,6 +33,23 @@ public:
 		m_prep_seq   = seq;
 		m_prep_queue = queue;
 	}
+	// Round 108: the stream may stop between packets, once it has run some packets and for
+	// `microseconds` (0: never), when the count of compute submissions enqueued
+	// (GuestGpu::ComputeEnqueued) is past `mark`; Yielded says so, and the next Process goes on
+	// from the packet it stopped before.
+	void AllowYield(uint32_t microseconds, uint64_t mark) noexcept {
+		m_yield_us      = microseconds;
+		m_yield_mark    = mark;
+		m_yield_packets = 0;
+		m_yielded       = false;
+		m_yield_start   = (microseconds != 0 ? std::chrono::steady_clock::now()
+		                                     : std::chrono::steady_clock::time_point {});
+	}
+	[[nodiscard]] bool Yielded() const noexcept { return m_yielded; }
+	[[nodiscard]] bool YieldTimeReached() const noexcept {
+		return std::chrono::steady_clock::now() - m_yield_start >=
+		       std::chrono::microseconds(m_yield_us);
+	}
 
 private:
 	friend class CommandProcessor;
@@ -50,6 +68,11 @@ private:
 	uint32_t                  m_prep_queue    = 0;
 	uint32_t                  m_prep_ordinal  = 0;
 	const uint32_t*           m_prep_packet   = nullptr; // the last numbered packet
+	uint32_t                              m_yield_us      = 0;
+	bool                                  m_yielded       = false;
+	std::chrono::steady_clock::time_point m_yield_start {};
+	uint64_t                              m_yield_mark    = 0;
+	uint32_t                              m_yield_packets = 0;
 };
 
 class CommandProcessor {

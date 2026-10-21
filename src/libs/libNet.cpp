@@ -881,6 +881,9 @@ static int KYTY_SYSV_ABI Http2CreateRequestWithURL(int tmpl_id, const char* meth
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	Network::NoteGameRequest("http2", method, nullptr, url,
+	                         "sending it times out (the emulator gives the game no network)");
+
 	const auto req_id        = g_http2_next_request_id++;
 	g_http2_requests[req_id] = {tmpl_id, method, url, content_length};
 
@@ -2274,6 +2277,10 @@ static int KYTY_SYSV_ABI NpWebApi2CreateRequest(int user_context_id, const char*
 	LOGF("\t request_id        = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(request_id));
 
 	static int64_t next_request_id = 1000;
+
+	const std::string web_api_base = std::string(api_group != nullptr ? api_group : "-") + ":";
+	Network::NoteGameRequest("webapi", method, web_api_base.c_str(), path,
+	                         "sending it fails: not signed in");
 
 	if (request_id != nullptr) {
 		*request_id = next_request_id++;

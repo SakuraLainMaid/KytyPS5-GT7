@@ -393,7 +393,8 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 			info.result = LibKernel::KERNEL_ERROR_ENOENT;
 		}
 
-		bool log_missing = false;
+		bool   log_missing  = false;
+		size_t log_resolved = 0;
 		{
 			std::scoped_lock lock(g_mutex);
 			auto [it, inserted] = g_resolved_paths.emplace(path, info);
@@ -401,12 +402,20 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 				info = it->second;
 			} else if (info.result == OK) {
 				RegisterHostPathLocked(info.file_id, info.host_path, info.file_size, info.is_dir);
+				log_resolved = g_resolved_paths.size();
 			} else if (info.result == LibKernel::KERNEL_ERROR_ENOENT) {
 				log_missing = true;
 			}
 		}
 		if (log_missing) {
 			LOGF("\tAPR resolve missing path: %s -> %s\n", guest_path, info.host_path.c_str());
+		}
+		// Round 108: each path the game reads through the APR, once (the first 4096), so a short
+		// report shows what a screen reads.
+		constexpr size_t MaxResolvedLogged = 4096;
+		if (log_resolved != 0 && log_resolved <= MaxResolvedLogged) {
+			LOGF("APR resolved: %s (%" PRIu64 " bytes%s)\n", guest_path, info.file_size,
+			     info.is_dir ? ", a folder" : "");
 		}
 	} else if (info.result == OK) {
 		AprShared::RegisterHostPath(info.file_id, info.host_path, info.file_size, info.is_dir);
