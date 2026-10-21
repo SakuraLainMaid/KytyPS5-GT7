@@ -161,6 +161,9 @@ public:
 
 	void WriteConstRam(uint32_t offset, const uint32_t* src, uint32_t dw_num);
 	void DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_num);
+	// Before the command processor stores to guest memory itself (a label the CPU may wait on):
+	// the page protections and upload reads it deferred are done (round 111).
+	void BeforeGuestStore();
 
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll, uint32_t wait_op);

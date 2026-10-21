@@ -668,7 +668,12 @@ void BufferCache::ForgetUnmapped(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
-	if (!GuestGpu::IsGpuThread() || size == 0 || !GuestRange {vaddr, size}.Valid() ||
+	if (!GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	// Round 111: the GPU thread's stores (labels, WRITE_DATA) come after its deferred work.
+	FinishDeferredMemoryWork();
+	if (size == 0 || !GuestRange {vaddr, size}.Valid() ||
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
 		return false;
 	}
@@ -1535,6 +1540,13 @@ void RecordSync(uint64_t size, bool is_written, bool uploaded, double walk_s) {
 }
 } // namespace
 
+// Round 111 (Bisect::AsyncMemorySync): whether the GPU thread's syncs leave the page protections
+// they ask for to the page manager's worker (PageManager::DeferScope). Their uploads then read
+// guest memory on the worker too, after those protections (UploadCopies).
+static bool DeferProtections(const CommandScheduler& /*scheduler*/) {
+	return t_guest_gpu_thread && Bisect::AsyncMemorySync();
+}
+
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
 	KYTY_PROFILER_FUNCTION();
@@ -1551,6 +1563,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	vk::Buffer                  source;
 	{
 		KYTY_PROFILER_BLOCK("Sync::Tracker");
+		// Round 111: the tracker's protections only (a texel buffer's image sync below keeps its
+		// own).
+		const PageManager::DeferScope defer(m_memory_tracker.Pages(),
+		                                    DeferProtections(m_scheduler));
 		m_memory_tracker.ForEachUploadRange(
 		    vaddr, size, is_written,
 		    [&](uint64_t address, uint64_t bytes) noexcept {
@@ -1647,7 +1663,32 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			const char* value = std::getenv("KYTY_UPLOAD_READS_ON_RECORD_THREAD");
 			return value != nullptr && value[0] == '1';
 		}();
-		if (deferred && m_staging_buffer.IsCoherent() && m_scheduler.Current().Recorder().Threaded()) {
+		// Round 111, Bisect::AsyncMemorySync: the reads run on the page manager's worker, after
+		// the protections deferred before them (these pages' among them). The GPU thread waits
+		// for them before its own stores to guest memory (FinishDeferredMemoryWork) and the
+		// command buffer is submitted after them, so the upload holds the bytes as they were
+		// before anything the guest can do once it sees this command done.
+		auto&      pages      = m_memory_tracker.Pages();
+		const bool async_sync = t_guest_gpu_thread && Bisect::AsyncMemorySync();
+		if (async_sync && m_staging_buffer.IsCoherent()) {
+			std::vector<UploadRead> reads;
+			reads.reserve(copies.size());
+			for (auto& copy: copies) {
+				reads.push_back(
+				    {mapped + copy.srcOffset, buffer.CpuAddress() + copy.dstOffset, copy.size});
+				copy.srcOffset += base_offset;
+			}
+			pages.PostDeferred([reads = std::move(reads)] {
+				for (const auto& read: reads) {
+					ReadGuestForUpload(read.destination, read.address, read.size);
+				}
+			});
+			m_staging_buffer.Commit();
+			return m_staging_buffer.Handle();
+		}
+		if (deferred && m_staging_buffer.IsCoherent() &&
+		    m_scheduler.Current().Recorder().Threaded()) {
+			const auto protections = pages.DeferredIssued();
 			m_upload_reads.clear();
 			for (auto& copy: copies) {
 				m_upload_reads.push_back(
@@ -1656,7 +1697,11 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			}
 			const auto* reads = m_scheduler.Stash(m_upload_reads.data(), m_upload_reads.size());
 			const auto  count = m_upload_reads.size();
-			m_scheduler.Record([reads, count](vk::CommandBuffer) {
+			auto*       deferring = &pages;
+			m_scheduler.Record([reads, count, protections, deferring](vk::CommandBuffer) {
+				if (protections != 0) {
+					deferring->WaitDeferred(protections);
+				}
 				for (size_t i = 0; i < count; i++) {
 					ReadGuestForUpload(reads[i].destination, reads[i].address, reads[i].size);
 				}
@@ -1664,6 +1709,8 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			m_staging_buffer.Commit();
 			return m_staging_buffer.Handle();
 		}
+		// Read here: after the page protections deferred so far (round 111).
+		pages.FinishDeferred();
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
 			ReadGuestForUpload(mapped + copy.srcOffset, address, copy.size);
@@ -1674,6 +1721,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	}
 
 	KYTY_PROFILER_BLOCK("BufferCache::UploadCopies(temporary)");
+	m_memory_tracker.Pages().FinishDeferred();
 	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
 	for (const auto& copy: copies) {
@@ -2446,6 +2494,9 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		    known_meta ? " (a known surface's metadata: a clear)" : "");
 	}
 	if (!IsRegionGpuModified(vaddr, size)) {
+		// Round 111: after the deferred protections (this store's faults need them) and the
+		// earlier uploads' reads.
+		FinishDeferredMemoryWork();
 		ForgetFillsUnder(vaddr, size);
 		// Hot pages do not fault (MemoryTracker::DirtyHotIn).
 		m_memory_tracker.DirtyHotIn(vaddr, size);
@@ -2546,6 +2597,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		                    : "");
 	}
 	if (cpu_copy) {
+		FinishDeferredMemoryWork(); // round 111, as FillBuffer
 		ForgetFillsUnder(dst_vaddr, size);
 		// Hot pages do not fault (MemoryTracker::DirtyHotIn).
 		m_memory_tracker.DirtyHotIn(dst_vaddr, size);
@@ -2930,6 +2982,9 @@ uint64_t BufferCache::SynchronizeBdaPending(const RangeSet& mapped) {
 	// span and changes their protection in one call, where one sync a run made one protection
 	// call a run (~3.7 us each; 216,000 protection changes in 10 s of a race in round 69, 8 % of
 	// the GPU thread). KYTY_BISECT's bdaspan:off synchronizes each run on its own again.
+	// Round 111: the walk's protections are deferred too (its uploads read on the page manager's
+	// worker, after them).
+	const PageManager::DeferScope defer(m_memory_tracker.Pages(), DeferProtections(m_scheduler));
 	thread_local std::vector<std::pair<uint64_t, uint64_t>> runs;
 	uint64_t                                                regions = 0;
 	const bool                                              by_run  = Bisect::BdaSpanOff();

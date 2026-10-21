@@ -28,6 +28,8 @@ class Timeline;
 enum class Transfer : uint8_t;
 } // namespace StallWatch
 
+class PageManager;
+
 class CommandScheduler {
 public:
 	CommandScheduler(RenderContext& context, GraphicContext& graphics);
@@ -51,6 +53,10 @@ public:
 		m_before_flush      = hook;
 		m_before_flush_user = user;
 	}
+	// Round 111: a command buffer is submitted only once the page protections deferred before
+	// its submission are made (PageManager::DeferScope): the GPU's writes it holds are then seen
+	// by the CPU's reads, and the bytes it uploads were read after their write protection.
+	void SetSubmitBarrier(PageManager* pages) noexcept { m_submit_pages = pages; }
 
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
 	void           BeginRendering(const RenderState& state);
@@ -299,6 +305,7 @@ private:
 	BeforeFlush                           m_before_flush      = nullptr;
 	void*                                 m_before_flush_user = nullptr;
 	bool                                  m_in_before_flush   = false;
+	PageManager*                          m_submit_pages      = nullptr;
 };
 
 } // namespace Libs::Graphics

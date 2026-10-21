@@ -210,6 +210,11 @@ public:
 	// protected as GPU-written) or it would be wrong (a download of these bytes is in flight, or
 	// no cached buffer covers them); the caller then writes normally.
 	[[nodiscard]] bool              WriteClean(uint64_t vaddr, const void* data, uint64_t size);
+	// Round 111 (Bisect::AsyncMemorySync): returns once the page protections and upload reads
+	// left to the page manager's worker are done. The GPU thread calls it before its own stores
+	// to guest memory: a game thread that sees one must fault on what the GPU writes, and the
+	// uploads recorded before it must not read what follows it.
+	void FinishDeferredMemoryWork() { m_memory_tracker.Pages().FinishDeferred(); }
 	// The dword a GPU fill (FillBuffer) left in all of [vaddr, vaddr + size), when no other GPU
 	// write and no CPU store touched those bytes since: a reader that only needs that value can
 	// skip downloading the range, which drains the GPU.

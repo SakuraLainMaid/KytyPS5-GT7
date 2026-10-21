@@ -1,6 +1,8 @@
 #include "graphics/host_gpu/pageManager.h"
 
 #include "common/alignment.h"
+#include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/regionDefinitions.h"
@@ -9,11 +11,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -77,6 +82,16 @@ void ValidateRange(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		Fatal("invalid range vaddr=0x%016" PRIx64 ", size=0x%016" PRIx64, vaddr, size);
 	}
+}
+
+// Round 111: the manager whose watcher additions on this thread leave their host protection to
+// its worker (PageManager::DeferScope), null for none.
+thread_local const void* t_defer_protection = nullptr;
+
+uint64_t NowNs() noexcept {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
 }
 
 } // namespace
@@ -160,6 +175,7 @@ struct PageManager::Impl {
 	}
 
 	~Impl() {
+		StopWorker();
 		for (const auto& region: region_storage) {
 			SpinGuard lock(region->lock);
 			for (auto& page: region->pages) {
@@ -214,7 +230,17 @@ struct PageManager::Impl {
 
 		const auto release_pending = [&] {
 			if (range_bytes != 0) {
-				Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				// Added write watchers only make pages read-only: that can wait for the worker. A
+				// GPU write's no-access protection is made at once, as the GPU thread's own reads
+				// of those pages (indirect arguments, scans) must fault for the download.
+				if (track && !is_read && t_defer_protection == this) {
+					Defer(base_addr + range_begin * PAGE_SIZE, range_bytes);
+				} else {
+					if (track && t_defer_protection == this) {
+						stat_kept.fetch_add(1, std::memory_order_relaxed);
+					}
+					Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				}
 				range_bytes           = 0;
 				potential_range_bytes = 0;
 			}
@@ -273,9 +299,207 @@ struct PageManager::Impl {
 		}
 	}
 
+	// Round 111, deferred protection (PageManager::DeferScope). Called with the region's lock
+	// held: the worker takes no region lock while it holds defer_mutex.
+	void Defer(uint64_t vaddr, uint64_t size) {
+		bool wake = false;
+		{
+			std::lock_guard lock(defer_mutex);
+			wake = deferred.empty() && jobs.empty();
+			deferred.push_back({vaddr, size});
+			issued.store(issued.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+		}
+		// The worker sleeps only with both queues empty.
+		if (wake) {
+			defer_available.notify_one();
+		}
+	}
+
+	void Post(Common::UniqueFunction<void> job) {
+		bool wake = false;
+		{
+			std::lock_guard lock(defer_mutex);
+			wake = deferred.empty() && jobs.empty();
+			jobs.push_back(std::move(job));
+			issued.store(issued.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+		}
+		if (wake) {
+			defer_available.notify_one();
+		}
+	}
+
+	void StartWorker() {
+		std::call_once(worker_started, [this] {
+			LOGF("Deferred protection: page protections the GPU thread's uploads and GPU writes "
+			     "ask for are made on a worker thread (KYTY_ASYNC_MEMORY_SYNC, memsync:async)\n");
+			worker = std::thread([this] { WorkerLoop(); });
+		});
+	}
+
+	void StopWorker() {
+		{
+			std::lock_guard lock(defer_mutex);
+			stop_worker = true;
+		}
+		defer_available.notify_all();
+		if (worker.joinable()) {
+			worker.join();
+		}
+	}
+
+	void WaitDeferred(uint64_t count) {
+		if (completed.load(std::memory_order_acquire) >= count) {
+			return;
+		}
+		const auto       begin = NowNs();
+		std::unique_lock lock(defer_mutex);
+		defer_done.wait(lock, [&] { return completed.load(std::memory_order_acquire) >= count; });
+		stat_waits.fetch_add(1, std::memory_order_relaxed);
+		stat_wait_ns.fetch_add(NowNs() - begin, std::memory_order_relaxed);
+	}
+
+	// Each page of [vaddr, vaddr + size) gets the protection its counts ask for now, a host call
+	// a run of pages that ask for the same one (writable pages are left: taking a watcher away
+	// made them so at once). The region's lock is held across its calls, as the counts' other
+	// changes protect in it.
+	uint64_t ApplyCurrent(uint64_t vaddr, uint64_t size) {
+		uint64_t   calls = 0;
+		const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
+		const auto end   = std::min(Common::AlignUp(vaddr + size, PAGE_SIZE), ADDRESS_SIZE);
+		for (auto chunk_begin = begin; chunk_begin < end;) {
+			const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+			const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
+			const auto first       = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
+			const auto last        = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+			auto*      region      = FindRegion(chunk_begin);
+			chunk_begin            = chunk_end;
+			if (region == nullptr) {
+				continue;
+			}
+			SpinGuard lock(region->lock);
+			for (size_t page = first; page < last;) {
+				const auto mode = region->pages[page].Perms();
+				size_t     run  = page + 1;
+				while (run < last && region->pages[run].Perms() == mode) {
+					run++;
+				}
+				if (mode != Common::VirtualMemory::Mode::ReadWrite) {
+					calls++;
+					// As Protect: watched pages left writable would lose the CPU's writes.
+					if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(
+					        region_base + page * PAGE_SIZE, (run - page) * PAGE_SIZE, mode)) {
+						Fatal("deferred address-space protection failed at 0x%016" PRIx64
+						      ", size=0x%016" PRIx64 ", mode=0x%08" PRIx32,
+						      region_base + page * PAGE_SIZE, (run - page) * PAGE_SIZE,
+						      static_cast<uint32_t>(mode));
+					}
+				}
+				page = run;
+			}
+		}
+		return calls;
+	}
+
+	void WorkerLoop() {
+		Common::PerfStats::NameThread("GpuProtect");
+		std::vector<DeferredRange>                batch;
+		std::vector<Common::UniqueFunction<void>> batch_jobs;
+		auto                                      report_time = std::chrono::steady_clock::now();
+		uint64_t                                  jobs_run    = 0;
+		uint64_t                                  ranges      = 0;
+		uint64_t                                  merged      = 0;
+		uint64_t                                  batches     = 0;
+		uint64_t                                  calls       = 0;
+		uint64_t                                  busy_ns     = 0;
+		for (;;) {
+			uint64_t batch_end = 0;
+			{
+				std::unique_lock lock(defer_mutex);
+				defer_available.wait(
+				    lock, [&] { return stop_worker || !deferred.empty() || !jobs.empty(); });
+				if (deferred.empty() && jobs.empty()) {
+					return;
+				}
+				batch.swap(deferred);
+				batch_jobs.swap(jobs);
+				batch_end = issued.load(std::memory_order_relaxed);
+			}
+			const auto begin = NowNs();
+			ranges += batch.size();
+			std::sort(
+			    batch.begin(), batch.end(),
+			    [](const DeferredRange& a, const DeferredRange& b) { return a.vaddr < b.vaddr; });
+			// Overlapping and adjacent ranges as one.
+			size_t out = 0;
+			for (size_t i = 1; i < batch.size(); i++) {
+				auto& last = batch[out];
+				if (batch[i].vaddr <= last.vaddr + last.size) {
+					last.size = std::max(last.vaddr + last.size, batch[i].vaddr + batch[i].size) -
+					            last.vaddr;
+				} else {
+					batch[++out] = batch[i];
+				}
+			}
+			batch.resize(batch.empty() ? 0 : out + 1);
+			merged += batch.size();
+			for (const auto& range: batch) {
+				calls += ApplyCurrent(range.vaddr, range.size);
+			}
+			batch.clear();
+			// The jobs after every protection of the batch, the ones queued before each among
+			// them, in the order they were posted.
+			for (const auto& job: batch_jobs) {
+				job();
+			}
+			jobs_run += batch_jobs.size();
+			batch_jobs.clear();
+			busy_ns += NowNs() - begin;
+			batches++;
+			{
+				std::lock_guard lock(defer_mutex);
+				completed.store(batch_end, std::memory_order_release);
+			}
+			defer_done.notify_all();
+			const auto now = std::chrono::steady_clock::now();
+			if (now - report_time >= std::chrono::seconds(10)) {
+				const auto seconds = std::chrono::duration<double>(now - report_time).count();
+				LOGF("Deferred protection (%.0f s): %" PRIu64 " ranges in %" PRIu64
+				     " batches, %" PRIu64 " after merging, %" PRIu64 " host calls, %" PRIu64
+				     " jobs (upload reads), %.1f ms busy; %" PRIu64
+				     " waits for it, %.1f ms; %" PRIu64 " no-access protections made at once\n",
+				     seconds, ranges, batches, merged, calls, jobs_run,
+				     static_cast<double>(busy_ns) / 1e6,
+				     stat_waits.exchange(0, std::memory_order_relaxed),
+				     static_cast<double>(stat_wait_ns.exchange(0, std::memory_order_relaxed)) / 1e6,
+				     stat_kept.exchange(0, std::memory_order_relaxed));
+				report_time = now;
+				ranges = merged = batches = calls = busy_ns = jobs_run = 0;
+			}
+		}
+	}
+
+	struct DeferredRange {
+		uint64_t vaddr = 0;
+		uint64_t size  = 0;
+	};
+
 	std::unique_ptr<std::atomic<Region*>[]> regions;
 	std::vector<std::unique_ptr<Region>>    region_storage;
 	std::mutex                              region_mutex;
+
+	std::mutex                                defer_mutex;
+	std::condition_variable                   defer_available;
+	std::condition_variable                   defer_done;
+	std::vector<DeferredRange>                deferred;
+	std::vector<Common::UniqueFunction<void>> jobs;
+	std::atomic<uint64_t>                     issued {0};
+	std::atomic<uint64_t>                     completed {0};
+	bool                                      stop_worker = false;
+	std::once_flag                            worker_started;
+	std::thread                               worker;
+	std::atomic<uint64_t>                     stat_waits {0};
+	std::atomic<uint64_t>                     stat_wait_ns {0};
+	std::atomic<uint64_t>                     stat_kept {0};
 };
 
 static_assert(std::atomic<void*>::is_always_lock_free);
@@ -313,6 +537,36 @@ bool PageManager::IsWriteWatched(uint64_t vaddr) const noexcept {
 	const auto  index = static_cast<size_t>((vaddr % REGION_SIZE) / PAGE_SIZE);
 	const auto& page  = region->pages[index];
 	return page.write_watchers != 0 || page.access_watchers != 0;
+}
+
+PageManager::DeferScope::DeferScope(PageManager& manager, bool on): m_previous(t_defer_protection) {
+	// Off keeps an outer scope's.
+	if (on) {
+		manager.m_impl->StartWorker();
+		t_defer_protection = manager.m_impl.get();
+	}
+}
+
+PageManager::DeferScope::~DeferScope() {
+	t_defer_protection = m_previous;
+}
+
+void PageManager::PostDeferred(Common::UniqueFunction<void> job) {
+	m_impl->StartWorker();
+	m_impl->Post(std::move(job));
+}
+
+uint64_t PageManager::DeferredIssued() const noexcept {
+	return m_impl->issued.load(std::memory_order_acquire);
+}
+
+bool PageManager::DeferredPending() const noexcept {
+	return m_impl->completed.load(std::memory_order_acquire) <
+	       m_impl->issued.load(std::memory_order_acquire);
+}
+
+void PageManager::WaitDeferred(uint64_t issued) {
+	m_impl->WaitDeferred(issued);
 }
 
 void PageManager::ResyncHostProtection(uint64_t vaddr, uint64_t size) {

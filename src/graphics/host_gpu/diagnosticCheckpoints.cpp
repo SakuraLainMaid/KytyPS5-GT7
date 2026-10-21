@@ -1,8 +1,8 @@
-#include "graphics/host_gpu/vulkanCommon.h"
-
 #include "common/logging/log.h"
 #include "graphics/host_gpu/aftermath.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferAddressLog.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
 #include <array>
@@ -383,6 +383,15 @@ static void DumpDeviceFault(GraphicContext& graphics) {
 		     vk::to_string(address.addressType).c_str(),
 		     static_cast<uint64_t>(address.reportedAddress),
 		     static_cast<uint64_t>(address.addressPrecision));
+		// Round 111: which buffer held the address a read or write faulted at.
+		if (address.addressType == vk::DeviceFaultAddressTypeEXT::eReadInvalid ||
+		    address.addressType == vk::DeviceFaultAddressTypeEXT::eWriteInvalid) {
+			const auto held =
+			    BufferAddressLog::Describe(static_cast<uint64_t>(address.reportedAddress),
+			                               static_cast<uint64_t>(address.addressPrecision));
+			std::printf("%s", held.c_str());
+			LOGF("%s", held.c_str());
+		}
 	}
 	for (uint32_t i = 0; i < counts.vendorInfoCount; i++) {
 		const auto& vendor = vendors[i];

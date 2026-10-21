@@ -7,14 +7,19 @@
 #include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/bisect.h"
+#include "graphics/host_gpu/renderer/cache/bufferAddressLog.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <numeric>
 #include <vk_mem_alloc.h>
 
@@ -62,6 +67,154 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 }
 
 } // namespace
+
+namespace BufferAddressLog {
+namespace {
+
+struct Range {
+	uint64_t device_address = 0;
+	uint64_t size           = 0;
+	uint64_t guest_address  = 0;
+	uint32_t usage          = 0;
+	uint64_t created_tick   = 0;
+	uint64_t destroyed_tick = 0;
+	uint64_t destroyed_gpu  = 0;
+	int64_t  destroyed_ms   = 0;
+};
+
+constexpr size_t DESTROYED_RING = 4096;
+
+std::atomic<bool> g_recording {true};
+
+struct State {
+	std::mutex                        mutex;
+	std::map<uint64_t, Range>         live; // by device address
+	std::array<Range, DESTROYED_RING> destroyed {};
+	uint64_t                          destroyed_count = 0;
+};
+
+State& Get() {
+	static State* state = new State; // left alive: buffers may go after static destructors
+	return *state;
+}
+
+int64_t NowMs() {
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
+const char* UsageName(uint32_t usage) {
+	switch (static_cast<MemoryUsage>(usage)) {
+		case MemoryUsage::DeviceLocal: return "device-local";
+		case MemoryUsage::Upload: return "upload";
+		case MemoryUsage::Download: return "download";
+		case MemoryUsage::Stream: return "stream";
+	}
+	return "?";
+}
+
+std::string Name(const Range& range, uint64_t address) {
+	char text[256];
+	std::snprintf(text, sizeof(text),
+	              "%s buffer 0x%016" PRIx64 "+0x%" PRIx64 " (offset 0x%" PRIx64
+	              "), guest 0x%016" PRIx64 ", made at tick %" PRIu64,
+	              UsageName(range.usage), range.device_address, range.size,
+	              address - range.device_address, range.guest_address, range.created_tick);
+	return text;
+}
+
+} // namespace
+
+bool Recording() noexcept {
+	return g_recording.load(std::memory_order_acquire);
+}
+
+void Stop() noexcept {
+	g_recording.store(false, std::memory_order_release);
+}
+
+void NoteCreated(uint64_t device_address, uint64_t size, uint64_t guest_address, uint32_t usage,
+                 uint64_t tick) {
+	auto&           state = Get();
+	std::lock_guard lock(state.mutex);
+	state.live[device_address] = {device_address, size, guest_address, usage, tick, 0, 0, 0};
+}
+
+void NoteDestroyed(uint64_t device_address, uint64_t tick, uint64_t gpu_tick) {
+	auto&           state = Get();
+	std::lock_guard lock(state.mutex);
+	const auto      found = state.live.find(device_address);
+	if (found == state.live.end()) {
+		return;
+	}
+	auto range                                                = found->second;
+	range.destroyed_tick                                      = tick;
+	range.destroyed_gpu                                       = gpu_tick;
+	range.destroyed_ms                                        = NowMs();
+	state.destroyed[state.destroyed_count++ % DESTROYED_RING] = range;
+	state.live.erase(found);
+}
+
+std::string Describe(uint64_t address, uint64_t precision) {
+	auto&           state = Get();
+	std::lock_guard lock(state.mutex);
+	// The fault is somewhere in the precision-aligned block holding the address.
+	if (precision > 1 && (precision & (precision - 1)) == 0) {
+		address &= ~(precision - 1);
+	}
+	const uint64_t end = address + std::max<uint64_t>(precision, 1);
+	std::string    text;
+	auto           above = state.live.lower_bound(end);
+	auto           below = above;
+	bool           live  = false;
+	// Live buffers overlapping the reported range.
+	while (below != state.live.begin()) {
+		--below;
+		const auto& range = below->second;
+		if (range.device_address + range.size > address) {
+			text += "    in the live " + Name(range, address) + "\n";
+			live = true;
+		} else {
+			break;
+		}
+	}
+	const auto now   = NowMs();
+	const auto count = std::min<uint64_t>(state.destroyed_count, DESTROYED_RING);
+	uint32_t   shown = 0;
+	for (uint64_t i = 0; i < count && shown < 4; i++) {
+		const auto& range = state.destroyed[(state.destroyed_count - 1 - i) % DESTROYED_RING];
+		if (range.device_address < end && range.device_address + range.size > address) {
+			char when[160];
+			std::snprintf(when, sizeof(when),
+			              ", destroyed at tick %" PRIu64 " (the GPU done to %" PRIu64 "), %" PRId64
+			              " ms ago",
+			              range.destroyed_tick, range.destroyed_gpu, now - range.destroyed_ms);
+			text += "    in a destroyed " + Name(range, address) + when + "\n";
+			shown++;
+		}
+	}
+	if (!live && shown == 0) {
+		char line[160];
+		std::snprintf(line, sizeof(line),
+		              "    in no buffer with a device address (live %zu, the latest %" PRIu64
+		              " destroyed); nearest:\n",
+		              state.live.size(), count);
+		text += line;
+		if (below != state.live.end() && below->second.device_address < address) {
+			text += "      below: " + Name(below->second, address) + "\n";
+		}
+		if (above != state.live.end()) {
+			char distance[64];
+			std::snprintf(distance, sizeof(distance), " (0x%" PRIx64 " above)",
+			              above->second.device_address - address);
+			text += "      above: " + Name(above->second, address) + distance + "\n";
+		}
+	}
+	return text;
+}
+
+} // namespace BufferAddressLog
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size, bool host_cached)
@@ -157,6 +310,10 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		address_info.buffer = m_buffer;
 		m_device_address    = graphics.device.getBufferAddress(address_info);
 		EXIT_IF(m_device_address == 0);
+		if (BufferAddressLog::Recording()) {
+			BufferAddressLog::NoteCreated(m_device_address, size, cpu_address,
+			                              static_cast<uint32_t>(usage), scheduler.CurrentTick());
+		}
 	}
 
 	VkMemoryPropertyFlags properties = 0;
@@ -171,6 +328,11 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 Buffer::~Buffer() {
 	if (m_buffer != nullptr) {
+		if (m_device_address != 0 && BufferAddressLog::Recording()) {
+			BufferAddressLog::NoteDestroyed(
+			    m_device_address, m_scheduler != nullptr ? m_scheduler->CurrentTick() : 0,
+			    m_scheduler != nullptr ? m_scheduler->GetMasterSemaphore().KnownGpuTick() : 0);
+		}
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }

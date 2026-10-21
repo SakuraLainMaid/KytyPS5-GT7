@@ -65,6 +65,7 @@ struct Step {
 	bool              grids_raw       = false;
 	bool              scan_one        = false;
 	bool              hot_pages       = false;
+	bool              memsync_async   = false; // memsync:async (round 111)
 	float             equal_relaxed   = 0.0f; // depth:equal-relaxed[:<units>]; 0: off
 	bool              hiz_off         = false;
 	bool              unorm_lod       = false;
@@ -284,6 +285,10 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "hotpages") {
 		step.hot_pages = true;
+		return true;
+	}
+	if (action == "memsync:async") {
+		step.memsync_async = true;
 		return true;
 	}
 	if (action == "depth:equal-relaxed") {
@@ -970,6 +975,15 @@ bool HotPages() {
 	}();
 	const auto* step = Current();
 	return always || (step != nullptr && step->hot_pages);
+}
+
+bool AsyncMemorySync() {
+	static const bool always = [] {
+		const char* value = std::getenv("KYTY_ASYNC_MEMORY_SYNC");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	const auto* step = Current();
+	return always || (step != nullptr && step->memsync_async);
 }
 
 bool HiZOff() {

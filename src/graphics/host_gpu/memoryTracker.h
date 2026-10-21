@@ -282,6 +282,8 @@ public:
 	// Whether the calling thread is inside one of this tracker's upload callbacks, where the
 	// tracker cannot be used.
 	[[nodiscard]] bool InUploadCallback() const noexcept { return s_upload_owner == this; }
+	// The page manager its regions protect through (round 111: deferred protection).
+	[[nodiscard]] PageManager& Pages() noexcept { return m_page_manager; }
 
 private:
 	static constexpr size_t REGION_COUNT  = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;

@@ -224,6 +224,11 @@
 //   buffers:dedicated a game buffer made while the step is on gets memory of its own, as before,
 //                instead of a place in a shared block when it is 64 MB or less
 //                (KYTY_BUFFERS_DEDICATED=1 for the whole run)
+// and, round 111:
+//   memsync:async the read-only protections the GPU thread's buffer syncs ask for, and their
+//                uploads' reads of guest memory, are done on a worker thread (PageManager's
+//                "GpuProtect"), which the GPU thread waits for before it stores to guest memory
+//                (KYTY_ASYNC_MEMORY_SYNC=1 for the whole run)
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -306,6 +311,10 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] bool ScanOneThread();
 // Any thread: hotpages, or KYTY_HOT_PAGES=1.
 [[nodiscard]] bool HotPages();
+// Round 111, any thread: memsync:async, or KYTY_ASYNC_MEMORY_SYNC=1: the read-only protections
+// the GPU thread's buffer syncs ask for and their uploads' reads are done on the page manager's
+// worker (PageManager::DeferScope, PostDeferred).
+[[nodiscard]] bool AsyncMemorySync();
 // Any thread: hiz:off.
 [[nodiscard]] bool HiZOff();
 // Any thread: unorm:lod.

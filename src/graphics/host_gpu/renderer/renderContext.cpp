@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/bisect.h"
+#include "graphics/host_gpu/renderer/cache/bufferAddressLog.h"
 #include "graphics/host_gpu/renderer/faultPages.h"
 #include "graphics/host_gpu/renderer/frameGraphQueries.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -240,12 +241,21 @@ RenderContext::RenderContext(GraphicContext& graphics)
 	     m_command_scheduler.AsyncSubmit() ? "on" : "off");
 	// Reads KYTY_FAULT_BLOCK_KB (and logs it) here rather than in the first fault's handler.
 	(void)FaultBlockBytes();
+	// Round 111: submissions wait for the page protections deferred before them.
+	m_command_scheduler.SetSubmitBarrier(&m_page_manager);
 }
 
 RenderContext::~RenderContext() {
 	FaultPages::Stop();
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
+	// Round 111: the page manager's worker is idle before the staging buffer its upload reads
+	// write into goes (the buffer cache, after the page manager), and the page manager goes
+	// before the scheduler that waits for it at each submission.
+	m_page_manager.FinishDeferred();
+	m_command_scheduler.SetSubmitBarrier(nullptr);
+	// The buffers destroyed from here on may outlive the scheduler their log entries ask.
+	BufferAddressLog::Stop();
 	FrameGraphQueries::Shutdown();
 }
 
@@ -491,6 +501,8 @@ void RenderContext::PrepareGpuThreadWrite(uint64_t vaddr, uint64_t size) {
 	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
 		return;
 	}
+	// Round 111: the store below relies on the protections the GPU thread deferred.
+	m_buffer_cache.FinishDeferredMemoryWork();
 	// A hot page is writable without a fault, and nothing else would tell the tracker.
 	m_buffer_cache.DirtyHotPagesIn(vaddr, size);
 	if (Bisect::GpuWritesFault()) {

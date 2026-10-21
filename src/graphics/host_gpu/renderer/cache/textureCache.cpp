@@ -3203,6 +3203,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			// to GPU-written bytes needs.
 			const LibKernel::Memory::WriteSourceScope source(
 			    LibKernel::Memory::WriteSource::MetadataClear);
+			// Round 111: a GPU-thread store, after the deferred memory work.
+			m_buffer_cache.FinishDeferredMemoryWork();
 			if (!known_fill || !m_buffer_cache.WriteClean(address, bytes.data(), bytes.size())) {
 				m_buffer_cache.InvalidateMemory(address, slice_size);
 				LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());

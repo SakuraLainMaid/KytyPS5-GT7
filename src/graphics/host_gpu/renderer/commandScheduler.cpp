@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
@@ -663,23 +664,33 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	m_recorded_draws                  = 0;
 	m_recorded_dispatches             = 0;
 
+	// Round 111: the page protections deferred so far are made before the submission.
+	const uint64_t deferred_protections =
+	    m_submit_pages != nullptr ? m_submit_pages->DeferredIssued() : 0;
 	if (m_threaded) {
 		// The tick is allocated now, in order; the recording thread ends the command buffer and
 		// submits it once it has recorded everything queued before.
 		job.tick = m_master.NextTick();
 		job.submit.AddSignal(m_master.Handle(), job.tick);
-		Record([this, job](vk::CommandBuffer command) mutable {
+		Record([this, job, deferred_protections,
+		        pages = m_submit_pages](vk::CommandBuffer command) mutable {
 			if (m_timeline) {
 				m_timeline->WriteEnd(command, job.tick);
 			}
 			EXIT_NOT_IMPLEMENTED(command.end() != vk::Result::eSuccess);
 			job.buffer = command;
+			if (deferred_protections != 0) {
+				pages->WaitDeferred(deferred_protections);
+			}
 			QueueSubmit(job);
 			m_worker_buffer = nullptr;
 		});
 		DispatchChunk();
 		ReportRecording();
 		return job.tick;
+	}
+	if (deferred_protections != 0) {
+		m_submit_pages->WaitDeferred(deferred_protections);
 	}
 	if (!m_async_submit) {
 		QueueSubmit(job);

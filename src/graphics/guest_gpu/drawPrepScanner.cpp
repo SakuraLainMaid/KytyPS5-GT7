@@ -85,6 +85,24 @@ uint32_t WorkerCount() {
 // Jobs waiting for a worker, at most: past it the scanner waits (it is far enough ahead).
 constexpr size_t MaxJobs = 128;
 
+// Round 111: the scanner walks its own copy of each command stream, read through the guest
+// memory's backing (TryReadBacking, which a racing unmap cannot fault). The streams are guest
+// memory the game may be freeing or reusing as the scanner reads them (a submission the GPU
+// thread has already run, an indirect buffer it called): read in place, one that went away ended
+// the emulator in the scanner thread (an access violation, at a license test's retry prompt), and
+// a packet could change between its check and its handler (round 109). As the scanner's other
+// reads, only bytes no GPU work wrote (the backing holds their older value). False when the range
+// cannot be read so.
+bool CopyStream(uint64_t address, uint64_t dwords, std::vector<uint32_t>& words) {
+	words.resize(static_cast<size_t>(dwords));
+	return dwords == 0 || LibKernel::Memory::TryReadGpuCleanBacking(address, words.data(),
+	                                                                dwords * sizeof(uint32_t));
+}
+
+// Indirect buffers called inside one another, at most (a garbage or looping call would otherwise
+// copy a buffer a level without end).
+constexpr size_t MaxScanDepth = 8;
+
 void LogScanStopped(const char* what, uint32_t header, uint64_t value) {
 	static std::atomic<uint32_t> reports {0};
 	const auto                   report = reports.fetch_add(1, std::memory_order_relaxed);
@@ -337,7 +355,7 @@ bool DrawPrepScanner::ApplyRegisterIndirect(uint32_t header, const uint32_t* bod
 	return true;
 }
 
-void DrawPrepScanner::ScanDraw(uint64_t seq, uint32_t ordinal, const uint32_t* packet) {
+void DrawPrepScanner::ScanDraw(uint64_t seq, uint32_t ordinal, const uint32_t* guest_packet) {
 	// KYTY_BISECT's drawprep:off: the GPU thread walks every draw itself.
 	if (Bisect::DrawPrepOff()) {
 		return;
@@ -346,7 +364,8 @@ void DrawPrepScanner::ScanDraw(uint64_t seq, uint32_t ordinal, const uint32_t* p
 		DrawPrep::Add(DrawPrep::Counter::Tainted);
 		return;
 	}
-	const DrawPrep::Key key {.queue = m_queue, .seq = seq, .ordinal = ordinal, .packet = packet};
+	const DrawPrep::Key key {
+	    .queue = m_queue, .seq = seq, .ordinal = ordinal, .packet = guest_packet};
 	if (!DrawPrep::GpuProgress(m_queue).Before(key)) {
 		DrawPrep::Add(DrawPrep::Counter::SkipBehind);
 		return;
@@ -370,7 +389,7 @@ void DrawPrepScanner::ScanDraw(uint64_t seq, uint32_t ordinal, const uint32_t* p
 
 // A dispatch: the compute inputs RenderExecutor::DispatchDirect / DispatchIndirect build.
 void DrawPrepScanner::ScanDispatch(uint64_t seq, uint32_t ordinal, const uint32_t* packet,
-                                   uint32_t opcode) {
+                                   const uint32_t* guest_packet, uint32_t opcode) {
 	if (Bisect::DrawPrepOff()) {
 		return;
 	}
@@ -378,7 +397,8 @@ void DrawPrepScanner::ScanDispatch(uint64_t seq, uint32_t ordinal, const uint32_
 		DrawPrep::Add(DrawPrep::Counter::Tainted);
 		return;
 	}
-	const DrawPrep::Key key {.queue = m_queue, .seq = seq, .ordinal = ordinal, .packet = packet};
+	const DrawPrep::Key key {
+	    .queue = m_queue, .seq = seq, .ordinal = ordinal, .packet = guest_packet};
 	if (!DrawPrep::GpuProgress(m_queue).Before(key)) {
 		DrawPrep::Add(DrawPrep::Counter::SkipBehind);
 		return;
@@ -443,12 +463,38 @@ void DrawPrepScanner::ScanDispatch(uint64_t seq, uint32_t ordinal, const uint32_
 // scanner's command processor, draws are prepared, everything else is stepped over.
 void DrawPrepScanner::Scan(const Item& item) {
 	struct Cursor {
-		std::span<const uint32_t> commands;
+		std::span<const uint32_t> commands;         // the scanner's copy (CopyStream)
+		const uint32_t*           guest  = nullptr; // where the stream is in guest memory
 		uint32_t                  offset = 0;
 	};
-	std::vector<Cursor> stack {{item.commands}};
-	uint32_t            ordinal = 0;
-	bool                prepare = true; // false after a COND_EXEC it could not follow
+	// One copy a nesting level (a chained indirect buffer replaces its level's). Moving the outer
+	// vector keeps each copy's storage.
+	thread_local std::vector<std::vector<uint32_t>> copies;
+	const auto copy = [&](size_t level, const uint32_t* guest, uint64_t dwords, Cursor& cursor) {
+		if (copies.size() <= level) {
+			copies.resize(level + 1);
+		}
+		auto& words = copies[level];
+		if (!CopyStream(reinterpret_cast<uint64_t>(guest), dwords, words)) {
+			return false;
+		}
+		cursor = {std::span<const uint32_t>(words.data(), words.size()), guest};
+		return true;
+	};
+	const auto unreadable = [&](uint32_t header, const uint32_t* guest) {
+		// Its registers are unknown here: the queue's register copy is unreliable until a reset.
+		m_state->tainted = true;
+		DrawPrep::Add(DrawPrep::Counter::TaintIndirect);
+		LogScanStopped("a command buffer it could not copy", header,
+		               reinterpret_cast<uint64_t>(guest));
+	};
+	std::vector<Cursor> stack(1);
+	if (!copy(0, item.commands.data(), item.commands.size(), stack[0])) {
+		unreadable(0, item.commands.data());
+		return;
+	}
+	uint32_t ordinal = 0;
+	bool     prepare = true; // false after a COND_EXEC it could not follow
 	while (!stack.empty()) {
 		auto& cursor = stack.back();
 		if (cursor.offset >= cursor.commands.size()) {
@@ -456,6 +502,7 @@ void DrawPrepScanner::Scan(const Item& item) {
 			continue;
 		}
 		const auto* const packet    = cursor.commands.data() + cursor.offset;
+		const auto* const guest     = cursor.guest + cursor.offset; // the GPU thread's key
 		const auto        total     = static_cast<uint32_t>(cursor.commands.size());
 		const auto        remaining = total - cursor.offset;
 		const auto        header    = packet[0];
@@ -486,9 +533,9 @@ void DrawPrepScanner::Scan(const Item& item) {
 				// After a COND_EXEC the scanner could not follow (its packet numbers may no
 				// longer be the GPU thread's).
 			} else if (IsGraphicsDraw(opcode)) {
-				ScanDraw(item.seq, this_ordinal, packet);
+				ScanDraw(item.seq, this_ordinal, guest);
 			} else {
-				ScanDispatch(item.seq, this_ordinal, packet, opcode);
+				ScanDispatch(item.seq, this_ordinal, packet, guest, opcode);
 			}
 			cursor.offset += length;
 			continue;
@@ -499,24 +546,18 @@ void DrawPrepScanner::Scan(const Item& item) {
 			case Pm4::IT_SET_SH_REG:
 			case Pm4::IT_SET_UCONFIG_REG:
 			case Pm4::IT_SET_UCONFIG_REG_INDEX: {
-				// Round 109: the packet is checked and applied from a copy. The stream is guest
-				// memory the game may be writing while the scanner reads it (a submission the GPU
-				// thread has already run, its memory reused): a packet that changed between the
-				// check and the handler ended the emulator in the handler ("cmd_offset >=
-				// Pm4::SH_NUM", at the end of a replay).
-				thread_local std::vector<uint32_t> copy;
-				copy.assign(packet, packet + length);
-				if (length < 2u || copy[0] != header ||
-				    !RegisterPacketIsSane(opcode, command, copy.data() + 1)) {
+				// The stream is the scanner's copy (CopyStream): the packet checked is the one
+				// applied. Before round 109 one the game changed between the check and the handler
+				// ended the emulator in the handler ("cmd_offset >= Pm4::SH_NUM").
+				if (length < 2u || !RegisterPacketIsSane(opcode, command, packet + 1)) {
 					// Garbage in the stream: the registers after it are unknown.
 					m_state->tainted = true;
 					DrawPrep::Add(DrawPrep::Counter::TaintIndirect);
-					LogScanStopped("an unknown register", header, copy.size() > 1 ? copy[1] : 0u);
+					LogScanStopped("an unknown register", header, packet[1]);
 					return;
 				}
 				const auto consumed =
-				    g_cp_op_func[opcode](*m_state->cp, command, copy.data() + 1, length, length) +
-				    1u;
+				    g_cp_op_func[opcode](*m_state->cp, command, packet + 1, length, length) + 1u;
 				cursor.offset += consumed;
 				continue;
 			}
@@ -595,10 +636,26 @@ void DrawPrepScanner::Scan(const Item& item) {
 					return;
 				}
 				if (count != 0 && sub != nullptr) {
-					if ((control & (1u << 20u)) != 0) {
-						cursor = {std::span(sub, count)};
+					// A chained buffer replaces this level's stream, a called one is a level more.
+					// Neither uses `packet` or `cursor` after (the copy may move them).
+					const bool chained = (control & (1u << 20u)) != 0;
+					const auto level   = chained ? stack.size() - 1 : stack.size();
+					Cursor     next;
+					if (level >= MaxScanDepth) {
+						m_state->tainted = true;
+						DrawPrep::Add(DrawPrep::Counter::TaintIndirect);
+						LogScanStopped("indirect buffers called too deep", header,
+						               reinterpret_cast<uint64_t>(sub));
+						return;
+					}
+					if (!copy(level, sub, count, next)) {
+						unreadable(header, sub);
+						return;
+					}
+					if (chained) {
+						stack.back() = next;
 					} else {
-						stack.push_back({std::span(sub, count)});
+						stack.push_back(next);
 					}
 				}
 				continue;

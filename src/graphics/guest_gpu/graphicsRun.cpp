@@ -510,6 +510,10 @@ void CommandProcessor::WaitForRewind(bool valid) {
 	GpuPhases::Count(GpuPhases::Phase::WaitPassed, 1);
 }
 
+void CommandProcessor::BeforeGuestStore() {
+	m_renderer.GetBufferCache().FinishDeferredMemoryWork();
+}
+
 void CommandProcessor::IncrementDe() {
 	m_de_count++;
 }
@@ -523,6 +527,7 @@ void CommandProcessor::WriteConstRam(uint32_t offset, const uint32_t* src, uint3
 }
 
 void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_num) {
+	BeforeGuestStore();
 	memcpy(dst, m_const_ram + offset / 4, static_cast<size_t>(dw_num) * 4);
 }
 
@@ -642,6 +647,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		     num_bytes);
 	}
 	const auto value = Sync::ReadReferenceClock();
+	BeforeGuestStore();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
@@ -1946,6 +1952,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			constexpr uint64_t counter_mask = ready_bit - 1u;
 			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
 			const auto         value        = ready_bit | m_synthetic_occlusion_counter;
+			BeforeGuestStore(); // the game polls the ready bits
 			for (uint32_t db = 0; db < 16u; db++) {
 				results[db * 2u] = value;
 			}
@@ -2001,6 +2008,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 		     reinterpret_cast<uint64_t>(dst_gpu_addr), value);
 	}
 
+	BeforeGuestStore();
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
@@ -2026,6 +2034,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	if (eop_event_type != 0x00000004 || cache_action != 0x00000038) {
 		EXIT("unknown event type\n");
 	}
+	BeforeGuestStore();
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);

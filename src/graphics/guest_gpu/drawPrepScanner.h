@@ -77,8 +77,11 @@ private:
 	// Publishes the result of job `index` (none: nothing prepared) once those before it are.
 	void Finish(uint64_t index, std::unique_ptr<DrawPrep::PacketResult> result);
 	void Scan(const Item& item);
-	void ScanDraw(uint64_t seq, uint32_t ordinal, const uint32_t* packet);
-	void ScanDispatch(uint64_t seq, uint32_t ordinal, const uint32_t* packet, uint32_t opcode);
+	// `packet` is in the scanner's copy of the stream, `guest_packet` where the GPU thread reads it
+	// (the key both sides match).
+	void ScanDraw(uint64_t seq, uint32_t ordinal, const uint32_t* guest_packet);
+	void ScanDispatch(uint64_t seq, uint32_t ordinal, const uint32_t* packet,
+	                  const uint32_t* guest_packet, uint32_t opcode);
 	bool ApplyRegisterIndirect(uint32_t header, const uint32_t* body);
 	void ApplyContextState(uint32_t operation);
 

@@ -585,6 +585,63 @@ void TestReadWriteWatcherInteractions() {
   std::_Exit(0x7f);
 }
 
+// Round 111: inside a DeferScope, a watch leaves its protection to the worker, which makes it
+// before WaitDeferred returns; an unwatch still restores access at once.
+void TestDeferredProtection() {
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size * 4, PAGE_READWRITE, 0x0000000200410000ull);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  {
+    PageManager::DeferScope defer(manager, true);
+    manager.UpdatePageWatchers<true>(address, page_size);
+    manager.UpdatePageWatchers<true>(address + page_size, page_size);
+  }
+  const auto issued = manager.DeferredIssued();
+  Check(issued != 0, "a deferred watch issued no deferred protection");
+  manager.WaitDeferred(issued);
+  Check(!manager.DeferredPending(), "deferred protections still pending after the wait");
+  Check(Protection(memory) == PAGE_READONLY &&
+            Protection(memory + page_size) == PAGE_READONLY &&
+            IsWritable(memory + page_size * 2),
+        "the worker did not make the deferred protection");
+  {
+    PageManager::DeferScope defer(manager, true);
+    manager.UpdatePageWatchers<false>(address, page_size * 2);
+  }
+  Check(IsWritable(memory) && IsWritable(memory + page_size),
+        "an unwatch waited for the worker");
+  // A GPU write's no-access protection is made at once, in a scope too.
+  {
+    const auto access_page = address + page_size * 2;
+    const auto region_base = access_page & ~(TRACKER_REGION_SIZE - 1);
+    RegionBits mask;
+    mask.Set((access_page - region_base) / TRACKER_PAGE_SIZE);
+    PageManager::DeferScope defer(manager, true);
+    manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+    Check(Protection(memory + page_size * 2) == PAGE_NOACCESS,
+          "an access watch in a scope was deferred");
+    manager.UpdatePageWatchersForRegion<false, true>(region_base, mask);
+  }
+  // A posted job runs after the protections deferred before it.
+  {
+    PageManager::DeferScope defer(manager, true);
+    manager.UpdatePageWatchers<true>(address, page_size);
+  }
+  bool read_only_in_job = false;
+  manager.PostDeferred(
+      [&] { read_only_in_job = Protection(memory) == PAGE_READONLY; });
+  manager.FinishDeferred();
+  Check(read_only_in_job, "a posted job ran before the protection deferred before it");
+  manager.UpdatePageWatchers<false>(address, page_size);
+  // Outside a scope, a watch protects at once again.
+  manager.UpdatePageWatchers<true>(address + page_size * 3, page_size);
+  Check(Protection(memory + page_size * 3) == PAGE_READONLY,
+        "a watch outside a scope was deferred");
+  manager.UpdatePageWatchers<false>(address + page_size * 3, page_size);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void CheckDeathCase(const char *name) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   char path[MAX_PATH]{};
@@ -669,6 +726,7 @@ int main(int argc, char **argv) {
   TestRegionMaskWatcherRanges();
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
+  TestDeferredProtection();
   TestFatalPaths();
   std::puts("PageManagerTests: all cases passed");
   return 0;

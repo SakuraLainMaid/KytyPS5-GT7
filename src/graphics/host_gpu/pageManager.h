@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_PAGEMANAGER_H_
 
 #include "common/common.h"
+#include "common/uniqueFunction.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <memory>
@@ -38,6 +39,40 @@ public:
 	// (and reach the GPU) once more. Unwatched pages keep what they were given. Any thread,
 	// outside the guest address-space lock.
 	void ResyncHostProtection(uint64_t vaddr, uint64_t size);
+
+	// Round 111, deferred protection (KYTY_ASYNC_MEMORY_SYNC=1, KYTY_BISECT's memsync:async):
+	// while a DeferScope made with `on` lives on a thread, the tighter host protection that
+	// adding watchers of this manager asks for there is left to a worker thread ("GpuProtect"),
+	// which gives each page the protection its counts ask for when it gets to it, adjacent ranges
+	// in one call. Taking watchers away still changes the protection at once. Jobs posted to the
+	// worker (an upload's guest reads) run after the protections deferred before them. The
+	// callers make sure nothing relies on deferred work before WaitDeferred(DeferredIssued())
+	// returns: the GPU thread waits before its own stores to guest memory (labels, WRITE_DATA,
+	// fills and copies on the CPU), and a command buffer is submitted after it.
+	class DeferScope final {
+	public:
+		DeferScope(PageManager& manager, bool on);
+		~DeferScope();
+		KYTY_CLASS_NO_COPY(DeferScope);
+
+	private:
+		const void* m_previous;
+	};
+	// Runs `job` on the worker after the protections deferred before it (any thread).
+	void PostDeferred(Common::UniqueFunction<void> job);
+	// The deferred protections and jobs asked for so far (a count: 0 while none was).
+	[[nodiscard]] uint64_t DeferredIssued() const noexcept;
+	// Whether some are still to be done.
+	[[nodiscard]] bool DeferredPending() const noexcept;
+	// Returns once the first `issued` deferred protections and jobs are done (any thread but the
+	// worker).
+	void WaitDeferred(uint64_t issued);
+	// WaitDeferred(DeferredIssued()) when some are pending.
+	void FinishDeferred() {
+		if (DeferredPending()) {
+			WaitDeferred(DeferredIssued());
+		}
+	}
 
 private:
 	struct Impl;
