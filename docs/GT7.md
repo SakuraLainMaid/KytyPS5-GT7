@@ -60,6 +60,21 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 21, 2026, fourth build)
+
+No shaders are compiled again after this update.
+
+- **Music plays** ([issue 6](https://github.com/usa-ratt/KytyPS5-GT7/issues/6)), in the menus and
+  everywhere else. The game plays its music through a kind of audio channel the emulator dropped;
+  those channels are now mixed into the sound output (from upstream KytyPS5's work by nmzik and
+  chenxiao07), with the game's own volume settings for each.
+- **Car photos and pictures everywhere** ([issue 7](https://github.com/usa-ratt/KytyPS5-GT7/issues/7)):
+  the used car dealer's photos and the other pictures in the menus that were missing. They are
+  JPEG pictures in the game's files, and the emulator had no JPEG decoder for the game to use.
+- **No more crash in time trials** ([issue 8](https://github.com/usa-ratt/KytyPS5-GT7/issues/8)).
+  A draw pointed the emulator at vertex data outside the game's memory, and reading it ended the
+  emulator. Such a draw is now skipped.
+
 ## What's new (October 21, 2026, third build)
 
 No shaders are compiled again after this update.
@@ -180,11 +195,9 @@ Graphics and shaders:
 ## Known problems
 
 - **Ray tracing mode:** the reflections still flicker a little and look a bit jagged, most of all
-  right after switching between the cockpit and outside views, and the wheels can show white
-  patches after such a switch. The data the reflections read is right now; the cause is still
-  being looked into.
-- The used car dealer shows no car photos. The game downloads them from its servers, which it
-  cannot reach in this build; the cars themselves can be bought.
+  right after switching between the cockpit and outside views. On some PCs (an RTX 5090, but not
+  an RTX 3090) car interiors also look blotchy, with dark spots and orange pixels, and the wheels
+  and the lower body glow white. Being looked into.
 - Tokyo: at some times of day and weather (twilight and night), the picture turns green at some
   tunnel exits and under some overpasses, most often in replays, and fades back once past them.
 - In replays, small red lights can show through walls.
@@ -192,7 +205,7 @@ Graphics and shaders:
   ([issue 3](https://github.com/usa-ratt/KytyPS5-GT7/issues/3)), is not fixed yet. If it happens
   to you, please add this build's crash report and the zipped log to that issue: the report now
   names the graphics buffer involved.
-- There is no music (the sound effects play), and in-game videos can play out of sync
+- In-game videos can play out of sync with their sound
   ([issue 4](https://github.com/usa-ratt/KytyPS5-GT7/issues/4)). Being looked into.
 - Once, in a race on a new track in the chase view, most of the track disappeared after it had
   loaded (cars and some objects stayed); switching to the cockpit view and back brought it back.
