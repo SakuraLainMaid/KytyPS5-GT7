@@ -88,6 +88,10 @@ bool GraphicContext::CreateAllocator() {
 		const uint64_t warn_mb   = value != nullptr ? std::strtoull(value, nullptr, 10) : 16384u;
 		LOGF("Commit limit (start): %" PRIu64 " MB free of %" PRIu64 " MB\n", commit_free >> 20u,
 		     commit_limit >> 20u);
+		// KYTY_CUDA_EARLY_INIT (main.cpp, for NVIDIA Smooth Motion): what cuInit did.
+		if (const char* cuda = std::getenv("KYTY_CUDA_EARLY_RESULT"); cuda != nullptr) {
+			LOGF("CUDA: %s\n", cuda);
+		}
 		if ((commit_free >> 20u) < warn_mb) {
 			std::fprintf(stderr,
 			             "Warning: only %" PRIu64 " MB of the system's commit limit (%" PRIu64

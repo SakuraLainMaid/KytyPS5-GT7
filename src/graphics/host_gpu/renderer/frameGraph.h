@@ -69,6 +69,10 @@ void                      NoteBuffer(uint64_t address, uint64_t size);
 // downloaded first) up to KYTY_FG_DUMP_BYTES (default 64 KB, at most 1 MB), whatever the draw.
 void                   NoteChosenBuffer(uint64_t address, uint64_t size);
 [[nodiscard]] uint64_t ChosenBufferBytes();
+// Round 106: a buffer a chosen dispatch writes is copied again right after the dispatch
+// (SnapshotWritten, called once the dispatch is recorded), what the draws after it read.
+void NoteWrittenForSnapshot(uint64_t address, uint64_t size, std::string label);
+void SnapshotWritten(BufferCache& cache);
 // Whether the current operation's buffers are shown (dispatches and full-screen draws).
 void               SetShowBuffers(bool show);
 [[nodiscard]] bool ShowBuffers();

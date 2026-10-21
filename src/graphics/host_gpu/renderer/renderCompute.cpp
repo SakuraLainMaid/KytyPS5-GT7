@@ -1882,6 +1882,8 @@ void RenderExecutor::DispatchDirectPart(uint64_t submit_id, CommandBuffer& buffe
 	} while (recovery.Retry());
 	// The dispatch's writes are in this command buffer now.
 	m_context.GetBufferCache().WritesRecorded(program.has_address_writes, program.shader_hash);
+	// Round 106, a capture: the chosen shaders' written buffers as the dispatch left them.
+	FrameGraph::SnapshotWritten(m_context.GetBufferCache());
 	if (TracedShader(program.shader_hash)) {
 		TraceDispatch(m_context, input_info.stage, bindings,
 		              fmt::format("{}x{}x{}", thread_group_x, thread_group_y, thread_group_z));
@@ -2116,6 +2118,8 @@ void RenderExecutor::DispatchIndirectPart(uint64_t submit_id, CommandBuffer& buf
 	} while (recovery.Retry());
 	// The dispatch's writes are in this command buffer now.
 	m_context.GetBufferCache().WritesRecorded(program.has_address_writes, program.shader_hash);
+	// Round 106, a capture: the chosen shaders' written buffers as the dispatch left them.
+	FrameGraph::SnapshotWritten(m_context.GetBufferCache());
 	if (TracedShader(program.shader_hash)) {
 		TraceDispatch(m_context, input_info.stage, bindings,
 		              fmt::format("indirect (arguments at 0x{:012x})", args_addr));

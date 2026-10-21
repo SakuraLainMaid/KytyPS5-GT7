@@ -6,13 +6,16 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fmt/format.h>
+#include <limits>
 #include <map>
 #include <memory>
 #include <set>
@@ -262,9 +265,10 @@ void LogSnapshots(BufferCache& cache) {
 	for (const auto& snapshot: snapshots) {
 		LOGF("FG 0 snapshot op %u %s 0x%012" PRIx64 "+0x%zx: %s\n", snapshot.op,
 		     snapshot.label.c_str(), snapshot.address, snapshot.words.size() * 4u,
-		     snapshot.words.empty() ? "not readable"
-		     : snapshot.from_gpu    ? "the GPU's copy before the dispatch ran"
-		                            : "guest memory (no cached buffer holds it all)");
+		     snapshot.words.empty()                ? "not readable"
+		     : snapshot.from_gpu && snapshot.after ? "the GPU's copy after the dispatch ran"
+		     : snapshot.from_gpu                   ? "the GPU's copy before the dispatch ran"
+		                         : "guest memory (no cached buffer holds it all)");
 		for (size_t row = 0; row < snapshot.words.size() && lines < MaxBufferLines; row += 16) {
 			char   line[16 * 9 + 1] {};
 			size_t used = 0;
@@ -299,6 +303,131 @@ void LogBuffers(BufferCache& cache) {
 
 } // namespace
 
+// Round 106, diagnostics: KYTY_WATCH_RGBA16F=<address>:<width>x<height>:<pitch bytes>[,...]
+// (hex address, up to 4) logs, at frame ends, the mean colour and the brightest texel of a small
+// linear RGBA16F image as guest memory holds it (what the CPU reads of a measurement the GPU
+// writes): when the mean moved by more than 2 % since the last line, and at least every 120
+// frames.
+namespace {
+struct ImageWatch {
+	uint64_t              address = 0;
+	uint32_t              width   = 0;
+	uint32_t              height  = 0;
+	uint32_t              pitch   = 0;
+	std::array<double, 3> last {-1.0, -1.0, -1.0};
+	uint64_t              last_frame = 0;
+	uint64_t              lines      = 0;
+};
+std::vector<ImageWatch>& ImageWatches() {
+	static std::vector<ImageWatch> watches = [] {
+		std::vector<ImageWatch> result;
+		const char*             text = std::getenv("KYTY_WATCH_RGBA16F");
+		while (text != nullptr && *text != '\0' && result.size() < 4) {
+			ImageWatch watch;
+			char*      end = nullptr;
+			watch.address  = std::strtoull(text, &end, 16);
+			if (end == text || *end != ':') break;
+			text        = end + 1;
+			watch.width = static_cast<uint32_t>(std::strtoul(text, &end, 10));
+			if (end == text || *end != 'x') break;
+			text         = end + 1;
+			watch.height = static_cast<uint32_t>(std::strtoul(text, &end, 10));
+			if (end == text || *end != ':') break;
+			text        = end + 1;
+			watch.pitch = static_cast<uint32_t>(std::strtoul(text, &end, 10));
+			if (end == text || watch.width == 0 || watch.height == 0 || watch.width > 256 ||
+			    watch.height > 256 || watch.pitch < watch.width * 8u) {
+				break;
+			}
+			result.push_back(watch);
+			text = *end == ',' ? end + 1 : end;
+		}
+		for (const auto& watch: result) {
+			LOGF("Image watch: 0x%012" PRIx64 " %ux%u RGBA16F, pitch %u bytes\n", watch.address,
+			     watch.width, watch.height, watch.pitch);
+		}
+		return result;
+	}();
+	return watches;
+}
+
+float HalfToFloat(uint16_t half) {
+	const uint32_t sign     = (half >> 15u) & 1u;
+	const uint32_t exponent = (half >> 10u) & 0x1fu;
+	const uint32_t mantissa = half & 0x3ffu;
+	float          value    = 0.0f;
+	if (exponent == 0) {
+		value = std::ldexp(static_cast<float>(mantissa), -24);
+	} else if (exponent == 31) {
+		value = mantissa == 0 ? std::numeric_limits<float>::infinity()
+		                      : std::numeric_limits<float>::quiet_NaN();
+	} else {
+		value = std::ldexp(static_cast<float>(mantissa | 0x400u), static_cast<int>(exponent) - 25);
+	}
+	return sign != 0 ? -value : value;
+}
+
+void WatchImages() {
+	auto& watches = ImageWatches();
+	for (auto& watch: watches) {
+		std::vector<uint16_t> texels(static_cast<size_t>(watch.pitch / 2u) * watch.height);
+		if (!LibKernel::Memory::TryReadBacking(watch.address, texels.data(), texels.size() * 2u)) {
+			continue;
+		}
+		std::array<double, 3> sum {};
+		double                best = -1.0;
+		std::array<float, 3>  best_rgb {};
+		uint32_t              best_x = 0;
+		uint32_t              best_y = 0;
+		uint32_t              bad    = 0;
+		for (uint32_t y = 0; y < watch.height; y++) {
+			for (uint32_t x = 0; x < watch.width; x++) {
+				const auto* texel =
+				    texels.data() + static_cast<size_t>(y) * (watch.pitch / 2u) + x * 4u;
+				const std::array<float, 3> rgb {HalfToFloat(texel[0]), HalfToFloat(texel[1]),
+				                                HalfToFloat(texel[2])};
+				if (!std::isfinite(rgb[0]) || !std::isfinite(rgb[1]) || !std::isfinite(rgb[2])) {
+					bad++;
+					continue;
+				}
+				for (size_t c = 0; c < 3; c++) {
+					sum[c] += rgb[c];
+				}
+				const double lum = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+				if (lum > best) {
+					best     = lum;
+					best_rgb = rgb;
+					best_x   = x;
+					best_y   = y;
+				}
+			}
+		}
+		const double n = static_cast<double>(watch.width) * watch.height - bad;
+		if (n <= 0) {
+			continue;
+		}
+		const std::array<double, 3> mean {sum[0] / n, sum[1] / n, sum[2] / n};
+		bool                        moved = false;
+		for (size_t c = 0; c < 3; c++) {
+			moved |=
+			    std::abs(mean[c] - watch.last[c]) > 0.02 * std::max(std::abs(watch.last[c]), 0.01);
+		}
+		if (!moved && g_frame_ends < watch.last_frame + 120u) {
+			continue;
+		}
+		if (watch.lines++ < 200000u) {
+			LOGF("Image watch (frame %" PRIu64 "): 0x%012" PRIx64 " mean %.4f %.4f %.4f, brightest "
+			     "(%u,%u) %.3f %.3f %.3f%s\n",
+			     g_frame_ends, watch.address, mean[0], mean[1], mean[2], best_x, best_y,
+			     best_rgb[0], best_rgb[1], best_rgb[2],
+			     bad != 0 ? fmt::format(", {} texels not finite", bad).c_str() : "");
+		}
+		watch.last       = mean;
+		watch.last_frame = g_frame_ends;
+	}
+}
+} // namespace
+
 void RequestCapture() {
 	if (!g_requested.exchange(true, std::memory_order_relaxed)) {
 		LOGF("FG 0 capture requested: the next whole frame is logged\n");
@@ -311,6 +440,7 @@ uint64_t GpuThreadFrames() {
 
 void OnFrameBoundary(BufferCache& cache) {
 	g_frame_ends++;
+	WatchImages();
 	bool continued = false;
 	if (g_active.load(std::memory_order_relaxed)) {
 		g_logging.store(false, std::memory_order_relaxed);
@@ -489,6 +619,36 @@ void NoteBuffer(uint64_t address, uint64_t size) {
 	if (g_buffers.size() < MaxBuffers) {
 		g_buffers.emplace(address, bytes);
 	}
+}
+
+namespace {
+struct WrittenForSnapshot {
+	uint32_t    op      = 0;
+	uint64_t    address = 0;
+	uint64_t    size    = 0;
+	std::string label;
+};
+std::vector<WrittenForSnapshot> g_written_for_snapshot;
+} // namespace
+
+void NoteWrittenForSnapshot(uint64_t address, uint64_t size, std::string label) {
+	if (Logging() && address != 0 && size != 0) {
+		g_written_for_snapshot.push_back({g_op, address, size, std::move(label)});
+	}
+}
+
+void SnapshotWritten(BufferCache& cache) {
+	if (g_written_for_snapshot.empty()) {
+		return;
+	}
+	for (auto& written: g_written_for_snapshot) {
+		// A dispatch skipped (no pipeline yet) leaves its notes to the next one: dropped.
+		if (written.op == g_op) {
+			cache.SnapshotForDiagnostics(written.address, written.size, written.op,
+			                             std::move(written.label), true);
+		}
+	}
+	g_written_for_snapshot.clear();
 }
 
 uint64_t ChosenBufferBytes() {

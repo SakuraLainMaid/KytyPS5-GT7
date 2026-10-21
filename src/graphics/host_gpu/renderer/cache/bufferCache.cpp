@@ -2642,9 +2642,9 @@ void BufferCache::WaitForDiagnostics() {
 }
 
 void BufferCache::SnapshotForDiagnostics(uint64_t vaddr, uint64_t size, uint32_t op,
-                                         std::string label) {
+                                         std::string label, bool after_dispatch) {
 	// At most this many a capture (each a buffer of its own, up to KYTY_FG_DUMP_BYTES).
-	constexpr size_t MaxSnapshots = 256;
+	constexpr size_t MaxSnapshots = 1024;
 	size &= ~uint64_t {3};
 	if (size == 0 || m_diagnostic_snapshots.size() >= MaxSnapshots ||
 	    !GuestRange {vaddr, size}.Valid()) {
@@ -2652,12 +2652,13 @@ void BufferCache::SnapshotForDiagnostics(uint64_t vaddr, uint64_t size, uint32_t
 	}
 	// What the binding uploads first (FindBuffers runs after the stage's capture lines): the
 	// CPU's writes since the last upload, so the copy is what the dispatch reads.
-	if (!HasGpuDirtyBytes(vaddr, size)) {
+	if (!after_dispatch && !HasGpuDirtyBytes(vaddr, size)) {
 		SynchronizeBuffersInRange(vaddr, size);
 	}
 	PendingSnapshot pending;
 	pending.snapshot.address = vaddr;
 	pending.snapshot.op      = op;
+	pending.snapshot.after   = after_dispatch;
 	pending.snapshot.label   = std::move(label);
 	pending.size             = size;
 	const Buffer* source     = nullptr;

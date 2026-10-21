@@ -44,6 +44,7 @@
 #include <bit>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
@@ -2536,6 +2537,12 @@ static void LogFrameGraphStage(RenderContext& context, const ShaderStageRuntime&
 					buffers.SnapshotForDiagnostics(
 					    r.Base48(), std::min(mapped, FrameGraph::ChosenBufferBytes()),
 					    FrameGraph::CurrentOp(), fmt::format("cs buf[{}]", i));
+					// Round 106: and what it wrote, right after it.
+					if (program.info.buffers[i].written) {
+						FrameGraph::NoteWrittenForSnapshot(
+						    r.Base48(), std::min(mapped, FrameGraph::ChosenBufferBytes()),
+						    fmt::format("cs buf[{}]", i));
+					}
 				}
 			}
 		}
@@ -2861,6 +2868,101 @@ void RenderExecutor::CheckLightGridView(const ShaderStageRuntime& runtime, uint3
 	}
 }
 
+// Round 106, diagnostics: KYTY_WATCH_CONSTANTS=<shader hash>:<user sgpr>:<offset>:<floats>
+// (hex hash and offset, decimal sgpr and count; up to 4 watches, comma-separated) logs that many
+// floats from the memory the pointer in that stage's user SGPR pair points at, plus the offset:
+// a constant the CPU writes each frame (a colour correction a full-screen pass reads). A line
+// when a value moved by more than 0.0005 since the last line, and at least every 120 frames.
+namespace {
+struct ConstantsWatch {
+	uint64_t           hash   = 0;
+	uint32_t           sgpr   = 0;
+	uint32_t           offset = 0;
+	uint32_t           count  = 0;
+	std::vector<float> last;
+	uint64_t           last_frame = 0;
+	uint64_t           lines      = 0;
+};
+std::vector<ConstantsWatch>& ConstantsWatches() {
+	static std::vector<ConstantsWatch> watches = [] {
+		std::vector<ConstantsWatch> result;
+		const char*                 text = std::getenv("KYTY_WATCH_CONSTANTS");
+		while (text != nullptr && *text != '\0' && result.size() < 4) {
+			ConstantsWatch watch;
+			char*          end = nullptr;
+			watch.hash         = std::strtoull(text, &end, 16);
+			if (end == text || *end != ':') break;
+			text       = end + 1;
+			watch.sgpr = static_cast<uint32_t>(std::strtoul(text, &end, 10));
+			if (end == text || *end != ':') break;
+			text         = end + 1;
+			watch.offset = static_cast<uint32_t>(std::strtoul(text, &end, 16));
+			if (end == text || *end != ':') break;
+			text = end + 1;
+			watch.count =
+			    std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(text, &end, 10)), 1u, 32u);
+			if (end == text) break;
+			result.push_back(std::move(watch));
+			text = *end == ',' ? end + 1 : end;
+		}
+		for (const auto& watch: result) {
+			LOGF("Constants watch: shader 0x%016" PRIx64 ", s[%u:%u] + 0x%x, %u floats\n",
+			     watch.hash, watch.sgpr, watch.sgpr + 1, watch.offset, watch.count);
+		}
+		return result;
+	}();
+	return watches;
+}
+
+void WatchConstants(RenderContext& context, const ShaderStageRuntime& runtime) {
+	auto& watches = ConstantsWatches();
+	if (watches.empty() || runtime.program == nullptr || runtime.resources == nullptr) {
+		return;
+	}
+	const auto& program = *runtime.program;
+	for (auto& watch: watches) {
+		if (watch.hash != program.shader_hash) {
+			continue;
+		}
+		const auto& user = runtime.resources->user_data;
+		if (watch.sgpr < program.user_data_base ||
+		    watch.sgpr + 1 - program.user_data_base >= user.size()) {
+			continue;
+		}
+		const auto         index   = watch.sgpr - program.user_data_base;
+		const uint64_t     pointer = user[index] | (static_cast<uint64_t>(user[index + 1]) << 32u);
+		std::vector<float> values(watch.count);
+		if (pointer == 0 || !Libs::LibKernel::Memory::TryReadBacking(
+		                        pointer + watch.offset, values.data(), values.size() * 4u)) {
+			continue;
+		}
+		const uint64_t frame =
+		    context.GetGraphics().presented_frames.load(std::memory_order_relaxed);
+		if (frame == watch.last_frame && !watch.last.empty()) {
+			continue;
+		}
+		bool moved = watch.last.size() != values.size();
+		for (size_t i = 0; !moved && i < values.size(); i++) {
+			moved = !(std::abs(values[i] - watch.last[i]) <= 0.0005f);
+		}
+		if (!moved && frame < watch.last_frame + 120u) {
+			continue;
+		}
+		std::string line;
+		for (const float value: values) {
+			line += fmt::format(" {:.4f}", value);
+		}
+		if (watch.lines++ < 200000u) {
+			LOGF("Constants watch (frame %" PRIu64 "): shader 0x%016" PRIx64 " 0x%012" PRIx64
+			     "+0x%x:%s\n",
+			     frame, watch.hash, pointer, watch.offset, line.c_str());
+		}
+		watch.last       = std::move(values);
+		watch.last_frame = frame;
+	}
+}
+} // namespace
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
@@ -3089,6 +3191,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	           GpuTiming::ProbesGridsOf(program.shader_hash)) {
 		ProbeSlowShaderGrids(m_context, runtime, prepared);
 	}
+	WatchConstants(m_context, runtime);
 }
 
 // KYTY_SPARSE_WRITES=0: a written buffer over memory with holes is bound up to its first hole.

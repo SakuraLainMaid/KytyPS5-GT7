@@ -9,13 +9,27 @@
 #include "emulator.h"
 #include "kytyGitVersion.h"
 
+#include <algorithm>
 #include <charconv>
+#include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
-#include <string_view>
-#include <vector>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
+#include <string_view>
+#include <vector>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #if defined(KYTY_PGO_GENERATE)
 #include <chrono>
@@ -532,7 +546,88 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// NVIDIA Smooth Motion (the driver's frame generation on RTX 40 and 50 cards) makes its frames
+// with CUDA in the driver's present layer, which initializes CUDA only when the swapchain is
+// created. By then the guest address space owns every free range below HOST_USER_MAX
+// (memoryAddressSpace.inc), CUDA finds no room for its address range there, and cuInit fails with
+// CUDA_ERROR_OUT_OF_MEMORY (2): Smooth Motion stays off (the layer's log is in C:/NvPresent/logs).
+// So CUDA is initialized here, before any reservation, with the free ranges below a floor held
+// for the duration of cuInit and released right after it: CUDA's range lands above the floor, and
+// the guest address space later reserves everything around it. The floor sits above the whole
+// guest range (HOST_USER_MAX + 1 = 1008 GiB): whatever CUDA reserved below it would be a hole in
+// guest memory that a fixed-address mapping could hit.
+// KYTY_CUDA_EARLY_INIT=1 turns it on (off by default: it adds a DLL, CUDA threads and startup
+// time, and only drivers with Smooth Motion gain anything). KYTY_CUDA_VA_FLOOR_GB: the floor in
+// GiB, 1024 (the default) to 65536. Without nvcuda.dll (no NVIDIA driver) nothing happens.
+// From Jetsku/KytyPS5 (Luiz Henrique, PR 58, and Jetsku's opt-in, ec9943e6).
+static void InitCudaEarly() {
+	if (const char* value = std::getenv("KYTY_CUDA_EARLY_INIT");
+	    value == nullptr || std::strcmp(value, "1") != 0) {
+		return;
+	}
+	HMODULE cuda = LoadLibraryExW(L"nvcuda.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+	if (cuda == nullptr) {
+		::printf("CUDA: nvcuda.dll not found (KYTY_CUDA_EARLY_INIT): no NVIDIA driver\n");
+		_putenv_s("KYTY_CUDA_EARLY_RESULT", "nvcuda.dll not found");
+		return;
+	}
+	using CuInit    = int(__stdcall*)(unsigned int);
+	const auto init = reinterpret_cast<CuInit>(GetProcAddress(cuda, "cuInit"));
+	if (init == nullptr) {
+		return;
+	}
+	constexpr uint64_t MinFloorGb = 1024;
+	constexpr uint64_t MaxFloorGb = 65536;
+	uint64_t           floor_gb   = MinFloorGb;
+	if (const char* value = std::getenv("KYTY_CUDA_VA_FLOOR_GB");
+	    value != nullptr && std::atoi(value) > 0) {
+		floor_gb =
+		    std::clamp<uint64_t>(static_cast<uint64_t>(std::atoi(value)), MinFloorGb, MaxFloorGb);
+	}
+	const uint64_t floor = floor_gb << 30u;
+	// Hold the free ranges below the floor.
+	std::vector<void*> held;
+	uint64_t           next = 0x10000;
+	while (next < floor) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(next), &info, sizeof(info)) == 0) {
+			break;
+		}
+		const auto base = reinterpret_cast<uint64_t>(info.BaseAddress);
+		const auto end  = std::min<uint64_t>(floor, base + static_cast<uint64_t>(info.RegionSize));
+		if (end <= next) {
+			break;
+		}
+		// Reservations start on the 64 KiB allocation granularity.
+		const auto start = (std::max<uint64_t>(base, next) + 0xffffu) & ~uint64_t {0xffff};
+		if (info.State == MEM_FREE && end > start) {
+			void* ptr = VirtualAlloc(reinterpret_cast<void*>(start), end - start, MEM_RESERVE,
+			                         PAGE_NOACCESS);
+			if (ptr != nullptr) {
+				held.push_back(ptr);
+			}
+		}
+		next = end;
+	}
+	const int result = init(0);
+	for (void* ptr: held) {
+		VirtualFree(ptr, 0, MEM_RELEASE);
+	}
+	const auto text =
+	    fmt::format("initialized before the guest address space, above {} GiB "
+	                "(cuInit {}{})",
+	                floor_gb, result, result == 0 ? "" : ", NVIDIA Smooth Motion will not start");
+	::printf("CUDA: %s\n", text.c_str());
+	// For the log, which starts later (vma.cpp logs it with the commit limit).
+	_putenv_s("KYTY_CUDA_EARLY_RESULT", text.c_str());
+}
+#endif
+
 static int Main(int argc, char* argv[]) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	InitCudaEarly();
+#endif
 	VirtualMemory::Init();
 	InitializeThreads();
 #if defined(KYTY_PGO_GENERATE)

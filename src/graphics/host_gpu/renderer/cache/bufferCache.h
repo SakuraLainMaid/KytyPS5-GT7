@@ -310,10 +310,13 @@ public:
 		uint64_t              address  = 0;
 		uint32_t              op       = 0;
 		bool                  from_gpu = false;
+		// Round 106: taken after the dispatch (what it wrote), not before it.
+		bool                  after = false;
 		std::string           label;
 		std::vector<uint32_t> words;
 	};
-	void SnapshotForDiagnostics(uint64_t vaddr, uint64_t size, uint32_t op, std::string label);
+	void SnapshotForDiagnostics(uint64_t vaddr, uint64_t size, uint32_t op, std::string label,
+	                            bool after_dispatch = false);
 	[[nodiscard]] std::vector<DiagnosticSnapshot> TakeDiagnosticSnapshots();
 
 	// Diagnostics: the guest shader whose bindings are being prepared on this thread, if any.
