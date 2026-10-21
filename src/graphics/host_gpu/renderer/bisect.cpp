@@ -1086,6 +1086,20 @@ uint32_t SlowReadMicroseconds() {
 	return step != nullptr ? step->slow_read_us : 0;
 }
 
+bool ZeroNewMemory() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ZERO_NEW_MEMORY");
+		const bool  on    = value != nullptr && value[0] == '1';
+		if (on) {
+			LOGF("Zero new memory (KYTY_ZERO_NEW_MEMORY=1): new game buffers are zeroed before "
+			     "their contents are copied in, and new images nothing uploads into are cleared "
+			     "to zero\n");
+		}
+		return on;
+	}();
+	return enabled;
+}
+
 void SpinMicroseconds(uint32_t microseconds) {
 	if (microseconds == 0) {
 		return;

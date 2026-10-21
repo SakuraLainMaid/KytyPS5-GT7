@@ -375,6 +375,11 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] uint32_t SlowFaultMicroseconds();
 [[nodiscard]] uint32_t SlowReadMicroseconds();
 void                   SpinMicroseconds(uint32_t microseconds);
+// Round 115, any thread: KYTY_ZERO_NEW_MEMORY=1. The memory of a new game buffer is zeroed before
+// what it takes over from older buffers is copied in, and a new image nothing uploads into (a
+// multisampled or compressed one) is cleared to zero, instead of both starting with whatever the
+// graphics driver's memory held (which differs from card to card).
+[[nodiscard]] bool ZeroNewMemory();
 
 } // namespace Libs::Graphics::Bisect
 

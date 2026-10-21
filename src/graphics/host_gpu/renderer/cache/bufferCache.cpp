@@ -1488,6 +1488,11 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
 	                     overlap.end - overlap.begin);
+	// Round 115, KYTY_ZERO_NEW_MEMORY=1: zeros where neither an older buffer's copy nor an upload
+	// puts bytes, instead of what the driver's memory held there.
+	if (Bisect::ZeroNewMemory()) {
+		m_slot_buffers[id].Fill(0, overlap.end - overlap.begin, 0);
+	}
 	uint32_t absorbed = 0;
 	for (auto it = overlap.first; it != overlap.last;) {
 		const auto old_id = (it++)->second;

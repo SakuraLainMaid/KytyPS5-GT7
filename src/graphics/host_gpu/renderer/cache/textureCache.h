@@ -318,6 +318,9 @@ private:
 	// Caller holds m_lock: a target's creation inside a known fill (ClearsTargetsFromFills)
 	// clears it to the fill; false when nothing was done (the caller uploads as before).
 	bool ClearFromKnownFill(ImageId id);
+	// Caller holds m_lock: KYTY_ZERO_NEW_MEMORY's clear of a new image that nothing uploads into
+	// (Bisect::ZeroNewMemory).
+	void ZeroNewImage(ImageId id);
 
 	// The GPU scan's pipeline, scratch and read-back ring (made at the first scan), and the NaN
 	// check's state (null with KYTY_NAN_CHECK=0). Caller holds m_lock.

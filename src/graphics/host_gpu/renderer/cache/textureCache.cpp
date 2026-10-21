@@ -2213,12 +2213,20 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	TrackImage(id);
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
+		if (!image.initialized && Bisect::ZeroNewMemory()) {
+			ZeroNewImage(id);
+		}
+		image.initialized = true;
 		if (image.IsCpuDirty()) {
 			image.RefreshComplete();
 		}
 		return;
 	}
 	if (image.info.samples > 1) {
+		if (!image.initialized && Bisect::ZeroNewMemory()) {
+			ZeroNewImage(id);
+		}
+		image.initialized = true;
 		return;
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
@@ -4136,6 +4144,43 @@ bool TextureCache::ClearFromKnownFill(ImageId id) {
 		    id, fmt::format("cleared to the GPU fill 0x{:08x} it was created in", value), true);
 	}
 	return true;
+}
+
+void TextureCache::ZeroNewImage(ImageId id) {
+	auto& image   = m_slot_images[id];
+	auto& command = m_scheduler.Current();
+	if (image.depth_id || image.backing.image == nullptr || command.IsInvalid()) {
+		return;
+	}
+	const auto&                     info  = image.info;
+	const bool                      depth = info.IsDepth();
+	const vk::ImageSubresourceRange range {
+	    depth ? ImageViewOps::DepthAspectMask(image.backing.format)
+	          : vk::ImageAspectFlagBits::eColor,
+	    0, info.resources.levels, 0, info.IsVolume() ? 1u : image.backing.layers};
+	command.EndRendering();
+	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
+	              command.Recorder());
+	if (depth) {
+		const vk::ClearDepthStencilValue zero {0.0f, 0};
+		command.Recorder().clearDepthStencilImage(
+		    image.backing.image, vk::ImageLayout::eTransferDstOptimal, &zero, 1, &range);
+	} else {
+		const vk::ClearColorValue zero {};
+		command.Recorder().clearColorImage(image.backing.image,
+		                                   vk::ImageLayout::eTransferDstOptimal, &zero, 1, &range);
+	}
+	static std::atomic<uint64_t> cleared {0};
+	const auto                   count = ++cleared;
+	if (count <= 32 || std::has_single_bit(count)) {
+		LOGF("TextureCache: new %s 0x%012" PRIx64 "+0x%" PRIx64 " %ux%u layers %u mips %u "
+		     "samples %u fmt %d%s cleared to zero (KYTY_ZERO_NEW_MEMORY; %" PRIu64 " so far)\n",
+		     depth ? "depth image" : "image", info.data.address, info.data.size, info.extent.width,
+		     info.extent.height, info.resources.layers, info.resources.levels, info.samples,
+		     static_cast<int>(info.pixel_format),
+		     info.metadata.compression != VideoOutCompression::Uncompressed ? " (compressed)" : "",
+		     count);
+	}
 }
 
 void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
