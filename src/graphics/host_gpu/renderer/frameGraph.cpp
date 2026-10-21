@@ -308,7 +308,9 @@ void LogBuffers(BufferCache& cache) {
 // (hex address, up to 4) logs, at frame ends, the mean colour and the brightest texel of a small
 // linear RGBA16F image as guest memory holds it (what the CPU reads of a measurement the GPU
 // writes): when the mean moved by more than 2 % since the last line, and at least every 120
-// frames.
+// frames. Round 109: an item may end in :<count>:<stride> (decimal count, hex stride in bytes)
+// to watch `count` images that far apart (a ring of measurements whose place differs between
+// sessions), 64 watches in all.
 namespace {
 struct ImageWatch {
 	uint64_t              address = 0;
@@ -323,7 +325,8 @@ std::vector<ImageWatch>& ImageWatches() {
 	static std::vector<ImageWatch> watches = [] {
 		std::vector<ImageWatch> result;
 		const char*             text = std::getenv("KYTY_WATCH_RGBA16F");
-		while (text != nullptr && *text != '\0' && result.size() < 4) {
+		constexpr size_t        MaxWatches = 64;
+		while (text != nullptr && *text != '\0' && result.size() < MaxWatches) {
 			ImageWatch watch;
 			char*      end = nullptr;
 			watch.address  = std::strtoull(text, &end, 16);
@@ -340,7 +343,21 @@ std::vector<ImageWatch>& ImageWatches() {
 			    watch.height > 256 || watch.pitch < watch.width * 8u) {
 				break;
 			}
-			result.push_back(watch);
+			uint64_t count  = 1;
+			uint64_t stride = 0;
+			if (*end == ':') {
+				text  = end + 1;
+				count = std::strtoull(text, &end, 10);
+				if (end == text || *end != ':' || count == 0) break;
+				text   = end + 1;
+				stride = std::strtoull(text, &end, 16);
+				if (end == text || stride == 0) break;
+			}
+			for (uint64_t i = 0; i < count && result.size() < MaxWatches; i++) {
+				auto copy    = watch;
+				copy.address = watch.address + i * stride;
+				result.push_back(copy);
+			}
 			text = *end == ',' ? end + 1 : end;
 		}
 		for (const auto& watch: result) {

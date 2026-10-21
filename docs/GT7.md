@@ -170,8 +170,8 @@ Graphics and shaders:
 As of October 2026:
 
 - The game reaches its menus and runs races.
-- Frame rate at 3840x2160 on the PC above: about 19 to 24 fps in a race against AI cars at Tokyo,
-  high 30s to near 50 fps in a time trial.
+- Frame rate at 3840x2160 on the PC above: about 19 to 24 fps in a race against AI cars at Tokyo;
+  in a time trial at Tokyo, high 30s on average, mid 50s in some sections.
 - On a Ryzen with 3D V-Cache on one of its two dies (such as the 7950X3D), the emulator's
   graphics threads start on the V-Cache cores by themselves (about 2 fps in a race). Starting the
   emulator with an affinity of your own (Process Lasso, for example) keeps yours, and

@@ -103,6 +103,7 @@ struct Step {
 	int64_t           readback_kb = -1; // -1: the usual window
 	// Round 108.
 	bool              yield_off = false;
+	int64_t           yield_us  = -1;   // yield:<microseconds> (round 109); -1: the usual
 	std::string       cpu_set;          // empty: as at the start
 	std::string       name;             // for the screen and the picture's file name
 	std::string       text;             // name and actions, for the log
@@ -303,6 +304,15 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "yield:off") {
 		step.yield_off = true;
+		return true;
+	}
+	if (action.starts_with("yield:")) {
+		const auto text = action.substr(6);
+		if (text.empty() || text.size() > 6 ||
+		    text.find_first_not_of("0123456789") != std::string_view::npos) {
+			return false;
+		}
+		step.yield_us = static_cast<int64_t>(std::strtoul(std::string(text).c_str(), nullptr, 10));
 		return true;
 	}
 	if (action == "drawprep:notess") {
@@ -1015,6 +1025,11 @@ bool BdaProtectOld() {
 bool ComputeYieldOff() {
 	const auto* step = Current();
 	return step != nullptr && step->yield_off;
+}
+
+int64_t ComputeYieldMicroseconds() {
+	const auto* step = Current();
+	return step != nullptr ? step->yield_us : -1;
 }
 
 bool ListResetOff() {

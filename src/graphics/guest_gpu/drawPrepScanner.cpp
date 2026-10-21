@@ -499,14 +499,24 @@ void DrawPrepScanner::Scan(const Item& item) {
 			case Pm4::IT_SET_SH_REG:
 			case Pm4::IT_SET_UCONFIG_REG:
 			case Pm4::IT_SET_UCONFIG_REG_INDEX: {
-				if (length < 2u || !RegisterPacketIsSane(opcode, command, packet + 1)) {
+				// Round 109: the packet is checked and applied from a copy. The stream is guest
+				// memory the game may be writing while the scanner reads it (a submission the GPU
+				// thread has already run, its memory reused): a packet that changed between the
+				// check and the handler ended the emulator in the handler ("cmd_offset >=
+				// Pm4::SH_NUM", at the end of a replay).
+				thread_local std::vector<uint32_t> copy;
+				copy.assign(packet, packet + length);
+				if (length < 2u || copy[0] != header ||
+				    !RegisterPacketIsSane(opcode, command, copy.data() + 1)) {
 					// Garbage in the stream: the registers after it are unknown.
 					m_state->tainted = true;
 					DrawPrep::Add(DrawPrep::Counter::TaintIndirect);
-					LogScanStopped("an unknown register", header, packet[1]);
+					LogScanStopped("an unknown register", header, copy.size() > 1 ? copy[1] : 0u);
 					return;
 				}
-				const auto consumed = g_cp_op_func[opcode](*m_state->cp, command, packet + 1, remaining, total) + 1u;
+				const auto consumed =
+				    g_cp_op_func[opcode](*m_state->cp, command, copy.data() + 1, length, length) +
+				    1u;
 				cursor.offset += consumed;
 				continue;
 			}

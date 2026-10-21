@@ -70,6 +70,16 @@ struct Layout {
 void Write(std::string name, std::string description, const Layout& layout,
            std::vector<uint8_t> bytes);
 
+// Round 109: a block-compressed format (BC1 to BC7): its DXGI format, and the bytes of a 4x4
+// block in `block_bytes`; 0 for any other format. Such an image is dumped as its blocks, each
+// mip of layer 0 a DDS file of its own (no decode), with the count of all-zero blocks logged:
+// the mips from the first no longer than KYTY_DUMP_IMAGES_SIZE on its longer side to the last.
+[[nodiscard]] uint32_t BlockFormat(vk::Format format, uint32_t& block_bytes);
+// Any thread: writes `bytes` (a mip's blocks, packed) as image-dumps/<name>.dds on a thread of
+// its own, and logs it ("FG dump <name>.dds: ...").
+void WriteBlocks(std::string name, std::string description, uint32_t dxgi_format,
+                 uint32_t block_bytes, uint32_t width, uint32_t height, std::vector<uint8_t> bytes);
+
 } // namespace Libs::Graphics::ImageDump
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGE_IMAGEDUMP_H_

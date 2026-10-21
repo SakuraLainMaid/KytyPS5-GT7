@@ -302,6 +302,10 @@ private:
 	// (ImageDump::ClaimTrace) instead of a capture's.
 	bool DumpImageLocked(Image& image, bool trace, uint32_t capture, const std::string& name,
 	                     const std::string& description);
+	// Round 109: DumpImageLocked's work for a block-compressed image (ImageDump::BlockFormat).
+	bool DumpBlocksLocked(Image& image, bool trace, uint32_t capture, const std::string& name,
+	                      const std::string& description, uint32_t dxgi_format,
+	                      uint32_t block_bytes);
 	void               TraceImageCreated(ImageId id);
 	void               TraceImageEvent(ImageId id, const std::string& event, bool guest_glyphs);
 	// Caller holds m_lock: a followed image's binding as a target, once a frame.

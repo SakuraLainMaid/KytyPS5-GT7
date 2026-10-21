@@ -5472,6 +5472,12 @@ bool TextureCache::DumpImageLocked(Image& target, bool trace, uint32_t capture,
 	const auto format      = image->backing.format;
 	bool       depth       = false;
 	const auto texel_bytes = ImageDump::TexelBytes(format, depth);
+	uint32_t   block_bytes = 0;
+	const auto dxgi_format = texel_bytes == 0 ? ImageDump::BlockFormat(format, block_bytes) : 0u;
+	if (dxgi_format != 0) {
+		return DumpBlocksLocked(*image, trace, capture, name, description, dxgi_format,
+		                        block_bytes);
+	}
 	if (texel_bytes == 0) {
 		static std::atomic<uint32_t> reported {0};
 		if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
@@ -5619,6 +5625,87 @@ bool TextureCache::DumpImageLocked(Image& target, bool trace, uint32_t capture,
 		dumped = true;
 	}
 	return dumped;
+}
+
+// Round 109: a block-compressed image, each mip of its first layer (or slice) as the GPU holds
+// its blocks, within the readback budget.
+bool TextureCache::DumpBlocksLocked(Image& image, bool trace, uint32_t capture,
+                                    const std::string& name, const std::string& description,
+                                    uint32_t dxgi_format, uint32_t block_bytes) {
+	if (trace) {
+		return false;
+	}
+	const auto& backing = image.backing;
+	const auto& info    = image.info;
+	const auto  levels  = std::max(backing.mip_levels, 1u);
+	const auto  width   = std::max(backing.extent.width, 1u);
+	const auto  height  = std::max(backing.extent.height, 1u);
+	const auto  budget  = ImageDump::MaxBytes();
+	if (!ImageDump::Claim(capture, info.data.address, image.content_serial)) {
+		return false;
+	}
+	// From the first mip no longer than KYTY_DUMP_IMAGES_SIZE on its longer side, to the last.
+	uint32_t first = 0;
+	while (first + 1 < levels && std::max(width >> first, height >> first) > ImageDump::MaxSide()) {
+		first++;
+	}
+	m_scheduler.EndRendering();
+	uint64_t total = 0;
+	for (uint32_t mip = first; mip < levels; mip++) {
+		const auto     mip_width  = std::max(width >> mip, 1u);
+		const auto     mip_height = std::max(height >> mip, 1u);
+		const uint64_t bytes =
+		    uint64_t {(mip_width + 3u) / 4u} * ((mip_height + 3u) / 4u) * block_bytes;
+		if (bytes == 0 || total + bytes > budget) {
+			break;
+		}
+		auto download = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                         AllFlags, bytes);
+		if (download->Mapped().data() == nullptr) {
+			break;
+		}
+		total += bytes;
+		vk::BufferImageCopy region {};
+		region.imageSubresource = {vk::ImageAspectFlagBits::eColor, mip, 0, 1};
+		region.imageExtent      = vk::Extent3D {mip_width, mip_height, 1};
+		m_scheduler.Current().MarkTransfer(
+		    CommandBufferDebugOp::InternalWork, info.data.address, 0,
+		    static_cast<uint32_t>(InternalWork::ImageDump),
+		    static_cast<uint32_t>(std::min<uint64_t>(bytes, UINT32_MAX)), 1);
+		const std::array<vk::BufferImageCopy, 1> regions {region};
+		image.Download(regions, download->Handle(), 0, bytes);
+		vk::BufferMemoryBarrier barrier {};
+		barrier.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.buffer              = download->Handle();
+		barrier.offset              = 0;
+		barrier.size                = bytes;
+		m_scheduler.Current().Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                                                 vk::PipelineStageFlagBits::eHost, {}, 0,
+		                                                 nullptr, 1, &barrier, 0, nullptr);
+		auto file = fmt::format("{}_{:012x}_{}x{}_m{}_f{}", name, info.data.address, width, height,
+		                        mip, static_cast<int>(backing.format));
+		auto text = fmt::format(
+		    "{} 0x{:012x}+0x{:x} {}x{}x{} layers {} mips {} fmt {} guest {} tile {} [{}{}{}], mip "
+		    "{} of layer 0",
+		    description, info.data.address, info.data.size, info.extent.width, info.extent.height,
+		    info.extent.depth, info.resources.layers, info.resources.levels,
+		    static_cast<int>(info.pixel_format), static_cast<uint32_t>(info.guest_format),
+		    static_cast<uint32_t>(info.tile_mode), image.IsGpuModified() ? 'G' : '-',
+		    image.IsBufferModified() ? 'B' : '-', image.IsCpuDirty() ? 'C' : '-', mip);
+		m_scheduler.DeferPriorityOperation([download, bytes, file = std::move(file),
+		                                    text = std::move(text), dxgi_format, block_bytes,
+		                                    mip_width, mip_height]() mutable {
+			download->Invalidate(0, bytes);
+			const auto*          mapped = download->Mapped().data();
+			std::vector<uint8_t> copy(mapped, mapped + bytes);
+			ImageDump::WriteBlocks(std::move(file), std::move(text), dxgi_format, block_bytes,
+			                       mip_width, mip_height, std::move(copy));
+		});
+	}
+	return total != 0;
 }
 
 bool TextureCache::TraceScanImage(ImageId id, const std::string& prefix, uint64_t max_bytes) {

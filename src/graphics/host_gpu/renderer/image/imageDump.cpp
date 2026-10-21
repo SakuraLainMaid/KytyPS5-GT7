@@ -643,4 +643,82 @@ void Write(std::string name, std::string description, const Layout& layout,
 	}).detach();
 }
 
+uint32_t BlockFormat(vk::Format format, uint32_t& block_bytes) {
+	using F = vk::Format;
+	// DXGI_FORMAT values.
+	struct Entry {
+		F        format;
+		uint32_t dxgi;
+		uint32_t bytes;
+	};
+	static constexpr Entry Entries[] = {
+	    {F::eBc1RgbUnormBlock, 71, 8},  {F::eBc1RgbSrgbBlock, 72, 8},
+	    {F::eBc1RgbaUnormBlock, 71, 8}, {F::eBc1RgbaSrgbBlock, 72, 8},
+	    {F::eBc2UnormBlock, 74, 16},    {F::eBc2SrgbBlock, 75, 16},
+	    {F::eBc3UnormBlock, 77, 16},    {F::eBc3SrgbBlock, 78, 16},
+	    {F::eBc4UnormBlock, 80, 8},     {F::eBc4SnormBlock, 81, 8},
+	    {F::eBc5UnormBlock, 83, 16},    {F::eBc5SnormBlock, 84, 16},
+	    {F::eBc6HUfloatBlock, 95, 16},  {F::eBc6HSfloatBlock, 96, 16},
+	    {F::eBc7UnormBlock, 98, 16},    {F::eBc7SrgbBlock, 99, 16},
+	};
+	for (const auto& entry: Entries) {
+		if (entry.format == format) {
+			block_bytes = entry.bytes;
+			return entry.dxgi;
+		}
+	}
+	block_bytes = 0;
+	return 0;
+}
+
+void WriteBlocks(std::string name, std::string description, uint32_t dxgi_format,
+                 uint32_t block_bytes, uint32_t width, uint32_t height,
+                 std::vector<uint8_t> bytes) {
+	std::thread([name = std::move(name), description = std::move(description), dxgi_format,
+	             block_bytes, width, height, bytes = std::move(bytes)] {
+		// The blocks that are all zero (black or transparent in every BC format), and those
+		// equal to the first block (a mip filled with one value).
+		uint64_t       zero = 0, same = 0;
+		const uint64_t blocks = block_bytes == 0 ? 0 : bytes.size() / block_bytes;
+		for (uint64_t b = 0; b < blocks; b++) {
+			const auto* block = bytes.data() + b * block_bytes;
+			bool        all   = true;
+			for (uint32_t i = 0; i < block_bytes && all; i++) {
+				all = block[i] == 0;
+			}
+			zero += all ? 1 : 0;
+			same += std::memcmp(block, bytes.data(), block_bytes) == 0 ? 1 : 0;
+		}
+		// A DDS file: the magic, DDS_HEADER (124 bytes), DDS_HEADER_DXT10 (20 bytes), the blocks.
+		std::array<uint32_t, 1 + 31 + 5> header {};
+		header[0]  = 0x20534444u;                             // "DDS "
+		header[1]  = 124;                                     // dwSize
+		header[2]  = 0x1u | 0x2u | 0x4u | 0x1000u | 0x80000u; // caps, height, width, format, size
+		header[3]  = height;
+		header[4]  = width;
+		header[5]  = static_cast<uint32_t>(bytes.size()); // dwPitchOrLinearSize
+		header[7]  = 1;                                   // dwMipMapCount
+		header[19] = 32;                                  // ddspf.dwSize
+		header[20] = 0x4u;                                // DDPF_FOURCC
+		header[21] = 0x30315844u;                         // "DX10"
+		header[27] = 0x1000u;                             // DDSCAPS_TEXTURE
+		header[32] = dxgi_format;
+		header[33] = 3; // D3D10_RESOURCE_DIMENSION_TEXTURE2D
+		header[35] = 1; // arraySize
+		std::error_code error;
+		std::filesystem::create_directories("image-dumps", error);
+		const auto    path = std::filesystem::path("image-dumps") / (name + ".dds");
+		std::ofstream file(path, std::ios::binary | std::ios::trunc);
+		file.write(reinterpret_cast<const char*>(header.data()),
+		           static_cast<std::streamsize>(header.size() * sizeof(uint32_t)));
+		file.write(reinterpret_cast<const char*>(bytes.data()),
+		           static_cast<std::streamsize>(bytes.size()));
+		const bool written = static_cast<bool>(file);
+		LOGF("FG dump %s.dds%s: %s; %ux%u, DXGI format %u, %" PRIu64 " blocks, %" PRIu64
+		     " all zero, %" PRIu64 " equal to the first\n",
+		     name.c_str(), written ? "" : " (NOT WRITTEN)", description.c_str(), width, height,
+		     dxgi_format, blocks, zero, same);
+	}).detach();
+}
+
 } // namespace Libs::Graphics::ImageDump

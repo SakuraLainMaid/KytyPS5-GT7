@@ -326,6 +326,9 @@ void RequestPicture(const std::string& name);
 // Round 108: yield:off, graphics streams do not stop for compute submissions
 // (GuestGpu::ComputeYield).
 [[nodiscard]] bool ComputeYieldOff();
+// Round 109: yield:<microseconds>, the time a graphics stream runs before it may stop for one
+// (0 never stops); -1 when the step does not set it.
+[[nodiscard]] int64_t ComputeYieldMicroseconds();
 [[nodiscard]] bool ListResetOff();
 // Any thread: scanwave:old; drawstate:old; refresh:old; expand:old (backing:locked is applied to
 // the kernel's memory, LibKernel::Memory::SetBackingCopyLocked).

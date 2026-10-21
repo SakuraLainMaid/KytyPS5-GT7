@@ -751,7 +751,11 @@ uint32_t GuestGpu::ComputeYieldMicroseconds() {
 		}
 		return result;
 	}();
-	return Bisect::ComputeYieldOff() ? 0u : microseconds;
+	if (Bisect::ComputeYieldOff()) {
+		return 0;
+	}
+	const auto step = Bisect::ComputeYieldMicroseconds();
+	return step >= 0 ? static_cast<uint32_t>(step) : microseconds;
 }
 
 void GuestGpu::WaitForIdle() {
