@@ -28,6 +28,7 @@ namespace Libs::Graphics::FrameGraph {
 
 std::atomic<bool> g_active {false};
 std::atomic<bool> g_logging {false};
+std::atomic<int>  g_guest_queue {0};
 
 namespace {
 

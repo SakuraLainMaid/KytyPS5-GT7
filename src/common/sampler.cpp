@@ -4,6 +4,7 @@
 #include "common/hostSymbols.h"
 #include "common/logging/log.h"
 #include "common/perfStats.h"
+#include "common/x64MemoryOperand.h"
 
 #include <algorithm>
 #include <array>
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -140,7 +142,53 @@ struct Target {
 	// Samples whose leaf is in the game's code: by the leaf's 256-byte bucket, its callers (the
 	// return address of the frame-pointer chain's first frame).
 	std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint32_t>> guest_callers;
+	// Round 107: samples in the game's code by the instruction they stopped at (past the red zone
+	// trampolines' stack adjustments) and the address its memory operand names (GuestOperand).
+	std::map<std::pair<uint64_t, uint64_t>, uint32_t> guest_loads;
 };
+
+// Round 107: the memory operand of the instruction a guest sample stopped at, and that
+// instruction's address. A sample often stops on a red zone trampoline's "lea rsp, [rsp -/+ 0x80]"
+// or on the jump into or out of one; those are stepped over (with the stack pointer they change),
+// up to four of them.
+bool GuestOperand(const CONTEXT& context, uint64_t* pc_out, uint64_t* address) {
+	X64::Registers regs {context.Rax, context.Rcx, context.Rdx, context.Rbx,
+	                     context.Rsp, context.Rbp, context.Rsi, context.Rdi,
+	                     context.R8,  context.R9,  context.R10, context.R11,
+	                     context.R12, context.R13, context.R14, context.R15};
+	static constexpr std::array<uint8_t, 5> RedZoneDown {0x48, 0x8d, 0x64, 0x24, 0x80};
+	static constexpr std::array<uint8_t, 8> RedZoneUp {0x48, 0x8d, 0xa4, 0x24,
+	                                                   0x80, 0x00, 0x00, 0x00};
+	uint64_t                                pc = context.Rip;
+	for (int step = 0; step < 5; step++) {
+		std::array<uint8_t, 16> code {};
+		SIZE_T                  read = 0;
+		if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(pc), code.data(),
+		                      code.size(), &read) == FALSE ||
+		    read != code.size()) {
+			return false;
+		}
+		if (std::memcmp(code.data(), RedZoneDown.data(), RedZoneDown.size()) == 0) {
+			regs[4] -= 0x80;
+			pc += RedZoneDown.size();
+			continue;
+		}
+		if (std::memcmp(code.data(), RedZoneUp.data(), RedZoneUp.size()) == 0) {
+			regs[4] += 0x80;
+			pc += RedZoneUp.size();
+			continue;
+		}
+		if (code[0] == 0xe9) {
+			int32_t rel = 0;
+			std::memcpy(&rel, &code[1], sizeof(rel));
+			pc = pc + 5u + static_cast<uint64_t>(static_cast<int64_t>(rel));
+			continue;
+		}
+		*pc_out = pc;
+		return X64::MemoryOperandAddress(code, regs, address);
+	}
+	return false;
+}
 
 struct Image {
 	uint64_t           begin = 0;
@@ -459,6 +507,16 @@ private:
 		target.self[frames[0]]++;
 		if (guest_leaf) {
 			target.guest_callers[frames[0] & ~uint64_t {0xff}][count > 1 ? frames[1] : 0]++;
+			uint64_t insn    = 0;
+			uint64_t address = 0;
+			if (GuestOperand(capture.context, &insn, &address)) {
+				const auto key = std::make_pair(insn, address);
+				if (const auto it = target.guest_loads.find(key); it != target.guest_loads.end()) {
+					it->second++;
+				} else if (target.guest_loads.size() < 8192) {
+					target.guest_loads.emplace(key, 1u);
+				}
+			}
 			return;
 		}
 		for (size_t i = 0; i < count; i++) {
@@ -704,6 +762,40 @@ private:
 			    CodeBytes(hottest - 32, 64), top_caller - 16,
 			    top_caller != 0 ? CodeBytes(top_caller - 16, 16) : std::string("?")));
 		}
+		ReportGuestLoads(target);
+	}
+
+	// Round 107: the memory the game's code was reading or writing where its samples stopped, by
+	// share: the instruction (its first bytes) and its operand's address, with what the address
+	// holds now ("Sample <thread> loads"). A thread spinning on a flag shows it at the top.
+	void ReportGuestLoads(const Target& target) {
+		if (target.guest_loads.empty()) {
+			return;
+		}
+		std::vector<std::pair<std::pair<uint64_t, uint64_t>, uint32_t>> sorted(
+		    target.guest_loads.begin(), target.guest_loads.end());
+		std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.second > b.second; });
+		std::string text;
+		for (size_t i = 0; i < std::min<size_t>(sorted.size(), 8); i++) {
+			const auto& [key, count] = sorted[i];
+			const auto share         = Share(count, target.samples);
+			if (share < 0.5) {
+				break;
+			}
+			uint64_t   value = 0;
+			SIZE_T     read  = 0;
+			const bool readable =
+			    ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(key.second),
+			                      &value, sizeof(value), &read) != FALSE &&
+			    read == sizeof(value);
+			text +=
+			    fmt::format("{} {:.1f}% at 0x{:x} ({}) -> 0x{:x} holding {}", i == 0 ? "" : " |",
+			                share, key.first, CodeBytes(key.first, 8), key.second,
+			                readable ? fmt::format("0x{:016x}", value) : std::string("?"));
+		}
+		if (!text.empty()) {
+			Log::WriteUnmuted(fmt::format("Sample {} loads:{}\n", target.name, text));
+		}
 	}
 
 	void Report(double seconds) {
@@ -742,6 +834,7 @@ private:
 			target->paths.clear();
 			target->chains.clear();
 			target->guest_callers.clear();
+			target->guest_loads.clear();
 		}
 		// The names stay: most addresses come back in the next report.
 		if (m_names.size() > 400'000) {

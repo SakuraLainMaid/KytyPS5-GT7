@@ -597,6 +597,17 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	if (dw_num == 0) {
 		return;
 	}
+	if (FrameGraph::Logging() && dw_num <= 2) {
+		// Round 107: the small writes a game thread may wait on (a sampled thread's "loads").
+		char second[16] = "";
+		if (dw_num > 1) {
+			std::snprintf(second, sizeof(second), " 0x%08" PRIx32, src[1]);
+		}
+		FrameGraph::BeginOp();
+		FrameGraph::Log("write data 0x%012" PRIx64 " <- 0x%08" PRIx32 "%s (%u dwords) queue %d",
+		                reinterpret_cast<uint64_t>(dst), src[0], second, dw_num,
+		                m_interrupt_event_id);
+	}
 
 	// Labels often share a page with bytes the GPU wrote. A plain write then faults and downloads
 	// the page, draining the GPU; WriteClean writes both copies instead.
@@ -1467,6 +1478,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
+		FrameGraph::SetGuestQueue(m_interrupt_event_id);
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode);
 	}
@@ -1485,6 +1497,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		return;
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	FrameGraph::SetGuestQueue(m_interrupt_event_id);
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode);
 	CompleteDispatch();
 }
@@ -1531,6 +1544,16 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
 
 	auto& command = CurrentBuffer();
+
+	if (FrameGraph::Logging()) {
+		// Round 107: the labels a game thread may wait on (a sampled thread's "loads").
+		FrameGraph::BeginOp();
+		FrameGraph::Log("end of pipe 0x%012" PRIx64 " <- 0x%" PRIx64
+		                " (%u bytes, source %u, event 0x%x, interrupt %u) queue %d",
+		                reinterpret_cast<uint64_t>(dst_gpu_addr), static_cast<uint64_t>(value),
+		                static_cast<uint32_t>(sizeof(T)), event_write_source, eop_event_type,
+		                interrupt_selector, m_interrupt_event_id);
+	}
 
 	if (GraphicsRunDebugDumpEnabled()) {
 		const auto bits      = static_cast<unsigned>(sizeof(T) * 8u);

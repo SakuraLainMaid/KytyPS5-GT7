@@ -138,6 +138,9 @@ void LogResults() {
 				} else if (kind == Kind::Close) {
 					LOGF("FG %u   samples passed as close or closer (16384 units): %" PRIu64 "\n",
 					     state.ops[q], count);
+				} else if (kind == Kind::Front) {
+					LOGF("FG %u   samples passed as close or closer (no bias): %" PRIu64 "\n",
+					     state.ops[q], count);
 				} else {
 					LOGF("FG %u   samples drawn without a depth test: %" PRIu64 "\n", state.ops[q],
 					     count);

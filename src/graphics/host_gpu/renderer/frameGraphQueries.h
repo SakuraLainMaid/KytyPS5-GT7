@@ -29,8 +29,10 @@ void PrepareDraw(vk::Device device, CommandScheduler& scheduler, const CommandRe
 // again after itself in a capture, colour and stencil writes off: once testing "as close or
 // closer" with a bias of 16384 units of its depth precision and 4 of its slope towards the camera
 // (Close), once without a depth test (Anywhere). Against the draw's own count they tell a pass
-// that lands a little apart from its depth prepass from one that something nearer hides.
-enum class Kind : uint8_t { Draw, Close, Anywhere };
+// that lands a little apart from its depth prepass from one that something nearer hides. Round
+// 107: once more "as close or closer" without the bias (Front): of the samples a little apart, it
+// passes those in front of the prepass's depth, not those behind it.
+enum class Kind : uint8_t { Draw, Close, Anywhere, Front };
 // GPU thread: another query after the draw's own ended, in the same rendering; -1: none.
 [[nodiscard]] int32_t BeginExtra(const CommandRecorder& recorder, Kind kind);
 void                  EndDraw(const CommandRecorder& recorder, int32_t query);

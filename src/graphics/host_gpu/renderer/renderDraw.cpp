@@ -2214,17 +2214,20 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, const CommandRecorder
 }
 
 // Round 93, diagnostics (an F9 capture): a draw that tests depth for EQUAL (a colour pass over its
-// depth prepass) is drawn twice more after itself, its colour, stencil and depth writes off, each
+// depth prepass) is drawn again after itself, its colour, stencil and depth writes off, each time
 // in an occlusion query (FrameGraphQueries::Kind): "as close or closer" with a bias towards the
-// camera, and without a depth test. Only a draw whose stages write no memory, with its counts on
-// the CPU (no GPU arguments, no mesh shader). The next draw sets its dynamic state again. Round
-// 105: also one that writes depth too (the crowd's colour passes do; writing the depth it equals
-// changes nothing).
+// camera, and without a depth test. Only a draw whose stages write no memory (no mesh shader).
+// The next draw sets its dynamic state again. Round 105: also one that writes depth too (the
+// crowd's colour passes do; writing the depth it equals changes nothing). Round 107: also one
+// with its counts on the GPU (the crowd's draws), drawn again from the same arguments, and a
+// third probe "as close or closer" without the bias (Kind::Front). The probes replace the draw's
+// own polygon offset (none in the crowd's passes).
 static void DrawDepthEqualProbes(const HW::UserConfig& ucfg, const CommandRecorder& vk_buffer,
                                  const DrawCallInfo& draw, const DrawEmitInfo& emit,
                                  const DrawRenderState&                 state,
                                  std::span<const ShaderVertexInputInfo> vertex_stages,
-                                 const RenderState&                     rendering) {
+                                 const RenderState& rendering, vk::Buffer indirect_buffer,
+                                 vk::DeviceSize indirect_offset) {
 	const auto& depth = state.depth_info;
 	if (!depth.image_id || !depth.depth_test_enable ||
 	    depth.depth_compare_op != vk::CompareOp::eEqual) {
@@ -2269,13 +2272,15 @@ static void DrawDepthEqualProbes(const HW::UserConfig& ucfg, const CommandRecord
 	}
 	vk_buffer.setDepthWriteEnable(VK_FALSE);
 	const bool reversed_z = ReversedDepth(depth);
-	for (const auto kind: {FrameGraphQueries::Kind::Close, FrameGraphQueries::Kind::Anywhere}) {
-		const bool close = kind == FrameGraphQueries::Kind::Close;
-		vk_buffer.setDepthCompareOp(!close       ? vk::CompareOp::eAlways
+	for (const auto kind: {FrameGraphQueries::Kind::Close, FrameGraphQueries::Kind::Front,
+	                       FrameGraphQueries::Kind::Anywhere}) {
+		const bool tested = kind != FrameGraphQueries::Kind::Anywhere;
+		const bool biased = kind == FrameGraphQueries::Kind::Close;
+		vk_buffer.setDepthCompareOp(!tested      ? vk::CompareOp::eAlways
 		                            : reversed_z ? vk::CompareOp::eGreaterOrEqual
 		                                         : vk::CompareOp::eLessOrEqual);
-		vk_buffer.setDepthBiasEnable(close ? VK_TRUE : VK_FALSE);
-		if (close) {
+		vk_buffer.setDepthBiasEnable(biased ? VK_TRUE : VK_FALSE);
+		if (biased) {
 			vk_buffer.setDepthBias(reversed_z ? 16384.0f : -16384.0f, 0.0f,
 			                       reversed_z ? 4.0f : -4.0f);
 		}
@@ -2283,7 +2288,13 @@ static void DrawDepthEqualProbes(const HW::UserConfig& ucfg, const CommandRecord
 		if (query < 0) {
 			return;
 		}
-		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+		if (indirect_buffer && draw.IsIndexed()) {
+			vk_buffer.drawIndexedIndirect(indirect_buffer, indirect_offset, 1, 20u);
+		} else if (indirect_buffer) {
+			vk_buffer.drawIndirect(indirect_buffer, indirect_offset, 1, 16u);
+		} else {
+			EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+		}
 		FrameGraphQueries::EndDraw(vk_buffer, query);
 	}
 }
@@ -3025,8 +3036,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		// Which way is closer on this depth target, from the draws that test GREATER or LESS.
 		(void)ReversedDepth(state.depth_info);
 	}
-	if (samples_query >= 0 && !mesh_active && !vertex_indirect_buffer) {
-		DrawDepthEqualProbes(ucfg, vk_buffer, draw, emit, state, vertex_stages, rendering);
+	if (samples_query >= 0 && !mesh_active) {
+		DrawDepthEqualProbes(ucfg, vk_buffer, draw, emit, state, vertex_stages, rendering,
+		                     vertex_indirect_buffer, vertex_indirect_offset);
 	}
 
 	SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);

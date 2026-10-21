@@ -1487,8 +1487,9 @@ void RenderExecutor::DispatchDirectPart(uint64_t submit_id, CommandBuffer& buffe
 	                    sh_ctx.GetCs().cs_regs.data_addr);
 	if (FrameGraph::Logging()) {
 		FrameGraph::BeginOp();
-		FrameGraph::Log("dispatch groups=%ux%ux%u mode=0x%x cs at 0x%012" PRIx64, thread_group_x,
-		                thread_group_y, thread_group_z, mode, sh_ctx.GetCs().cs_regs.data_addr);
+		FrameGraph::Log("dispatch groups=%ux%ux%u mode=0x%x cs at 0x%012" PRIx64 " queue %s",
+		                thread_group_x, thread_group_y, thread_group_z, mode,
+		                sh_ctx.GetCs().cs_regs.data_addr, FrameGraph::GuestQueueName().c_str());
 	}
 
 	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
@@ -1934,8 +1935,9 @@ void RenderExecutor::DispatchIndirectPart(uint64_t submit_id, CommandBuffer& buf
 	const auto&       cs_regs = buffer.GetShaders().GetCs();
 	if (FrameGraph::Logging()) {
 		FrameGraph::BeginOp();
-		FrameGraph::Log("dispatch indirect args 0x%012" PRIx64 " mode=0x%x cs at 0x%012" PRIx64,
-		                args_addr, mode, cs_regs.cs_regs.data_addr);
+		FrameGraph::Log(
+		    "dispatch indirect args 0x%012" PRIx64 " mode=0x%x cs at 0x%012" PRIx64 " queue %s",
+		    args_addr, mode, cs_regs.cs_regs.data_addr, FrameGraph::GuestQueueName().c_str());
 		FrameGraph::SetShowBuffers(true);
 		FrameGraph::NoteBuffer(args_addr, 12);
 	}

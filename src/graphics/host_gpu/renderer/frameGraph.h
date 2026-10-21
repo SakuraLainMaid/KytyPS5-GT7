@@ -38,6 +38,21 @@ extern std::atomic<bool> g_logging;
 	return g_logging.load(std::memory_order_relaxed);
 }
 
+// Round 107: the guest queue whose packets the GPU thread runs now (0: graphics; 0x20 on: the
+// compute queues), set by the command processor before a dispatch, for its capture line.
+extern std::atomic<int> g_guest_queue;
+inline void             SetGuestQueue(int queue) {
+    g_guest_queue.store(queue, std::memory_order_relaxed);
+}
+[[nodiscard]] inline int GuestQueue() {
+	return g_guest_queue.load(std::memory_order_relaxed);
+}
+// "graphics", or "compute <n>" (counted from 0).
+[[nodiscard]] inline std::string GuestQueueName() {
+	const auto queue = GuestQueue();
+	return queue < 0x20 ? std::string("graphics") : "compute " + std::to_string(queue - 0x20);
+}
+
 // The capture's lines. BeginOp starts a numbered operation (a draw, a dispatch, ...); Log adds a
 // line to the current one.
 uint32_t               BeginOp();
