@@ -15,36 +15,13 @@ uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, ui
 	return input < info.input_num ? info.interpolator_settings[input] & PsInputOffsetMask : input;
 }
 
+// Every alias of a vertex output reads that output's own location, flat and smooth ones too: a
+// vertex shader writes each parameter once, at its index, and knows nothing of the pixel shader's
+// aliases, so a location of their own was never written (a crowd shader's flat alias of a smooth
+// UV export read garbage for its light probe index). A location read both flat and smooth is
+// read per vertex (ShaderInfoCollection), the flat alias taking vertex zero.
 uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
-                                      std::span<const uint32_t> active_inputs, uint32_t input) {
-	std::array<bool, 32> used_locations {};
-	for (const auto active_input: active_inputs) {
-		used_locations[ShaderPixelParameterMappedLocation(info, active_input)] = true;
-	}
-	std::array<uint32_t, 64> group_locations;
-	group_locations.fill(UINT32_MAX);
-	for (const auto active_input: active_inputs) {
-		const auto mapped = ShaderPixelParameterMappedLocation(info, active_input);
-		const auto group  = mapped * 2u + ShaderPixelParameterIsFlat(info, active_input);
-		auto&      location = group_locations[group];
-		if (location == UINT32_MAX) {
-			location = mapped;
-			// Smooth and custom interpolation read the same vertex output. Only
-			// differing flat/smooth rectangle outputs need separate locations.
-			if (group_locations[group ^ 1u] != UINT32_MAX) {
-				location = 0;
-				while (location < used_locations.size() && used_locations[location]) {
-					location++;
-				}
-				EXIT_NOT_IMPLEMENTED(location >= used_locations.size());
-			}
-			used_locations[location] = true;
-		}
-
-		if (active_input == input) {
-			return location;
-		}
-	}
+                                      std::span<const uint32_t> /*active_inputs*/, uint32_t input) {
 	return ShaderPixelParameterMappedLocation(info, input);
 }
 

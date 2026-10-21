@@ -11,8 +11,10 @@
 #include "libs/libs.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
+#include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -211,10 +213,12 @@ static bool AjmLogCodecSupport(uint32_t codec) {
 		static std::atomic_bool logged {false};
 		if (!logged.exchange(true, std::memory_order_relaxed)) {
 			std::printf("AJM codec=%u, name=%s\n", codec, AjmCodecName(codec));
+			LOGF("AJM codec=%u, name=%s\n", codec, AjmCodecName(codec));
 		}
 	} else {
 		std::printf("AJM codec=%u, name=%s\n", codec, AjmCodecName(codec));
 		std::printf("AJM unsupported codec=%u (%s)\n", codec, AjmCodecName(codec));
+		LOGF("AJM unsupported codec=%u (%s)\n", codec, AjmCodecName(codec));
 	}
 	return supported;
 }
@@ -430,6 +434,55 @@ static bool AjmCodecIsValid(uint32_t codec) {
 	}
 }
 
+// Round 110, for reports on missing music: a line on the first decode and every 2000th, with
+// the decodes of each codec, the bytes in and out and the decodes whose result was not clean,
+// and the first 8 of those on their own. Guarded by g_ajm_instances_mutex.
+struct AjmStats {
+	std::array<uint64_t, 32> decodes {};
+	uint64_t                 total     = 0;
+	uint64_t                 unclean   = 0;
+	uint64_t                 in_bytes  = 0;
+	uint64_t                 out_bytes = 0;
+	uint64_t                 silent    = 0;
+};
+static AjmStats g_ajm_stats;
+
+static void AjmNoteDecodeLocked(uint32_t codec, size_t input_size, size_t output_size,
+                                const AjmDecodeResult& result) {
+	auto& stats = g_ajm_stats;
+	stats.decodes[codec & 31u]++;
+	stats.total++;
+	stats.in_bytes += result.input_consumed;
+	stats.out_bytes += result.output_written;
+	if (result.output_written == 0) {
+		stats.silent++;
+	}
+	if (result.result != OK) {
+		stats.unclean++;
+		if (stats.unclean <= 8) {
+			LOGF("AJM decode result 0x%08x (internal %d): %s, %zu bytes in, %zu consumed, %zu of "
+			     "%zu bytes out\n",
+			     static_cast<uint32_t>(result.result), result.internal_result, AjmCodecName(codec),
+			     input_size, result.input_consumed, result.output_written, output_size);
+		}
+	}
+	if (stats.total == 1 || stats.total % 2000u == 0) {
+		std::string codecs;
+		for (uint32_t c = 0; c < stats.decodes.size(); c++) {
+			if (stats.decodes[c] != 0) {
+				char part[96];
+				std::snprintf(part, sizeof(part), "%s%s %" PRIu64, codecs.empty() ? "" : ", ",
+				              AjmCodecName(c), stats.decodes[c]);
+				codecs += part;
+			}
+		}
+		LOGF("AJM stats: %" PRIu64 " decodes (%s), %.1f MB in, %.1f MB out, %" PRIu64
+		     " with no output, %" PRIu64 " not clean\n",
+		     stats.total, codecs.c_str(), static_cast<double>(stats.in_bytes) / 1048576.0,
+		     static_cast<double>(stats.out_bytes) / 1048576.0, stats.silent, stats.unclean);
+	}
+}
+
 static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, size_t input_size,
                                          void* output, size_t output_size, bool multiple_frames) {
 	std::scoped_lock lock(g_ajm_instances_mutex);
@@ -440,8 +493,10 @@ static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, s
 		return result;
 	}
 
-	return state->decoder->Decode(input, input_size, output, output_size, multiple_frames,
-	                              &state->gapless);
+	auto result = state->decoder->Decode(input, input_size, output, output_size, multiple_frames,
+	                                     &state->gapless);
+	AjmNoteDecodeLocked(state->codec, input_size, output_size, result);
+	return result;
 }
 
 static AjmDecodeResult AjmDecodeSplitInstance(uint32_t instance, const AjmBuffer* input_buffers,

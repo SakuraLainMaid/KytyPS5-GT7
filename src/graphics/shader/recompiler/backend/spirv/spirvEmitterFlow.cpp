@@ -193,6 +193,13 @@ uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
 		state.builder.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
 		return value;
 	};
+	if (input->per_vertex && PixelParameterIsFlat(state, attr)) {
+		// A flat alias of an output also read smooth: the guest's FLAT_SHADE gives vertex zero's
+		// value at every pixel, bit for bit (packed integers).
+		const auto bits = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, load_per_vertex(0));
+		return bits;
+	}
 	if (input->per_vertex) {
 		const auto barycentric_kind = state.input_info.pixel->ps_no_perspective
 		                                  ? IR::StageInputKind::BaryCoordNoPerspective

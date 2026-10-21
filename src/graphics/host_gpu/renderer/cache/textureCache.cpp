@@ -642,7 +642,9 @@ struct TextureCache::GpuScan {
 
 // KYTY_NAN_CHECK (default on; 0 or off turns it off): see TextureCache::TraceFrameEnd. Candidates
 // are the images CommitGpuWrite saw (GPU thread, under the cache's lock). An image over
-// KYTY_NAN_CHECK_MB (default 64) in all its mips is not checked (said once).
+// KYTY_NAN_CHECK_MB (default 256; 64 before round 110, which left out the 128x128 light probe
+// arrays of about 127 MB that a race's smoke is lit from) in all its mips is not checked (said
+// once).
 struct TextureCache::NanCheck {
 	static constexpr uint64_t Interval = 30; // presented frames between two checks of an image
 
@@ -655,7 +657,7 @@ struct TextureCache::NanCheck {
 	};
 	std::unordered_map<ImageId, Candidate> candidates;
 	std::shared_ptr<NanCheckResults>       results   = std::make_shared<NanCheckResults>();
-	uint64_t                               max_bytes = 64ull << 20u;
+	uint64_t                               max_bytes = 256ull << 20u;
 
 	[[nodiscard]] static std::unique_ptr<NanCheck> FromEnvironment() {
 		std::string value =

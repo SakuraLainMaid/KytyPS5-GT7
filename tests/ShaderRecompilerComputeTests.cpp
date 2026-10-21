@@ -2263,12 +2263,12 @@ void CheckPixelParameterAliases() {
   pixel.interpolator_settings[1] = 0u;
   pixel.interpolator_settings[2] = 1u;
   const std::array<uint32_t, 3> active = {0, 1, 2};
-  Require(name, "reserved physical locations",
+  Require(name, "flat/smooth alias",
           ShaderPixelParameterLocation(pixel, active, 0) == 0u &&
-              ShaderPixelParameterLocation(pixel, active, 1) == 2u &&
+              ShaderPixelParameterLocation(pixel, active, 1) == 0u &&
               ShaderPixelParameterLocation(pixel, active, 2) == 1u,
-          "a synthesized opposite-mode alias must not occupy another "
-          "vertex export's physical location");
+          "flat and smooth aliases of one export must read its own "
+          "location: the vertex shader writes no other");
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -2306,9 +2306,9 @@ void CheckRectListShaders() {
   const std::array<uint32_t, 2> active_inputs = {0, 1};
   Require(name, "duplicate mapping",
           ShaderPixelParameterLocation(pixel, active_inputs, 0) == 0 &&
-              ShaderPixelParameterLocation(pixel, active_inputs, 1) == 1,
-          "duplicate pixel mappings must receive distinct effective output "
-          "locations");
+              ShaderPixelParameterLocation(pixel, active_inputs, 1) == 0,
+          "flat and smooth pixel mappings of one export must share its "
+          "location");
 
   const auto shaders = BuildRectListShaders(vertex, &pixel);
   Require(name, "SPIR-V version",
@@ -2343,18 +2343,18 @@ void CheckRectListShaders() {
           control_text.find("Geometry") == std::string::npos &&
               evaluation_text.find("Geometry") == std::string::npos,
           "rectangle-list expansion must not use geometry shaders");
-  Require(name, "flat broadcast",
+  Require(name, "mixed alias reconstruction",
           CountText(control_text, "OpVectorTimesScalar") == 6 &&
               CountText(control_text, "OpSelect %v4float") == 2,
-          "flat parameters must use guest vertex zero instead of reconstructed "
-          "values");
-  Require(name, "remapped interface",
+          "an export read both flat and smooth must be reconstructed at the "
+          "fourth corner (the pixel shader reads it per vertex)");
+  Require(name, "shared interface",
           CountText(control_text, " Location 0") == 2 &&
-              CountText(control_text, " Location 1") == 1 &&
+              control_text.find(" Location 1") == std::string::npos &&
               CountText(evaluation_text, " Location 0") == 2 &&
-              CountText(evaluation_text, " Location 1") == 2,
-          "duplicate pixel mappings must share one vertex input and keep "
-          "distinct patch outputs");
+              evaluation_text.find(" Location 1") == std::string::npos,
+          "flat and smooth pixel mappings of one export must share one "
+          "vertex input and one patch output");
 
   for (const auto flat : {0u, 0x400u}) {
     pixel.interpolator_settings[0] = flat;
@@ -2373,6 +2373,13 @@ void CheckRectListShaders() {
                 evaluation_text.find(" Location 1") == std::string::npos,
             "same-mode aliases must produce one input and one output at "
             "the shared location in each rectangle-list stage");
+    Require(name, "flat broadcast",
+            CountText(control_text, "OpVectorTimesScalar") ==
+                    (flat != 0 ? 3u : 6u) &&
+                CountText(control_text, "OpSelect %v4float") ==
+                    (flat != 0 ? 1u : 2u),
+            "flat parameters must use guest vertex zero instead of "
+            "reconstructed values");
   }
 
   const auto position_only = BuildRectListShaders(vertex, nullptr);
@@ -35308,6 +35315,39 @@ GraphicsCase GraphicsSmoothRawInputAlias() {
   return test;
 }
 
+GraphicsCase GraphicsFlatSmoothInputAlias() {
+  auto test = GraphicsSmoothRawInputAlias();
+  test.name = "GraphicsFlatSmoothInputAlias";
+  // A FLAT_SHADE alias of a smooth export (a packed integer next to UVs):
+  // both read the export's own location, the flat one vertex zero.
+  test.pixel_custom_interpolation_mask = 0;
+  test.pixel_interpolator_settings = {0u, 0x400u};
+  return test;
+}
+
+void CheckFlatSmoothAliasSpirv() {
+  constexpr const char *name = "FlatSmoothAliasSpirv";
+  const auto fragment = CompileFragmentCase(GraphicsFlatSmoothInputAlias());
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  std::string text;
+  Require(name, "disassembly", tools.Disassemble(fragment.spirv, &text),
+          "failed to disassemble the fragment shader");
+  // One input and the colour output at location 0, nothing at 1.
+  Require(name, "shared location",
+          CountText(text, " Location 0") == 2 &&
+              text.find(" Location 1") == std::string::npos,
+          "a flat alias of a smooth export must read that export's own "
+          "location (the vertex shader writes no other): " +
+              std::to_string(CountText(text, " Location 0")) + " at 0, " +
+              std::to_string(CountText(text, " Location 1")) + " at 1");
+  Require(name, "per-vertex read",
+          text.find("PerVertexKHR") != std::string::npos &&
+              text.find("BaryCoordKHR") != std::string::npos &&
+              text.find(" Flat") == std::string::npos,
+          "an export read both flat and smooth must be read per vertex");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 GraphicsCase GraphicsAncillaryLayer(bool front_face) {
   GraphicsCase test;
   test.name = front_face ? "GraphicsAncillaryAfterFrontFace" : "GraphicsAncillaryLayer";
@@ -36116,6 +36156,7 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsPackedHalfInputAlias(false),
       GraphicsPackedHalfInputAlias(true),
       GraphicsSmoothRawInputAlias(),
+      GraphicsFlatSmoothInputAlias(),
       GraphicsAncillaryLayer(false),
       GraphicsAncillaryLayer(true),
       GraphicsAncillarySampleId(),
@@ -42380,11 +42421,13 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--pixel-alias-only") == 0) {
     CheckPixelParameterAliases();
     CheckRectListShaders();
+    CheckFlatSmoothAliasSpirv();
     VulkanHarness vulkan;
     RunGraphicsCase(&vulkan, GraphicsPackedHalfCentroid());
     RunGraphicsCase(&vulkan, GraphicsPackedHalfInputAlias(false));
     RunGraphicsCase(&vulkan, GraphicsPackedHalfInputAlias(true));
     RunGraphicsCase(&vulkan, GraphicsSmoothRawInputAlias());
+    RunGraphicsCase(&vulkan, GraphicsFlatSmoothInputAlias());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--clip-control-only") == 0) {
@@ -42890,6 +42933,7 @@ int main(int argc, char **argv) {
   CheckTessellationPrograms();
   CheckPixelParameterAliases();
   CheckRectListShaders();
+  CheckFlatSmoothAliasSpirv();
   CheckIndirectBufferStore(vulkan);
   CheckRuntimeBufferRecords(vulkan);
   CheckComputeThreadDimensions(vulkan);

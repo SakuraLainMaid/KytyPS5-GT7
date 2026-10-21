@@ -227,17 +227,19 @@ void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixe
 			}
 		}
 	}
-	// Aliases of a vertex output share one SPIR-V interface variable. If any
-	// alias reads raw vertices, interpolate the other aliases from those too.
+	// Aliases of a vertex output share one SPIR-V interface variable, so they are all read the same
+	// way: per vertex if any alias reads raw vertices, or if one alias is flat and another smooth
+	// (a packed integer next to UVs), the flat one then taking vertex zero.
+	std::array<uint32_t, 32> location_modes {}; // bit 0: a smooth alias, bit 1: a flat alias
+	std::array<bool, 32>     location_per_vertex {};
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
-		for (uint32_t alias = 0; alias < pixel->input_num; alias++) {
-			if (ShaderPixelParameterMappedLocation(*pixel, input) ==
-			        ShaderPixelParameterMappedLocation(*pixel, alias) &&
-			    ShaderPixelParameterIsFlat(*pixel, input) ==
-			        ShaderPixelParameterIsFlat(*pixel, alias)) {
-				per_vertex[input] = per_vertex[input] || per_vertex[alias];
-			}
-		}
+		const auto location = ShaderPixelParameterMappedLocation(*pixel, input);
+		location_modes[location] |= ShaderPixelParameterIsFlat(*pixel, input) ? 2u : 1u;
+		location_per_vertex[location] = location_per_vertex[location] || per_vertex[input];
+	}
+	for (uint32_t input = 0; input < pixel->input_num; input++) {
+		const auto location = ShaderPixelParameterMappedLocation(*pixel, input);
+		per_vertex[input]   = location_per_vertex[location] || location_modes[location] == 3u;
 	}
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
 		AddInput(info, StageInputKind::Parameter, input, 4, fmt::format("in_param_{}", input),

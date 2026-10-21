@@ -241,7 +241,7 @@ public:
 	// GPU thread, at each guest frame end: a snapshot of each image KYTY_TRACE_IMAGES follows
 	// that changed in the frame (what changed in it, and who wrote it); and the NaN check
 	// (KYTY_NAN_CHECK, default on): the float arrays of six layers or more the GPU writes (light
-	// probe atlases, cube maps), up to KYTY_NAN_CHECK_MB (default 64) in all their mips, are
+	// probe atlases, cube maps), up to KYTY_NAN_CHECK_MB (default 256) in all their mips, are
 	// scanned on the GPU for texels that are not finite, one image a frame end, each at most every
 	// 30 frames and only once it changed; "TextureCache: NaN check ..." is logged at an image's
 	// first check and whenever the layers that hold such texels change.
