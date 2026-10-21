@@ -60,6 +60,23 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 21, 2026, second build)
+
+After updating to this build, the first session compiles every shader again (pop-in everywhere,
+once).
+
+- **The spectators in the stands all have their colour now**, in the shade too. Each spectator
+  looks up its own light probe (a small record of the light around it) by a number, and that
+  number reached the shader through a slot the emulator never filled: the spectators lit only by
+  their probe were drawn black. Other shaders that read data the same way are fixed with it.
+- **No more crash at the end of a replay** ("cmd_offset >= Pm4::SH_NUM"). A helper thread that
+  reads the game's graphics commands ahead of time read some that the game was already
+  overwriting, and stopped the emulator; it now checks a copy.
+- Smoke drawn as a solid blue or black blob (rare): the emulator cleans invalid numbers out of
+  the light probes the smoke is lit from, but the biggest probe arrays were too big for that
+  check. They are checked now.
+- More information in the log for bug reports about missing music.
+
 ## What's new (October 21, 2026)
 
 - **The lines on your car's windows in the race countdown and in replays are gone.** Those views
@@ -150,17 +167,17 @@ Graphics and shaders:
   right after switching between the cockpit and outside views, and the wheels can show white
   patches after such a switch. The data the reflections read is right now; the cause is still
   being looked into.
-- Some spectators are still drawn dark, mostly those in the shade (under a roof).
 - The used car dealer shows no car photos. The game downloads them from its servers, which it
   cannot reach in this build; the cars themselves can be bought.
-- Tokyo: at some times of day and weather the picture turns green at some tunnel exits and under
-  some overpasses, and fades back once past them.
+- Tokyo: at some times of day and weather (twilight and night), the picture turns green at some
+  tunnel exits and under some overpasses, most often in replays, and fades back once past them.
+- In replays, small red lights can show through walls.
 - A crash after several races in one session
   ([issue 3](https://github.com/usa-ratt/KytyPS5-GT7/issues/3)) is not fixed yet. If it happens
   to you, please add this build's crash report to that issue: it now says which shader failed and
   why.
-- In-game videos and music can play out of sync, or not at all
-  ([issue 4](https://github.com/usa-ratt/KytyPS5-GT7/issues/4)). Not looked into yet.
+- There is no music (the sound effects play), and in-game videos can play out of sync
+  ([issue 4](https://github.com/usa-ratt/KytyPS5-GT7/issues/4)). Being looked into.
 - Once, in a race on a new track in the chase view, most of the track disappeared after it had
   loaded (cars and some objects stayed); switching to the cockpit view and back brought it back.
 - If a loading screen still never ends, please open an issue with the log.
