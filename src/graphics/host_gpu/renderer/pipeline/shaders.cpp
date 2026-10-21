@@ -891,7 +891,8 @@ bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;
-	if (DisableOptimizationFor(input_info.stage.program->shader_hash)) {
+	if (pipeline.disable_optimization ||
+	    DisableOptimizationFor(input_info.stage.program->shader_hash)) {
 		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
 		LOGF("PipelineTrace: compute shader 0x%016" PRIx64 " built without optimization\n",
 		     input_info.stage.program->shader_hash);

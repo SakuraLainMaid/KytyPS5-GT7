@@ -37,6 +37,11 @@ bool SetProcessCpuSet(const char* which, std::string* description);
 // SetProcessCpuSet's "gpuvcache" and "gpufrequency" place it apart from the other threads.
 void RegisterGpuSideThread(const char* name);
 
+// Round 117: the calling thread runs below normal priority, so that the game's threads go first
+// (background work such as the driver's compiles of big shaders). Windows:
+// THREAD_PRIORITY_BELOW_NORMAL; Linux: a nice value of 5; a no-op elsewhere.
+void LowerThreadPriority();
+
 } // namespace Common
 
 #endif // EMULATOR_SRC_COMMON_CPUAFFINITY_H_

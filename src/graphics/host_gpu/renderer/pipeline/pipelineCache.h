@@ -257,6 +257,9 @@ public:
 		// Round 105: the driver could not build this compute pipeline (`pipeline` is null); its
 		// dispatches are skipped (TryGetComputePipeline).
 		bool build_failed = false;
+		// Round 117: built with VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT (KYTY_PARTITION_QUICK
+		// for the partitions of the ray tracing material passes), looked up so as well.
+		bool disable_optimization = false;
 	};
 
 	struct GraphicsPrograms {
@@ -353,9 +356,25 @@ public:
 
 private:
 	struct BackgroundCompute;
+	struct WaitingPartition;
 	// Waits up to `budget` for the compute pipelines still compiling in the background (Save:
 	// they compile into the driver cache); returns how many still compile.
 	size_t FinishBackgroundCompute(std::chrono::milliseconds budget);
+	// Round 117: starts the background compile of a program no driver cache held (its layouts
+	// made by the lookup), for TryGetComputePipeline and StartWaitingPartitions.
+	void StartBackgroundCompute(uint64_t id, std::unique_ptr<Pipeline> cached,
+	                            const ShaderComputeInputInfo&                   input_info,
+	                            const ShaderRecompiler::IR::CompiledShaderInfo& program,
+	                            vk::ShaderModule module, uint32_t words, bool partition,
+	                            std::span<const uint32_t> expansion, uint64_t skipped, bool ahead);
+	// Round 117: partitions waiting for a compile slot take the slots that are free, the ones
+	// their dispatches asked for most first, without waiting for their next dispatch: rt116a
+	// ended with 63 of 87 waiting and 6 compiling.
+	void StartWaitingPartitions();
+	// Round 117: while compute pipelines compile in the background or wait to, a line every 10 s
+	// on the console and in the log (how many compile, wait and are done, and the memory left),
+	// and one when they are all done.
+	void ReportBackgroundProgress();
 	// Round 98: takes in the background compiles that are done (their pipelines become usable, and
 	// an expansion the newest ready one of its shader), and the one still compiling for a shader.
 	void                     ReapBackgroundCompute();
@@ -441,6 +460,19 @@ private:
 		std::vector<uint32_t> code;
 	};
 	std::unordered_map<uint64_t, WaitingExpansion> m_compute_waiting_expansions;
+	// Round 117: what a waiting partition's compile needs (StartWaitingPartitions), by program id.
+	std::unordered_map<uint64_t, std::unique_ptr<WaitingPartition>> m_partition_waiting;
+	uint64_t                                                        m_partition_wait_serial = 0;
+	// Round 117: ReportBackgroundProgress's counts and times.
+	uint64_t                              m_background_started  = 0;
+	uint64_t                              m_background_finished = 0;
+	uint64_t                              m_backlog_started_at  = 0;
+	uint64_t                              m_backlog_finished_at = 0;
+	bool                                  m_backlog             = false;
+	bool                                  m_backlog_reported    = false;
+	std::chrono::steady_clock::time_point m_backlog_begin {};
+	std::chrono::steady_clock::time_point m_backlog_last_report {};
+	bool                                  m_saved = false;
 	// Round 99: the shaders whose call is partitioned (by hash), their partitions' programs (by
 	// id: their pipelines compile alongside each other), and when the next new partition's SPIR-V
 	// may be made (GetComputeProgram).

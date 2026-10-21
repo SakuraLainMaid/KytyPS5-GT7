@@ -346,6 +346,17 @@ bool QueryCommit(uint64_t& limit, uint64_t& available) {
 	return true;
 }
 
+bool QueryPhysical(uint64_t& total, uint64_t& available) {
+	MEMORYSTATUSEX status {};
+	status.dwLength = sizeof(status);
+	if (GlobalMemoryStatusEx(&status) == 0) {
+		return false;
+	}
+	total     = status.ullTotalPhys;
+	available = status.ullAvailPhys;
+	return true;
+}
+
 } // namespace Common::VirtualMemory
 
 #endif

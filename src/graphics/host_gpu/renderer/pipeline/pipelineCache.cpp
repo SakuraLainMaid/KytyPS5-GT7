@@ -8,6 +8,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/gpuPhases.h"
@@ -657,17 +658,41 @@ static uint32_t ComputeBackgroundWords() {
 }
 
 // Round 98: how many compute pipelines compile in the background at once
-// (KYTY_COMPUTE_BACKGROUND_THREADS, 1 to 16, default 3), one per shader. Without a limit, a run in
-// the ray tracing mode started 71 compiles of material passes of up to 14 million SPIR-V words,
-// each new expansion of a shader while the older ones still compiled: up to 27 compiled at once,
-// ordinary pipelines took up to 36 s meanwhile, memory ran out and the driver ended the emulator.
+// (KYTY_COMPUTE_BACKGROUND_THREADS, 1 to 16), one per shader. Without a limit, a run in the ray
+// tracing mode started 71 compiles of material passes of up to 14 million SPIR-V words, each new
+// expansion of a shader while the older ones still compiled: up to 27 compiled at once, ordinary
+// pipelines took up to 36 s meanwhile, memory ran out and the driver ended the emulator.
+// Round 117: the default was 3 (six partitions of 0.4 to 0.6 million words, 20 to 35 s each on a
+// Ryzen 9 7950X3D); the ray tracing mode's garage needed about 90 of them after each change of
+// the translator, minutes of blotched cars. Now a quarter of the logical processors, from 3 to 8,
+// and at most 5 with less than 48 GB of memory, 3 with less than 24.
 static uint32_t ComputeBackgroundThreads() {
 	static const uint32_t value = [] {
 		const char* text = std::getenv("KYTY_COMPUTE_BACKGROUND_THREADS");
-		if (text == nullptr || *text == '\0') {
-			return 3u;
+		if (text != nullptr && *text != '\0') {
+			const auto slots =
+			    static_cast<uint32_t>(std::clamp(std::strtoul(text, nullptr, 10), 1ul, 16ul));
+			LOGF("Compute pipelines: up to %u compile in the background at once (a partition takes "
+			     "half of one; KYTY_COMPUTE_BACKGROUND_THREADS)\n",
+			     slots);
+			return slots;
 		}
-		return static_cast<uint32_t>(std::clamp(std::strtoul(text, nullptr, 10), 1ul, 16ul));
+		const uint32_t processors = std::max(std::thread::hardware_concurrency(), 1u);
+		uint32_t       slots      = std::clamp(processors / 4u, 3u, 8u);
+		uint64_t       total      = 0;
+		uint64_t       available  = 0;
+		const bool     memory     = Common::VirtualMemory::QueryPhysical(total, available);
+		const uint64_t gb         = total >> 30u;
+		if (memory && gb < 47u) {
+			slots = std::min(slots, gb < 23u ? 3u : 5u);
+		}
+		LOGF("Compute pipelines: up to %u compile in the background at once (a partition takes "
+		     "half of one), from %u logical processors and %s of memory "
+		     "(KYTY_COMPUTE_BACKGROUND_THREADS sets it)\n",
+		     slots, processors,
+		     memory ? fmt::format("{} GB", (total + (uint64_t {1} << 29u)) >> 30u).c_str()
+		            : "an unknown amount");
+		return slots;
 	}();
 	return value;
 }
@@ -4139,6 +4164,7 @@ void PipelineCache::InitializeDriverCache() {
 }
 
 void PipelineCache::Save() {
+	m_saved = true;
 	m_program_cache->FlushDisk();
 	// No worker may use the driver caches once they are destroyed below; later pipelines are
 	// compiled on the GPU thread (FinishPending).
@@ -4797,9 +4823,36 @@ struct PipelineCache::BackgroundCompute {
 	uint64_t              serial = 0;
 	// Round 99: a partition's pipeline (GetComputeProgram), which takes half a compile slot.
 	bool                  partition = false;
+	// Round 117: started by StartWaitingPartitions, not by a dispatch of its own.
+	bool                  ahead = false;
 	std::atomic<bool>     done {false};
 	std::thread           thread;
 };
+
+// Round 117: a partition waiting for a compile slot, with what its compile needs, so that a free
+// slot starts it without waiting for its next dispatch (StartWaitingPartitions). Its layouts are in
+// m_compute_waiting.
+struct PipelineCache::WaitingPartition {
+	ShaderRecompiler::IR::CompiledShaderInfo program;
+	ShaderComputeInputInfo                   input_info {};
+	vk::ShaderModule                         module = nullptr;
+	uint32_t                                 words  = 0;
+	// The dispatches that asked for it meanwhile (skipped), and the order it first waited in.
+	uint64_t asks   = 0;
+	uint64_t serial = 0;
+};
+
+// Round 117: KYTY_PARTITION_QUICK=1: the partitions of the ray tracing material passes are built
+// with VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT (a test of how much faster the driver compiles
+// them so; their dispatches may run slower). Looked up so as well: a run without it compiles them
+// again.
+static bool PartitionQuick() {
+	static const bool value = [] {
+		const char* text = std::getenv("KYTY_PARTITION_QUICK");
+		return text != nullptr && *text != '\0' && *text != '0';
+	}();
+	return value;
+}
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
@@ -5443,11 +5496,14 @@ void PipelineCache::ReapBackgroundCompute() {
 			     job.hash, job.words, job.partition ? ", a partition," : "", seconds, job.skipped);
 			m_compute_pipelines.emplace(it->first, std::move(job.pipeline));
 			it = m_compute_background.erase(it);
+			m_background_finished++;
 			continue;
 		}
 		LOGF("Compute pipeline CS=0x%016" PRIx64 " (%u SPIR-V words)%s compiled in the background "
-		     "in %.1f s; %" PRIu64 " of its dispatches were skipped meanwhile\n",
-		     job.hash, job.words, job.partition ? ", a partition," : "", seconds, job.skipped);
+		     "in %.1f s; %" PRIu64 " of its dispatches were skipped meanwhile%s%s\n",
+		     job.hash, job.words, job.partition ? ", a partition," : "", seconds, job.skipped,
+		     job.ahead ? " (started while it waited)" : "",
+		     job.pipeline->disable_optimization ? " (without optimization)" : "");
 		ReportPipelineBuilt(Profiler::Counter::ComputePipelinesBuilt, "Compute", job.hash, 0,
 		                    job.begin);
 		if (job.hash != 0 && !job.expansion.empty() && !job.partition) {
@@ -5462,7 +5518,10 @@ void PipelineCache::ReapBackgroundCompute() {
 		}
 		m_compute_pipelines.emplace(it->first, std::move(job.pipeline));
 		it = m_compute_background.erase(it);
+		m_background_finished++;
 	}
+	StartWaitingPartitions();
+	ReportBackgroundProgress();
 }
 
 const PipelineCache::BackgroundCompute*
@@ -5521,8 +5580,14 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 	const auto hash =
 	    input_info.stage.program != nullptr ? input_info.stage.program->shader_hash : 0;
+	// Round 99: the partitions of a shader (GetComputeProgram) compile alongside each other, and
+	// each takes half a slot: a partition inlines one material function, a fraction of the
+	// whole expansions the slots were sized for (rt97 ran out of memory with 27 of those).
+	const bool                partition = m_partition_programs.contains(compute_program.id);
 	std::unique_ptr<Pipeline> cached;
 	std::vector<uint32_t>     waiting_code;
+	uint64_t                  asks        = 0;
+	uint64_t                  wait_serial = 0;
 	if (auto waiting = m_compute_waiting.find(compute_program.id);
 	    waiting != m_compute_waiting.end()) {
 		// Looked up before, in no cache: its layouts are made.
@@ -5533,8 +5598,15 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 			waiting_code = std::move(code->second.code);
 			m_compute_waiting_expansions.erase(code);
 		}
+		if (auto entry = m_partition_waiting.find(compute_program.id);
+		    entry != m_partition_waiting.end()) {
+			asks        = entry->second->asks;
+			wait_serial = entry->second->serial;
+			m_partition_waiting.erase(entry);
+		}
 	} else {
-		cached = std::make_unique<Pipeline>();
+		cached                       = std::make_unique<Pipeline>();
+		cached->disable_optimization = partition && PartitionQuick();
 		const GpuPhases::Scope phase(GpuPhases::Phase::PipelineCompile);
 		if (CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
 		                           m_driver_cache, m_driver_older, ComputeBuild::LookUp)) {
@@ -5547,12 +5619,7 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 	// Round 98: one compile per shader at a time, and ComputeBackgroundThreads in all; the
 	// program waits meanwhile (GetComputeProgram runs the shader's ready expansion, if any). A
 	// shader with a ready expansion leaves one of them to the shaders with nothing to run.
-	const auto running   = m_compute_background.size();
-	const auto slots     = ComputeBackgroundThreads();
-	// Round 99: the partitions of a shader (GetComputeProgram) compile alongside each other, and
-	// each takes half a slot: a partition inlines one material function, a fraction of the
-	// whole expansions the slots were sized for (rt97 ran out of memory with 27 of those).
-	const bool partition   = m_partition_programs.contains(compute_program.id);
+	const auto slots       = ComputeBackgroundThreads();
 	const bool same        = !partition && CompilingCompute(hash) != nullptr;
 	const bool has_ready   = !partition && hash != 0 && m_ready_expansions.contains(hash);
 	uint32_t   used_halves = 0;
@@ -5575,6 +5642,18 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 			m_compute_waiting_expansions[compute_program.id] = {
 			    hash, std::vector<uint32_t>(expansion.begin(), expansion.end())};
 		}
+		if (partition) {
+			// Round 117: what StartWaitingPartitions needs to start it in a free slot.
+			auto entry                      = std::make_unique<WaitingPartition>();
+			entry->program                  = *input_info.stage.program;
+			entry->input_info               = input_info;
+			entry->input_info.stage.program = &entry->program;
+			entry->module                   = compute_program.module;
+			entry->words                    = compute_program.spirv_words;
+			entry->asks                     = asks + (expansion.empty() ? 1u : 0u);
+			entry->serial = wait_serial != 0 ? wait_serial : ++m_partition_wait_serial;
+			m_partition_waiting[compute_program.id] = std::move(entry);
+		}
 		if (m_compute_wait_logged.size() < 4096 &&
 		    m_compute_wait_logged.insert(compute_program.id).second) {
 			LOGF("Compute pipeline CS=0x%016" PRIx64 " (%u SPIR-V words) waits to compile in the "
@@ -5584,39 +5663,172 @@ PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
 		}
 		return nullptr;
 	}
-	auto job          = std::make_unique<BackgroundCompute>();
-	job->pipeline     = std::move(cached);
-	job->program                  = *input_info.stage.program;
-	job->input_info   = input_info;
+	StartBackgroundCompute(compute_program.id, std::move(cached), input_info,
+	                       *input_info.stage.program, compute_program.module,
+	                       compute_program.spirv_words, partition, expansion,
+	                       asks + (expansion.empty() ? 1u : 0u), false);
+	return nullptr;
+}
+
+void PipelineCache::StartBackgroundCompute(uint64_t id, std::unique_ptr<Pipeline> cached,
+                                           const ShaderComputeInputInfo& input_info,
+                                           const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                           vk::ShaderModule module, uint32_t words, bool partition,
+                                           std::span<const uint32_t> expansion, uint64_t skipped,
+                                           bool ahead) {
+	const auto running            = m_compute_background.size();
+	auto       job                = std::make_unique<BackgroundCompute>();
+	job->pipeline                 = std::move(cached);
+	job->program                  = program;
+	job->input_info               = input_info;
 	job->input_info.stage.program = &job->program;
-	job->hash         = hash;
-	job->words        = compute_program.spirv_words;
-	job->begin        = std::chrono::steady_clock::now();
+	job->hash                     = program.shader_hash;
+	job->words                    = words;
+	job->begin                    = std::chrono::steady_clock::now();
 	job->expansion.assign(expansion.begin(), expansion.end());
-	job->serial       = ++m_expansion_serial;
-	job->partition    = partition;
-	auto*      raw    = job.get();
-	const auto module = compute_program.module;
+	job->serial    = ++m_expansion_serial;
+	job->partition = partition;
+	job->ahead     = ahead;
+	// The dispatch that asked for it now is skipped too (and those while it waited).
+	job->skipped = skipped;
+	auto* raw    = job.get();
 	if (partition) {
 		LOGF("Compute pipeline CS=0x%016" PRIx64 " (%u SPIR-V words), a partition, is compiled in "
-		     "the background (%zu compiling, %u slots, a partition takes half of one); until then "
-		     "its partition's dispatch is skipped\n",
-		     hash, compute_program.spirv_words, running + 1u, ComputeBackgroundThreads());
+		     "the background (%zu compiling, %u slots, a partition takes half of one%s%s); until "
+		     "then its partition's dispatch is skipped\n",
+		     job->hash, words, running + 1u, ComputeBackgroundThreads(),
+		     ahead ? "; started while it waited, after " : "",
+		     ahead ? fmt::format("{} dispatches asked for it", skipped).c_str() : "");
 	} else {
 		LOGF("Compute pipeline CS=0x%016" PRIx64 " (%u SPIR-V words) is compiled in the "
 		     "background (%zu of %u running); until then its shader runs an earlier expansion, if "
 		     "one is ready\n",
-		     hash, compute_program.spirv_words, running + 1u, ComputeBackgroundThreads());
+		     job->hash, words, running + 1u, ComputeBackgroundThreads());
 	}
+	if (job->pipeline->disable_optimization) {
+		LOGF("Compute pipeline CS=0x%016" PRIx64 " (%u SPIR-V words) is compiled without "
+		     "optimization (KYTY_PARTITION_QUICK)\n",
+		     job->hash, words);
+	}
+	m_background_started++;
 	// The driver cache stays until Save, which waits for this thread first.
 	raw->thread = std::thread([this, raw, module, cache = m_driver_cache] {
 		KYTY_PROFILER_THREAD("ComputePipelineCompile");
+		// Round 117: the game's threads first; up to 16 of these compile at once.
+		Common::LowerThreadPriority();
 		(void)CreatePipelineInternal(m_graphics, *raw->pipeline, raw->input_info, module, cache, {},
 		                             ComputeBuild::Compile);
 		raw->done.store(true, std::memory_order_release);
 	});
-	m_compute_background.emplace(compute_program.id, std::move(job));
-	return nullptr;
+	m_compute_background.emplace(id, std::move(job));
+}
+
+void PipelineCache::StartWaitingPartitions() {
+	// After Save (the emulator closes), none starts unasked.
+	if (m_partition_waiting.empty() || m_saved) {
+		return;
+	}
+	const auto slots       = ComputeBackgroundThreads();
+	uint32_t   used_halves = 0;
+	for (const auto& [id, job]: m_compute_background) {
+		(void)id;
+		used_halves += job->partition ? 1u : 2u;
+	}
+	// One slot is left to a dispatch of a shader that is not a partition (a whole expansion,
+	// which waits otherwise), when there are four or more.
+	const uint32_t limit = 2u * slots - (slots >= 4u ? 2u : 0u);
+	while (used_halves + 1u <= limit && !m_partition_waiting.empty()) {
+		auto best = m_partition_waiting.begin();
+		for (auto it = m_partition_waiting.begin(); it != m_partition_waiting.end(); ++it) {
+			if (it->second->asks > best->second->asks ||
+			    (it->second->asks == best->second->asks &&
+			     it->second->serial < best->second->serial)) {
+				best = it;
+			}
+		}
+		const auto id    = best->first;
+		auto       entry = std::move(best->second);
+		m_partition_waiting.erase(best);
+		auto layouts = m_compute_waiting.find(id);
+		if (layouts == m_compute_waiting.end()) {
+			continue;
+		}
+		auto cached = std::move(layouts->second);
+		m_compute_waiting.erase(layouts);
+		StartBackgroundCompute(id, std::move(cached), entry->input_info, entry->program,
+		                       entry->module, entry->words, true, {}, entry->asks, true);
+		used_halves += 1u;
+	}
+}
+
+// The minutes and seconds of a span, as "4 min 10 s" or "25 s".
+static std::string MinutesAndSeconds(std::chrono::steady_clock::duration span) {
+	const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(span).count();
+	if (seconds < 60) {
+		return fmt::format("{} s", seconds);
+	}
+	return fmt::format("{} min {} s", seconds / 60, seconds % 60);
+}
+
+void PipelineCache::ReportBackgroundProgress() {
+	const size_t compiling = m_compute_background.size();
+	const size_t waiting   = m_compute_waiting.size();
+	const auto   now       = std::chrono::steady_clock::now();
+	// What waits and is not a partition starts at its next dispatch; with nothing compiling, no
+	// dispatch asks for it now.
+	if (compiling != 0 || !m_partition_waiting.empty()) {
+		if (!m_backlog) {
+			m_backlog             = true;
+			m_backlog_reported    = false;
+			m_backlog_begin       = now;
+			m_backlog_last_report = now;
+			m_backlog_started_at  = m_background_started - compiling;
+			m_backlog_finished_at = m_background_finished;
+		}
+		if (now - m_backlog_last_report < std::chrono::seconds(10)) {
+			return;
+		}
+		m_backlog_last_report = now;
+		m_backlog_reported    = true;
+		const auto done       = m_background_finished - m_backlog_finished_at;
+		uint64_t   total = 0, available = 0, commit_limit = 0, commit_free = 0;
+		const bool physical = Common::VirtualMemory::QueryPhysical(total, available);
+		const bool commit   = Common::VirtualMemory::QueryCommit(commit_limit, commit_free);
+		const auto memory =
+		    physical ? fmt::format("; memory: {:.1f} GB free of {:.1f} GB",
+		                           static_cast<double>(available) / double(uint64_t {1} << 30u),
+		                           static_cast<double>(total) / double(uint64_t {1} << 30u))
+		             : std::string();
+		::printf("Shaders compiling in the background: %zu now, %zu waiting, %" PRIu64
+		         " done (%s so far%s). Until they are done, parts of the picture can be missing or "
+		         "wrong (ray tracing: blotches, white glow).\n",
+		         compiling, waiting, done, MinutesAndSeconds(now - m_backlog_begin).c_str(),
+		         memory.c_str());
+		std::fflush(stdout);
+		LOGF("Background compiles: %zu compiling, %zu waiting (%zu of them partitions), %" PRIu64
+		     " done in %.0f s%s%s\n",
+		     compiling, waiting, m_partition_waiting.size(), done,
+		     std::chrono::duration<double>(now - m_backlog_begin).count(), memory.c_str(),
+		     commit ? fmt::format("; commit: {} MB free of {} MB", commit_free >> 20u,
+		                          commit_limit >> 20u)
+		                  .c_str()
+		            : "");
+		return;
+	}
+	if (!m_backlog) {
+		return;
+	}
+	m_backlog       = false;
+	const auto done = m_background_finished - m_backlog_finished_at;
+	if (m_backlog_reported) {
+		::printf("Shaders compiling in the background: all done (%" PRIu64 " in %s).\n", done,
+		         MinutesAndSeconds(now - m_backlog_begin).c_str());
+		std::fflush(stdout);
+		LOGF("Background compiles: all done, %" PRIu64 " in %.0f s (%zu others wait for a "
+		     "dispatch)\n",
+		     done, std::chrono::duration<double>(now - m_backlog_begin).count(), waiting);
+	}
+	m_backlog_reported = false;
 }
 
 size_t PipelineCache::FinishBackgroundCompute(std::chrono::milliseconds budget) {

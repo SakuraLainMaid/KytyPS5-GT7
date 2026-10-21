@@ -41,6 +41,9 @@ bool     FlushInstructionCache(uint64_t address, uint64_t size);
 // Linux the strict-overcommit CommitLimit. False where no such limit applies (Linux with heuristic
 // overcommit, macOS) or it cannot be read.
 bool     QueryCommit(uint64_t& limit, uint64_t& available);
+// Round 117: the system's physical memory and what is available of it, in bytes (Windows:
+// GlobalMemoryStatusEx; Linux: MemTotal and MemAvailable). False where it cannot be read.
+bool QueryPhysical(uint64_t& total, uint64_t& available);
 
 } // namespace VirtualMemory
 

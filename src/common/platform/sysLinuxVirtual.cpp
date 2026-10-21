@@ -593,6 +593,37 @@ bool QueryCommit(uint64_t& limit, uint64_t& available) {
 #endif
 }
 
+bool QueryPhysical(uint64_t& total, uint64_t& available) {
+#if defined(__APPLE__)
+	(void)total;
+	(void)available;
+	return false;
+#else
+	FILE* info = std::fopen("/proc/meminfo", "r");
+	if (info == nullptr) {
+		return false;
+	}
+	uint64_t total_kb     = 0;
+	uint64_t available_kb = 0;
+	char     line[256];
+	while (std::fgets(line, sizeof(line), info) != nullptr) {
+		unsigned long long kb = 0;
+		if (std::sscanf(line, "MemTotal: %llu kB", &kb) == 1) {
+			total_kb = kb;
+		} else if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+			available_kb = kb;
+		}
+	}
+	std::fclose(info);
+	if (total_kb == 0) {
+		return false;
+	}
+	total     = total_kb * 1024u;
+	available = available_kb * 1024u;
+	return true;
+#endif
+}
+
 } // namespace Common::VirtualMemory
 
 #endif

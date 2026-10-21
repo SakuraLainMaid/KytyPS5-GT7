@@ -22,6 +22,8 @@
 #include <pthread.h>
 #include <sched.h>
 #include <string>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #endif
 
@@ -549,5 +551,13 @@ std::string StartCpuSet(std::string* reason) {
 }
 
 #endif
+
+void LowerThreadPriority() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#elif !defined(__APPLE__)
+	(void)setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 5);
+#endif
+}
 
 } // namespace Common
