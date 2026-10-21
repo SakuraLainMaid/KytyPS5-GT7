@@ -60,6 +60,22 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 21, 2026, third build)
+
+No shaders are compiled again after this update.
+
+- **No more freeze when you pick Exit after finishing a license test.** At that moment the game
+  points some graphics memory at the start of its own program code. To keep track of that
+  memory, the emulator changed the code's memory protection, and every game thread that ran
+  that code got stuck. The emulator now leaves the game's code and stack memory alone.
+- **Fewer crashes in license tests and at retry prompts.** A helper thread that reads the game's
+  graphics commands ahead of time could still read commands from memory the game was freeing or
+  reusing, and crash on them. It now works on its own safe copy, checks every register a command
+  sets, and throws away a copy made after the game could have reused that memory.
+- When the graphics driver itself crashes (one of the crashes in
+  [issue 3](https://github.com/usa-ratt/KytyPS5-GT7/issues/3)), the crash report now names the
+  graphics buffer the GPU tried to read, and whether and when it had been freed.
+
 ## What's new (October 21, 2026, second build)
 
 After updating to this build, the first session compiles every shader again (pop-in everywhere,
@@ -172,10 +188,10 @@ Graphics and shaders:
 - Tokyo: at some times of day and weather (twilight and night), the picture turns green at some
   tunnel exits and under some overpasses, most often in replays, and fades back once past them.
 - In replays, small red lights can show through walls.
-- A crash after several races in one session
-  ([issue 3](https://github.com/usa-ratt/KytyPS5-GT7/issues/3)) is not fixed yet. If it happens
-  to you, please add this build's crash report to that issue: it now says which shader failed and
-  why.
+- A graphics driver crash, seen after many license test retries
+  ([issue 3](https://github.com/usa-ratt/KytyPS5-GT7/issues/3)), is not fixed yet. If it happens
+  to you, please add this build's crash report and the zipped log to that issue: the report now
+  names the graphics buffer involved.
 - There is no music (the sound effects play), and in-game videos can play out of sync
   ([issue 4](https://github.com/usa-ratt/KytyPS5-GT7/issues/4)). Being looked into.
 - Once, in a race on a new track in the chase view, most of the track disappeared after it had
