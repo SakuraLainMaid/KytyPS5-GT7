@@ -60,6 +60,20 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 21, 2026)
+
+- **The lines on your car's windows in the race countdown and in replays are gone.** Those views
+  are drawn at half resolution with two depth samples a pixel and one colour sample, and on
+  NVIDIA cards both triangles that share an edge coloured the pixels along it, so the glass
+  darkened them twice. Each pixel now goes to one triangle. The first countdown and replay after
+  updating build their shaders once more (a little pop-in there, once).
+- **About 1 to 2 fps more in races** (21 instead of 20 at Tokyo against AI cars on the PC above,
+  and steadier). Small jobs the game hands the graphics card, and waits for, no longer wait
+  behind long stretches of drawing. `KYTY_COMPUTE_YIELD=0` turns this off, for comparison.
+- A compute shader the graphics driver cannot build is skipped instead of ending the emulator.
+- More information in the log for bug reports (what the game tries to download, and the files
+  it looks for that are not there).
+
 ## What's new (October 20, 2026)
 
 After updating to this build, the first session compiles every shader again (pop-in everywhere,
@@ -136,7 +150,9 @@ Graphics and shaders:
   right after switching between the cockpit and outside views, and the wheels can show white
   patches after such a switch. The data the reflections read is right now; the cause is still
   being looked into.
-- Some spectators are still drawn dark.
+- Some spectators are still drawn dark, mostly those in the shade (under a roof).
+- The used car dealer shows no car photos. The game downloads them from its servers, which it
+  cannot reach in this build; the cars themselves can be bought.
 - Tokyo: at some times of day and weather the picture turns green at some tunnel exits and under
   some overpasses, and fades back once past them.
 - A crash after several races in one session
@@ -154,7 +170,7 @@ Graphics and shaders:
 As of October 2026:
 
 - The game reaches its menus and runs races.
-- Frame rate at 3840x2160 on the PC above: about 18 to 22 fps in a race against AI cars at Tokyo,
+- Frame rate at 3840x2160 on the PC above: about 19 to 24 fps in a race against AI cars at Tokyo,
   high 30s to near 50 fps in a time trial.
 - On a Ryzen with 3D V-Cache on one of its two dies (such as the 7950X3D), the emulator's
   graphics threads start on the V-Cache cores by themselves (about 2 fps in a race). Starting the
@@ -171,8 +187,7 @@ As of October 2026:
   compiled.
 - The thin spike that stuck out of the roof of the cars in the chase view is gone: the last bytes
   of a table the cars' glass reads were read as zero.
-- Known graphics problems: lines show on the player's car's glass during the race countdown and in
-  replays (it looks right while driving); the FINISH and retry screens are drawn wrong.
+- Known graphics problems: the FINISH and retry screens are drawn wrong.
 - The reflections' light lists sometimes hold corrupt cells (cells asking for thousands of lights).
   Those cells are emptied before they reach the graphics card; without that, they caused freezes of
   tens of milliseconds. Their cause is still being investigated.
