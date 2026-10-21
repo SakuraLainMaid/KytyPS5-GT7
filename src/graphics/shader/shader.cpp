@@ -719,6 +719,38 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 			}
 			return false;
 		}
+		// Round 114: the tables are guest memory the user data points at, checked before they are
+		// read. A draw whose user data held no table address there (two time trials, issue 8:
+		// 0xb081083800000012) ended the emulator with an access violation in the reads below; it
+		// is skipped, as one with null tables is.
+		if (!metadata.input_semantics.empty()) {
+			uint32_t max_semantic = 0;
+			for (const auto& in: metadata.input_semantics) {
+				max_semantic = std::max<uint32_t>(max_semantic, in.semantic);
+			}
+			bool readable = LibKernel::Memory::IsCommittedRange(
+			    reinterpret_cast<uint64_t>(attrib), (uint64_t {max_semantic} + 1u) * 4u);
+			if (readable) {
+				uint32_t max_index = 0;
+				for (const auto& in: metadata.input_semantics) {
+					max_index = std::max<uint32_t>(max_index, attrib[in.semantic] & 0x1fu);
+				}
+				readable = LibKernel::Memory::IsCommittedRange(reinterpret_cast<uint64_t>(buffer),
+				                                               (uint64_t {max_index} + 1u) * 16u);
+			}
+			if (!readable) {
+				if (FirstVertexInputReport(shader_addr, 3)) {
+					LOGF("ShaderGetVertexInputInfo(): vertex tables outside guest memory "
+					     "shader=0x%016" PRIx64 " attrib=0x%016" PRIx64
+					     " (s%d) buffer=0x%016" PRIx64
+					     " (s%d) user_sgpr_num=%u: the draw is skipped\n",
+					     shader_addr, reinterpret_cast<uint64_t>(attrib),
+					     metadata.vertex_attrib_reg, reinterpret_cast<uint64_t>(buffer),
+					     metadata.vertex_buffer_reg, user_sgpr_num);
+				}
+				return false;
+			}
+		}
 		ShaderApplyAttribSemantics(info, metadata.input_semantics, attrib, buffer);
 		ShaderDetectBuffers(info);
 	}

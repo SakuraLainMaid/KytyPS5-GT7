@@ -1504,6 +1504,8 @@ void RenderExecutor::DispatchDirectPart(uint64_t submit_id, CommandBuffer& buffe
                                         PipelineCache::ComputePartition* partition) {
 	const GpuPhases::Scope dispatch_phase(GpuPhases::Phase::Dispatch);
 	const GpuPhases::OpStats op_stats(true);
+	// KYTY_BISECT's slow:gpu (round 114).
+	Bisect::SpinMicroseconds(Bisect::SlowGpuMicroseconds());
 	EXIT_IF(buffer.IsInvalid());
 	{
 		const GpuPhases::Scope phase(GpuPhases::Phase::DispatchPending);
@@ -1956,6 +1958,8 @@ void RenderExecutor::DispatchIndirectPart(uint64_t submit_id, CommandBuffer& buf
 	    (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	const GpuPhases::Scope dispatch_phase(GpuPhases::Phase::Dispatch);
 	const GpuPhases::OpStats op_stats(true);
+	// KYTY_BISECT's slow:gpu (round 114).
+	Bisect::SpinMicroseconds(Bisect::SlowGpuMicroseconds());
 	{
 		const GpuPhases::Scope phase(GpuPhases::Phase::DispatchPending);
 		m_context.GetCommandScheduler().PopPendingOperations(false);

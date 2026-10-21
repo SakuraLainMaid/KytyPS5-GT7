@@ -826,6 +826,11 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Unknown: return false;
 		}
 		const auto started = std::chrono::steady_clock::now();
+		// KYTY_BISECT's slow:faults (round 114): a game thread's faults take longer.
+		if (!Libs::Graphics::GuestGpu::IsGpuThread()) {
+			Libs::Graphics::Bisect::SpinMicroseconds(
+			    Libs::Graphics::Bisect::SlowFaultMicroseconds());
+		}
 		// A read of bytes the GPU has not written, on a page protected because it wrote others:
 		// complete the load from the backing store and leave the page protected. Otherwise the
 		// fault waits for the GPU thread, which downloads the page and drains the GPU.
@@ -874,6 +879,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+			// KYTY_BISECT's slow:reads (round 114): a game thread's read of what the GPU wrote
+			// gets its bytes later.
+			if (access == GpuAccess::Read && !Libs::Graphics::GuestGpu::IsGpuThread()) {
+				Libs::Graphics::Bisect::SpinMicroseconds(
+				    Libs::Graphics::Bisect::SlowReadMicroseconds());
+			}
 			const auto ns = elapsed_ns();
 			Common::PerfStats::AddFault(ns, access == GpuAccess::Read, false);
 			RecordTrackedFault(info->exception_address, info->access_violation_vaddr,

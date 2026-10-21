@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -16,6 +17,7 @@
 #include <mutex>
 #include <optional>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace Libs::Graphics::Bisect {
@@ -105,6 +107,10 @@ struct Step {
 	// Round 108.
 	bool              yield_off = false;
 	int64_t           yield_us  = -1;   // yield:<microseconds> (round 109); -1: the usual
+	// Round 114: slow:gpu, slow:faults, slow:reads (microseconds; 0: off).
+	uint32_t          slow_gpu_us   = 0;
+	uint32_t          slow_fault_us = 0;
+	uint32_t          slow_read_us  = 0;
 	std::string       cpu_set;          // empty: as at the start
 	std::string       name;             // for the screen and the picture's file name
 	std::string       text;             // name and actions, for the log
@@ -319,6 +325,25 @@ bool ParseAction(std::string_view action, Step& step) {
 		}
 		step.yield_us = static_cast<int64_t>(std::strtoul(std::string(text).c_str(), nullptr, 10));
 		return true;
+	}
+	// Round 114: slow:gpu, slow:faults and slow:reads, each with an optional :<microseconds>.
+	for (const auto& [prefix, target, fallback]:
+	     {std::tuple {std::string_view("slow:gpu"), &step.slow_gpu_us, 3u},
+	      std::tuple {std::string_view("slow:faults"), &step.slow_fault_us, 15u},
+	      std::tuple {std::string_view("slow:reads"), &step.slow_read_us, 2500u}}) {
+		if (action == prefix) {
+			*target = fallback;
+			return true;
+		}
+		if (action.size() > prefix.size() + 1 && action.starts_with(prefix) &&
+		    action[prefix.size()] == ':') {
+			const auto text = action.substr(prefix.size() + 1);
+			if (text.size() > 6 || text.find_first_not_of("0123456789") != std::string_view::npos) {
+				return false;
+			}
+			*target = static_cast<uint32_t>(std::strtoul(std::string(text).c_str(), nullptr, 10));
+			return true;
+		}
 	}
 	if (action == "drawprep:notess") {
 		step.drawprep_notess = true;
@@ -1044,6 +1069,30 @@ bool ComputeYieldOff() {
 int64_t ComputeYieldMicroseconds() {
 	const auto* step = Current();
 	return step != nullptr ? step->yield_us : -1;
+}
+
+uint32_t SlowGpuMicroseconds() {
+	const auto* step = Current();
+	return step != nullptr ? step->slow_gpu_us : 0;
+}
+
+uint32_t SlowFaultMicroseconds() {
+	const auto* step = Current();
+	return step != nullptr ? step->slow_fault_us : 0;
+}
+
+uint32_t SlowReadMicroseconds() {
+	const auto* step = Current();
+	return step != nullptr ? step->slow_read_us : 0;
+}
+
+void SpinMicroseconds(uint32_t microseconds) {
+	if (microseconds == 0) {
+		return;
+	}
+	const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(microseconds);
+	while (std::chrono::steady_clock::now() < until) {
+	}
 }
 
 bool ListResetOff() {

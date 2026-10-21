@@ -3085,6 +3085,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	KYTY_PROFILER_FUNCTION();
 	const GpuPhases::Scope draw_phase(GpuPhases::Phase::Draw);
 	const GpuPhases::OpStats op_stats(false);
+	// KYTY_BISECT's slow:gpu (round 114).
+	Bisect::SpinMicroseconds(Bisect::SlowGpuMicroseconds());
 	// A tessellated draw's time, whole (round 78).
 	std::optional<GpuPhases::Scope> tess_phase;
 	if (buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kPatch) {
@@ -3280,6 +3282,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	KYTY_PROFILER_FUNCTION();
 	const GpuPhases::Scope draw_phase(GpuPhases::Phase::Draw);
 	const GpuPhases::OpStats op_stats(false);
+	// KYTY_BISECT's slow:gpu (round 114).
+	Bisect::SpinMicroseconds(Bisect::SlowGpuMicroseconds());
 	// A tessellated draw's time, whole (round 78).
 	std::optional<GpuPhases::Scope> tess_phase;
 	if (buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kPatch) {

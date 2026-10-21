@@ -229,6 +229,14 @@
 //                uploads' reads of guest memory, are done on a worker thread (PageManager's
 //                "GpuProtect"), which the GPU thread waits for before it stores to guest memory
 //                (KYTY_ASYNC_MEMORY_SYNC=1 for the whole run)
+// and, round 114 (slowing one part down on purpose: how much the frame slows shows how much that
+// part holds the frame rate, and so how much making it faster would give):
+//   slow:gpu[:<us>]    the GPU thread spends <us> microseconds more (3 by default) on each draw
+//                and each dispatch, busy
+//   slow:faults[:<us>] a game thread spends <us> microseconds more (15 by default) on each fault
+//                on memory the GPU uses, busy
+//   slow:reads[:<us>]  a game thread's read of bytes the GPU wrote, which waits for them, waits
+//                <us> microseconds more (2500 by default)
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -361,6 +369,12 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] bool StreamHostConfigured();
 [[nodiscard]] bool StreamHost();
 [[nodiscard]] bool BuffersDedicated();
+// Round 114, any thread: slow:gpu's, slow:faults' and slow:reads' microseconds (0 when the
+// current step has none), and the busy wait they ask for.
+[[nodiscard]] uint32_t SlowGpuMicroseconds();
+[[nodiscard]] uint32_t SlowFaultMicroseconds();
+[[nodiscard]] uint32_t SlowReadMicroseconds();
+void                   SpinMicroseconds(uint32_t microseconds);
 
 } // namespace Libs::Graphics::Bisect
 
