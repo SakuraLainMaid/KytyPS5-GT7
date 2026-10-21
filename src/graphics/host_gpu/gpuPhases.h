@@ -212,6 +212,51 @@ inline void NoteUpload(uint64_t bytes, uint64_t copies) noexcept {
 	return Detail::g_totals.count[static_cast<size_t>(phase)];
 }
 
+namespace Detail {
+// Round 113: the GPU thread's slices by the kind of queue they ran (0 graphics, 1 compute):
+// cycles, slices, draws, dispatches, the draws' cycles, the dispatches' cycles (GPU thread).
+inline std::array<std::array<uint64_t, 6>, 2> g_queue_stats {};
+} // namespace Detail
+
+// Round 113: a slice of a guest submission, timed by the kind of queue it ran (the report's "by
+// queue"): what a second GPU thread for the compute queues would take off this one.
+class QueueSlice {
+public:
+	explicit QueueSlice(bool compute) noexcept: m_compute(compute) {
+		if (!Detail::t_on) {
+			return;
+		}
+		m_draws           = CountOf(Phase::Draw);
+		m_dispatches      = CountOf(Phase::Dispatch);
+		m_draw_cycles     = Detail::g_totals.cycles[static_cast<size_t>(Phase::Draw)];
+		m_dispatch_cycles = Detail::g_totals.cycles[static_cast<size_t>(Phase::Dispatch)];
+		m_start           = Now();
+	}
+	~QueueSlice() {
+		if (m_start == 0) {
+			return;
+		}
+		auto& stats = Detail::g_queue_stats[m_compute ? 1u : 0u];
+		stats[0] += Now() - m_start;
+		stats[1]++;
+		stats[2] += CountOf(Phase::Draw) - m_draws;
+		stats[3] += CountOf(Phase::Dispatch) - m_dispatches;
+		stats[4] += Detail::g_totals.cycles[static_cast<size_t>(Phase::Draw)] - m_draw_cycles;
+		stats[5] +=
+		    Detail::g_totals.cycles[static_cast<size_t>(Phase::Dispatch)] - m_dispatch_cycles;
+	}
+	QueueSlice(const QueueSlice&)            = delete;
+	QueueSlice& operator=(const QueueSlice&) = delete;
+
+private:
+	bool     m_compute;
+	uint64_t m_start           = 0;
+	uint64_t m_draws           = 0;
+	uint64_t m_dispatches      = 0;
+	uint64_t m_draw_cycles     = 0;
+	uint64_t m_dispatch_cycles = 0;
+};
+
 // Times its block on the GPU thread.
 class Scope {
 public:

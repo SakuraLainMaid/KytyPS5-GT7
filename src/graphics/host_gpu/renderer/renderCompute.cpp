@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/drawRepeats.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
@@ -57,6 +58,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -469,6 +471,34 @@ void NanScanLanded(const std::shared_ptr<NanTraceDispatch>& dispatch, const std:
 		}
 	}
 	keep();
+}
+
+// KYTY_DRAW_REPEATS=1 (round 113, DrawRepeats): how much of each frame's dispatches the frame
+// before had too.
+void NoteDispatchRepeat(const ShaderStageRuntime& stage, const ShaderComputeInputInfo& input_info,
+                        uint64_t image_generation) {
+	if (!DrawRepeats::Enabled() || !stage) {
+		return;
+	}
+	static DrawRepeats::Stats stats("Dispatch");
+	const auto                mix = [](uint64_t seed, const void* data, size_t size) {
+        return size == 0 ? seed : XXH3_64bits_withSeed(data, size, seed);
+	};
+	const auto  hash   = stage.program->shader_hash;
+	const auto& snap   = *stage.resources;
+	uint64_t    inputs = mix(0x5eed, &hash, sizeof(hash));
+	inputs             = mix(inputs, snap.user_data.data(), snap.user_data.size() * 4u);
+	uint64_t textures  = mix(0x7e47, &hash, sizeof(hash));
+	textures           = mix(textures, snap.images.data(),
+	                         snap.images.size() * sizeof(ShaderRecompiler::IR::DescriptorValue));
+	textures           = mix(textures, snap.samplers.data(),
+	                         snap.samplers.size() * sizeof(ShaderRecompiler::IR::DescriptorValue));
+	uint64_t resolved  = mix(textures, snap.buffers.data(),
+	                         snap.buffers.size() * sizeof(ShaderRecompiler::IR::DescriptorValue));
+	resolved           = mix(resolved, snap.flattened_srt.data(), snap.flattened_srt.size() * 4u);
+	resolved = mix(resolved, input_info.workgroup_counts, sizeof(input_info.workgroup_counts));
+	resolved ^= inputs * 0x9e3779b97f4a7c15ull;
+	stats.Note(FrameGraph::GpuThreadFrames(), inputs, resolved, textures, image_generation);
 }
 
 // KYTY_TRACE_NAN: records the GPU scans of a traced dispatch's float images (GPU thread).
@@ -1597,6 +1627,8 @@ void RenderExecutor::DispatchDirectPart(uint64_t submit_id, CommandBuffer& buffe
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
+	NoteDispatchRepeat(input_info.stage, input_info,
+	                   m_context.GetTextureCache().ImageSetGeneration());
 	if (GpuPhases::OpStatsOn()) {
 		GpuPhases::SetOpKey(program.shader_hash, uint64_t {input_info.workgroup_counts[0]} *
 		                                             input_info.workgroup_counts[1] *

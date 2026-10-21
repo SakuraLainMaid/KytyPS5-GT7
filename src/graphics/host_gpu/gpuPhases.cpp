@@ -388,6 +388,24 @@ void ReportIfDue(uint64_t frames) {
 		}
 		blocks.clear();
 	}
+	{
+		// Round 113: the slices by the kind of queue they ran, a frame.
+		const double frames_d = new_frames != 0 ? static_cast<double>(new_frames) : 1.0;
+		const auto   ms_frame = [&](uint64_t cycles) {
+            return static_cast<double>(cycles) / cycles_per_us / 1000.0 / frames_d;
+		};
+		const auto  per_frame = [&](uint64_t n) { return static_cast<double>(n) / frames_d; };
+		const auto& queues    = Detail::g_queue_stats;
+		line += fmt::format(
+		    " | by queue, a frame: graphics {:.1f} ms in {:.0f} slices ({:.0f} draws {:.1f} ms, "
+		    "{:.0f} dispatches {:.1f} ms), compute queues {:.1f} ms in {:.0f} slices ({:.0f} "
+		    "dispatches {:.1f} ms)",
+		    ms_frame(queues[0][0]), per_frame(queues[0][1]), per_frame(queues[0][2]),
+		    ms_frame(queues[0][4]), per_frame(queues[0][3]), ms_frame(queues[0][5]),
+		    ms_frame(queues[1][0]), per_frame(queues[1][1]), per_frame(queues[1][3]),
+		    ms_frame(queues[1][5]));
+		Detail::g_queue_stats = {};
+	}
 	if (Detail::g_yields != 0) {
 		// Round 108: graphics streams stopped for compute work, and how far they ran first.
 		line += fmt::format(" | compute yields {} ({:.0f} packets before each)", Detail::g_yields,

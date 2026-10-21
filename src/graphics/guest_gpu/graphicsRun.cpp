@@ -879,7 +879,8 @@ void GuestGpu::ThreadRun(void* data) {
 		const auto busy_from = perf_time();
 		bool       complete  = false;
 		{
-			const GpuPhases::Scope phase(GpuPhases::Phase::Process);
+			const GpuPhases::QueueSlice slice(submission.type == SubmissionType::Compute);
+			const GpuPhases::Scope      phase(GpuPhases::Phase::Process);
 			complete = gpu->Process(submission);
 		}
 		Common::PerfStats::AddGpuThread(PerfPhase::Busy, perf_time() - busy_from);

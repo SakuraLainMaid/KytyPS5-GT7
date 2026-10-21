@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawRepeats.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/frameGraphQueries.h"
 #include "graphics/host_gpu/renderer/gpuProfiler.h"
@@ -1189,51 +1190,21 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	return prepared;
 }
 
-// KYTY_DRAW_REPEATS=1 (round 83): how many of each frame's draws the frame before had too, by two
-// keys: the inputs (the stages' shaders and user data) and everything resolved from them (the
-// descriptors the shaders read, the flattened tables, the render and depth targets, the index and
-// vertex buffers). A draw whose resolved key the frame before had could reuse that draw's work
-// (bindings, targets, pipeline): the share of such draws says what a draw memo would save.
-// "Draw repeats" lines every 10 s (GPU thread).
-static bool DrawRepeatsEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_DRAW_REPEATS");
-		return value != nullptr && value[0] == '1';
-	}();
-	return enabled;
-}
-
+// KYTY_DRAW_REPEATS=1 (round 83, DrawRepeats): how much of each frame's draws the frame before
+// had too: the share a memo of a draw's prepared state could serve.
 static void NoteDrawRepeat(const DrawCallInfo& draw, const DrawRenderState& state,
-                           const DrawIndexBufferSource& index, size_t vertex_stage_count) {
-	if (!DrawRepeatsEnabled()) {
+                           const DrawIndexBufferSource& index, size_t vertex_stage_count,
+                           uint64_t image_generation) {
+	if (!DrawRepeats::Enabled()) {
 		return;
 	}
-	struct Stats {
-		std::unordered_set<uint64_t>          inputs[2];
-		std::unordered_set<uint64_t>          resolved[2];
-		uint64_t                              frame         = UINT64_MAX;
-		uint64_t                              draws         = 0;
-		uint64_t                              input_hits    = 0;
-		uint64_t                              resolved_hits = 0;
-		uint64_t                              same_frame    = 0;
-		uint64_t                              frames        = 0;
-		std::chrono::steady_clock::time_point last          = std::chrono::steady_clock::now();
-	};
-	static Stats stats;
-	const auto   frame = FrameGraph::GpuThreadFrames();
-	if (frame != stats.frame) {
-		stats.frame = frame;
-		std::swap(stats.inputs[0], stats.inputs[1]);
-		std::swap(stats.resolved[0], stats.resolved[1]);
-		stats.inputs[0].clear();
-		stats.resolved[0].clear();
-		stats.frames++;
-	}
+	static DrawRepeats::Stats stats("Draw");
 	const auto mix = [](uint64_t seed, const void* data, size_t size) {
 		return size == 0 ? seed : XXH3_64bits_withSeed(data, size, seed);
 	};
 	uint64_t   inputs   = 0x5eed;
 	uint64_t   resolved = 0;
+	uint64_t   textures = 0x7e47;
 	const auto stage    = [&](const ShaderStageRuntime& runtime) {
         if (!runtime) {
             return;
@@ -1242,7 +1213,8 @@ static void NoteDrawRepeat(const DrawCallInfo& draw, const DrawRenderState& stat
         const auto& snap = *runtime.resources;
         inputs           = mix(inputs, &hash, sizeof(hash));
         inputs   = mix(inputs, snap.user_data.data(), snap.user_data.size() * sizeof(uint32_t));
-        resolved = mix(resolved, snap.buffers.data(),
+		textures         = mix(textures, &hash, sizeof(hash));
+		resolved = mix(resolved, snap.buffers.data(),
 		                  snap.buffers.size() * sizeof(ShaderRecompiler::IR::DescriptorValue));
         resolved = mix(resolved, snap.images.data(),
 		                  snap.images.size() * sizeof(ShaderRecompiler::IR::DescriptorValue));
@@ -1250,6 +1222,10 @@ static void NoteDrawRepeat(const DrawCallInfo& draw, const DrawRenderState& stat
 		                  snap.samplers.size() * sizeof(ShaderRecompiler::IR::DescriptorValue));
         resolved =
             mix(resolved, snap.flattened_srt.data(), snap.flattened_srt.size() * sizeof(uint32_t));
+		textures = mix(textures, snap.images.data(),
+		               snap.images.size() * sizeof(ShaderRecompiler::IR::DescriptorValue));
+		textures = mix(textures, snap.samplers.data(),
+		               snap.samplers.size() * sizeof(ShaderRecompiler::IR::DescriptorValue));
 	};
 	for (size_t i = 0; i < vertex_stage_count; i++) {
 		stage(state.vertex_info[i].stage);
@@ -1262,6 +1238,7 @@ static void NoteDrawRepeat(const DrawCallInfo& draw, const DrawRenderState& stat
 		targets[i] = state.color_info[i].desc.info.data.address;
 	}
 	targets[6]     = state.depth_info.image_id ? state.depth_info.desc.info.data.address : 0u;
+	textures       = mix(textures, targets.data(), sizeof(uint64_t) * 7u);
 	targets[7]     = (static_cast<uint64_t>(draw.index_count) << 32u) | draw.instance_count;
 	resolved       = mix(resolved, targets.data(), sizeof(targets));
 	resolved       = mix(resolved, &index.address, sizeof(index.address));
@@ -1273,31 +1250,7 @@ static void NoteDrawRepeat(const DrawCallInfo& draw, const DrawRenderState& stat
 		resolved = mix(resolved, vb.data(), sizeof(vb));
 	}
 	resolved ^= inputs * 0x9e3779b97f4a7c15ull;
-	stats.draws++;
-	stats.input_hits += stats.inputs[1].contains(inputs) ? 1u : 0u;
-	stats.resolved_hits += stats.resolved[1].contains(resolved) ? 1u : 0u;
-	stats.same_frame += stats.resolved[0].insert(resolved).second ? 0u : 1u;
-	stats.inputs[0].insert(inputs);
-	const auto now = std::chrono::steady_clock::now();
-	if (now - stats.last >= std::chrono::seconds(10)) {
-		const auto percent = [&](uint64_t n) {
-			return stats.draws != 0
-			           ? 100.0 * static_cast<double>(n) / static_cast<double>(stats.draws)
-			           : 0.0;
-		};
-		LOGF("Draw repeats (%.0f s): %" PRIu64 " draws in %" PRIu64 " frames; the frame before had "
-		     "the same inputs (shaders, user data) for %.1f%%, the same resolved descriptors, "
-		     "targets and index/vertex buffers for %.1f%%; %.1f%% repeat one earlier in their "
-		     "frame\n",
-		     std::chrono::duration<double>(now - stats.last).count(), stats.draws, stats.frames,
-		     percent(stats.input_hits), percent(stats.resolved_hits), percent(stats.same_frame));
-		stats.last          = now;
-		stats.draws         = 0;
-		stats.input_hits    = 0;
-		stats.resolved_hits = 0;
-		stats.same_frame    = 0;
-		stats.frames        = 0;
-	}
+	stats.Note(FrameGraph::GpuThreadFrames(), inputs, resolved, textures, image_generation);
 }
 
 // KYTY_OP_STATS=1 (round 84): the draw's group in the "Draw targets" line, its first color target
@@ -2485,7 +2438,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
-	NoteDrawRepeat(draw, state, index_source, vertex_stages.size());
+	NoteDrawRepeat(draw, state, index_source, vertex_stages.size(),
+	               m_context.GetTextureCache().ImageSetGeneration());
 	NoteDrawTarget(state);
 	LearnCubeTarget(buffer, state);
 	uint32_t   mesh_groups = 0;

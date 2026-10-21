@@ -250,6 +250,25 @@ elseif(KYTY_PGO_USE)
 	message(STATUS "PGO: optimizing with ${KYTY_PGO_USE}")
 endif()
 
+# KYTY_CPU_ARCH (clang and clang-cl; empty: the compiler's default, plain x86-64): the processor
+# Kyty's own code is compiled for, as -march takes it ("x86-64-v3" for AVX2, which every PC that
+# runs the guest's code has; "znver4" for a Ryzen 7000; "native" for the building PC only). The
+# guest's code is the console's, run as it is: this changes only the emulator's. Floating-point
+# multiplies and adds stay separate (-ffp-contract=off), as without it, so the emulator's own
+# arithmetic gives the same results.
+set(KYTY_CPU_ARCH "" CACHE STRING "-march for Kyty's own code (clang; empty: the default)")
+if(KYTY_CPU_ARCH)
+	if(NOT CLANG)
+		message(FATAL_ERROR "KYTY_CPU_ARCH needs clang or clang-cl")
+	endif()
+	if(KYTY_CLANG_CL)
+		add_compile_options("/clang:-march=${KYTY_CPU_ARCH}" "/clang:-ffp-contract=off")
+	else()
+		add_compile_options("-march=${KYTY_CPU_ARCH}" "-ffp-contract=off")
+	endif()
+	message(STATUS "CPU: Kyty's code compiled for ${KYTY_CPU_ARCH}")
+endif()
+
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
 file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
