@@ -45,6 +45,17 @@ uint32_t GetDeviceClockShift();
 // layer enables it on every vendor but NVIDIA; KYTY_COHERENT_LOAD_ACQUIRE=0/1 overrides that.
 void SetCoherentLoadAcquire(bool enabled);
 bool GetCoherentLoadAcquire();
+// Round 116: how a coherent buffer load is made. Barrier: a load and the acquire barrier above.
+// Acquire: one atomic load at device scope with acquire semantics (the load reads the device's
+// copy, and later loads are ordered after it), cheaper than the barrier. Relaxed: one atomic load
+// at device scope, unordered. Plain: a volatile load. KYTY_COHERENT_LOAD_MODE=barrier, acquire,
+// relaxed or plain picks one; without it, Barrier when the acquire barrier is on
+// (KYTY_COHERENT_LOAD_ACQUIRE or the device's default), else Plain. On an RTX 5090 a plain load
+// kept reading what other workgroups had replaced (ray tracing mode's car interiors blotchy, the
+// wheels glowing white), while an RTX 3090 reloads it anyway.
+enum class CoherentLoadMode : uint32_t { Plain = 0, Barrier = 1, Acquire = 2, Relaxed = 3 };
+CoherentLoadMode          GetCoherentLoadMode();
+[[nodiscard]] const char* CoherentLoadModeName(CoherentLoadMode mode);
 
 // Why a mesh program cannot run in passes (ShaderMeshInputInfo::passes), or nullptr.
 [[nodiscard]] const char* MeshPassesUnsupported(const IR::Program& program);

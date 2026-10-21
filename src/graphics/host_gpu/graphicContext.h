@@ -151,6 +151,11 @@ struct GraphicContext {
 	// Descriptor indexing for bindless images: runtime arrays indexed non-uniformly, partially
 	// bound and updated after bind.
 	bool                               bindless_enabled                      = false;
+	// Round 116, KYTY_HOST_IMPORT_PROBE=1 (renderer/cache/hostImportProbe.h):
+	// VK_EXT_external_memory_host is enabled, and the alignment an imported host pointer and size
+	// need.
+	bool                                      external_memory_host_enabled          = false;
+	uint64_t                                  imported_host_pointer_alignment       = 0;
 	uint32_t                           bindless_max_sampled_images           = 0;
 	uint32_t                           bindless_max_samplers                 = 0;
 	vk::DescriptorSetLayout            bindless_layout                       = nullptr;

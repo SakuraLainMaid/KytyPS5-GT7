@@ -696,6 +696,12 @@ std::vector<uint8_t> SessionKey(const SessionInfo& session) {
 	key.Put(session.float_image_atomics);
 	// The emitter's device switches (vulkanWindow.cpp sets them before any shader is compiled).
 	key.Put(ShaderRecompiler::Spirv::GetCoherentLoadAcquire());
+	// Round 116: the atomic modes of coherent loads have sessions of their own.
+	if (const auto mode = ShaderRecompiler::Spirv::GetCoherentLoadMode();
+	    mode == ShaderRecompiler::Spirv::CoherentLoadMode::Acquire ||
+	    mode == ShaderRecompiler::Spirv::CoherentLoadMode::Relaxed) {
+		key.Put(static_cast<uint32_t>(mode));
+	}
 	key.Put(ShaderRecompiler::Spirv::GetDeviceClockShift());
 	key.Put(ShaderRecompiler::Spirv::GetHostImageFeatures().min_lod);
 	key.Put(ShaderRecompiler::Spirv::GetHostFloatFeatures().denorm_flush_f32);

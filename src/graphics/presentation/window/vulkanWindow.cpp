@@ -826,8 +826,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	// NVIDIA reloads coherent loads without a barrier; AMD's drivers need one (SpirvEmitter.h).
 	ShaderRecompiler::Spirv::SetCoherentLoadAcquire(properties2.properties.vendorID != 0x10deu);
-	LOGF("Vulkan coherent loads: acquire barrier %s\n",
-	     ShaderRecompiler::Spirv::GetCoherentLoadAcquire() ? "on" : "off");
+	LOGF("Vulkan coherent loads: acquire barrier %s, loads made as %s\n",
+	     ShaderRecompiler::Spirv::GetCoherentLoadAcquire() ? "on" : "off",
+	     ShaderRecompiler::Spirv::CoherentLoadModeName(
+	         ShaderRecompiler::Spirv::GetCoherentLoadMode()));
 	vk::PhysicalDeviceAddressBindingReportFeaturesEXT address_binding {};
 	if (graphics.address_binding_report_enabled) {
 		address_binding.reportAddressBinding = VK_TRUE;
@@ -1329,6 +1331,16 @@ void WindowContext::CreateVulkan() {
 		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
 		}
+		// Round 116, KYTY_HOST_IMPORT_PROBE=1 (renderer/cache/hostImportProbe.h).
+		if (const char* probe = std::getenv("KYTY_HOST_IMPORT_PROBE");
+		    probe != nullptr && probe[0] == '1') {
+			if (HasExtension(available_extensions, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+				graphic_ctx.external_memory_host_enabled = true;
+			} else {
+				LOGF("Host import probe: the device has no VK_EXT_external_memory_host\n");
+			}
+		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
@@ -1413,6 +1425,13 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create device");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	if (graphic_ctx.external_memory_host_enabled) {
+		vk::PhysicalDeviceExternalMemoryHostPropertiesEXT host {};
+		vk::PhysicalDeviceProperties2                     properties {};
+		properties.pNext = &host;
+		graphic_ctx.physical_device.getProperties2(&properties);
+		graphic_ctx.imported_host_pointer_alignment = host.minImportedHostPointerAlignment;
+	}
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
 	if (g_readback_family != static_cast<uint32_t>(-1)) {

@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/bisect.h"
+#include "graphics/host_gpu/renderer/cache/hostImportProbe.h"
 #include "graphics/host_gpu/renderer/cache/readbackQueue.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
@@ -1501,6 +1502,8 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	}
 	Register(id);
 	NoteBufferEvent(BufferEventKind::Created, m_slot_buffers[id], vaddr, size, absorbed);
+	// KYTY_HOST_IMPORT_PROBE=1 (round 116), once.
+	HostImportProbe::MaybeRun(m_graphics, overlap.begin, overlap.end - overlap.begin);
 	return id;
 }
 

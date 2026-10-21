@@ -512,6 +512,42 @@ bool GetCoherentLoadAcquire() {
 	return forced >= 0 ? forced == 1 : g_coherent_load_acquire.load(std::memory_order_relaxed);
 }
 
+CoherentLoadMode GetCoherentLoadMode() {
+	static const int forced = [] {
+		const char* value = std::getenv("KYTY_COHERENT_LOAD_MODE");
+		if (value == nullptr) {
+			return -1;
+		}
+		if (std::strcmp(value, "barrier") == 0) {
+			return static_cast<int>(CoherentLoadMode::Barrier);
+		}
+		if (std::strcmp(value, "acquire") == 0) {
+			return static_cast<int>(CoherentLoadMode::Acquire);
+		}
+		if (std::strcmp(value, "relaxed") == 0) {
+			return static_cast<int>(CoherentLoadMode::Relaxed);
+		}
+		if (std::strcmp(value, "plain") == 0 || std::strcmp(value, "off") == 0) {
+			return static_cast<int>(CoherentLoadMode::Plain);
+		}
+		return -1;
+	}();
+	if (forced >= 0) {
+		return static_cast<CoherentLoadMode>(forced);
+	}
+	return GetCoherentLoadAcquire() ? CoherentLoadMode::Barrier : CoherentLoadMode::Plain;
+}
+
+const char* CoherentLoadModeName(CoherentLoadMode mode) {
+	switch (mode) {
+		case CoherentLoadMode::Plain: return "plain";
+		case CoherentLoadMode::Barrier: return "barrier";
+		case CoherentLoadMode::Acquire: return "acquire";
+		case CoherentLoadMode::Relaxed: return "relaxed";
+	}
+	return "?";
+}
+
 void SetDeviceClockShift(uint32_t shift) {
 	g_device_clock_shift.store(shift, std::memory_order_relaxed);
 }
