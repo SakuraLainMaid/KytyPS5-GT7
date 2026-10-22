@@ -8,18 +8,19 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/bisect.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
-#include "graphics/host_gpu/timeline.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/rendererLock.h"
 #include "graphics/host_gpu/renderer/stallWatch.h"
+#include "graphics/host_gpu/timeline.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
-#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
-#include "graphics/host_gpu/renderer/commandRecorder.h"
 
 // A private copy for the frame dump (libPngEnc.cpp has its own, without file output).
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -1177,7 +1178,8 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	KYTY_PROFILER_FUNCTION();
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
-	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+	Common::LockGuard       render_lock(m_impl->renderer.GetMutex());
+	const RendererHoldTimer hold;
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
@@ -1270,8 +1272,9 @@ void Presenter::Impl::Present() {
 		bool     pictured  = false;
 		uint64_t dump_tick = 0;
 		{
-			Common::LockGuard render_lock(renderer.GetMutex());
-			auto&             command = present_scheduler.BeginCommand();
+			Common::LockGuard       render_lock(renderer.GetMutex());
+			const RendererHoldTimer hold;
+			auto&                   command = present_scheduler.BeginCommand();
 			const bool        draw_system_overlay =
 			    overlay_visual.active && swapchain.PrepareSystemOverlay();
 			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],

@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/rendererLock.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/timeline.h"
 #include "graphics/presentation/videoOut.h"
@@ -1918,7 +1919,7 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 }
 
 void CommandProcessor::EmitGlobalBarrier() {
-	Common::LockGuard lock(m_renderer.GetMutex());
+	const RendererLock lock(m_renderer.GetMutex());
 
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;

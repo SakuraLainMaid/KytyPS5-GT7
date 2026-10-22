@@ -169,7 +169,15 @@ inline void AddLightGridView(uint32_t garbage_cells) {
 }
 // The graphics caches' spin locks (graphics/host_gpu/regionManager.h): a thread found one held by
 // another and waited `nanoseconds` for it. The "Perf locks:" line gives them by lock.
-enum class Lock : uint32_t { TextureCache, MemoryTracker, Count };
+// Round 128: Renderer, the GPU thread's waits for the renderer's lock (RendererLock), and
+// RendererHeldByPresenter, the presenter's holds of it (RendererHoldTimer).
+enum class Lock : uint32_t {
+	TextureCache,
+	MemoryTracker,
+	Renderer,
+	RendererHeldByPresenter,
+	Count
+};
 inline void AddLockWait(Lock lock, uint64_t nanoseconds) {
 	if (Active()) {
 		Detail::AddLockWaitSlow(static_cast<uint32_t>(lock), nanoseconds);

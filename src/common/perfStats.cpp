@@ -388,15 +388,17 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 	// The graphics caches' locks: how often a thread found one held, and how long it waited.
 	{
 		std::string          line = fmt::format("Perf locks:{}", configuration);
-		constexpr std::array names {"texture cache", "memory tracker"};
+		constexpr std::array names {"texture cache", "memory tracker", "renderer",
+		                            "renderer held by the presenter"};
+		constexpr std::array nouns {"waits", "waits", "waits", "holds"};
 		static_assert(names.size() == static_cast<size_t>(Lock::Count));
 		for (size_t i = 0; i < names.size(); i++) {
 			const auto waits        = take(c.lock_waits[i]);
 			const auto wait_ns      = take(c.lock_wait_ns[i]);
 			const auto longest_wait = take(c.longest_lock_wait_ns[i]);
-			line += fmt::format("{} {} {:.0f} waits/s, {:.1f} ms/s, longest {:.2f} ms",
+			line += fmt::format("{} {} {:.0f} {}/s, {:.1f} ms/s, longest {:.2f} ms",
 			                    i == 0 ? "" : " |", names[i], static_cast<double>(waits) / seconds,
-			                    static_cast<double>(wait_ns) / 1e6 / seconds,
+			                    nouns[i], static_cast<double>(wait_ns) / 1e6 / seconds,
 			                    static_cast<double>(longest_wait) / 1e6);
 		}
 		line += SpinLocks() ? " (spinning as before round 65)" : "";

@@ -9,12 +9,16 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
+#include <cmath>
 #include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics {
 
 SamplerCache::~SamplerCache() {
-	for (const auto& [key, sampler]: m_samplers) {
+	// The S# map's samplers are these (or the nearest of them): each is destroyed once.
+	for (const auto& [key, sampler]: m_vulkan_samplers) {
 		(void)key;
 		m_graphics.device.destroySampler(sampler, nullptr);
 	}
@@ -191,12 +195,132 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool intege
 		sampler_info.mipLodBias       = 0.0f;
 	}
 
-	vk::Sampler vk_sampler = nullptr;
-	const auto  result     = m_graphics.device.createSampler(&sampler_info, nullptr, &vk_sampler);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || vk_sampler == nullptr);
-
+	const auto vk_sampler = FindOrCreate(sampler_info);
+	// The S# map only finds the sampler for words seen before: past this many it starts again
+	// (the samplers stay, in m_vulkan_samplers).
+	constexpr size_t MaxSamplerKeys = 65536;
+	if (m_samplers.size() >= MaxSamplerKeys) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+			LOGF("Samplers: %zu S# variants seen; their map starts again (%zu Vulkan samplers)\n",
+			     m_samplers.size(), m_vulkan_samplers.size());
+		}
+		m_samplers.clear();
+	}
 	m_samplers.emplace(key, vk_sampler);
 	slot = {m_generation, key, vk_sampler};
+	return vk_sampler;
+}
+
+namespace {
+
+uint32_t FloatBits(float value) {
+	uint32_t bits = 0;
+	std::memcpy(&bits, &value, sizeof(bits));
+	return bits;
+}
+
+// Bits 25 to 29 of a discrete key's first word: compare enable, unnormalized coordinates and the
+// compare op, which a sampler standing in for another must share (FindOrCreate).
+constexpr uint32_t SamplerKindBits = 0x3e000000u;
+
+} // namespace
+
+// Round 128: a VkSampler for each distinct create info, not for each distinct S#. Every S# the
+// game used got a sampler of its own and none was freed; S#s that differ only where the Vulkan
+// sampler does not (or by a LOD bias the game moves) piled up past the driver's limit
+// (maxSamplerAllocationCount, 4000 on NVIDIA), and creating the next one ended the emulator after
+// ten minutes of Circuit Experience retries (issue 9). Past a budget under that limit, a new LOD
+// range or bias takes the nearest sampler of the same discrete state.
+vk::Sampler SamplerCache::FindOrCreate(const vk::SamplerCreateInfo& info) {
+	const DiscreteKey discrete {
+	    static_cast<uint32_t>(info.magFilter) | (static_cast<uint32_t>(info.minFilter) << 4u) |
+	        (static_cast<uint32_t>(info.mipmapMode) << 8u) |
+	        (static_cast<uint32_t>(info.addressModeU) << 12u) |
+	        (static_cast<uint32_t>(info.addressModeV) << 16u) |
+	        (static_cast<uint32_t>(info.addressModeW) << 20u) |
+	        (static_cast<uint32_t>(info.anisotropyEnable) << 24u) |
+	        (static_cast<uint32_t>(info.compareEnable) << 25u) |
+	        (static_cast<uint32_t>(info.unnormalizedCoordinates) << 26u) |
+	        ((static_cast<uint32_t>(info.compareOp) & 7u) << 27u),
+	    static_cast<uint32_t>(info.borderColor), FloatBits(info.maxAnisotropy)};
+	const VulkanKey key {discrete[0],
+	                     discrete[1],
+	                     discrete[2],
+	                     FloatBits(info.mipLodBias),
+	                     FloatBits(info.minLod),
+	                     FloatBits(info.maxLod)};
+	if (const auto found = m_vulkan_samplers.find(key); found != m_vulkan_samplers.end()) {
+		return found->second;
+	}
+	if (m_budget == 0) {
+		// Room for the samplers made elsewhere (the blit helper's, the presenter's, the overlay's).
+		const auto limit =
+		    m_graphics.GetPhysicalDeviceProperties().limits.maxSamplerAllocationCount;
+		m_budget = limit > 1024u ? limit - 256u : std::max(limit / 2u, 1u);
+		LOGF("Samplers: one Vulkan sampler for each create info, %u at most (the device allows "
+		     "%u); past that a new LOD range takes the nearest of the same kind (round 128)\n",
+		     m_budget, limit);
+	}
+	auto&      variants = m_variants[discrete];
+	const auto nearest  = [&info](const std::vector<LodVariant>& list) -> vk::Sampler {
+        const LodVariant* best          = nullptr;
+        float             best_distance = 0.0f;
+        for (const auto& variant: list) {
+            const float distance = std::abs(variant.bias - info.mipLodBias) +
+                                   std::abs(variant.min_lod - info.minLod) +
+                                   std::abs(variant.max_lod - info.maxLod);
+            if (best == nullptr || distance < best_distance) {
+                best          = &variant;
+                best_distance = distance;
+            }
+        }
+        return best != nullptr ? best->sampler : nullptr;
+	};
+	const auto note_reuse = [this](const char* why) {
+		m_nearest_reuses++;
+		if (m_nearest_reuses <= 8 || (m_nearest_reuses & (m_nearest_reuses - 1u)) == 0) {
+			LOGF("Samplers: %s; the nearest of the same kind stands in (%" PRIu64
+			     " so far, %zu Vulkan samplers, %zu kinds)\n",
+			     why, m_nearest_reuses, m_vulkan_samplers.size(), m_variants.size());
+		}
+	};
+	if (m_vulkan_samplers.size() >= m_budget) {
+		if (const auto stand_in = nearest(variants); stand_in != nullptr) {
+			note_reuse("the budget is used up");
+			return stand_in;
+		}
+	}
+	vk::Sampler vk_sampler = nullptr;
+	const auto  result     = m_graphics.device.createSampler(&info, nullptr, &vk_sampler);
+	if (result != vk::Result::eSuccess || vk_sampler == nullptr) {
+		// The nearest of the same discrete state, or else any of the same kind (compare and
+		// coordinates), rather than ending the emulator.
+		auto stand_in = nearest(variants);
+		for (auto it = m_variants.begin(); stand_in == nullptr && it != m_variants.end(); ++it) {
+			if ((it->first[0] & SamplerKindBits) == (discrete[0] & SamplerKindBits)) {
+				stand_in = nearest(it->second);
+			}
+		}
+		if (stand_in == nullptr) {
+			EXIT("vkCreateSampler failed: %s (%zu samplers made)\n", vk::to_string(result).c_str(),
+			     m_vulkan_samplers.size());
+		}
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("Samplers: vkCreateSampler failed: %s, with %zu made\n",
+			     vk::to_string(result).c_str(), m_vulkan_samplers.size());
+		}
+		note_reuse("a sampler could not be made");
+		return stand_in;
+	}
+	m_vulkan_samplers.emplace(key, vk_sampler);
+	variants.push_back({info.mipLodBias, info.minLod, info.maxLod, vk_sampler});
+	if (m_vulkan_samplers.size() >= m_next_count_log) {
+		LOGF("Samplers: %zu Vulkan samplers made (%zu kinds), for %zu S# variants\n",
+		     m_vulkan_samplers.size(), m_variants.size(), m_samplers.size() + 1u);
+		m_next_count_log *= 2u;
+	}
 	return vk_sampler;
 }
 

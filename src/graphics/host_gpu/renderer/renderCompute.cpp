@@ -25,6 +25,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/rendererLock.h"
 #include "graphics/host_gpu/timeline.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -1550,7 +1551,7 @@ void RenderExecutor::DispatchDirectPart(uint64_t submit_id, CommandBuffer& buffe
 		return;
 	}
 
-	Common::LockGuard lock(m_context.GetMutex());
+	const RendererLock lock(m_context.GetMutex());
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
@@ -1983,7 +1984,7 @@ void RenderExecutor::DispatchIndirectPart(uint64_t submit_id, CommandBuffer& buf
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
-	Common::LockGuard lock(m_context.GetMutex());
+	const RendererLock lock(m_context.GetMutex());
 	const auto&       cs_regs = buffer.GetShaders().GetCs();
 	if (FrameGraph::Logging()) {
 		FrameGraph::BeginOp();
