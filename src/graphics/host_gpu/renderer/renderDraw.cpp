@@ -26,6 +26,7 @@
 #include "graphics/host_gpu/renderer/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -2892,11 +2893,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	FrameGraphQueries::PrepareDraw(m_context.GetGraphics().device, m_context.GetCommandScheduler(),
 	                               vk_buffer);
+	// Round 119: the guest's occlusion counters (OcclusionQueries); one occlusion query at a time,
+	// so a capture's own query leaves the draw to it.
+	const int32_t occlusion_query = OcclusionQueries::PrepareDraw(
+	    m_context, vk_buffer, buffer.GetRegisters().GetDbCountControl());
 	m_context.GetCommandScheduler().BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	GpuTiming::Before(m_context, buffer);
-	const int32_t samples_query = FrameGraphQueries::BeginDraw(vk_buffer);
+	OcclusionQueries::BeginDraw(vk_buffer, occlusion_query);
+	const int32_t samples_query =
+	    occlusion_query < 0 ? FrameGraphQueries::BeginDraw(vk_buffer) : -1;
 	int64_t gpu_zone = -1;
 	if (Profiler::g_counters) {
 		// The draw's program, as its GPU zone's name and its command zone's text.
@@ -2950,6 +2957,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                    : vertex_stages.back().stage.program->shader_hash,
 	    static_cast<bool>(vertex_indirect_buffer) || static_cast<bool>(mesh_indirect_buffer));
 	FrameGraphQueries::EndDraw(vk_buffer, samples_query);
+	OcclusionQueries::EndDraw(vk_buffer, occlusion_query);
 	GpuProfiler::End(buffer, gpu_zone);
 	GpuTiming::AfterDraw(
 	    m_context, buffer,

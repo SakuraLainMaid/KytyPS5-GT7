@@ -314,6 +314,10 @@ static void HwCtxSetDepthBoundsRegister(CommandProcessor& cp, uint32_t cmd_offse
 
 static void HwCtxSetDepthMetadataRegister(CommandProcessor& cp, uint32_t cmd_offset,
                                          uint32_t value) {
+	if (cmd_offset == Pm4::DB_COUNT_CONTROL) {
+		// Round 119: whether the draws count occlusion samples (OcclusionQueries).
+		cp.GetCtx().SetDbCountControl(value);
+	}
 	if (cmd_offset == Pm4::DB_RENDER_OVERRIDE) {
 		HW::DepthRenderOverride control;
 		control.force_z_valid       = (value & 0x20000000u) != 0;

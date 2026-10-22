@@ -109,6 +109,8 @@ struct GraphicContext {
 	bool                               diagnostic_checkpoints_enabled        = false;
 	// With --profile, for the host GPU timeline (renderer/gpuProfiler).
 	bool                               host_query_reset_enabled              = false;
+	// Round 119: occlusionQueryPrecise, for the guest's occlusion counters (OcclusionQueries).
+	bool                               occlusion_query_precise_enabled       = false;
 	bool                               calibrated_timestamps_enabled         = false;
 	bool                               device_fault_enabled                  = false;
 	// pipelineStatisticsQuery: GPU timing's counts for each timed draw (gpuTiming.cpp).

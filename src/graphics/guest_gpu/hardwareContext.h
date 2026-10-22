@@ -838,6 +838,9 @@ public:
 	void SetDepthRenderOverride(const DepthRenderOverride& control) {
 		m_depth_render_override = control;
 	}
+	// Round 119: DB_COUNT_CONTROL as written (whether draws count occlusion samples).
+	[[nodiscard]] uint32_t GetDbCountControl() const { return m_db_count_control; }
+	void                   SetDbCountControl(uint32_t value) { m_db_count_control = value; }
 	[[nodiscard]] const DepthControl& GetDepthControl() const { return m_depth_control; }
 	void SetDepthControl(const DepthControl& control) { m_depth_control = control; }
 	[[nodiscard]] const ModeControl& GetModeControl() const { return m_mode_control; }
@@ -937,6 +940,7 @@ private:
 	DepthRenderTarget   m_depth_render_target;
 	RenderControl       m_render_control;
 	DepthRenderOverride m_depth_render_override;
+	uint32_t            m_db_count_control = 0;
 	DepthControl        m_depth_control;
 	StencilControl      m_stencil_control;
 	StencilMask         m_stencil_mask;

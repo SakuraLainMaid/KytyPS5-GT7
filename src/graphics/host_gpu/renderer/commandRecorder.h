@@ -216,6 +216,9 @@ public:
 	void beginQuery(vk::QueryPool pool, uint32_t query) const {
 		Run([=](vk::CommandBuffer command) { command.beginQuery(pool, query, {}); });
 	}
+	void beginQuery(vk::QueryPool pool, uint32_t query, vk::QueryControlFlags flags) const {
+		Run([=](vk::CommandBuffer command) { command.beginQuery(pool, query, flags); });
+	}
 	void endQuery(vk::QueryPool pool, uint32_t query) const {
 		Run([=](vk::CommandBuffer command) { command.endQuery(pool, query); });
 	}

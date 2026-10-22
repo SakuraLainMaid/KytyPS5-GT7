@@ -701,6 +701,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
+	// Optional (round 119): the guest's occlusion counters count samples exactly
+	// (OcclusionQueries; the guest weighs light glows by them).
+	if (supported_features2.features.occlusionQueryPrecise == VK_TRUE) {
+		device_features.occlusionQueryPrecise    = VK_TRUE;
+		graphics.occlusion_query_precise_enabled = true;
+	}
+	LOGF("Vulkan occlusionQueryPrecise: %s\n",
+	     graphics.occlusion_query_precise_enabled ? "true" : "false");
 	// Optional: what GPU timing counts for each timed draw (fragments shaded, primitives clipped).
 	if (supported_features2.features.pipelineStatisticsQuery == VK_TRUE) {
 		device_features.pipelineStatisticsQuery = VK_TRUE;

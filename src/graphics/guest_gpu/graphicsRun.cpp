@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
+#include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -1931,6 +1932,11 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				EXIT("invalid occlusion-counter dump: index=0x%08" PRIx32 ", address=0x%016" PRIx64
 				     "\n",
 				     event_index, event_address);
+			}
+			// Round 119: the host GPU counts the samples (OcclusionQueries), and the counters are
+			// written once it has run the work before the dump.
+			if (OcclusionQueries::Enabled() && OcclusionQueries::Dump(m_renderer, event_address)) {
+				break;
 			}
 			static std::once_flag warning_once;
 			std::call_once(warning_once, [] {

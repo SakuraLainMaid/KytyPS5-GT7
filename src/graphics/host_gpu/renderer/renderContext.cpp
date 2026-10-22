@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferAddressLog.h"
 #include "graphics/host_gpu/renderer/faultPages.h"
 #include "graphics/host_gpu/renderer/frameGraphQueries.h"
+#include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/timeline.h"
 #include "graphics/presentation/videoOut.h"
@@ -257,6 +258,7 @@ RenderContext::~RenderContext() {
 	// The buffers destroyed from here on may outlive the scheduler their log entries ask.
 	BufferAddressLog::Stop();
 	FrameGraphQueries::Shutdown();
+	OcclusionQueries::Shutdown();
 }
 
 void WarmUpLocalMemory(GraphicContext& graphics, CommandScheduler& scheduler);
