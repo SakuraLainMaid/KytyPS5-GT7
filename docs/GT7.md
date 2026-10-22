@@ -60,6 +60,18 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 22, 2026, third build)
+
+No shaders are compiled again after this update.
+
+- **No more crash in Scapes** ([issue 11](https://github.com/usa-ratt/KytyPS5-GT7/issues/11)). After 10 to 15 minutes,
+  as the next scene loaded, the emulator froze and closed without an error. The game gives some
+  of its worker threads stacks inside its own graphics memory. The emulator watches parts of that
+  memory for changes by making them read-only, and once a block holding one of those stacks was
+  made read-only, the next write to the stack ended the emulator before it could report anything.
+  The emulator now leaves the stacks of running threads alone. A 30-minute Scapes run no longer
+  crashed.
+
 ## What's new (October 22, 2026, second build)
 
 **All shaders are compiled again after this update** (pop-in the first time in each place, and a
@@ -258,9 +270,6 @@ Graphics and shaders:
   some tunnel exits and under some overpasses, and fades back once past them. It depends on the
   camera angle, so watching the same replay twice can give green once and not the other time.
 - Tokyo at night: some shadows on tunnel ceilings and walls move with the camera.
-- **Scapes:** the emulator can close by itself after about 10 to 15 minutes in Scapes, as the
-  next scene loads ([issue 11](https://github.com/usa-ratt/KytyPS5-GT7/issues/11)). The cause is found and the fix
-  is being tested.
 - **AMD graphics cards:** the game crashes at the GT logo, inside the AMD driver's shader compiler
   ([issue 12](https://github.com/usa-ratt/KytyPS5-GT7/issues/12)). Being looked into.
 - **Livery editor:** leaving it shows error CE-210717 (the game uploads the livery to its online
