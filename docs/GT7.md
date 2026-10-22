@@ -41,9 +41,9 @@ the game. The user profile, audio and notification settings don't matter.
 
 In the game's own graphics options, use the **performance (frame rate) mode**.
 
-The ray tracing (RT) mode works much better in this build (see What's new), but it is **not
-recommended yet**: its reflections still flicker a little and look a bit jagged, and races in it
-are untested. It needs **Bindless textures** on in the launcher.
+The ray tracing (RT) mode looks right once its shaders are compiled (see What's new), but it is
+**not recommended for playing yet**: its frame rate is low (about 10 to 20 fps in the garage), and
+races in it are untested. It needs **Bindless textures** on in the launcher.
 
 ## Notes
 
@@ -59,6 +59,31 @@ update everything is compiled once more.
 
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
+
+## What's new (October 22, 2026)
+
+**All shaders are compiled again after this update** (pop-in the first time in each place, and a
+few minutes for each car's first visit in ray tracing mode).
+
+- **Ray tracing mode looks right** (on an RTX 5090 too): no more blotchy interiors, white glow on
+  the wheels or rainbow colors. These came from the cars' material shaders, which are very big:
+  each one takes 20 to 35 seconds to compile, and a car needs about 100 of them. Until a
+  material's shader was ready, that part of the car was drawn wrong. Now:
+  - The emulator's console window shows how far they are, every 10 seconds
+    (`Shaders compiling in the background: ...`), and says `all done` at the end.
+  - More of them compile at once on CPUs with many cores (up to 16 with 32 threads and 48 GB of
+    memory or more), at a lower priority than the game, and none sits waiting while there is
+    room.
+  - A car's materials are compiled once. Before, the game loading the same car again at another
+    place in memory (each garage visit could) made the emulator compile them all again.
+  - **Tip:** the first time you look at a car in ray tracing mode, wait until the console says
+    `all done`. The car repairs itself while you look at it; you don't need to leave the garage.
+- **No more crash in races** with `resource.mip_count` in the error
+  ([issue 3](https://github.com/usa-ratt/KytyPS5-GT7/issues/3),
+  [issue 9](https://github.com/usa-ratt/KytyPS5-GT7/issues/9)). The game asked for a texture of 7
+  mip levels whose description arrived half empty; the emulator puts in an empty stand-in for it,
+  and the shader that reads it by mip level now gets the stand-in at every level instead of the
+  emulator stopping.
 
 ## What's new (October 21, 2026, fourth build)
 
@@ -194,10 +219,10 @@ Graphics and shaders:
 
 ## Known problems
 
-- **Ray tracing mode:** the reflections still flicker a little and look a bit jagged, most of all
-  right after switching between the cockpit and outside views. On some PCs (an RTX 5090, but not
-  an RTX 3090) car interiors also look blotchy, with dark spots and orange pixels, and the wheels
-  and the lower body glow white. Being looked into.
+- **Ray tracing mode:** the frame rate is low (about 10 to 20 fps in the garage). A car looks
+  blotchy for the few minutes its material shaders compile the first time (see What's new). The
+  reflections can still flicker a little and look a bit jagged, most of all right after switching
+  between the cockpit and outside views.
 - Tokyo: at some times of day and weather (twilight and night), the picture turns green at some
   tunnel exits and under some overpasses, most often in replays, and fades back once past them.
 - In replays, small red lights can show through walls.
