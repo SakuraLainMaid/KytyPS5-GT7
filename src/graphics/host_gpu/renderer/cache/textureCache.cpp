@@ -402,6 +402,55 @@ void ForgetLandedReadbacks(uint64_t address, uint64_t size) {
 	return copies;
 }
 
+// Round 123: `info` (the requested image with the layers of the cached one it replaces) gets a
+// range that holds those layers: the requested slices, stacked from the same address (as a depth
+// target's are), and the stencil and HTile ranges likewise. False when the requested image is not
+// such a stack (another first address, mips, a range its layers do not divide), and the caller
+// keeps the requested layers.
+[[nodiscard]] bool GrowDepthLayers(ImageInfo& info, const ImageInfo& requested,
+                                   const ImageInfo& cached) {
+	const auto old_layers = requested.resources.layers;
+	const auto new_layers = info.resources.layers;
+	if (info.resources.levels != requested.resources.levels || requested.resources.levels != 1 ||
+	    old_layers == 0 || new_layers <= old_layers || info.IsVolume() ||
+	    requested.data.address != cached.data.address || requested.data.size % old_layers != 0 ||
+	    requested.mip_layout[0].offset != 0 ||
+	    requested.mip_layout[0].size != requested.data.size ||
+	    requested.stencil.size % old_layers != 0 ||
+	    requested.metadata.range.size % old_layers != 0) {
+		return false;
+	}
+	const auto grow = [&](GuestRange range) -> std::optional<GuestRange> {
+		if (range.Empty()) {
+			return range;
+		}
+		const auto slice = range.size / old_layers;
+		if (slice > UINT64_MAX / new_layers) {
+			return std::nullopt;
+		}
+		const GuestRange grown {range.address, slice * new_layers};
+		return grown.Valid() ? std::optional {grown} : std::nullopt;
+	};
+	const auto data     = grow(requested.data);
+	const auto stencil  = grow(requested.stencil);
+	const auto metadata = grow(requested.metadata.range);
+	if (!data || !stencil || !metadata) {
+		return false;
+	}
+	info.data               = *data;
+	info.stencil            = *stencil;
+	info.metadata.range     = *metadata;
+	info.mip_layout[0].size = data->size;
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+		LOGF("TextureCache: depth image 0x%012" PRIx64 " %ux%u of %u layers replaced for a "
+		     "binding of %u: the new one keeps %u layers, 0x%" PRIx64 " bytes (round 123)\n",
+		     requested.data.address, requested.extent.width, requested.extent.height,
+		     cached.resources.layers, old_layers, new_layers, data->size);
+	}
+	return true;
+}
+
 [[nodiscard]] std::vector<GpuTileInfo> BuildDepthTiles(const ImageInfo& info) {
 	TileBlockLayout block {};
 	EXIT_NOT_IMPLEMENTED(
@@ -1654,6 +1703,13 @@ TextureCache::DiagnosticState TextureCache::DiagnosticImageState(ImageId id) {
 	state.gpu_written  = image->IsGpuModified();
 	state.buffer_write = image->IsBufferModified();
 	state.cpu_dirty    = image->IsCpuDirty();
+	state.data         = image->info.data;
+	state.extent       = image->info.extent;
+	state.levels       = image->info.resources.levels;
+	state.layers       = image->info.resources.layers;
+	state.host_width   = image->backing.extent.width;
+	state.host_height  = image->backing.extent.height;
+	state.format       = image->info.pixel_format;
 	if (!image->registered || image->info.data.Empty()) {
 		return state;
 	}
@@ -1971,6 +2027,14 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		info.mip_layout = cached.info.mip_layout;
 	} else {
 		info.resources = std::max(requested.resources, cached.info.resources);
+		// Round 123: the layers of the image it replaces, in a range that holds them. Before,
+		// a depth binding of one slice over a depth image of four (the livery editor saving a
+		// livery) made an image of four layers in the range of one, and its first upload ended
+		// the emulator in the tiler (a 512x512 32-bit slice in 256 KB).
+		if (info.resources != requested.resources &&
+		    !GrowDepthLayers(info, requested, cached.info)) {
+			info.resources = requested.resources;
+		}
 	}
 	info.htile_clear_mask     = 0;
 	const auto replacement_id = InsertImage(info);
@@ -2388,6 +2452,22 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	}
 	const auto          layers          = info.resources.layers;
 	const auto          full_slice_size = info.data.size / layers;
+	// Round 123: a slice its range cannot hold (an image made with more layers than its range
+	// has room for) is left as it is rather than ending the emulator in the tiler.
+	if (const uint64_t slice_bytes =
+	        static_cast<uint64_t>(info.pitch) * info.extent.height * info.bytes_per_block;
+	    info.extent.height == 0 || slice_bytes > full_slice_size) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("TextureCache: depth %s 0x%012" PRIx64 "+0x%" PRIx64
+			     " %ux%u pitch %u, %u bytes a texel, %u layers: a slice needs 0x%" PRIx64
+			     " bytes and has 0x%" PRIx64 "; not uploaded (round 123)\n",
+			     image.depth_id ? "stencil" : "image", info.data.address, info.data.size,
+			     info.extent.width, info.extent.height, info.pitch, info.bytes_per_block, layers,
+			     slice_bytes, full_slice_size);
+		}
+		return;
+	}
 	auto copies = BuildDepthCopies(info, full_slice_size, image.depth_id
 	                                                        ? vk::ImageAspectFlagBits::eStencil
 	                                                        : vk::ImageAspectFlagBits::eDepth);
@@ -4571,7 +4651,18 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 	const uint64_t guest_slice    = texels_per_slice * info.bytes_per_block;
 	EXIT_NOT_IMPLEMENTED(transfer_slice > UINT64_MAX / layers);
 	const uint64_t transfer_size = transfer_slice * layers;
-	EXIT_NOT_IMPLEMENTED(guest_slice > full_slice_size);
+	if (guest_slice > full_slice_size) {
+		// Round 123: as in UploadImage, a slice its range cannot hold is not written back.
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("TextureCache: depth image 0x%012" PRIx64 "+0x%" PRIx64
+			     " %ux%u, %u layers: a slice needs 0x%" PRIx64 " bytes and has 0x%" PRIx64
+			     "; not written back (round 123)\n",
+			     info.data.address, info.data.size, info.extent.width, info.extent.height, layers,
+			     guest_slice, full_slice_size);
+		}
+		return;
+	}
 	auto copies = BuildDepthCopies(info, full_slice_size, vk::ImageAspectFlagBits::eDepth);
 	if (transfer_bytes == info.bytes_per_block) {
 		if (!info.IsTiled()) {

@@ -1366,10 +1366,15 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
 		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size);
-		// Round 122: a multisample depth target read through a single-sample T# (EQAA depth in
-		// replays: the light sprites' occlusion test, depth-based effects) reads a copy of its
-		// first sample, as the console's texture unit does (TextureCache::SingleSampleDepth).
-		if (image->backing.samples > 1 && desc.info.samples == 1) {
+		// Round 122: a multisample depth target read by an instruction of a single-sample
+		// dimension (EQAA depth in replays: the light sprites' occlusion test, depth-based
+		// effects) reads a copy of its first sample, as the console's texture unit does
+		// (TextureCache::SingleSampleDepth). Round 123: decided by the instruction's dimension,
+		// which sets the binding's kind in the shader; the T# itself is a 2-sample one (the
+		// round 122 test of its sample count never held).
+		if (image->backing.samples > 1 &&
+		    resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa &&
+		    resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray) {
 			id    = texture_cache.SingleSampleDepth(id);
 			image = &texture_cache.GetImage(id);
 		}
@@ -2462,6 +2467,20 @@ static void LogFrameGraphStage(RenderContext& context, const ShaderStageRuntime&
 		    static_cast<int>(info.pixel_format), static_cast<uint32_t>(info.guest_format),
 		    static_cast<uint32_t>(info.tile_mode), static_cast<uint32_t>(info.type),
 		    state.valid ? flags : "none", state.overlaps, state.gpu_overlaps, state.first_overlap);
+		// Round 123: the image the binding found, when its shape is not the T#'s (a glyph
+		// texture viewed through an older image of another width at its address, a copy of a
+		// depth image's first sample).
+		if (state.valid &&
+		    (state.data != info.data || state.extent != info.extent ||
+		     state.host_width != std::max(info.extent.width, 1u) ||
+		     state.host_height != std::max(info.extent.height, 1u) ||
+		     state.levels < info.resources.levels || state.layers < info.resources.layers)) {
+			FrameGraph::Log("  %s tex[%zu] found image 0x%012" PRIx64 "+0x%" PRIx64
+			                " %ux%ux%u layers %u mips %u fmt %d, host %ux%u",
+			                stage, i, state.data.address, state.data.size, state.extent.width,
+			                state.extent.height, state.extent.depth, state.layers, state.levels,
+			                static_cast<int>(state.format), state.host_width, state.host_height);
+		}
 		// A light grid the CPU wrote: does the GPU's copy hold what the guest wrote? (Shown as
 		// the submission lands.)
 		if (!resource.written && binding.image_id && info.pixel_format == vk::Format::eR32G32Uint &&

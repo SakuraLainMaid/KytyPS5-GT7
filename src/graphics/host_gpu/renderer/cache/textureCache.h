@@ -202,6 +202,14 @@ public:
 		uint32_t overlaps      = 0;
 		uint32_t gpu_overlaps  = 0;
 		uint64_t first_overlap = 0; // the guest address of one of them
+		// Round 123: the image itself (a binding may view one of another shape).
+		GuestRange   data;
+		vk::Extent3D extent {};
+		uint32_t     levels      = 0;
+		uint32_t     layers      = 0;
+		uint32_t     host_width  = 0; // its host image's (the backing's)
+		uint32_t     host_height = 0;
+		vk::Format   format      = vk::Format::eUndefined;
 	};
 	[[nodiscard]] DiagnosticState DiagnosticImageState(ImageId id);
 	// Diagnostics (the frame graph): the pixels the GPU holds for a texture a shader reads, once
