@@ -161,6 +161,15 @@ public:
 	// Round 121: whether a read-back for the CPU is on its way (enrolled, or recorded and not
 	// landed). GPU thread.
 	[[nodiscard]] bool ReadbacksOnTheirWay();
+	// Round 122: for a texture binding that reads a multisample depth image as single-sample (a
+	// T# of a 2D image over a multisample depth target: the console's texture unit reads its
+	// first sample), a single-sample depth image holding that sample, copied again whenever the
+	// depth image changed. Vulkan cannot sample a multisample image through a single-sample
+	// binding: what NVIDIA read there was the samples interleaved, rows of two images, so depth
+	// tests in shaders (the light sprites' occlusion in replays) and depth-based effects read the
+	// wrong depth. Any other image: itself. KYTY_MS_DEPTH_SAMPLE0=0: the image itself, as before.
+	// GPU thread.
+	[[nodiscard]] ImageId SingleSampleDepth(ImageId id);
 	void RunGarbageCollector();
 	// The guest no longer refers to this bindless image from any heap entry (it replaced or
 	// cleared them): free it once no draw has used it for a few frames (engine method).
@@ -518,6 +527,13 @@ private:
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	// SingleSampleDepth's copies, by the multisample depth image they copy: the copy (an image
+	// with no guest memory, so never registered) and the depth image's content serial it holds.
+	struct SingleSampleDepthCopy {
+		ImageId  copy {};
+		uint64_t serial = UINT64_MAX;
+	};
+	std::unordered_map<ImageId, SingleSampleDepthCopy> m_single_sample_depths;
 	std::unordered_set<ImageId>                       m_bindless_evictable;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	// The addresses color targets' CMASK and DCC start at (IsColorMeta).

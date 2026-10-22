@@ -1366,6 +1366,13 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
 		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size);
+		// Round 122: a multisample depth target read through a single-sample T# (EQAA depth in
+		// replays: the light sprites' occlusion test, depth-based effects) reads a copy of its
+		// first sample, as the console's texture unit does (TextureCache::SingleSampleDepth).
+		if (image->backing.samples > 1 && desc.info.samples == 1) {
+			id    = texture_cache.SingleSampleDepth(id);
+			image = &texture_cache.GetImage(id);
+		}
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {

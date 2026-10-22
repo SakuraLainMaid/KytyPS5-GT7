@@ -1245,6 +1245,14 @@ void TextureCache::FreeImage(ImageId id, const char* why, bool copied) {
 	if (image.IsGpuModified()) {
 		image.ClearGpuModified();
 	}
+	// Its single-sample copy (SingleSampleDepth) goes with it.
+	if (const auto copy = m_single_sample_depths.find(id); copy != m_single_sample_depths.end()) {
+		const auto copy_id = copy->second.copy;
+		m_single_sample_depths.erase(copy);
+		if (copy_id) {
+			m_scheduler.DeferRelease([this, copy_id] { ReleaseImage(copy_id); });
+		}
+	}
 	DeleteImage(id);
 }
 
@@ -7002,6 +7010,81 @@ bool TextureCache::ReadbacksOnTheirWay() {
 	}
 	std::lock_guard lock(m_pending_writebacks->mutex);
 	return !m_pending_writebacks->ranges.empty();
+}
+
+ImageId TextureCache::SingleSampleDepth(ImageId id) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MS_DEPTH_SAMPLE0");
+		const bool  on    = value == nullptr || value[0] != '0';
+		LOGF("Multisample depth read as single-sample: %s (KYTY_MS_DEPTH_SAMPLE0)\n",
+		     on ? "from a copy of its first sample" : "the multisample image itself");
+		return on;
+	}();
+	if (!enabled) {
+		return id;
+	}
+	std::scoped_lock lock {m_lock};
+	const auto*      source = m_slot_images.try_get(id);
+	if (source == nullptr || source->backing.samples <= 1 || !source->info.IsDepth() ||
+	    source->backing.image == nullptr || source->backing.image_type != vk::ImageType::e2D ||
+	    source->info.resources.layers != 1 || source->info.resources.levels != 1 ||
+	    source->depth_id) {
+		return id;
+	}
+	const auto width  = source->info.extent.width;
+	const auto height = source->info.extent.height;
+	auto&      entry  = m_single_sample_depths[id];
+	auto*      copy   = entry.copy ? m_slot_images.try_get(entry.copy) : nullptr;
+	if (copy == nullptr || copy->info.extent.width != width || copy->info.extent.height != height) {
+		if (copy != nullptr) {
+			const auto old = entry.copy;
+			m_scheduler.DeferRelease([this, old] { ReleaseImage(old); });
+		}
+		ImageInfo info {};
+		info.pixel_format    = vk::Format::eD32Sfloat;
+		info.guest_format    = source->info.guest_format;
+		info.type            = source->info.type;
+		info.extent          = {width, height, 1};
+		info.resources       = {1, 1};
+		info.pitch           = width;
+		info.bytes_per_block = 4;
+		info.samples         = 1;
+		info.tile_mode       = Prospero::TileMode::kLinear;
+		info.mip_layout[0]   = {0, uint64_t {width} * height * 4u, width, height};
+		const auto guest     = source->info.data.address;
+		const auto samples   = source->backing.samples;
+		entry.copy           = InsertImage(info);
+		entry.serial         = UINT64_MAX;
+		copy                 = &m_slot_images[entry.copy];
+		source               = &m_slot_images[id];
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("Multisample depth read as single-sample: 0x%012" PRIx64 " %ux%u, %u samples: "
+			     "read from a copy of its first sample\n",
+			     guest, width, height, samples);
+		}
+	}
+	copy->tick_accessed_last = m_scheduler.CurrentTick();
+	static uint64_t copies   = 0;
+	static uint64_t reads    = 0;
+	static auto     since    = std::chrono::steady_clock::now();
+	reads++;
+	if (entry.serial != source->content_serial) {
+		m_blit_helper.CopyMsDepthSample0(m_slot_images[id], *copy);
+		entry.serial = m_slot_images[id].content_serial;
+		copies++;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - since >= std::chrono::seconds(10)) {
+		LOGF("Multisample depth read as single-sample (%.0f s): %" PRIu64 " reads, %" PRIu64
+		     " copies of the first sample, %zu depth images\n",
+		     std::chrono::duration<double>(now - since).count(), reads, copies,
+		     m_single_sample_depths.size());
+		since  = now;
+		reads  = 0;
+		copies = 0;
+	}
+	return entry.copy;
 }
 
 void TextureCache::ProcessDownloadImages() {
