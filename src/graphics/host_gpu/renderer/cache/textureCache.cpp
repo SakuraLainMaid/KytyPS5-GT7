@@ -1445,16 +1445,21 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	}
 }
 
-// KYTY_READBACK_SMALL_IMAGES_KB (default 64, 0: off): GPU-written linear images up to this size
-// are copied back to guest memory after each submission, as --readback-linear-images does for
+// KYTY_READBACK_SMALL_IMAGES_KB (default 32768 since round 126, 64 before; 0: off): GPU-written
+// linear images up to this size are copied back to guest memory after each submission, as
+// --readback-linear-images does for
 // every linear image. A small linear target or storage image nothing on the GPU reads is how a
 // game reads GPU results on the CPU: GT7 writes 16x16 and 32x32 reductions of its scene colour
 // and depth each frame for the CPU, which sets the white balance (and more) from them. Without
 // this the CPU read stale bytes; small render targets are never evicted, so never written back.
+// Round 126: a livery's pictures are drawn into a 1920x540 linear target (4 MB) twice, the halves
+// of the 1920x1080 picture the CPU encodes as PNG; with 64 KB that picture was noise, with 16 MB
+// right. 32 MB holds a 3840x2160 RGBA8 picture (a photo). The frames of a race write none above
+// 64 KB, so they read back what they did before.
 static uint64_t SmallReadbackBytes() {
 	static const uint64_t bytes = [] {
 		const char* value = std::getenv("KYTY_READBACK_SMALL_IMAGES_KB");
-		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 64ull) << 10u;
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 32768ull) << 10u;
 	}();
 	return bytes;
 }
@@ -1732,7 +1737,7 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 			     image.info.extent.height, static_cast<int>(image.info.pixel_format),
 			     logged.size() == 1
 			         ? " (GPU-written linear images up to KYTY_READBACK_SMALL_IMAGES_KB, default "
-			           "64, go back to guest memory after each submission)"
+			           "32768, go back to guest memory after each submission)"
 			         : "");
 		}
 	}

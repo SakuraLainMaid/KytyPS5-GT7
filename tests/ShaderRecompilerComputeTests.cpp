@@ -20699,6 +20699,37 @@ TestCase ScalarFlbitI32B32Gpu() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+// The signed form counts the leading bits equal to the sign bit; 0 and -1 give -1.
+TestCase ScalarFlbitI32Gpu() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 0, 0x00000000u);
+  code.push_back(EncodeSop1(0x17, 20, 0));
+
+  AppendSMovLiteral(&code, 0, 0x40000000u);
+  code.push_back(EncodeSop1(0x17, 21, 0));
+
+  AppendSMovLiteral(&code, 0, 0xfffffff0u);
+  code.push_back(EncodeSop1(0x17, 22, 0));
+
+  AppendSMovLiteral(&code, 0, 0xffffffffu);
+  code.push_back(EncodeSop1(0x17, 23, 0));
+
+  AppendStoreSgpr(&code, 20, 0);
+  AppendStoreSgpr(&code, 21, 1);
+  AppendStoreSgpr(&code, 22, 2);
+  AppendStoreSgpr(&code, 23, 3);
+  AppendEnd(&code);
+
+  return {"ScalarFlbitI32Gpu",
+          code,
+          {},
+          {0xffffffffu, 1, 28, 0xffffffffu},
+          {O::S_MOV_B32, O::S_FLBIT_I32, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase ScalarSaveExecOps() {
   using O = ShaderOpcode;
 
@@ -35788,6 +35819,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarQuadmaskB64);
   AddCase(ScalarFlbitI32B64Gpu);
   AddCase(ScalarFlbitI32B32Gpu);
+  AddCase(ScalarFlbitI32Gpu);
   AddCase(ScalarSaveExecOps);
   AddCase(ScalarOrn2SaveexecUsesSourceOrNotExec);
   cases.push_back(ScalarOrn2SaveexecB32(32, 32));

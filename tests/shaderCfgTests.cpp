@@ -4630,6 +4630,18 @@ void TestNewShaderDecoderArchitecture() {
             (completed_result.decoded_dump.find("V_CMP_LT_U64 vcc_lo, 0, v0") != std::string::npos),
         "completed PR #427 opcodes were absent from the decoded shader");
 
+  // s_flbit_i32 s35, s24, taken from a compute shader that gave up on it.
+  const uint32_t flbit_i32_code[] = {0xbea31718u, EncodeSopp(0x01, 0)};
+  Instruction flbit_i32;
+  ShaderRecompiler::Decoder::DecodeInstruction(flbit_i32_code, 0u, flbit_i32);
+  Check(flbit_i32.family == Family::SOP1 && flbit_i32.opcode == Opcode::S_FLBIT_I32 &&
+            flbit_i32.dst.kind == OperandKind::Sgpr && flbit_i32.dst.reg == 35u &&
+            flbit_i32.src0.kind == OperandKind::Sgpr && flbit_i32.src0.reg == 24u,
+        "decoder rejected the signed s_flbit_i32");
+  const auto flbit_i32_result = RecompileForTest(flbit_i32_code, completed_options);
+  Check(flbit_i32_result.decoded_dump.find("S_FLBIT_I32 s35, s24") != std::string::npos,
+        "the signed s_flbit_i32 was absent from the decoded shader");
+
   const uint32_t ffbh_i32_code[] = {0x7e1c770eu};
   Instruction ffbh_i32;
   ShaderRecompiler::Decoder::DecodeInstruction(ffbh_i32_code, 0u, ffbh_i32);

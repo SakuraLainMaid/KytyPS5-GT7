@@ -469,8 +469,11 @@ static bool IsSupportedStorageTextureEncoding(const ShaderRecompiler::IR::ImageR
                                               const ShaderTextureResource& descriptor) {
 	constexpr uint32_t field1_reserved_mask = 0x200fff00u;
 	constexpr uint32_t field2_reserved_mask = 0xf0003000u;
-	constexpr uint32_t field5_expected      = 0x00700000u;
-	constexpr uint32_t field5_max_mip_mask  = 0x000000f0u;
+	// Dword 5: MAX_MIP and PERF_MOD, a hint to the texture unit that changes nothing a storage
+	// image holds. Round 126: any PERF_MOD (before, only 7): T#s with PERF_MOD 0, their upper
+	// dwords zero, ended the emulator in a compute dispatch of two testers' races (issues 9 and
+	// 13).
+	constexpr uint32_t field5_hint_mask = 0x007000f0u;
 	const uint32_t     expected_field3 = descriptor.DstSelXYZW() |
 	                                     (static_cast<uint32_t>(descriptor.BaseLevel()) << 12u) |
 	                                     (static_cast<uint32_t>(descriptor.LastLevel()) << 16u) |
@@ -486,7 +489,7 @@ static bool IsSupportedStorageTextureEncoding(const ShaderRecompiler::IR::ImageR
 		       descriptor.fields[6] == 0 && descriptor.fields[7] == 0;
 	}
 	return common && descriptor.fields[4] == expected_field4 &&
-	       (descriptor.fields[5] & ~field5_max_mip_mask) == field5_expected;
+	       (descriptor.fields[5] & ~field5_hint_mask) == 0;
 }
 
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,

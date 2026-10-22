@@ -1000,6 +1000,27 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		mesh.scratch_size_dwords = std::max(mesh.scratch_size_dwords, back.scratch_size_dwords);
 	}
 	const auto& group = user_config.GetGeControl();
+	// Round 126: a GS whose VGT_GS_MAX_VERT_OUT is 0 emits no vertex, so the draw puts nothing
+	// on screen: it is skipped (as the draws of a shader that gives up) instead of ending the
+	// emulator ("unsupported GS assembly ... vertices=0", a tester's time trial, issue 8). What
+	// it would write to memory besides is lost with it. Logged once per shader.
+	if (sh.m_vgtGsMaxVertOut == 0u) {
+		static std::mutex                   logged_mutex;
+		static std::unordered_set<uint64_t> logged;
+		{
+			std::lock_guard lock(logged_mutex);
+			if (logged.size() < 64 && logged.insert(params.hash).second) {
+				LOGF("GS 0x%016" PRIx64 " at 0x%016" PRIx64 " emits no vertex (VGT_GS_MAX_VERT_OUT "
+				     "0; input primitive %u, output %u, GE %u/%u, max output %u): its draws are "
+				     "skipped (round 126)\n",
+				     params.hash, regs.es_regs.data_addr, mesh.input_primitive,
+				     sh.m_vgtGsOutPrimType, group.primitive_group_size, group.vertex_group_size,
+				     mesh.max_vertices);
+			}
+		}
+		info.prepare_failed = true;
+		return params;
+	}
 	if (mesh.fast_launch) {
 		const auto& user_vgpr = user_config.GetGeUserVgprEn();
 		EXIT_NOT_IMPLEMENTED(data.type != Prospero::ShaderBinaryType::kGs ||
