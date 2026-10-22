@@ -209,6 +209,7 @@ uint32_t              EmitGetTessellationAttribute(ValueEmitContext& ctx, const 
 void                  EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetUserData(EmitterState& state, IR::ScalarReg reg);
 uint32_t              EmitGetDispatchThreadExtent(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitGetPartitionTarget(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetBuiltin(ValueEmitContext& ctx, IR::Value kind, IR::Value index);
 uint32_t              EmitUndefU1(EmitterState& state, const IR::Inst& inst);
 inline constexpr auto EmitUndefU8  = EmitUndefU1;

@@ -145,6 +145,12 @@ IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::PopsExitingWaveId: return IR::U32(IR::Value(0u));
 		case Decoder::OperandKind::SharedLimit:
 		case Decoder::OperandKind::PrivateLimit: return IR::U32(IR::Value(UINT32_MAX));
+		// Round 118: a partition's expansion compares with the target its dispatch passes in.
+		case Decoder::OperandKind::PartitionTargetLow:
+		case Decoder::OperandKind::PartitionTargetHigh:
+			return IR::U32(ir.Emit(
+			    IR::ValueOpcode::GetPartitionTarget,
+			    {IR::Value(operand.kind == Decoder::OperandKind::PartitionTargetHigh ? 1u : 0u)}));
 		case Decoder::OperandKind::Sgpr:
 			return ir.GetScalarReg(static_cast<IR::ScalarReg>(operand.reg));
 		case Decoder::OperandKind::Vgpr:
@@ -709,6 +715,8 @@ IR::U1 Translator::ReadMaskValid(const Decoder::Operand& operand) {
 	}
 	switch (operand.kind) {
 		case Decoder::OperandKind::Null:
+		case Decoder::OperandKind::PartitionTargetLow:
+		case Decoder::OperandKind::PartitionTargetHigh:
 		case Decoder::OperandKind::PopsExitingWaveId: return IR::U1(IR::Value(true));
 		case Decoder::OperandKind::Sgpr:
 			return ir.GetScalarMaskTag(static_cast<IR::ScalarReg>(operand.reg));

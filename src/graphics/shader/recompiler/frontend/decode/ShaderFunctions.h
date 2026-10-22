@@ -97,9 +97,33 @@ struct ShaderCallPartition {
 	// when the shader is partitioned but has no target yet (one dispatch whose lanes all leave at
 	// the call, reporting their targets); empty when the shader is not partitioned.
 	std::vector<uint64_t> targets;
+	// Out (round 118): the target the expansion runs (the one asked for, or the first), which its
+	// dispatch passes to the shader (GetPartitionTarget); 0 when it runs none.
+	uint64_t built = 0;
+	// Out (round 118): how many targets the shader has partitions for, before
+	// ShaderCallPartitionIdle left out the ones not reported lately (targets.size() otherwise).
+	size_t known = 0;
 };
 bool ShaderCallPartitions();
 void SetShaderCallPartitions(bool value);
+// Round 118: a partition's expansion compares the call's target with the partition's target as
+// the dispatch passes it in, not as a literal: S_CMP_EQ_U32 with these scalar source codes (249
+// and 250, reserved in a scalar instruction's source fields; the decoder reads them as the
+// partition target's low and high words, the translation as GetPartitionTarget). The same
+// material function at another address then expands to the same code, one program and one
+// pipeline. KYTY_PARTITION_RUNTIME_TARGET=0 compares with the address, as before. Tests switch it.
+constexpr uint32_t ShaderCallPartitionTargetLow  = 249u;
+constexpr uint32_t ShaderCallPartitionTargetHigh = 250u;
+bool               ShaderCallPartitionRuntimeTarget();
+void               SetShaderCallPartitionRuntimeTarget(bool value);
+// Round 118: a window in milliseconds (0, the default: none). With one, a partitioned shader runs
+// only the partitions of the targets its dispatches reported in it (ReportShaderCallMiss: the
+// lanes of each target in view leave every other partition's dispatch at the call and report it,
+// every frame), and always one, the one reported last: its known targets grow with every material
+// the game loaded, and each partition's dispatch runs the shader's code before the call for every
+// lane. The pipeline cache sets it (KYTY_PARTITION_IDLE_MS).
+void     SetShaderCallPartitionIdle(uint32_t milliseconds);
+uint32_t ShaderCallPartitionIdle();
 // Diagnostics (shader_batch_tool --partition-check): why the code outside a shader's call keeps
 // it from being partitioned, or empty when it would be (its call permitting).
 std::string ShaderCallPartitionCheck(std::span<const uint32_t> code);

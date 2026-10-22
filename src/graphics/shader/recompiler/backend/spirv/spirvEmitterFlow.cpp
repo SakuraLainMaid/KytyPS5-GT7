@@ -787,6 +787,14 @@ uint32_t EmitGetDispatchThreadExtent(ValueEmitContext& ctx, const IR::Inst& inst
 	return EmitShaderDataDwordLoad(ctx.state, start + inst.Arg(0).U32());
 }
 
+uint32_t EmitGetPartitionTarget(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto start = ctx.state.program.bindings.partition_target_dword;
+	if (start == IR::PushData::NoStart || !inst.Arg(0).IsImmediate() || inst.Arg(0).U32() >= 2u) {
+		ctx.Fail(inst, "invalid partition target word");
+	}
+	return EmitShaderDataDwordLoad(ctx.state, start + inst.Arg(0).U32());
+}
+
 uint32_t EmitUndefU1(EmitterState& state, const IR::Inst& inst) {
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpUndef, TypeId(state, inst.GetType()), result);

@@ -2229,6 +2229,92 @@ void CheckShaderFunctionPartitions() {
       Require(name, "partition SPIR-V", !result.spirv.empty(), "the partition gave no SPIR-V");
       ValidateSpirv(name, result.spirv);
     }
+    // Round 118: the same function at another address (a material the game loaded again) expands
+    // to the same code: it compares the call's target with the one its dispatch passes in
+    // (GetPartitionTarget), and the partition tells which target that is. With
+    // KYTY_PARTITION_RUNTIME_TARGET=0 it compares with the address, as before.
+    {
+      constexpr uint64_t callee_c = 0x10000200ull;
+      constexpr uint64_t hash_c = 0x7ab1ebull;
+      store(callee_c, {EncodeVop1(0x01u, 0, InlineU32(1)), EncodeSop1(0x20u, 0, 14)});
+      store(srt + 0x40, {u32(table), u32(table >> 32u), 4u * 16u, 0u});
+      for (u32 e = 0; e < 4; ++e) {
+        const uint64_t target = (e % 2u) != 0u ? callee_c : callee_a;
+        store(table + e * 16u, {u32(target), u32(target >> 32u), 0x7000u + e * 0x100u, 0x7u});
+      }
+      (void)Decoder::ReportShaderCallMiss(hash_c, {callee_a, 0x7000u, 0x7u});
+      (void)Decoder::ReportShaderCallMiss(hash_c, {callee_c, 0x7100u, 0x7u});
+      std::this_thread::sleep_for(std::chrono::milliseconds(350));
+      (void)Decoder::ShaderCallMissTargets(hash_c);
+      const auto expand_at = [&](Decoder::ShaderFunctionExpander &with, uint64_t target,
+                                 std::vector<u32> &out) {
+        Decoder::ShaderCallPartition request;
+        request.target = target;
+        const bool done = with.Expand(code, reinterpret_cast<uint64_t>(code.data()), user_data,
+                                      read, out, reason, 64, hash_c, &summary, &request);
+        return std::tuple{done, request.built, request.targets};
+      };
+      Decoder::ShaderFunctionExpander same;
+      std::vector<u32> at_a;
+      std::vector<u32> at_c;
+      const auto [a_ok, a_built, a_targets] = expand_at(same, callee_a, at_a);
+      const auto [c_ok, c_built, c_targets] = expand_at(same, callee_c, at_c);
+      Require(name, "one code for one function",
+              a_ok && c_ok && a_built == callee_a && c_built == callee_c &&
+                  a_targets == Targets{callee_a, callee_c} && c_targets == a_targets &&
+                  at_a == at_c && count(at_a, body_a) == 1,
+              "one function at two addresses did not expand to the same partition code, or the "
+              "partitions did not name their targets");
+      const auto translated = ShaderRecompiler::TranslateProgram(at_a, options);
+      size_t reads = 0;
+      for (const auto *block : translated.program.blocks) {
+        for (const auto &inst : *block) {
+          reads += inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::GetPartitionTarget ? 1u
+                                                                                           : 0u;
+        }
+      }
+      Require(name, "partition target read", !translated.unsupported && reads == 2,
+              "the partition's compares did not read the dispatch's target (" +
+                  std::to_string(reads) + " reads)");
+      for (const u32 host_subgroup : {64u, 32u}) {
+        compute.host_subgroup_size = host_subgroup;
+        const auto result = compile(at_a);
+        Require(name, "partition target SPIR-V",
+                !result.spirv.empty() &&
+                    result.program.bindings.partition_target_dword !=
+                        ShaderRecompiler::IR::PushData::NoStart,
+                "the partition with the dispatch's target gave no SPIR-V or no target words");
+        ValidateSpirv(name, result.spirv);
+      }
+      Decoder::SetShaderCallPartitionRuntimeTarget(false);
+      Decoder::ShaderFunctionExpander literal;
+      std::vector<u32> literal_a;
+      std::vector<u32> literal_c;
+      const auto [la_ok, la_built, la_targets] = expand_at(literal, callee_a, literal_a);
+      const auto [lc_ok, lc_built, lc_targets] = expand_at(literal, callee_c, literal_c);
+      Decoder::SetShaderCallPartitionRuntimeTarget(true);
+      Require(name, "address compares",
+              la_ok && lc_ok && la_built == callee_a && literal_a != literal_c &&
+                  literal_a != at_a,
+              "KYTY_PARTITION_RUNTIME_TARGET=0 did not compare with the addresses");
+      // Round 118: KYTY_PARTITION_IDLE_MS leaves out the targets not reported within its window,
+      // and keeps the one reported last when none was.
+      Decoder::SetShaderCallPartitionIdle(60000u);
+      std::vector<u32> recent;
+      const auto [r_ok, r_built, r_targets] = expand_at(same, 0, recent);
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      Decoder::SetShaderCallPartitionIdle(5u);
+      const auto [i_ok, i_built, i_targets] = expand_at(same, 0, recent);
+      (void)Decoder::ReportShaderCallMiss(hash_c, {callee_a, 0x7000u, 0x7u});
+      const auto [n_ok, n_built, n_targets] = expand_at(same, 0, recent);
+      Decoder::SetShaderCallPartitionIdle(0u);
+      Require(name, "idle partitions",
+              r_ok && r_targets == Targets{callee_a, callee_c} && i_ok &&
+                  i_targets == Targets{callee_c} && i_built == callee_c && n_ok &&
+                  n_targets == Targets{callee_a} && n_built == callee_a,
+              "the partitions of targets not reported lately were not left out, or the last one "
+              "reported was not kept");
+    }
   }
   Decoder::SetShaderCallPartitions(partitions);
   Decoder::SetShaderCallRuntimeRecords(runtime_records);

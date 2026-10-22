@@ -5,6 +5,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 #include "graphics/shader/recompiler/frontend/decode/MemoryOps.h"
 #include "graphics/shader/recompiler/frontend/decode/ScalarAluOps.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/recompiler/frontend/decode/VectorAluOps.h"
 
 #include <algorithm>
@@ -265,6 +266,8 @@ void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 			operand.kind      = OperandKind::FloatInlineConstant;
 			operand.value = std::bit_cast<uint32_t>(0.15915494309189535f);
 			return;
+		case ShaderCallPartitionTargetLow: operand.kind = OperandKind::PartitionTargetLow; return;
+		case ShaderCallPartitionTargetHigh: operand.kind = OperandKind::PartitionTargetHigh; return;
 		case 251u: operand.kind = OperandKind::VccZ; return;
 		case 252u: operand.kind = OperandKind::ExecZ; return;
 		case 253u: operand.kind = OperandKind::Scc; return;
@@ -477,6 +480,8 @@ std::string OperandToString(const Operand& operand) {
 		case OperandKind::PrivateBase: text = "private_base"; break;
 		case OperandKind::PrivateLimit: text = "private_limit"; break;
 		case OperandKind::Null: text = "null"; break;
+		case OperandKind::PartitionTargetLow: text = "partition_target_lo"; break;
+		case OperandKind::PartitionTargetHigh: text = "partition_target_hi"; break;
 		default: text = "unknown"; break;
 	}
 	if (operand.sdwa_sel != 6 || operand.sdwa_sext) {

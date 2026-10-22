@@ -97,11 +97,17 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	const auto shader_data_dwords = program.bindings.ShaderDataDwords();
 	const auto user_data_dwords = program.bindings.user_data_registers.size();
 	const bool has_dispatch_threads = program.bindings.dispatch_thread_dword != IR::PushData::NoStart;
+	const bool has_partition_target =
+	    program.bindings.partition_target_dword != IR::PushData::NoStart;
+	const auto extra_dwords = (has_dispatch_threads ? 3u : 0u) + (has_partition_target ? 2u : 0u);
 	if ((program.bindings.UsesPushData() &&
 	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
 	    (has_dispatch_threads && (program.stage != ShaderType::Compute ||
 	                              program.bindings.dispatch_thread_dword != user_data_dwords)) ||
-	    program.bindings.memory_offset_dword != user_data_dwords + (has_dispatch_threads ? 3u : 0u) ||
+	    (has_partition_target && (program.stage != ShaderType::Compute ||
+	                              program.bindings.partition_target_dword !=
+	                                  user_data_dwords + (has_dispatch_threads ? 3u : 0u))) ||
+	    program.bindings.memory_offset_dword != user_data_dwords + extra_dwords ||
 	    program.bindings.memory_offset_count != buffers.size() ||
 	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),

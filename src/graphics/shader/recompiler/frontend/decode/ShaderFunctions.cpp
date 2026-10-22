@@ -1110,17 +1110,37 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 					result.push_back(0xbf06ff00u | reg); // S_CMP_EQ_U32 s[reg], literal
 					result.push_back(value);
 				};
+				// Round 118: a partition (one variant, its other lanes dropped) compares the call's
+				// target with the one its dispatch passes in (ShaderCallPartitionTargetLow/High),
+				// not with the address: the game loads the same material again at other
+				// addresses (each time a car comes into the garage), and each copy took a program
+				// and a 20 to 35 s pipeline compile of its own.
+				const bool runtime_target = call.drop && call.variants.size() == 1u &&
+				                            !call.specialized && ShaderCallPartitionRuntimeTarget();
+				const auto compare_target = [&](uint32_t reg, bool high, uint32_t value) {
+					if (!runtime_target) {
+						compare(reg, value);
+						return;
+					}
+					// S_CMP_EQ_U32 s[reg], the partition's target word.
+					result.push_back(
+					    0xbf060000u |
+					    ((high ? ShaderCallPartitionTargetHigh : ShaderCallPartitionTargetLow)
+					     << 8u) |
+					    reg);
+				};
 				const auto select_scc = static_cast<uint32_t>(result.size());
 				if (dual) result.push_back(0xbf850000u); // S_CBRANCH_SCC1 to the SCC=1 tree.
 				for (uint32_t scc = 0; scc < trees; ++scc) {
 					if (scc != 0) relocations.emplace_back(select_scc, result.size());
 					for (const auto& [high, members]: groups) {
-						compare(call.source_reg + 1u, high);
+						compare_target(call.source_reg + 1u, true, high);
 						const auto high_miss = static_cast<uint32_t>(result.size());
 						result.push_back(0xbf840000u); // S_CBRANCH_SCC0 to the next group.
 						for (const auto k: members) {
 							const auto& variant = call.variants[k].first;
-							compare(call.source_reg, static_cast<uint32_t>(variant.target));
+							compare_target(call.source_reg, false,
+							               static_cast<uint32_t>(variant.target));
 							if (!dual) {
 								// An if/else chain with each body in place: the structurizer
 								// keeps it linear (bodies placed after the chain made it
@@ -1294,6 +1314,16 @@ void SelectTableTargets(std::vector<CallSite>&                sites,
 	}
 }
 
+// KYTY_PARTITION_RUNTIME_TARGET=0: a partition compares the call's target with its address, as
+// before round 118 (ShaderCallPartitionRuntimeTarget).
+std::atomic_bool& PartitionRuntimeTargetSwitch() {
+	static std::atomic_bool value = [] {
+		const char* text = std::getenv("KYTY_PARTITION_RUNTIME_TARGET");
+		return text == nullptr || text[0] != '0';
+	}();
+	return value;
+}
+
 // KYTY_CALL_PARTITIONS=0: no partitioned expansions (ShaderCallPartition), as before round 99.
 std::atomic_bool& PartitionsSwitch() {
 	static std::atomic_bool value = [] {
@@ -1420,6 +1450,8 @@ struct CallMissRegistry {
 		std::shared_ptr<const std::vector<ShaderCallVariant>> absorbed;
 		std::chrono::steady_clock::time_point        first_pending {};
 		std::map<uint64_t, Target>                   targets;
+		// Round 118: when each target was last reported (ShaderCallPartitionIdle).
+		std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> seen;
 		uint64_t                                     batch = 0; // absorptions so far
 		bool                                         dirty = false; // a target started churning
 	};
@@ -1617,6 +1649,56 @@ void SetShaderCallPartitions(bool value) {
 	PartitionsSwitch().store(value, std::memory_order_relaxed);
 }
 
+bool ShaderCallPartitionRuntimeTarget() {
+	return PartitionRuntimeTargetSwitch().load(std::memory_order_relaxed);
+}
+
+void SetShaderCallPartitionRuntimeTarget(bool value) {
+	PartitionRuntimeTargetSwitch().store(value, std::memory_order_relaxed);
+}
+
+static std::atomic<uint32_t>& PartitionIdleValue() {
+	static std::atomic<uint32_t> value {0};
+	return value;
+}
+
+void SetShaderCallPartitionIdle(uint32_t milliseconds) {
+	PartitionIdleValue().store(milliseconds, std::memory_order_relaxed);
+}
+
+uint32_t ShaderCallPartitionIdle() {
+	return PartitionIdleValue().load(std::memory_order_relaxed);
+}
+
+// Round 118 (ShaderCallPartitionIdle): the targets reported within the window, in their order;
+// the one reported last when none was.
+static void KeepRecentTargets(uint64_t shader_hash, std::vector<uint64_t>& targets) {
+	const auto idle = ShaderCallPartitionIdle();
+	if (idle == 0u || targets.size() <= 1u) return;
+	const auto      now      = std::chrono::steady_clock::now();
+	const auto      window   = std::chrono::milliseconds(idle);
+	auto&           registry = CallMissRegistry::Get();
+	std::lock_guard lock(registry.mutex);
+	const auto      found = registry.shaders.find(shader_hash);
+	if (found == registry.shaders.end()) return;
+	const auto&                           seen   = found->second.seen;
+	uint64_t                              latest = 0;
+	std::chrono::steady_clock::time_point latest_time {};
+	std::vector<uint64_t>                 kept;
+	kept.reserve(targets.size());
+	for (const auto target: targets) {
+		const auto at = seen.find(target);
+		if (at == seen.end()) continue;
+		if (latest == 0 || at->second > latest_time) {
+			latest      = target;
+			latest_time = at->second;
+		}
+		if (now - at->second <= window) kept.push_back(target);
+	}
+	if (kept.empty()) kept.push_back(latest != 0 ? latest : targets.front());
+	targets = std::move(kept);
+}
+
 bool ReportShaderCallMiss(uint64_t shader_hash, const ShaderCallVariant& reported, bool* churned) {
 	if (churned != nullptr) *churned = false;
 	// With runtime records no expansion specializes on the record pointer: a target is one
@@ -1627,6 +1709,7 @@ bool ReportShaderCallMiss(uint64_t shader_hash, const ShaderCallVariant& reporte
 	auto&           registry = CallMissRegistry::Get();
 	std::lock_guard lock(registry.mutex);
 	auto&           shader = registry.shaders[shader_hash];
+	shader.seen[target.target]  = std::chrono::steady_clock::now();
 	const bool      specialized = target.data0 != 0u || target.data1 != 0u;
 	auto*           stats = specialized ? &shader.targets[target.target] : nullptr;
 	if (stats != nullptr && stats->churning) return false;
@@ -1724,7 +1807,11 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	reason.clear();
 	if (summary != nullptr) summary->clear();
 	const uint64_t requested_target = partition != nullptr ? partition->target : 0;
-	if (partition != nullptr) partition->targets.clear();
+	if (partition != nullptr) {
+		partition->targets.clear();
+		partition->built = 0;
+		partition->known = 0;
+	}
 	if (wave_size != 32u && wave_size != 64u) {
 		reason = "shader calls require a known wave size";
 		return false;
@@ -1834,6 +1921,8 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 					targets.push_back(variant.target);
 				}
 			}
+			partition->known = targets.size();
+			KeepRecentTargets(shader_hash, targets);
 			if (targets.empty()) {
 				// One dispatch whose lanes all report their targets and leave.
 				targets.push_back(0);
@@ -1848,8 +1937,9 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 			        : 0;
 			site.variants.clear();
 			if (partition_target != 0) site.variants.push_back({partition_target, 0u, 0u});
-			site.preferred = site.variants;
-			site.drop      = true;
+			site.preferred   = site.variants;
+			site.drop        = true;
+			partition->built = partition_target;
 		}
 	}
 	const bool partitioned = partition != nullptr && !partition->targets.empty();
@@ -1888,6 +1978,7 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 			shader.unpartitioned.insert(partition_target);
 			std::erase(partition->targets, partition_target);
 			if (partition->targets.empty()) partition->targets.push_back(0);
+			partition->built = 0;
 		}
 		if (summary != nullptr && expansion.ok) {
 			char line[256];

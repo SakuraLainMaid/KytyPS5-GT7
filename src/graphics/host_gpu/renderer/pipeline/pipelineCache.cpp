@@ -3893,6 +3893,18 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
               .float_image_atomics = Config::FloatImageAtomicsEnabled()},
           ShaderDiskCacheDirectory())) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	// Round 118: KYTY_PARTITION_IDLE_MS=<ms> (0, the default: off): a partitioned shader runs only
+	// the partitions of the materials its dispatches reported within that time
+	// (ShaderCallPartitionIdle).
+	if (const char* idle = std::getenv("KYTY_PARTITION_IDLE_MS");
+	    idle != nullptr && *idle != '\0') {
+		const auto milliseconds = static_cast<uint32_t>(
+		    std::min<unsigned long>(std::strtoul(idle, nullptr, 10), 600000ul));
+		ShaderRecompiler::Decoder::SetShaderCallPartitionIdle(milliseconds);
+		LOGF("Partitioned dispatches: only the materials reported in the last %u ms run "
+		     "(KYTY_PARTITION_IDLE_MS)\n",
+		     milliseconds);
+	}
 	m_program_cache->pixel_rate_variants =
 	    graphics.mixed_attachment_samples == GraphicContext::MixedAttachmentSamples::Nv &&
 	    !EqaaPerSampleShading();
@@ -4854,6 +4866,59 @@ static bool PartitionQuick() {
 	return value;
 }
 
+// Round 118: the partitioned shaders' dispatches, every 10 s a line (GPU thread): for the busiest
+// ones, how many partitions their dispatches ran and how many materials they know (more when
+// KYTY_PARTITION_IDLE_MS leaves out the ones not in view).
+static void
+NotePartitionedDispatch(uint64_t                                              hash,
+                        const ShaderRecompiler::Decoder::ShaderCallPartition& partition) {
+	struct Counts {
+		uint64_t groups     = 0;
+		uint64_t dispatches = 0;
+		size_t   known      = 0;
+		size_t   run        = 0;
+	};
+	static std::mutex                            mutex;
+	static std::unordered_map<uint64_t, Counts>  shaders;
+	static std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+	const std::lock_guard                        lock(mutex);
+	auto&                                        counts = shaders[hash];
+	counts.groups++;
+	counts.dispatches += partition.targets.size();
+	counts.known   = std::max(partition.known, partition.targets.size());
+	counts.run     = partition.targets.size();
+	const auto now = std::chrono::steady_clock::now();
+	if (now - since < std::chrono::seconds(10)) {
+		return;
+	}
+	std::vector<std::pair<uint64_t, Counts>> busiest(shaders.begin(), shaders.end());
+	std::sort(busiest.begin(), busiest.end(), [](const auto& a, const auto& b) {
+		return a.second.dispatches > b.second.dispatches;
+	});
+	uint64_t total = 0;
+	for (const auto& [shader, entry]: busiest) {
+		(void)shader;
+		total += entry.dispatches;
+	}
+	std::string text;
+	for (size_t i = 0; i < busiest.size() && i < 8; i++) {
+		const auto& [shader, entry] = busiest[i];
+		text += fmt::format(
+		    "{}{:016x}: {} dispatches in {} groups, the last ran {} of {} materials",
+		    i == 0 ? "" : "; ", shader, entry.dispatches, entry.groups, entry.run, entry.known);
+	}
+	LOGF("Partitioned dispatches (%.0f s): %" PRIu64 " in all%s; %s\n",
+	     std::chrono::duration<double>(now - since).count(), total,
+	     ShaderRecompiler::Decoder::ShaderCallPartitionIdle() != 0u
+	         ? fmt::format(" (materials reported in the last {} ms)",
+	                       ShaderRecompiler::Decoder::ShaderCallPartitionIdle())
+	               .c_str()
+	         : " (every material known)",
+	     text.c_str());
+	shaders.clear();
+	since = now;
+}
+
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info,
@@ -4886,7 +4951,11 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 		return program;
 	};
 	if (partition != nullptr && m_partitioned_shaders.contains(params.hash)) {
-		auto program = get_partition();
+		const bool first_of_dispatch = partition->target == 0;
+		auto       program           = get_partition();
+		if (first_of_dispatch) {
+			NotePartitionedDispatch(params.hash, *partition);
+		}
 		if (partition->targets.empty()) {
 			// Its call no longer partitions (the table call took another shape): the usual way
 			// from its next dispatch.

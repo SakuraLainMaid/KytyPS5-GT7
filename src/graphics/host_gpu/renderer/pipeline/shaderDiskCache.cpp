@@ -24,7 +24,7 @@ namespace {
 
 // Bump when the encoding below changes in a way the source version cannot see (it hashes this
 // file too, so this is belt and braces).
-constexpr uint32_t FormatVersion = 3;
+constexpr uint32_t FormatVersion = 4;           // Round 118: BindingLayout::partition_target_dword.
 constexpr uint32_t FileMagic     = 0x4344534bu; // "KSDC"
 constexpr uint64_t MaxFileSize   = uint64_t {256} << 20u;
 
@@ -197,6 +197,7 @@ requires Is<T, IR::BindingLayout>
 void Visit(Io& io, T& v) {
 	io(v.push_data_start_dword);
 	io(v.dispatch_thread_dword);
+	io(v.partition_target_dword);
 	io(v.memory_offset_dword);
 	io(v.memory_offset_count);
 	io(v.write_tracking);

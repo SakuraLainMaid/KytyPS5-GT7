@@ -686,6 +686,10 @@ enum class OperandKind {
 	PrivateLimit,
 	Null,
 	Vgpr,
+	// Round 118: the target of the partition a dispatch runs, its low and high words (the codes
+	// ShaderCallPartitionTargetLow and High, which only a partition's expansion uses).
+	PartitionTargetLow,
+	PartitionTargetHigh,
 	// A special register the recompiler does not model;
 	// DecodeInstruction turns the instruction into UNSUPPORTED, so the shader gives up.
 	Unsupported,

@@ -1469,6 +1469,21 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	bindings.shared_memory = {storage.Handle(), 0, size};
 }
 
+// Round 118: the target of the partition this dispatch runs, for the expansion's compares of
+// the call's target (GetPartitionTarget): the same code serves the material at any address.
+static void FillPartitionTarget(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                const PipelineCache::ComputePartition*          partition,
+                                PreparedBindings&                               bindings) {
+	const auto dword = program.bindings.partition_target_dword;
+	if (dword == ShaderRecompiler::IR::PushData::NoStart ||
+	    dword + 2u > bindings.shader_data.size()) {
+		return;
+	}
+	const uint64_t target            = partition != nullptr ? partition->built : 0;
+	bindings.shader_data[dword]      = static_cast<uint32_t>(target);
+	bindings.shader_data[dword + 1u] = static_cast<uint32_t>(target >> 32u);
+}
+
 // Round 99: a shader whose call is partitioned (ShaderCallPartition) runs once per partition,
 // each partition's lanes in its own dispatch; the first one also tells which partitions there are.
 // A partition whose program translates or compiles is skipped meanwhile (its lanes keep what the
@@ -1763,6 +1778,7 @@ void RenderExecutor::DispatchDirectPart(uint64_t submit_id, CommandBuffer& buffe
 		std::copy(std::begin(input_info.dispatch_threads_num), std::end(input_info.dispatch_threads_num),
 		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
 	}
+	FillPartitionTarget(program, partition, bindings);
 	if (program.info.uses_dma) {
 		PrefaultDmaPointers(m_context.GetBufferCache(), input_info.stage);
 	}
@@ -2055,6 +2071,7 @@ void RenderExecutor::DispatchIndirectPart(uint64_t submit_id, CommandBuffer& buf
 		PrepareBindings(input_info.stage, bindings);
 	}
 	const auto& program = *input_info.stage.program;
+	FillPartitionTarget(program, partition, bindings);
 	ReportWritesOverHoles(input_info, "an indirect dispatch is not checked for a fill", nullptr,
 	                      args_addr, mode);
 	if (program.info.uses_dma) {

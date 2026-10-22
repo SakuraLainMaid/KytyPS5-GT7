@@ -3513,12 +3513,28 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			binding.mip_views.clear();
 		}
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
-			EXIT_IF(resource.mip_count == 0u ||
-			        resource.mip_count != binding.desc.view_info.level_count);
+			EXIT_IF(resource.mip_count == 0u);
+			// Round 118: a T# the texture cache bound as a null texture (one with mips past its
+			// last, ResolveTexture) has one level where the shader has a view for each of its
+			// T#'s: the views past the binding's levels repeat its last one. Before, the emulator
+			// ended here (issues 3 and 9, a race's 64x64 cube array of 7 mips whose descriptor
+			// read with its upper half zero).
+			const uint32_t levels = std::max(binding.desc.view_info.level_count, 1u);
+			if (levels != resource.mip_count) {
+				static std::atomic<uint32_t> reported {0};
+				if (const auto count = reported.fetch_add(1, std::memory_order_relaxed) + 1u;
+				    count <= 16u || std::has_single_bit(count)) {
+					LOGF("Dynamic mips: %s shader %016" PRIx64 " tex[%u] 0x%012" PRIx64
+					     " has %u levels bound where the shader selects among %u: the views past "
+					     "them repeat its last level (%u so far)\n",
+					     FrameGraphStage(program.stage), program.shader_hash, i,
+					     binding.desc.info.data.address, levels, resource.mip_count, count);
+				}
+			}
 			binding.mip_views.reserve(resource.mip_count);
 			for (uint32_t mip = 0; mip < resource.mip_count; mip++) {
 				auto desc = binding.desc;
-				desc.view_info.base_level += mip;
+				desc.view_info.base_level += std::min(mip, levels - 1u);
 				desc.view_info.level_count = 1;
 				// The shader selects the mip after applying the guest minimum LOD.
 				desc.view_info.min_lod = 0;

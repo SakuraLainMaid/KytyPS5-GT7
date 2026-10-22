@@ -19,6 +19,9 @@ VALUE_OPCODE(ShaderStuckProbe, Void, U1, U32, U32, U32, U32, U32, U32, U32, U32,
 // Translation and register-state pseudo operations.
 VALUE_OPCODE(GetUserData, U32, ScalarReg)
 VALUE_OPCODE(GetDispatchThreadExtent, U32, U32)
+// Round 118: a word of the target of the partition the dispatch runs (0: low, 1: high), which the
+// dispatch passes in the shader data (BindingLayout::partition_target_dword).
+VALUE_OPCODE(GetPartitionTarget, U32, U32)
 VALUE_OPCODE(GetShaderBase, U64)
 VALUE_OPCODE(ReadClockRealtime64, U64)
 // The invocation's loop budget (arguments: the bound, the loop's label: the lowest pc of its

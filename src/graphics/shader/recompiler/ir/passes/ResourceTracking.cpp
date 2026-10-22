@@ -1257,6 +1257,7 @@ private:
 				case ValueOpcode::ReadFirstLane:
 				case ValueOpcode::ReadLane:
 				case ValueOpcode::GetUserData:
+				case ValueOpcode::GetPartitionTarget:
 				case ValueOpcode::GetShaderBase:
 				case ValueOpcode::GetSrtResource:
 				case ValueOpcode::ReadConst:

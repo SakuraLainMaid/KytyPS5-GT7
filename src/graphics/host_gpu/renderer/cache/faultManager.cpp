@@ -40,10 +40,19 @@ constexpr size_t PageFaultBitsetSize = BufferCache::CACHING_NUMPAGES / 8;
 void ReportCallMisses(const uint8_t* slots) {
 	static std::atomic<uint32_t> logged {0};
 	static std::atomic<uint64_t> total {0};
+	// Round 118: how full the set got, every 10 s (a full one loses reports; the partitions of
+	// KYTY_PARTITION_IDLE_MS rely on them).
+	static std::mutex                            fill_mutex;
+	static uint32_t                              fill_max   = 0;
+	static uint64_t                              fill_reads = 0;
+	static uint64_t                              fill_full  = 0;
+	static std::chrono::steady_clock::time_point fill_since = std::chrono::steady_clock::now();
+	uint32_t                                     used       = 0;
 	for (uint32_t index = 0; index < kShaderCallMissSlots; ++index) {
 		ShaderCallMissSlot slot;
 		std::memcpy(&slot, slots + index * sizeof(slot), sizeof(slot));
 		if (slot.key == 0) continue;
+		used++;
 		const auto hash   = (uint64_t {slot.shader_hash_high} << 32u) | slot.shader_hash_low;
 		const auto target = (uint64_t {slot.target_high} << 32u) | slot.target_low;
 		if (target == 0) continue;
@@ -64,6 +73,22 @@ void ReportCallMisses(const uint8_t* slots) {
 				     hash, target, slot.data1, slot.data0, count);
 			}
 		}
+	}
+	if (used == 0) return;
+	const std::lock_guard lock(fill_mutex);
+	fill_max = std::max(fill_max, used);
+	fill_reads++;
+	fill_full += used * 8u >= kShaderCallMissSlots * 7u ? 1u : 0u;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - fill_since >= std::chrono::seconds(10)) {
+		LOGF("Shader call misses (%.0f s): up to %u of %u slots used in one read, %" PRIu64
+		     " reads with some, %" PRIu64 " of them seven eighths full or more\n",
+		     std::chrono::duration<double>(now - fill_since).count(), fill_max,
+		     kShaderCallMissSlots, fill_reads, fill_full);
+		fill_max   = 0;
+		fill_reads = 0;
+		fill_full  = 0;
+		fill_since = now;
 	}
 }
 
