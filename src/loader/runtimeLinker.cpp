@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/guestWatch.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/perfStats.h"
@@ -27,16 +28,16 @@
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
-#include <chrono>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -1522,6 +1523,11 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		                      m_programs)) {
 			EXIT("Failed to apply game cheat\n");
 		}
+	}
+	if (!m_programs.empty() && !m_programs.front()->elf->IsShared()) {
+		// Diagnostics: code addresses relative to the main program (KYTY_FIND_CONSTANTS).
+		Common::GuestWatch::SetProgram(m_programs.front()->base_vaddr,
+		                               m_programs.front()->base_size);
 	}
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);

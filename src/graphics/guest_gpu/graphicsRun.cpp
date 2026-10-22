@@ -1665,7 +1665,26 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		default: EXIT("unknown interrupt_selector\n");
 	}
 
-	const bool at_completion = !with_interrupt && GuestGpu::LabelsAtCompletion();
+	// Round 121 (KYTY_READBACK_LABELS=1, off by default): while a read-back for the CPU is on its
+	// way (a small linear image the GPU wrote, going back to guest memory), a label is written once
+	// the GPU has run the work before it, as with KYTY_LABELS_AT_COMPLETION, and its read-back is
+	// recorded first, so that it lands before the label: a game thread that waits for the label
+	// and then reads the result takes this frame's. With KYTY_LABELS_AT_COMPLETION the read-backs
+	// are recorded first as well.
+	static const bool readback_labels = [] {
+		const char* value = std::getenv("KYTY_READBACK_LABELS");
+		const bool  on    = value != nullptr && value[0] == '1';
+		LOGF("Read-backs for the CPU: %s (KYTY_READBACK_LABELS)\n",
+		     on ? "a label written while one is on its way waits for it to land"
+		        : "labels do not wait for them");
+		return on;
+	}();
+	bool at_completion = !with_interrupt && GuestGpu::LabelsAtCompletion();
+	if (!with_interrupt && (at_completion || readback_labels) &&
+	    m_renderer.GetTextureCache().ReadbacksOnTheirWay()) {
+		at_completion = true;
+		m_renderer.GetTextureCache().ProcessDownloadImages();
+	}
 
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);

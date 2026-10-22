@@ -6993,6 +6993,17 @@ void TextureCache::SetBindlessEvictable(std::span<const ImageId> ids) {
 	m_bindless_evictable.insert(ids.begin(), ids.end());
 }
 
+bool TextureCache::ReadbacksOnTheirWay() {
+	{
+		std::scoped_lock lock {m_lock};
+		if (!m_download_images.empty()) {
+			return true;
+		}
+	}
+	std::lock_guard lock(m_pending_writebacks->mutex);
+	return !m_pending_writebacks->ranges.empty();
+}
+
 void TextureCache::ProcessDownloadImages() {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: m_download_images) {

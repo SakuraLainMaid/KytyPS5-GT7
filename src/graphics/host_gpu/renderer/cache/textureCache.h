@@ -158,6 +158,9 @@ public:
 	// linear one with --readback-linear-images.
 	[[nodiscard]] bool ReadsBackForCpu(const ImageInfo& info) const;
 	void ProcessDownloadImages();
+	// Round 121: whether a read-back for the CPU is on its way (enrolled, or recorded and not
+	// landed). GPU thread.
+	[[nodiscard]] bool ReadbacksOnTheirWay();
 	void RunGarbageCollector();
 	// The guest no longer refers to this bindless image from any heap entry (it replaced or
 	// cleared them): free it once no draw has used it for a few frames (engine method).

@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/file.h"
+#include "common/guestWatch.h"
 #include "common/logging/log.h"
 #include "common/perfStats.h"
 #include "common/profiler.h"
@@ -2975,6 +2976,181 @@ void WatchConstants(RenderContext& context, const ShaderStageRuntime& runtime) {
 		watch.last_frame = frame;
 	}
 }
+
+// Round 121, diagnostics: KYTY_FIND_CONSTANTS=<shader hash>:<user sgpr>:<offset>:<bytes> (hex
+// hash and offset, decimal sgpr and byte count, 8 to 64; up to 2, comma-separated). In each F9
+// capture, at the first draw of that shader, the bytes at its user data pointer plus the offset
+// (a colour correction the CPU writes each frame, say) are searched for in all of the guest's
+// committed memory, 4-byte aligned: where else the CPU keeps them. Each place (up to 32) is logged
+// with its mapping and the 512 bytes around it, as hex and as floats ("Find constants"). The first
+// capture that finds places more than 64 MiB from the constants' own memory arms hardware write
+// watches on up to four of them (Common::GuestWatch, Windows): the code that writes them is logged,
+// with its bytes. KYTY_FIND_CONSTANTS_WATCH=0 leaves them unarmed.
+struct FindConstantsItem {
+	uint64_t hash         = 0;
+	uint32_t sgpr         = 0;
+	uint32_t offset       = 0;
+	uint32_t bytes        = 0;
+	uint32_t last_capture = 0;
+};
+
+std::vector<FindConstantsItem>& FindConstantsItems() {
+	static std::vector<FindConstantsItem> items = [] {
+		std::vector<FindConstantsItem> result;
+		const char*                    text = std::getenv("KYTY_FIND_CONSTANTS");
+		while (text != nullptr && *text != '\0' && result.size() < 2) {
+			FindConstantsItem item;
+			char*             end = nullptr;
+			item.hash             = std::strtoull(text, &end, 16);
+			if (end == text || *end != ':') break;
+			text      = end + 1;
+			item.sgpr = static_cast<uint32_t>(std::strtoul(text, &end, 10));
+			if (end == text || *end != ':') break;
+			text        = end + 1;
+			item.offset = static_cast<uint32_t>(std::strtoul(text, &end, 16));
+			if (end == text || *end != ':') break;
+			text = end + 1;
+			item.bytes =
+			    std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(text, &end, 10)), 8u, 64u) &
+			    ~3u;
+			if (end == text) break;
+			result.push_back(item);
+			text = *end == ',' ? end + 1 : end;
+		}
+		for (const auto& item: result) {
+			LOGF("Find constants: shader 0x%016" PRIx64 ", s[%u:%u] + 0x%x, %u bytes, searched "
+			     "for in each F9 capture\n",
+			     item.hash, item.sgpr, item.sgpr + 1, item.offset, item.bytes);
+		}
+		return result;
+	}();
+	return items;
+}
+
+// The words around a place, each as hex and as a float, 8 a line, every line naming the place (a
+// search for "Find constants" keeps them all).
+[[nodiscard]] std::string WordsAround(uint64_t address, uint64_t before, uint64_t after) {
+	std::vector<uint32_t> words((before + after) / 4u);
+	if (!Libs::LibKernel::Memory::TryReadBacking(address - before, words.data(),
+	                                             words.size() * 4u)) {
+		return fmt::format("Find constants 0x{:012x}: the bytes around it are unreadable\n",
+		                   address);
+	}
+	std::string text;
+	for (size_t i = 0; i < words.size(); i++) {
+		if (i % 8u == 0) {
+			const auto at = static_cast<int64_t>(i * 4u) - static_cast<int64_t>(before);
+			text += fmt::format("{}Find constants 0x{:012x} {}0x{:03x}:", i == 0 ? "" : "\n",
+			                    address, at < 0 ? "-" : "+", at < 0 ? -at : at);
+		}
+		float value = 0;
+		std::memcpy(&value, &words[i], 4);
+		text += fmt::format(" {:08x}={:.6g}", words[i], value);
+	}
+	return text + "\n";
+}
+
+void FindConstants(RenderContext& context, const ShaderStageRuntime& runtime) {
+	auto& items = FindConstantsItems();
+	if (items.empty() || !FrameGraph::Active() || runtime.program == nullptr ||
+	    runtime.resources == nullptr) {
+		return;
+	}
+	(void)context;
+	const auto& program = *runtime.program;
+	const auto  capture = FrameGraph::CaptureNumber();
+	for (auto& item: items) {
+		if (item.hash != program.shader_hash || item.last_capture == capture) {
+			continue;
+		}
+		const auto& user = runtime.resources->user_data;
+		if (item.sgpr < program.user_data_base ||
+		    item.sgpr + 1 - program.user_data_base >= user.size()) {
+			continue;
+		}
+		const auto     index   = item.sgpr - program.user_data_base;
+		const uint64_t pointer = user[index] | (static_cast<uint64_t>(user[index + 1]) << 32u);
+		const uint64_t own     = pointer + item.offset;
+		std::vector<uint8_t> pattern(item.bytes);
+		if (pointer == 0 ||
+		    !Libs::LibKernel::Memory::TryReadBacking(own, pattern.data(), pattern.size())) {
+			continue;
+		}
+		item.last_capture = capture;
+		std::string values;
+		for (size_t i = 0; i < pattern.size(); i += 4) {
+			float value = 0;
+			std::memcpy(&value, pattern.data() + i, 4);
+			values += fmt::format(" {:.6g}", value);
+		}
+		std::vector<std::pair<uint64_t, uint64_t>> spans;
+		constexpr uint64_t                         From = uint64_t {1} << 32u;
+		constexpr uint64_t                         To   = uint64_t {1} << 40u;
+		if (!Libs::LibKernel::Memory::CommittedSpans(From, To - From, size_t {1} << 20u, &spans)) {
+			LOGF("Find constants (capture %u): too many mappings to search\n", capture);
+			continue;
+		}
+		const auto            start = std::chrono::steady_clock::now();
+		constexpr uint64_t    Chunk = uint64_t {4} << 20u;
+		const auto            n     = static_cast<uint64_t>(pattern.size());
+		std::vector<uint8_t>  buffer(static_cast<size_t>(Chunk));
+		std::vector<uint64_t> hits;
+		uint64_t              scanned = 0;
+		for (const auto& [address, size]: spans) {
+			for (uint64_t done = 0; done + n <= size && hits.size() < 32;) {
+				const auto part = std::min<uint64_t>(size - done, Chunk);
+				if (Libs::LibKernel::Memory::TryReadBacking(address + done, buffer.data(), part)) {
+					scanned += part;
+					for (uint64_t i = 0; i + n <= part && hits.size() < 32; i += 4) {
+						if (std::memcmp(buffer.data() + i, pattern.data(), 4) == 0 &&
+						    std::memcmp(buffer.data() + i, pattern.data(), n) == 0) {
+							const auto at = address + done + i;
+							if (hits.empty() || hits.back() < at) {
+								hits.push_back(at);
+							}
+						}
+					}
+				}
+				// Overlap the next chunk by the pattern, less one word.
+				done += part < size - done ? part - (n - 4) : part;
+			}
+		}
+		const auto ms =
+		    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+		        .count();
+		LOGF("Find constants (capture %u): shader 0x%016" PRIx64 " reads%s at 0x%012" PRIx64
+		     "; %zu places hold them in %.1f GB of guest memory (%zu mappings, %.0f ms)\n",
+		     capture, item.hash, values.c_str(), own, hits.size(),
+		     static_cast<double>(scanned) / 1e9, spans.size(), ms);
+		std::vector<uint64_t> distant;
+		for (const auto hit: hits) {
+			const auto distance = hit > own ? hit - own : own - hit;
+			const bool is_far   = distance > (uint64_t {64} << 20u);
+			if (is_far) {
+				distant.push_back(hit);
+			}
+			LOGF("Find constants (capture %u): 0x%012" PRIx64 "%s (%s), the 512 bytes around it "
+			     "as hex and float:\n%s",
+			     capture, hit,
+			     hit == own ? " (the constants themselves)"
+			     : is_far   ? ""
+			                : " (within 64 MiB of them)",
+			     Libs::LibKernel::Memory::DescribeMappings(hit, 16).c_str(),
+			     WordsAround(hit, 0x100, 0x100).c_str());
+		}
+		static bool       armed = false;
+		static const bool watch = [] {
+			const char* value = std::getenv("KYTY_FIND_CONSTANTS_WATCH");
+			return value == nullptr || value[0] != '0';
+		}();
+		if (!armed && watch && !distant.empty()) {
+			armed = true;
+			distant.resize(std::min<size_t>(distant.size(), 4));
+			(void)Common::GuestWatch::Arm(distant.data(), static_cast<uint32_t>(distant.size()),
+			                              "KYTY_FIND_CONSTANTS");
+		}
+	}
+}
 } // namespace
 
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
@@ -3206,6 +3382,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		ProbeSlowShaderGrids(m_context, runtime, prepared);
 	}
 	WatchConstants(m_context, runtime);
+	FindConstants(m_context, runtime);
 }
 
 // KYTY_SPARSE_WRITES=0: a written buffer over memory with holes is bound up to its first hole.
