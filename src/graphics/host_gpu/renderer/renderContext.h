@@ -86,6 +86,11 @@ public:
 	void               RunGarbageCollector();
 	// Diagnostics: the latest changes to the mapped ranges over [vaddr, vaddr + size) (at most
 	// `count`, the latest last), one line each, with the frame they happened in.
+	// Round 124, diagnostics: the texture cache's images over the range (DescribeImagesInRange).
+	[[nodiscard]] std::vector<std::string> DescribeImages(uint64_t vaddr, uint64_t size,
+	                                                      size_t count) {
+		return m_texture_cache.DescribeImagesInRange(vaddr, size, count);
+	}
 	[[nodiscard]] std::vector<std::string> DescribeMappings(uint64_t vaddr, uint64_t size,
 	                                                        size_t count) const;
 

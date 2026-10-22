@@ -581,6 +581,77 @@ void TestMixedSamplerVariantsShareRuntimeDescriptor() {
         "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
+// Round 124: a multisample T# read by an instruction of a single-sample dimension. Depth tiling
+// (a depth or stencil surface): the single-sample dimension the instruction reads, which the host
+// binds a single-sample copy of the first sample to. Render-target tiling (a colour surface), or an
+// instruction of a multisample dimension: the multisample dimension, as before.
+void TestMultisampleDepthReadAsSingleSample() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
+  using Libs::Graphics::Prospero::BufferFormat;
+  using Libs::Graphics::Prospero::ImageType;
+  using Libs::Graphics::Prospero::TileMode;
+
+  struct Case {
+    ImageType type;
+    TileMode tile;
+    ImageDimension instruction;
+    ImageDimension expected;
+    const char *text;
+  };
+  const Case cases[] = {
+      {ImageType::kColor2DMsaa, TileMode::kDepth, ImageDimension::Dim2D, ImageDimension::Dim2D,
+       "a 2D read of a multisample depth T# is a single-sample 2D image"},
+      {ImageType::kColor2DMsaa, TileMode::kDepth, ImageDimension::Dim2DArray,
+       ImageDimension::Dim2D, "a 2D-array read of a multisample depth T# is a 2D image"},
+      {ImageType::kColor2DMsaa, TileMode::kDepth, ImageDimension::Dim2DMsaa,
+       ImageDimension::Dim2DMsaa, "a 2D-MSAA read of a multisample depth T# stays multisample"},
+      {ImageType::kColor2DMsaaArray, TileMode::kDepth, ImageDimension::Dim2DArray,
+       ImageDimension::Dim2DArray, "a 2D-array read of a multisample depth array is a 2D array"},
+      {ImageType::kColor2DMsaaArray, TileMode::kDepth, ImageDimension::Dim2DMsaaArray,
+       ImageDimension::Dim2DMsaaArray, "a 2D-MSAA-array read stays a multisample array"},
+      {ImageType::kColor2DMsaa, TileMode::kRenderTarget, ImageDimension::Dim2D,
+       ImageDimension::Dim2DMsaa, "a 2D read of a multisample colour T# keeps its samples"},
+  };
+  for (const auto &test : cases) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Pixel;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    AddValueBlock(program);
+    DescriptorSource source;
+    source.dword_count = 8;
+    const uint32_t fragments = 1u; // two samples
+    const uint32_t words[8] = {
+        0x0120fc00u, // base address 0x120fc0000 >> 8
+        static_cast<uint32_t>(BufferFormat::k32Float) << 20u | 0xc0000000u, // width - 1 low bits
+        0x021bc1dfu, // width - 1 high bits (1919 >> 2), height - 1 (2159) << 14
+        static_cast<uint32_t>(test.type) << 28u | static_cast<uint32_t>(test.tile) << 20u |
+            fragments << 16u | 0xfacu,
+        0u,
+        fragments << 4u,
+        0u,
+        0u};
+    for (uint32_t i = 0; i < 8; i++) {
+      source.dwords[i] = Value(words[i]);
+    }
+    program.descriptor_sources.push_back(source);
+    program.info.images.push_back(
+        {.source = 0,
+         .resource_class = ImageResourceClass::Sampled,
+         .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
+         .dimension = test.instruction});
+    auto plan = ExtractResourcePlan(program);
+    const SrtRuntime runtime{};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization), test.text);
+    Check(specialization.images.size() == 1 &&
+              specialization.images[0].dimension == test.expected,
+          test.text);
+  }
+}
+
 } // namespace
 
 namespace Common {
@@ -608,6 +679,7 @@ int main() {
   TestFailedMaterializationRejectsStage();
   TestFiniteImageRefreshReusesScalarReads();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
+  TestMultisampleDepthReadAsSingleSample();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

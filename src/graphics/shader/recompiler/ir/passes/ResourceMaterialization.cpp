@@ -76,6 +76,18 @@ Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
 	const bool is_array = requested == Decoder::ImageDimension::Dim1DArray ||
 	                      requested == Decoder::ImageDimension::Dim2DArray ||
 	                      requested == Decoder::ImageDimension::Dim2DMsaaArray;
+	// Round 124: a multisample depth or stencil T# (depth tiling) read by an instruction of a
+	// single-sample dimension (image_sample, image_load without a sample index) reads its first
+	// sample on the console. The shader gets a single-sample image, and the host binds a
+	// single-sample copy of that sample (TextureCache::SingleSampleDepth, SingleSampleStencil).
+	// Before, the shader sampled a multisample image (not valid SPIR-V): on NVIDIA the samples
+	// came back interleaved, rows of two pictures, so a replay's light sprites tested the wrong
+	// depth and its 16x16 depth reduction for the CPU read two pictures at once. Multisample
+	// colour T#s keep their multisample dimension, as before.
+	constexpr uint32_t depth_tiling = static_cast<uint32_t>(Prospero::TileMode::kDepth);
+	const bool single_sample_read   = ((descriptor.dwords[3] >> 20u) & 0x1fu) == depth_tiling &&
+	                                (requested == Decoder::ImageDimension::Dim2D ||
+	                                 requested == Decoder::ImageDimension::Dim2DArray);
 	switch (static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu)) {
 		case Prospero::ImageType::kColor1D: return Decoder::ImageDimension::Dim1D;
 		case Prospero::ImageType::kColor1DArray:
@@ -91,12 +103,18 @@ Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
 			}
 			return Decoder::ImageDimension::Dim2D;
 		case Prospero::ImageType::kColor2DMsaaArray:
+			if (single_sample_read) {
+				return is_array ? Decoder::ImageDimension::Dim2DArray
+				                : Decoder::ImageDimension::Dim2D;
+			}
 			if (is_array) {
 				return Decoder::ImageDimension::Dim2DMsaaArray;
 			}
 			return Decoder::ImageDimension::Dim2DMsaa;
 		case Prospero::ImageType::kColor2D: return Decoder::ImageDimension::Dim2D;
-		case Prospero::ImageType::kColor2DMsaa: return Decoder::ImageDimension::Dim2DMsaa;
+		case Prospero::ImageType::kColor2DMsaa:
+			return single_sample_read ? Decoder::ImageDimension::Dim2D
+			                          : Decoder::ImageDimension::Dim2DMsaa;
 		default: return Decoder::ImageDimension::Unknown;
 	}
 }

@@ -399,3 +399,4 @@ licenses included with those components.
 - [shadps4-emu/shadPS4](https://github.com/shadps4-emu/shadPS4) — reference for understanding PS4
   memory behavior, GPU resource aliasing and cache coherency,
   and the AVPlayer implementation.
+- Franseven — fixes contributed to this branch (see [docs/GT7.md](docs/GT7.md#credits)).

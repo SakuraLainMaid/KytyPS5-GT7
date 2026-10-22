@@ -157,6 +157,11 @@ public:
 	// submission, for the CPU to read: linear images up to KYTY_READBACK_SMALL_IMAGES_KB, or every
 	// linear one with --readback-linear-images.
 	[[nodiscard]] bool ReadsBackForCpu(const ImageInfo& info) const;
+	// Round 124, diagnostics, any thread: the images over [address, address + size), one line each
+	// (at most `count`): extent, formats, tiling and whether what the GPU wrote reaches guest
+	// memory. For a CPU-side encoder's input (a thumbnail that came out as noise).
+	[[nodiscard]] std::vector<std::string> DescribeImagesInRange(uint64_t address, uint64_t size,
+	                                                             size_t count);
 	void ProcessDownloadImages();
 	// Round 121: whether a read-back for the CPU is on its way (enrolled, or recorded and not
 	// landed). GPU thread.
@@ -167,9 +172,24 @@ public:
 	// depth image changed. Vulkan cannot sample a multisample image through a single-sample
 	// binding: what NVIDIA read there was the samples interleaved, rows of two images, so depth
 	// tests in shaders (the light sprites' occlusion in replays) and depth-based effects read the
-	// wrong depth. Any other image: itself. KYTY_MS_DEPTH_SAMPLE0=0: the image itself, as before.
-	// GPU thread.
+	// wrong depth. Each layer of an array is copied. Any other image: itself (the binding then
+	// gets a null texture, RenderExecutor::FindResolvedTexture). KYTY_MS_DEPTH_SAMPLE0=0: itself
+	// (so a null texture: for comparisons only). The source is refreshed first, as FindTexture
+	// would refresh it. GPU thread.
 	[[nodiscard]] ImageId SingleSampleDepth(ImageId id);
+	// Round 124: the same for the stencil of a multisample depth/stencil image read through a
+	// single-sample binding (a T# of its stencil plane): an R8_UINT image holding the first
+	// sample's stencil, copied again whenever the depth image or its stencil plane changed. Any
+	// other image: itself. KYTY_MS_DEPTH_SAMPLE0=0 turns this off too. GPU thread.
+	[[nodiscard]] ImageId SingleSampleStencil(ImageId depth_id);
+	// Round 124 (Franseven's case): a texture narrower or shorter than the single-sample colour
+	// image at its address, with the same guest layout (the same size and tiling: text drawn with
+	// a narrower viewport into a wider target, then sampled at the narrower width). A view cannot
+	// shrink the extent, so normalized coordinates would reach the image's columns past the
+	// texture's: the texture reads a copy of the image's corner of its extent, made again
+	// whenever the image changed. The image itself stays as it is (the target keeps all its
+	// pixels). Any other request: `id`. GPU thread.
+	[[nodiscard]] ImageId SubExtentCopy(ImageId id, const ImageInfo& requested);
 	void RunGarbageCollector();
 	// The guest no longer refers to this bindless image from any heap entry (it replaced or
 	// cleared them): free it once no draw has used it for a few frames (engine method).
@@ -542,6 +562,17 @@ private:
 		uint64_t serial = UINT64_MAX;
 	};
 	std::unordered_map<ImageId, SingleSampleDepthCopy> m_single_sample_depths;
+	// SingleSampleStencil's, likewise (the serial: the depth image's and its stencil planes').
+	std::unordered_map<ImageId, SingleSampleDepthCopy> m_single_sample_stencils;
+	// SubExtentCopy's, by the image they copy (a few extents each): likewise never registered.
+	struct SubExtentCopyEntry {
+		ImageId  copy {};
+		uint32_t width  = 0;
+		uint32_t height = 0;
+		uint64_t serial = UINT64_MAX;
+		uint64_t used   = 0;
+	};
+	std::unordered_map<ImageId, std::vector<SubExtentCopyEntry>> m_sub_extent_copies;
 	std::unordered_set<ImageId>                       m_bindless_evictable;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	// The addresses color targets' CMASK and DCC start at (IsColorMeta).

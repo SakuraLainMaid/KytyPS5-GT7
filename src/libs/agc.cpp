@@ -3701,6 +3701,78 @@ int KYTY_SYSV_ABI AgcRewindPatchSetRewindState(uint32_t* cmd, uint8_t state) {
 	return OK;
 }
 
+// Round 124, from Franseven: the asynchronous compute command buffer's REWIND packet (its two
+// imports were unresolved stubs that wrote nothing, so the queue never waited at it). The packet
+// is the DCB's, with the offload bit (24) the ACB function takes. Its patch function is checked
+// against the packets handed out here before it writes: its arguments are taken from the import
+// it replaces, unverified. The first calls of each are logged.
+namespace {
+
+struct AcbRewindPackets {
+	std::mutex                  mutex;
+	std::array<uint32_t*, 1024> packets {};
+	size_t                      next = 0;
+};
+
+AcbRewindPackets& RecentAcbRewinds() {
+	static AcbRewindPackets packets;
+	return packets;
+}
+
+// The packets the patch function made valid (the CPU released them): the command processor's
+// watchdog keeps waiting at REWINDs once there are some (AcbRewindReleases).
+std::atomic<uint64_t> g_acb_rewind_releases {0};
+
+} // namespace
+
+uint64_t AcbRewindReleases() {
+	return g_acb_rewind_releases.load(std::memory_order_relaxed);
+}
+
+uint32_t* KYTY_SYSV_ABI AgcAcbRewind(CommandBuffer* buf, uint8_t initial_state, uint8_t offload) {
+	uint32_t* cmd = buf != nullptr ? buf->AllocateDW(2) : nullptr;
+	if (cmd != nullptr) {
+		cmd[0] = KYTY_PM4(2, Pm4::IT_REWIND, 0u);
+		cmd[1] = ((static_cast<uint32_t>(initial_state) & 0x1u) << 31u) |
+		         ((static_cast<uint32_t>(offload) & 0x1u) << 24u);
+		auto&           recent = RecentAcbRewinds();
+		std::lock_guard lock(recent.mutex);
+		recent.packets[recent.next] = cmd;
+		recent.next                 = (recent.next + 1) % recent.packets.size();
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		LOGF("Agc: ACB rewind: buffer %p, initial state %u, offload %u: packet %p\n",
+		     static_cast<void*>(buf), static_cast<unsigned>(initial_state),
+		     static_cast<unsigned>(offload), static_cast<void*>(cmd));
+	}
+	return cmd;
+}
+
+int KYTY_SYSV_ABI AgcAcbRewindPatchSetRewindState(uint32_t* cmd, uint8_t state) {
+	bool known = false;
+	if (cmd != nullptr) {
+		auto&           recent = RecentAcbRewinds();
+		std::lock_guard lock(recent.mutex);
+		known =
+		    std::find(recent.packets.begin(), recent.packets.end(), cmd) != recent.packets.end();
+	}
+	const int result =
+	    known ? AgcRewindPatchSetRewindState(cmd, state) : GRAPHICS5_ERROR_INVALID_PACKET;
+	if (known && result == OK && state != 0) {
+		g_acb_rewind_releases.fetch_add(1, std::memory_order_relaxed);
+	}
+	// The first 16 calls, and the first 16 refused ones.
+	static std::atomic<uint32_t> logged {0};
+	static std::atomic<uint32_t> refused {0};
+	if ((known ? logged : refused).fetch_add(1, std::memory_order_relaxed) < 16) {
+		LOGF("Agc: ACB rewind patch: packet %p, state %u: %s\n", static_cast<void*>(cmd),
+		     static_cast<unsigned>(state),
+		     known ? "set" : "not a packet ACB rewind made, left alone");
+	}
+	return result;
+}
+
 int KYTY_SYSV_ABI AgcCondExecPatchSetEnd(uint32_t* cmd, const volatile uint32_t* buffer) {
 	PRINT_NAME();
 

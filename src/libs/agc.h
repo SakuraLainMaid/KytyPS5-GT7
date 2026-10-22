@@ -264,6 +264,10 @@ int KYTY_SYSV_ABI       AgcSetPacketPredication(uint32_t* packet, uint32_t predi
 int KYTY_SYSV_ABI       AgcSetRangePredication(uint32_t* start, const volatile uint32_t* end,
                                                uint32_t predication);
 int KYTY_SYSV_ABI       AgcRewindPatchSetRewindState(uint32_t* cmd, uint8_t state);
+uint32_t* KYTY_SYSV_ABI AgcAcbRewind(CommandBuffer* buf, uint8_t initial_state, uint8_t offload);
+int KYTY_SYSV_ABI       AgcAcbRewindPatchSetRewindState(uint32_t* cmd, uint8_t state);
+// Round 124: how many REWIND packets AgcAcbRewindPatchSetRewindState made valid so far.
+uint64_t                AcbRewindReleases();
 int KYTY_SYSV_ABI       AgcCondExecPatchSetEnd(uint32_t* cmd, const volatile uint32_t* buffer);
 int KYTY_SYSV_ABI       AgcCondExecPatchSetCommandAddress(uint32_t*                cmd,
                                                           const volatile uint32_t* command);

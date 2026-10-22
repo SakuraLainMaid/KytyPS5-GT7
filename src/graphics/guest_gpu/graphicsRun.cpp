@@ -501,11 +501,51 @@ void CommandProcessor::WaitDeDiff(uint32_t diff) {
 	}
 }
 
-void CommandProcessor::WaitForRewind(bool valid) {
-	if (!valid) {
+void CommandProcessor::WaitForRewind(bool valid, const uint32_t* packet) {
+	const bool compute = m_interrupt_event_id != 0;
+	if (valid) {
+		if (compute && packet == m_rewind_packet && !m_rewind_released) {
+			// The CPU released a REWIND this queue waited at: its rewinds work.
+			m_rewind_released = true;
+			LOGF("PM4: compute queue 0x%x: the CPU released the REWIND at %p it waited at "
+			     "(round 124)\n",
+			     static_cast<unsigned>(m_interrupt_event_id), static_cast<const void*>(packet));
+		}
+	} else if (!compute) {
 		SuspendPm4();
 		return;
+	} else if (!m_rewind_waits_off) {
+		// The time this packet was polled: a longer gap between two polls (the host busy
+		// elsewhere, compiling pipelines or paused) counts as 250 ms.
+		const auto now = std::chrono::steady_clock::now();
+		if (packet != m_rewind_packet) {
+			m_rewind_packet = packet;
+			m_rewind_waited = {};
+		} else {
+			m_rewind_waited += std::min<std::chrono::steady_clock::duration>(
+			    now - m_rewind_polled, std::chrono::milliseconds(250));
+		}
+		m_rewind_polled = now;
+		if (m_rewind_waited < std::chrono::seconds(3)) {
+			SuspendPm4();
+			return;
+		}
+		const auto releases = Gen5::AcbRewindReleases();
+		const bool released = m_rewind_released || releases != 0;
+		if (released && ++m_rewind_timeouts < 8) {
+			LOGF("PM4: compute queue 0x%x waited 3 s at the REWIND at %p: passed (timeout %u of "
+			     "8; the CPU released %" PRIu64 " ACB rewinds so far, round 124)\n",
+			     static_cast<unsigned>(m_interrupt_event_id), static_cast<const void*>(packet),
+			     m_rewind_timeouts, releases);
+		} else {
+			m_rewind_waits_off = true;
+			LOGF("PM4: compute queue 0x%x waited 3 s at the REWIND at %p, %s: it no longer waits "
+			     "at REWINDs (round 124)\n",
+			     static_cast<unsigned>(m_interrupt_event_id), static_cast<const void*>(packet),
+			     released ? "its eighth timeout" : "and the CPU has released no rewind");
+		}
 	}
+	m_rewind_packet = nullptr;
 	// The CPU let the GPU go on, as a WAIT_REG_MEM that passes (round 90).
 	g_guest_wait_seq.fetch_add(1, std::memory_order_relaxed);
 	GpuPhases::Count(GpuPhases::Phase::WaitPassed, 1);

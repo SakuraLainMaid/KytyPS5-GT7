@@ -11,6 +11,12 @@
 #include <cstdlib>
 #include <vector>
 
+namespace Libs::LibKernel::Memory {
+std::vector<std::string> DescribeGpuImages(uint64_t, uint64_t, size_t) {
+	return {};
+}
+} // namespace Libs::LibKernel::Memory
+
 namespace Loader {
 void SymbolDatabase::Add(const SymbolResolve&, uint64_t, const std::string&) {}
 namespace Timer {

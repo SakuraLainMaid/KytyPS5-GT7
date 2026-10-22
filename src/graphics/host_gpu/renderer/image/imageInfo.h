@@ -307,6 +307,17 @@ DepthAttachmentFormat(Prospero::DepthFormat   depth_format,
 	}
 }
 
+// Whether a host format has a stencil aspect.
+[[nodiscard]] inline constexpr bool HasStencilAspect(vk::Format format) noexcept {
+	switch (format) {
+		case vk::Format::eS8Uint:
+		case vk::Format::eD16UnormS8Uint:
+		case vk::Format::eD24UnormS8Uint:
+		case vk::Format::eD32SfloatS8Uint: return true;
+		default: return false;
+	}
+}
+
 inline bool ImageInfo::IsDepth() const noexcept {
 	return DepthAspectTransferFormat(pixel_format) != vk::Format::eUndefined;
 }

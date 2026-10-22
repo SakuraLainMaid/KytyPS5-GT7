@@ -28,7 +28,9 @@
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -137,6 +139,9 @@ struct StubbedImportRecord {
 
 static std::vector<StubbedImportRecord> g_stubbed_imports;
 static std::atomic_uint32_t             g_unresolved_stub_call_log_count {0};
+// Round 124: the calls of each stubbed import, so one that the game calls every frame does not
+// use up the log for the others (the first 1024 calls of all of them filled with two).
+static std::array<std::atomic_uint32_t, 4096> g_unresolved_stub_calls {};
 static std::vector<uint64_t>            g_unresolved_stub_thunk_pages;
 static uint64_t                         g_unresolved_stub_thunk_offset = 0;
 static constexpr uint64_t               UNRESOLVED_STUB_PAGE_SIZE      = 4096;
@@ -207,16 +212,24 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 }
 
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
+	// Each import's first 8 calls, then its 16th, 32nd, ... (with the count), at most 8192 lines.
+	uint32_t calls = 0;
+	if (record_id < g_unresolved_stub_calls.size()) {
+		calls = g_unresolved_stub_calls[record_id].fetch_add(1, std::memory_order_relaxed) + 1u;
+		if (calls > 8u && !std::has_single_bit(calls)) {
+			return 0;
+		}
+	}
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
-	if (log_index < 1024) {
+	if (log_index < 8192) {
 		if (record_id < g_stubbed_imports.size()) {
 			const auto& record = g_stubbed_imports[record_id];
 			printf("Unresolved import stub called: %s\n", record.name.c_str());
 			LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
-			     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",
+			     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s (call %u)\n",
 			     log_index, record.patch_vaddr, record.index, record.name.c_str(),
-			     magic_enum::enum_name(record.type), magic_enum::enum_name(record.bind),
-			     record.program.c_str());
+			     magic_enum::enum_name(record.type).data(),
+			     magic_enum::enum_name(record.bind).data(), record.program.c_str(), calls);
 		} else {
 			printf("Unresolved import stub called: <bad-record>\n");
 			LOGF("Unresolved import stub called [%u]: record_id=%" PRIu64 " symbol=<bad-record>\n",
@@ -1566,6 +1579,9 @@ void RuntimeLinker::Clear() {
 	g_unresolved_stub_thunk_offset = 0;
 	g_stubbed_imports.clear();
 	g_unresolved_stub_call_log_count.store(0);
+	for (auto& calls: g_unresolved_stub_calls) {
+		calls.store(0, std::memory_order_relaxed);
+	}
 	if (g_invalid_memory != 0) {
 		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(g_invalid_memory, 4096));
 		g_invalid_memory = 0;

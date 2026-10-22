@@ -192,7 +192,13 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	ShaderStageRuntime stage;
 };
 
-enum class ShaderAlphaBlendSource : uint8_t { None, SourceAlpha, SourceAlphaOne, SourceAlphaZero };
+enum class ShaderAlphaBlendSource : uint8_t {
+	None,
+	SourceAlpha,
+	SourceAlphaOne,
+	SourceAlphaZero,
+	OneAlphaZero
+};
 
 struct ShaderPixelInputInfo {
 	uint32_t                                       interpolator_settings[32]    = {0};

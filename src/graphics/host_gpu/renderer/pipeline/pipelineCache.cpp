@@ -4573,6 +4573,18 @@ bool PipelineCache::DescribeGraphicsStages(
 				pixel_info.target_half_float_mask |= 1u << slot;
 			}
 		}
+		// Exports to unbound targets are dead; they need not block the dual-source takeover of
+		// MRT1.
+		const auto target_live = [&](uint32_t slot) {
+			return context.GetRenderTarget(slot).base.addr != 0 &&
+			       render_target_mask_slot(context.GetRenderTargetMask(), slot) != 0;
+		};
+		bool other_targets_free = true;
+		for (uint32_t slot = 1; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			if (pixel_info.target_output_mode[slot] != 0 && target_live(slot)) {
+				other_targets_free = false;
+			}
+		}
 		const auto& blend = context.GetBlendControl(0);
 		pixel_info.dual_source_blending =
 		    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
@@ -4587,9 +4599,7 @@ bool PipelineCache::DescribeGraphicsStages(
 		} else if (blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
 		           pixel_info.target_output_mode[0] != 0 && pixel_info.target_output_mode[0] != 7 &&
 		           ((pixel_info.target_uint_mask | pixel_info.target_sint_mask) & 1u) == 0 &&
-		           std::all_of(std::begin(pixel_info.target_output_mode) + 1,
-		                       std::end(pixel_info.target_output_mode),
-		                       [](uint8_t mode) { return mode == 0; })) {
+		           other_targets_free) {
 			switch (ClassifyBlendMapping(blend, pixel_info.target_export_mapping[0])) {
 				case BlendMappingSupport::SourceAlpha:
 					pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlpha;
@@ -4600,9 +4610,15 @@ bool PipelineCache::DescribeGraphicsStages(
 				case BlendMappingSupport::SourceAlphaZero:
 					pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlphaZero;
 					break;
+				case BlendMappingSupport::OneAlphaZero:
+					pixel_info.alpha_blend_source = ShaderAlphaBlendSource::OneAlphaZero;
+					break;
 				default: break;
 			}
 			if (pixel_info.alpha_blend_source != ShaderAlphaBlendSource::None) {
+				for (uint32_t slot = 2; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+					pixel_info.target_output_mode[slot] = 0;
+				}
 				pixel_info.dual_source_blending     = true;
 				pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
 				pixel_info.target_export_mapping[1] = {};
@@ -5190,6 +5206,18 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 					blend.color_destblend =
 					    static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
 					blend.separate_alpha_blend = false;
+					break;
+				case ShaderAlphaBlendSource::OneAlphaZero:
+					// The second source: 1 or 0 for each physical colour channel (0 where logical
+					// alpha lies), logical Sa in its A for the destination factor. Physical A
+					// holds a logical colour channel (alpha lies elsewhere, or this mapping would
+					// be direct), so its own source factor is One.
+					blend.color_srcblend  = static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color);
+					blend.color_destblend = RemapSourceAlphaFactor(blend.color_destblend);
+					blend.alpha_srcblend  = static_cast<uint8_t>(Prospero::BlendFactor::kOne);
+					blend.alpha_destblend = blend.color_destblend;
+					blend.alpha_comb_fcn  = blend.color_comb_fcn;
+					blend.separate_alpha_blend = true;
 					break;
 				case ShaderAlphaBlendSource::None: break;
 			}

@@ -224,6 +224,10 @@ void               TraceMemory(const char* format, ...) KYTY_FORMAT_PRINTF(1, 2)
 // The kernel's mappings over [vaddr, vaddr + size): each piece's offset from vaddr, size and type,
 // the holes between them included ("+0x0 0x8c00000 Direct rw, +0x8c00000 0x400000 hole, ...").
 [[nodiscard]] std::string DescribeMappings(uint64_t vaddr, uint64_t size);
+// Round 124, diagnostics, any thread: the GPU's images over [vaddr, vaddr + size), one line each
+// (at most `count`), or none before the GPU is set up.
+[[nodiscard]] std::vector<std::string> DescribeGpuImages(uint64_t vaddr, uint64_t size,
+                                                         size_t count);
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;

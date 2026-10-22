@@ -2455,14 +2455,25 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr) {
-		EXIT("BufferCache: staging reservation failed for guest image\n");
+	if (staging != nullptr) {
+		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
+			std::memset(staging, 0, static_cast<size_t>(size));
+		}
+		m_staging_buffer.Commit();
+		return {&m_staging_buffer, stage_offset};
 	}
-	if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
-		std::memset(staging, 0, static_cast<size_t>(size));
+	// Larger than the staging ring: a one-time host allocation, freed once the GPU is done.
+	auto temporary = std::make_unique<Buffer>(
+	    m_graphics, m_scheduler, MemoryUsage::Upload, 0,
+	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer, size);
+	auto* mapped = temporary->Mapped().data();
+	if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size)) {
+		std::memset(mapped, 0, static_cast<size_t>(size));
 	}
-	m_staging_buffer.Commit();
-	return {&m_staging_buffer, stage_offset};
+	temporary->Flush(0, size);
+	auto* result = temporary.get();
+	m_scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+	return {result, 0};
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::StageGuestBytesForImage(uint64_t vaddr, uint64_t size) {

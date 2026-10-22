@@ -1,8 +1,11 @@
 #include "common/abi.h"
 #include "common/logging/log.h"
+#include "kernel/memory.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstring>
@@ -315,6 +318,64 @@ static int32_t KYTY_SYSV_ABI PngEncEncode(void* handle, const PngEncEncodeParam*
 	}
 
 	LOGF("\t data_size = %" PRIu32 "\n", writer.size);
+
+	// Round 124, diagnostics: what the game encoded (a livery thumbnail came out as noise). The
+	// mean of each channel and how much neighbouring pixels differ, over 16 rows: a picture's
+	// neighbours differ by a few levels, random bytes by about 85.
+	{
+		static std::atomic<uint32_t> encoded {0};
+		const auto                   count = encoded.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (count <= 32) {
+			uint64_t       sums[3]        = {};
+			uint64_t       diff           = 0;
+			uint64_t       pixels_counted = 0;
+			uint64_t       pairs          = 0;
+			const uint32_t columns        = std::min(width, 512u);
+			for (uint32_t row = 0; row < 16; row++) {
+				const uint32_t y   = static_cast<uint32_t>(uint64_t {row} * (height - 1u) / 15u);
+				const auto*    src = pixels.get() + static_cast<size_t>(y) * row_size;
+				for (uint32_t x = 0; x < columns; x++) {
+					const auto* pixel = src + static_cast<size_t>(x) * components;
+					for (int c = 0; c < 3; c++) {
+						sums[c] += pixel[c];
+					}
+					pixels_counted++;
+					if (x > 0) {
+						const auto* left = pixel - components;
+						for (int c = 0; c < 3; c++) {
+							diff += static_cast<uint64_t>(pixel[c] > left[c] ? pixel[c] - left[c]
+							                                                 : left[c] - pixel[c]);
+						}
+						pairs++;
+					}
+				}
+			}
+			const auto mean = [&](int c) {
+				return pixels_counted != 0 ? static_cast<double>(sums[c]) / pixels_counted : 0.0;
+			};
+			LOGF("PngEnc: encode %u: %ux%u pitch %u, format %u, colour space %u, from %p (%u "
+			     "bytes): "
+			     "mean RGB %.0f %.0f %.0f, neighbours differ by %.1f; %u bytes out\n",
+			     count, width, height, pitch, static_cast<unsigned>(param->pixel_format),
+			     static_cast<unsigned>(param->color_space),
+			     static_cast<const void*>(param->image_mem_addr), param->image_mem_size, mean(0),
+			     mean(1), mean(2), pairs != 0 ? static_cast<double>(diff) / (pairs * 3u) : 0.0,
+			     writer.size);
+			// The GPU's images over the input: one the GPU drew that does not go back to guest
+			// memory would leave the encoder whatever the memory held before.
+			if (count <= 8) {
+				const auto lines = Libs::LibKernel::Memory::DescribeGpuImages(
+				    reinterpret_cast<uint64_t>(param->image_mem_addr),
+				    static_cast<uint64_t>(pitch) * height, 4);
+				if (lines.empty()) {
+					LOGF("PngEnc: input of encode %u: no GPU image over it\n", count);
+				}
+				for (const auto& line: lines) {
+					LOGF("PngEnc: input of encode %u: image %s\n", count, line.c_str());
+				}
+			}
+		}
+	}
 
 	return static_cast<int32_t>(writer.size);
 }

@@ -367,7 +367,9 @@ static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResourc
                                         const ShaderTextureResource& descriptor, const Image& image,
                                         vk::Format view_format, uint64_t size) {
 	const bool resource_ok = IsSupportedSampledDepthResource(resource);
-	const bool encoding_ok = IsSupportedDepthTextureEncoding(descriptor, resource.r128);
+	// Comparison sampling changes the host format, not the guest metadata encoding.
+	const bool encoding_ok = descriptor.TileMode() != Prospero::TileMode::kDepth ||
+	                         IsSupportedDepthTextureEncoding(descriptor, resource.r128);
 	const bool view_ok =
 	    IsSupportedSampledDepthView(image.info.pixel_format, view_format, descriptor.DstSelXYZW());
 	if (resource_ok && encoding_ok && view_ok) {
@@ -1256,8 +1258,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
 	desc.info.samples   = samples;
 	desc.info.tile_mode = tile;
-	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth &&
-	    !desc.info.IsDepth()) {
+	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
 		TileSizeAlign metadata_size {};
 		(void)TileGetDccSize(width, height, volume ? depth : image_layers,
 		                     desc.info.bytes_per_block, physical_levels, tile, metadata_size,
@@ -1349,9 +1350,22 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion, same_backing);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
+	// Round 124: the shader reads it as a single-sample image (an instruction of a single-sample
+	// dimension over a multisample depth T#, ResourceMaterialization's DescriptorDimension).
+	const bool single_sample_read =
+	    resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa &&
+	    resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray;
 	if (stencil_association) {
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
+		// Round 124: the stencil of a multisample depth target read as single-sample (the
+		// stencil plane's T# in replays): a copy of its first sample, as for the depth below.
+		// Not for bindless heap entries: their slots take no image without guest memory (the
+		// entry stays on its placeholder below).
+		if (image->backing.samples > 1 && single_sample_read && !storage && !t_resolving_bindless) {
+			id    = texture_cache.SingleSampleStencil(id);
+			image = &texture_cache.GetImage(id);
+		}
 	} else if (image->info.IsDepth()) {
 		// Round 94: a bindless heap entry the image it found cannot be viewed through (each an
 		// EXIT below) is left on its placeholder, as with the layout checks in ResolveTexture.
@@ -1369,12 +1383,10 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 		// Round 122: a multisample depth target read by an instruction of a single-sample
 		// dimension (EQAA depth in replays: the light sprites' occlusion test, depth-based
 		// effects) reads a copy of its first sample, as the console's texture unit does
-		// (TextureCache::SingleSampleDepth). Round 123: decided by the instruction's dimension,
-		// which sets the binding's kind in the shader; the T# itself is a 2-sample one (the
-		// round 122 test of its sample count never held).
-		if (image->backing.samples > 1 &&
-		    resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa &&
-		    resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray) {
+		// (TextureCache::SingleSampleDepth). Round 124: the shader's dimension is that
+		// single-sample one now (before, specialization gave it the T#'s multisample one, so
+		// rounds 122 and 123 never made the copy).
+		if (image->backing.samples > 1 && single_sample_read && !t_resolving_bindless) {
 			id    = texture_cache.SingleSampleDepth(id);
 			image = &texture_cache.GetImage(id);
 		}
@@ -1388,6 +1400,45 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 		}
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
+		// Round 124 (Franseven's case): a texture smaller than the image at its address, with the
+		// same memory and tiling (text drawn into part of a wider target), reads a copy of the
+		// image's corner: a view of the image would stretch its coordinates over the whole
+		// image. Not for bindless heap entries (their slots keep a view past the draw).
+		if (!t_resolving_bindless) {
+			if (const auto copy_id = texture_cache.SubExtentCopy(id, desc.info); copy_id != id) {
+				id    = copy_id;
+				image = &texture_cache.GetImage(id);
+			}
+		}
+	}
+	if (image->backing.samples > 1 && single_sample_read) {
+		// Round 124: a multisample image left for a single-sample binding (a colour image under a
+		// depth-tiled multisample T#, or a depth image SingleSampleDepth or SingleSampleStencil
+		// made no copy of). The shader's image is a single-sample one, and a multisample image
+		// bound to it is a mismatch Vulkan leaves undefined (wrong reads or a lost device): a
+		// null texture instead (a bindless entry stays on its placeholder).
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("Multisample depth read as single-sample: 0x%012" PRIx64 " %ux%u fmt %d, %u "
+			     "samples, %u layers, %u levels, %s%s: no single-sample copy, a null texture "
+			     "instead\n",
+			     image->info.data.address, image->info.extent.width, image->info.extent.height,
+			     static_cast<int>(image->info.pixel_format), image->backing.samples,
+			     image->info.resources.layers, image->info.resources.levels,
+			     image->info.IsDepth() ? "a depth image" : "a colour image",
+			     stencil_association ? " (its stencil)" : "");
+		}
+		if (RejectBindlessTexture("a multisample image read as single-sample",
+		                          descriptor.Base40())) {
+			return {};
+		}
+		if (same_backing != nullptr) {
+			*same_backing = false;
+		}
+		auto null_desc     = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                       : TextureCache::BindingType::Texture);
+		const auto null_id = texture_cache.FindImage(null_desc);
+		return {null_id, nullptr, std::move(null_desc)};
 	}
 	return {id, nullptr, std::move(desc)};
 }
@@ -3466,7 +3517,15 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	for (const auto resource: resources) {
 		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 		const auto address = descriptor.Base48();
-		const auto requested_size = descriptor.GetSize();
+		auto       requested_size = descriptor.GetSize();
+		// Round 124, upstream fde0b98e (nmzik), ported by Franseven: OOB_SELECT=2 only tests
+		// NumRecords != 0; a zero-stride fetch still needs its full payload when NumRecords is
+		// smaller than it.
+		if (requested_size != 0 && descriptor.Stride() == 0 && descriptor.OutOfBounds() == 2 &&
+		    resource < program.info.buffers.size() && !program.info.buffers[resource].scalar) {
+			requested_size =
+			    std::max<uint64_t>(requested_size, program.info.buffers[resource].max_byte_extent);
+		}
 		if (address != 0 && address < BufferCache::CACHING_PAGESIZE) {
 			// A base in guest page 0 cannot be read on the hardware either; the shader must not
 			// touch it, so it binds as null. Logged so the descriptor's origin can be traced.

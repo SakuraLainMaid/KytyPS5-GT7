@@ -42,6 +42,18 @@ BlendMappingSupport ClassifyBlendMapping(const HW::BlendControl&                
 			default: break;
 		}
 	}
+	// Round 124, from Franseven: colour One and alpha Zero over a source-alpha destination factor
+	// (UI text): the second source carries 1 for colour and 0 for alpha, and logical Sa in its A.
+	if (blend.separate_alpha_blend &&
+	    blend.color_srcblend == static_cast<uint8_t>(Prospero::BlendFactor::kOne) &&
+	    blend.alpha_srcblend == static_cast<uint8_t>(Prospero::BlendFactor::kZero) &&
+	    (blend.color_destblend == static_cast<uint8_t>(Prospero::BlendFactor::kSrcAlpha) ||
+	     blend.color_destblend == static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrcAlpha)) &&
+	    blend.alpha_destblend == blend.color_destblend &&
+	    blend.color_comb_fcn == static_cast<uint8_t>(Prospero::BlendOp::kAdd) &&
+	    blend.alpha_comb_fcn == blend.color_comb_fcn) {
+		return BlendMappingSupport::OneAlphaZero;
+	}
 	// Moving alpha requires the same equation for all channels.
 	if (blend.separate_alpha_blend && (blend.alpha_srcblend != blend.color_srcblend ||
 	                                   blend.alpha_destblend != blend.color_destblend ||

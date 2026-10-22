@@ -236,6 +236,14 @@ Graphics and shaders:
   loaded (cars and some objects stayed); switching to the cockpit view and back brought it back.
 - If a loading screen still never ends, please open an issue with the log.
 
+## Credits
+
+- **Franseven** contributed fixes to this branch: the asynchronous compute rewind functions the game
+  calls every frame, UI text blending (color One, alpha Zero over a source-alpha destination, with
+  dead render-target exports no longer blocking it), UI text sampled narrower than the target it was
+  drawn into (the text shadow smear), and ports of upstream fixes by nmzik (zero-stride buffer
+  fetches, oversized image uploads, NOP marker tags, depth DCC metadata).
+
 ## Current state
 
 As of October 2026:

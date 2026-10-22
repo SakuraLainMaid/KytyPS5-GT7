@@ -155,6 +155,9 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("k-JpyR2dYAM", Gen5::AgcCondExecPatchSetEnd);
 	LIB_FUNC("3ZWa3AoyWZQ", Gen5::AgcCondExecPatchSetCommandAddress);
 	LIB_FUNC("ziVA3whp3p4", Gen5::AgcRewindPatchSetRewindState);
+	// Round 124, from Franseven: the ACB rewind and its patch function.
+	LIB_FUNC("DwICrVxerkY", Gen5::AgcAcbRewind);
+	LIB_FUNC("eWaWyFegzgQ", Gen5::AgcAcbRewindPatchSetRewindState);
 	LIB_FUNC("YUeqkyT7mEQ", Gen5::AgcDcbSetFlip);
 }
 

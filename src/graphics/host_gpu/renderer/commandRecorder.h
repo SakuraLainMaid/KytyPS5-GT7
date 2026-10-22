@@ -340,6 +340,14 @@ public:
 	void setCheckpointNV(const void* marker) const {
 		Run([=](vk::CommandBuffer command) { command.setCheckpointNV(marker); });
 	}
+	// Round 124: one viewport or scissor, for pipelines with VK_DYNAMIC_STATE_VIEWPORT/SCISSOR
+	// (the blit helper's).
+	void setViewport(const vk::Viewport& viewport) const {
+		Run([viewport](vk::CommandBuffer command) { command.setViewport(0, 1, &viewport); });
+	}
+	void setScissor(const vk::Rect2D& scissor) const {
+		Run([scissor](vk::CommandBuffer command) { command.setScissor(0, 1, &scissor); });
+	}
 	void setViewportWithCount(uint32_t count, const vk::Viewport* viewports) const {
 		if (!Threaded()) {
 			m_direct.setViewportWithCount(count, viewports);

@@ -1512,6 +1512,13 @@ std::string DescribeMappings(uint64_t vaddr, uint64_t size) {
 	                                   : "(no memory map)";
 }
 
+std::vector<std::string> DescribeGpuImages(uint64_t vaddr, uint64_t size, size_t count) {
+	if (g_gpu_resources == nullptr || size == 0) {
+		return {};
+	}
+	return g_gpu_resources->DescribeImages(vaddr, size, count);
+}
+
 bool IsCommittedRange(uint64_t vaddr, uint64_t size) {
 	// No guest memory map (unit tests that drive the libraries on host memory): nothing to check.
 	if (g_virtual_ranges == nullptr) {

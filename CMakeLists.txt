@@ -425,6 +425,7 @@ set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
 	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms_depth.frag"
 	"${gpu_tiler_shader_dir}/gpu_blit_ms_depth_sample0.frag"
+	"${gpu_tiler_shader_dir}/gpu_blit_ms_stencil_sample0.frag"
 	"${gpu_tiler_shader_dir}/gpu_video_out_overlay.frag"
 	"${gpu_tiler_shader_dir}/color_clear_check.comp"
 	"${gpu_tiler_shader_dir}/gpu_conditional_clear_float.frag"
@@ -753,6 +754,10 @@ add_executable(jpeg_dec_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/JpegDecTests.c
 target_link_libraries(jpeg_dec_tests common fmt::fmt)
 target_include_directories(jpeg_dec_tests PRIVATE ${inc_headers})
 
+add_executable(jpeg_enc_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/JpegEncTests.cpp")
+target_link_libraries(jpeg_enc_tests common fmt::fmt)
+target_include_directories(jpeg_enc_tests PRIVATE ${inc_headers})
+
 add_executable(ces_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CesTests.cpp")
 target_link_libraries(ces_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(ces_tests PRIVATE ${inc_headers})
@@ -874,6 +879,7 @@ if(BUILD_TESTING)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
 	add_test(NAME jpeg_dec COMMAND $<TARGET_FILE:jpeg_dec_tests>)
+	add_test(NAME jpeg_enc COMMAND $<TARGET_FILE:jpeg_enc_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
@@ -954,6 +960,7 @@ if(BUILD_TESTING)
 		save_data_memory_tests
 		png_enc_tests
 		jpeg_dec_tests
+		jpeg_enc_tests
 		ces_tests
 		save_data_dialog_tests
 		http_uri_parse_tests

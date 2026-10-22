@@ -155,7 +155,13 @@ public:
 	void SetCeComplete(bool complete) { m_ce_complete = complete; }
 	void WaitCe();
 	void WaitDeDiff(uint32_t diff);
-	void WaitForRewind(bool valid);
+	// A REWIND packet: the queue waits at it until its valid bit is set. Round 124: a compute
+	// queue waits at most 3 s at one packet, counted while it is polled (a host stall counts
+	// 250 ms at most). Once the CPU has released rewinds (the ACB patch function made packets
+	// valid, or one this queue waited at became valid), that packet is passed, up to 8 times;
+	// otherwise, or after that, the queue no longer waits at REWINDs (as before the ACB's rewinds
+	// were written at all). Both are logged.
+	void WaitForRewind(bool valid, const uint32_t* packet);
 	void IncrementDe();
 	void IncrementCe();
 
@@ -223,6 +229,16 @@ private:
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;
 	bool     m_ce_complete = false;
+
+	// WaitForRewind's watchdog (compute queues): the packet waited at, when it was polled last,
+	// the polled time it has waited, whether the CPU released a REWIND this queue waited at, the
+	// packets passed after a timeout, and whether the queue no longer waits.
+	const uint32_t*                       m_rewind_packet    = nullptr;
+	std::chrono::steady_clock::time_point m_rewind_polled    = {};
+	std::chrono::steady_clock::duration   m_rewind_waited    = {};
+	bool                                  m_rewind_released  = false;
+	uint32_t                              m_rewind_timeouts  = 0;
+	bool                                  m_rewind_waits_off = false;
 
 	uint32_t m_const_ram[0x3000] = {0};
 
