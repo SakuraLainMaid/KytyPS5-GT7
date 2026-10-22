@@ -4876,6 +4876,20 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode m
 	       g_guest_address_space->ProtectTransient(vaddr, size, mode);
 }
 
+void AddLiveThreadStack(uint64_t vaddr, uint64_t size) {
+	if (g_guest_address_space != nullptr) {
+		g_guest_address_space->AddLiveStack(vaddr, size);
+	}
+}
+
+void RemoveLiveThreadStack(uint64_t vaddr, uint64_t size) {
+	// The tracker's protection of what it still watches there comes back (outside the
+	// address-space lock: the tracker protects through it).
+	if (g_guest_address_space != nullptr && g_guest_address_space->RemoveLiveStack(vaddr, size)) {
+		ResyncGpuRangeProtection(vaddr, size);
+	}
+}
+
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 

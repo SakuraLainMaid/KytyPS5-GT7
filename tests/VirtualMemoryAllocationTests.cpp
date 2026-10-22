@@ -1414,6 +1414,46 @@ void TestPartialUnmapPreservesHostPermissions() {
 	        "KernelMunmap(right cleanup)");
 	std::printf("[host]    %-48s ok\n", test);
 }
+
+// Round 127: a live thread's stack in the game's memory stays writable under the page tracker's
+// protections, and gets them again once it is no longer a live stack.
+void TestLiveThreadStackKeptWritable() {
+	const char* test = "LiveThreadStackKeptWritable";
+	const auto  page = SceKernelPageSize;
+	const auto  base = MapNamedFlexible(test, page * 3, SceKernelProtCpuRw, "live_stack");
+	using Common::VirtualMemory::Mode;
+	uint64_t   value    = 0x5354414b4c495645ull;
+	const auto writable = [&](uint64_t address) {
+		iovec local {&value, sizeof(value)};
+		iovec remote {reinterpret_cast<void*>(address), sizeof(value)};
+		return process_vm_writev(getpid(), &local, 1, &remote, 1, 0) ==
+		       static_cast<ssize_t>(sizeof(value));
+	};
+	const auto stack = base + page;
+
+	Libs::LibKernel::Memory::AddLiveThreadStack(stack + 0x100, page - 0x200);
+	Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(base, page * 3, Mode::Read),
+	      "could not protect the range around the stack");
+	Check(test, !writable(base) && !writable(base + page * 2),
+	      "the memory around the live stack stayed writable");
+	Check(test, writable(stack) && writable(stack + page - 8),
+	      "the page tracker made a live stack read-only");
+
+	Libs::LibKernel::Memory::RemoveLiveThreadStack(stack + 0x100, page - 0x200);
+	Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(base, page * 3, Mode::Read),
+	      "could not protect the range again");
+	Check(test, !writable(stack), "a stack no longer live was left out of the protection");
+
+	// A stack the tracker had protected before its thread started is writable at once.
+	Libs::LibKernel::Memory::AddLiveThreadStack(stack, page);
+	Check(test, writable(stack) && !writable(base), "a new live stack was left read-only");
+	Libs::LibKernel::Memory::RemoveLiveThreadStack(stack, page);
+
+	Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(base, page * 3, Mode::ReadWrite),
+	      "could not restore the range");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, page * 3), "KernelMunmap");
+	std::printf("[host]    %-48s ok\n", test);
+}
 #endif
 
 void TestDirectMapValidationBeforeOwnerMutation() {
@@ -4397,6 +4437,10 @@ int main(int argc, char** argv) {
 		RunTest(TestFixedDirectReplacementPreservesAccess);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
+	if (argc == 2 && std::strcmp(argv[1], "--live-stack-only") == 0) {
+		RunTest(TestLiveThreadStackKeptWritable);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 #endif
 #if defined(__x86_64__) || defined(_M_X64)
 	if (argc == 2 && std::strcmp(argv[1], "--fiber-only") == 0) {
@@ -4462,6 +4506,7 @@ int main(int argc, char** argv) {
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 #if defined(__linux__)
 	RunTest(TestPartialUnmapPreservesHostPermissions);
+	RunTest(TestLiveThreadStackKeptWritable);
 #endif
 	RunTest(TestDirectMapValidationBeforeOwnerMutation);
 	RunTest(TestDirectReleaseRollbackRestoresOwnerMapping);
