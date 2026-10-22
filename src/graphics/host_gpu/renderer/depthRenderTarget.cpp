@@ -30,14 +30,32 @@
 namespace Libs::Graphics {
 
 [[noreturn]] static void DepthFatal(const char* format, ...) {
-	std::fputs("Depth target fatal: ", stderr);
+	// Round 129: into the log too (the console alone had them, so a tester's log said only
+	// "details were printed above").
+	char    details[512] {};
 	va_list args;
 	va_start(args, format);
-	std::vfprintf(stderr, format, args);
+	std::vsnprintf(details, sizeof(details), format, args);
 	va_end(args);
-	std::fputc('\n', stderr);
+	std::fprintf(stderr, "Depth target fatal: %s\n", details);
 	std::fflush(stderr);
-	EXIT("unsupported render state; details were printed above\n");
+	EXIT("unsupported render state: %s\n", details);
+}
+
+// Round 129: a stencil or depth state Vulkan cannot express exactly, drawn with the nearest one
+// it can (or the draw left out, RenderDepthInfo::unsupported) instead of ending the emulator: a
+// tester's time trial on a new track ended so after 16 minutes (issue 8). The first 16 are logged.
+static void DepthApproximation(const char* format, ...) {
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) >= 16) {
+		return;
+	}
+	char    details[512] {};
+	va_list args;
+	va_start(args, format);
+	std::vsnprintf(details, sizeof(details), format, args);
+	va_end(args);
+	LOGF("DepthTarget: %s (round 129)\n", details);
 }
 
 static vk::StencilOp ConvertStencilOp(uint8_t value, uint8_t write_mask, uint8_t op_value) {
@@ -63,12 +81,14 @@ static vk::StencilOp ConvertStencilOp(uint8_t value, uint8_t write_mask, uint8_t
 				return vk::StencilOp::eKeep;
 			}
 			if ((write_mask & ~op_value) != 0) {
-				DepthFatal("unsupported stencil XOR operands: write mask=0x%02" PRIx8
-				           ", operation value=0x%02" PRIx8,
-				           write_mask, op_value);
+				DepthApproximation("stencil XOR of only some written bits (write mask=0x%02" PRIx8
+				                   ", operation value=0x%02" PRIx8 "): inverted as a whole",
+				                   write_mask, op_value);
 			}
 			return vk::StencilOp::eInvert;
-		default: DepthFatal("unsupported stencil operation: 0x%02" PRIx8, value);
+		default:
+			DepthApproximation("unknown stencil operation 0x%02" PRIx8 ": kept", value);
+			return vk::StencilOp::eKeep;
 	}
 }
 
@@ -93,10 +113,12 @@ static vk::StencilOpState ConvertStencilState(
 			replacement = op_value;
 		}
 		if (((reference ^ replacement) & required_bits & state.writeMask) != 0) {
-			DepthFatal("unsupported stencil replacement: compare=%u, compare mask=0x%02" PRIx32
-			           ", write mask=0x%02" PRIx32 ", operation value=0x%02" PRIx8
-			           ", test value=0x%02" PRIx32,
-			           compare, state.compareMask, state.writeMask, op_value, test_value);
+			// Vulkan's one reference cannot be both: the replacement wins the written bits.
+			DepthApproximation("stencil replacement other than the test value (compare=%u, "
+			                   "compare mask=0x%02" PRIx32 ", write mask=0x%02" PRIx32
+			                   ", operation value=0x%02" PRIx8 ", test value=0x%02" PRIx32
+			                   "): the test compares with the replacement",
+			                   compare, state.compareMask, state.writeMask, op_value, test_value);
 		}
 		// Vulkan shares one reference between comparison and every replacement on this face.
 		reference = (reference & ~state.writeMask) | (replacement & state.writeMask);
@@ -261,6 +283,7 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r) {
 	KYTY_PROFILER_FUNCTION();
+	r.unsupported            = false;
 	const auto& hw          = buffer.GetRegisters();
 	const auto& z           = hw.GetDepthRenderTarget();
 	const auto& rc          = hw.GetRenderControl();
@@ -304,7 +327,19 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
 	    (has_stencil && !z.depth_view.stencil_write_disable &&
 	     z.stencil_write_base_addr != z.stencil_read_base_addr)) {
-		DepthFatal("unsupported depth register state");
+		DepthApproximation(
+		    "unsupported depth register state, the draw left out: copy depth %d stencil %d "
+		    "centroid %d sample %u, zfunc %u, depth write %d read 0x%012" PRIx64
+		    " write 0x%012" PRIx64 ", stencil write %d read 0x%012" PRIx64 " write 0x%012" PRIx64,
+		    rc.copy_depth_to_color ? 1 : 0, rc.copy_stencil_to_color ? 1 : 0,
+		    rc.copy_centroid ? 1 : 0, static_cast<uint32_t>(rc.copy_sample),
+		    static_cast<uint32_t>(dc.zfunc), z.depth_view.depth_write_disable ? 0 : 1,
+		    static_cast<uint64_t>(z.z_read_base_addr), static_cast<uint64_t>(z.z_write_base_addr),
+		    (has_stencil && !z.depth_view.stencil_write_disable) ? 1 : 0,
+		    static_cast<uint64_t>(z.stencil_read_base_addr),
+		    static_cast<uint64_t>(z.stencil_write_base_addr));
+		r.unsupported = true;
+		return;
 	}
 	r.desc                    = MakeDepthTargetDesc(buffer, z);
 	r.guest_array_layer       = r.desc.view_info.base_layer;
@@ -332,7 +367,11 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		if (dc.stencilfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
 		    (dc.backface_enable &&
 		     dc.stencilfunc_bf > static_cast<uint8_t>(vk::CompareOp::eAlways))) {
-			DepthFatal("unsupported stencil compare state");
+			DepthApproximation("unsupported stencil compare %u / %u, the draw left out",
+			                   static_cast<uint32_t>(dc.stencilfunc),
+			                   static_cast<uint32_t>(dc.stencilfunc_bf));
+			r.unsupported = true;
+			return;
 		}
 		r.stencil_front = ConvertStencilState(
 		    dc.stencilfunc, {sc.stencil_fail, sc.stencil_zpass, sc.stencil_zfail},

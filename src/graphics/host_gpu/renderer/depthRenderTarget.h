@@ -40,6 +40,9 @@ struct RenderDepthInfo {
 	// The target's own first slice (DB_DEPTH_VIEW's), which its HTile's per-layer clear state is
 	// kept by: desc.view_info.base_layer counts from the cache image it was found in.
 	uint32_t guest_array_layer = 0;
+	// Round 129: a depth or stencil state the host cannot draw with (DepthApproximation): the draw
+	// is left out.
+	bool unsupported = false;
 
 	[[nodiscard]] vk::ImageAspectFlags AttachmentWriteAspects() const;
 };

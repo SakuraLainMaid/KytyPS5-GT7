@@ -2053,6 +2053,12 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		}
 		ResolveRenderDepthTarget(buffer, state.depth_info);
 	}
+	if (state.depth_info.unsupported) {
+		if (FrameGraph::Logging()) {
+			FrameGraph::Log("  not drawn: a depth or stencil state the host cannot draw with");
+		}
+		return false;
+	}
 
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
