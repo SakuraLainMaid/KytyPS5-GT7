@@ -1390,6 +1390,218 @@ static uint64_t SmallReadbackBytes() {
 	return bytes;
 }
 
+namespace {
+
+// Round 120 (KYTY_READBACK_PREFILL, default on; 0 turns it off). A read-back for the CPU lands in
+// guest memory once the host GPU has run the submission that drew it, but the guest may see the
+// GPU finish before that: labels and interrupts are written as they are recorded. A game thread
+// that reads the result at once takes what the memory held before. A game that takes its
+// read-backs from a ring of per-frame memory finds another kind of read-back there as often as
+// not (depth floats read as colour halves, values in the tens of thousands): its white balance,
+// set from a 16x16 reduction of the scene colour, went to its limit in tunnels, and the picture
+// turned green. So when a read-back is enrolled (its draw recorded, before any later label), its
+// guest memory gets the bytes the last read-back of its kind landed: a reader that comes early
+// takes the frame before's result instead. A kind is a format, a size, and the order among the
+// read-backs of that format and size in a frame (a game may make two of them a frame).
+struct ReadbackKind {
+	int32_t  format = 0;
+	uint32_t width  = 0;
+	uint32_t height = 0;
+	uint64_t size   = 0;
+	uint32_t index  = 0;
+
+	[[nodiscard]] bool operator<(const ReadbackKind& other) const noexcept {
+		return std::tie(format, width, height, size, index) <
+		       std::tie(other.format, other.width, other.height, other.size, other.index);
+	}
+	[[nodiscard]] bool operator==(const ReadbackKind& other) const noexcept {
+		return format == other.format && width == other.width && height == other.height &&
+		       size == other.size && index == other.index;
+	}
+};
+
+struct ReadbackPrefill {
+	std::mutex mutex;
+	// The GPU thread (enrolment) and the priority thread (landing), under the mutex.
+	std::map<ReadbackKind, std::vector<uint8_t>> latest;      // the last bytes each kind landed
+	std::map<uint64_t, ReadbackKind>             landed_kind; // the kind that last landed there
+	struct Enrolled {
+		ReadbackKind kind;
+		uint64_t     ns = 0; // when its draw was recorded
+	};
+	std::map<uint64_t, Enrolled> enrolled;
+	// The GPU thread only: the read-backs of this frame, and how many of each format and size.
+	uint64_t                         frame = UINT64_MAX;
+	std::unordered_set<uint64_t>     frame_addresses;
+	std::map<ReadbackKind, uint32_t> frame_counts;
+	// Statistics (under the mutex), logged every 10 s.
+	uint64_t since_ns    = 0;
+	uint64_t enrolments  = 0;
+	uint64_t other_kind  = 0; // held a read-back of another kind
+	uint64_t other_bytes = 0; // held bytes no read-back landed
+	uint64_t older_own   = 0; // held an older read-back of its kind
+	uint64_t already     = 0; // held the latest of its kind
+	uint64_t first       = 0; // no read-back of its kind had landed yet
+	uint64_t written     = 0;
+	uint64_t landed      = 0;
+	uint64_t landed_ns   = 0;
+	uint64_t longest_ns  = 0;
+	uint64_t dropped     = 0;
+};
+
+ReadbackPrefill& GetReadbackPrefill() {
+	// Never destroyed: read-backs may still land during static destruction.
+	static auto* prefill = new ReadbackPrefill;
+	return *prefill;
+}
+
+bool ReadbackPrefillEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_PREFILL");
+		const bool  on    = value == nullptr || value[0] != '0';
+		LOGF("Read-backs for the CPU: %s (KYTY_READBACK_PREFILL)\n",
+		     on ? "until one lands, its guest memory holds the last of its kind"
+		        : "guest memory keeps what it held until a read-back lands");
+		return on;
+	}();
+	return enabled;
+}
+
+// Under the mutex: every 10 s, what the read-backs' guest memory held when they were enrolled.
+void LogReadbackPrefill(ReadbackPrefill& prefill, uint64_t now_ns) {
+	if (prefill.since_ns == 0) {
+		prefill.since_ns = now_ns;
+		return;
+	}
+	if (now_ns - prefill.since_ns < 10'000'000'000ull) {
+		return;
+	}
+	const bool on = ReadbackPrefillEnabled();
+	LOGF("Read-backs for the CPU (%.0f s): %" PRIu64 " new; before they landed, their memory held "
+	     "another kind of read-back in %" PRIu64 ", bytes no read-back left in %" PRIu64
+	     ", an older one of their kind in %" PRIu64 " (%s %" PRIu64
+	     " of these the last bytes of their kind), the latest of their kind in %" PRIu64
+	     ", and %" PRIu64 " were the first of their kind; %" PRIu64
+	     " landed, %.2f ms after their draw on average (longest %.2f ms), %" PRIu64
+	     " dropped (the guest wrote there first)\n",
+	     static_cast<double>(now_ns - prefill.since_ns) / 1e9, prefill.enrolments,
+	     prefill.other_kind, prefill.other_bytes, prefill.older_own,
+	     on ? "gave" : "would have given (KYTY_READBACK_PREFILL=0)", prefill.written,
+	     prefill.already, prefill.first, prefill.landed,
+	     prefill.landed != 0
+	         ? static_cast<double>(prefill.landed_ns) / 1e6 / static_cast<double>(prefill.landed)
+	         : 0.0,
+	     static_cast<double>(prefill.longest_ns) / 1e6, prefill.dropped);
+	prefill.since_ns    = now_ns;
+	prefill.enrolments  = 0;
+	prefill.other_kind  = 0;
+	prefill.other_bytes = 0;
+	prefill.older_own   = 0;
+	prefill.already     = 0;
+	prefill.first       = 0;
+	prefill.written     = 0;
+	prefill.landed      = 0;
+	prefill.landed_ns   = 0;
+	prefill.longest_ns  = 0;
+	prefill.dropped     = 0;
+}
+
+// GPU thread: a small read-back enrolled in `frame` (presented frames so far).
+void PrefillReadback(const ImageInfo& info, uint64_t frame) {
+	const auto range = info.data;
+	if (range.Empty() || range.size > SmallReadbackBytes() || info.samples != 1) {
+		return;
+	}
+	(void)ReadbackPrefillEnabled(); // logs the setting at the first read-back
+	auto& prefill = GetReadbackPrefill();
+	if (prefill.frame != frame) {
+		prefill.frame = frame;
+		prefill.frame_addresses.clear();
+		prefill.frame_counts.clear();
+	}
+	if (!prefill.frame_addresses.insert(range.address).second) {
+		// Drawn again in a later submission of the frame: its first read-back may have landed.
+		return;
+	}
+	ReadbackKind kind;
+	kind.format = static_cast<int32_t>(info.pixel_format);
+	kind.width  = info.extent.width;
+	kind.height = info.extent.height;
+	kind.size   = range.size;
+	kind.index  = prefill.frame_counts[kind]++;
+
+	std::vector<uint8_t> current(static_cast<size_t>(range.size));
+	const bool           readable =
+	    LibKernel::Memory::TryReadBacking(range.address, current.data(), range.size);
+	const auto own_hash = LandedReadbackHash(range.address);
+	const auto now_ns   = LibKernel::Memory::JournalNowNs();
+
+	std::lock_guard lock(prefill.mutex);
+	prefill.enrolments++;
+	prefill.enrolled[range.address] = {kind, now_ns};
+	LogReadbackPrefill(prefill, now_ns);
+	const auto latest = prefill.latest.find(kind);
+	if (!readable || latest == prefill.latest.end() || latest->second.size() != current.size()) {
+		prefill.first++;
+		return;
+	}
+	if (current == latest->second) {
+		prefill.already++;
+		return;
+	}
+	const auto landed = prefill.landed_kind.find(range.address);
+	if (own_hash == 0 || landed == prefill.landed_kind.end() ||
+	    HashBytes(current.data(), current.size()) != own_hash) {
+		prefill.other_bytes++;
+	} else if (landed->second.format != kind.format || landed->second.size != kind.size ||
+	           landed->second.width != kind.width || landed->second.height != kind.height) {
+		prefill.other_kind++;
+	} else {
+		prefill.older_own++;
+	}
+	prefill.written++;
+	if (ReadbackPrefillEnabled()) {
+		const LibKernel::Memory::WriteSourceScope source(
+		    LibKernel::Memory::WriteSource::ImageWriteBack);
+		(void)LibKernel::Memory::TryWriteBacking(range.address, latest->second.data(),
+		                                         latest->second.size());
+	}
+}
+
+// Priority thread: a small read-back landed (its bytes are in guest memory now), or was dropped.
+void NoteReadbackLanded(uint64_t address, const uint8_t* bytes, uint64_t size, bool dropped) {
+	auto&           prefill = GetReadbackPrefill();
+	const auto      now_ns  = LibKernel::Memory::JournalNowNs();
+	std::lock_guard lock(prefill.mutex);
+	const auto      enrolled = prefill.enrolled.find(address);
+	if (enrolled == prefill.enrolled.end() || enrolled->second.kind.size != size) {
+		return;
+	}
+	if (dropped) {
+		prefill.dropped++;
+	} else {
+		prefill.latest[enrolled->second.kind].assign(bytes, bytes + size);
+		prefill.landed_kind[address] = enrolled->second.kind;
+		const auto waited            = now_ns - std::min(now_ns, enrolled->second.ns);
+		prefill.landed++;
+		prefill.landed_ns += waited;
+		prefill.longest_ns = std::max(prefill.longest_ns, waited);
+	}
+	prefill.enrolled.erase(enrolled);
+}
+
+// Guest memory unmapped.
+void ForgetReadbackPrefill(uint64_t address, uint64_t size) {
+	auto&           prefill = GetReadbackPrefill();
+	std::lock_guard lock(prefill.mutex);
+	prefill.landed_kind.erase(prefill.landed_kind.lower_bound(address),
+	                          prefill.landed_kind.lower_bound(address + size));
+	prefill.enrolled.erase(prefill.enrolled.lower_bound(address),
+	                       prefill.enrolled.lower_bound(address + size));
+}
+
+} // namespace
+
 bool TextureCache::ReadsBackForCpu(const ImageInfo& info) const {
 	return !info.IsTiled() && !info.data.Empty() &&
 	       (m_readback_linear_images ||
@@ -1403,7 +1615,10 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 	if (!image.IsGpuModified()) {
 		EXIT("TextureCache: cannot enroll a non-GPU-owned image for download\n");
 	}
-	m_download_images.insert(id);
+	const bool added = m_download_images.insert(id).second;
+	if (added) {
+		PrefillReadback(image.info, m_graphics.presented_frames.load(std::memory_order_relaxed));
+	}
 	if (!m_readback_linear_images) {
 		// The first images read back, each once (under m_lock).
 		static std::unordered_set<uint64_t> logged;
@@ -4626,6 +4841,7 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 				     " size=0x%" PRIx64 ": the guest wrote the bytes after it was recorded\n",
 				     range.address, range.size);
 			}
+			NoteReadbackLanded(range.address, mapped, range.size, true);
 			return;
 		}
 		const LibKernel::Memory::WriteSourceScope source(
@@ -4633,6 +4849,7 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
 		if (readback_guard) {
 			NoteLandedReadback(range.address, mapped, range.size);
+			NoteReadbackLanded(range.address, mapped, range.size, false);
 		}
 	});
 	return true;
@@ -6396,6 +6613,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 	std::scoped_lock lock {m_lock};
 	ForgetLandedReadbacks(address, size);
+	ForgetReadbackPrefill(address, size);
 	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
 		const auto base = metadata->first;
 		if (base >= address && base < address + size) {
