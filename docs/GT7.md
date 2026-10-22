@@ -60,6 +60,37 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 22, 2026, second build)
+
+**All shaders are compiled again after this update** (pop-in the first time in each place, and a
+few minutes for each car's first visit in ray tracing mode).
+
+- **GT Sophy drives properly** ([issue 13](https://github.com/usa-ratt/KytyPS5-GT7/issues/13), [issue 14](https://github.com/usa-ratt/KytyPS5-GT7/issues/14)).
+  Sophy's driving runs as a neural network on the graphics card. The emulator could not translate
+  that one GPU program (it uses one instruction the emulator did not support yet), so the program
+  was skipped and Sophy drove without it: hard into the wall the moment the countdown ended.
+- **No more crash in time trials** on draws that are set up to output nothing
+  ([issue 8](https://github.com/usa-ratt/KytyPS5-GT7/issues/8)). They are skipped now; they draw nothing on the console either.
+- **No more crash in Circuit Experience (Eiger Nordwand, sector 3) and in Sophy races**
+  ([issue 9](https://github.com/usa-ratt/KytyPS5-GT7/issues/9), [issue 13](https://github.com/usa-ratt/KytyPS5-GT7/issues/13)): a texture description with
+  a speed hint value the emulator did not expect.
+- **Red lights no longer show through walls in replays.** The game asks the graphics card how
+  much of each light is visible (an occlusion query); the emulator now answers with the real
+  count instead of "all of it", and reads the replays' depth picture the way the console does.
+- **Large text is complete:** countdown numbers and result stamps lost everything past 128 pixels
+  (fix from upstream KytyPS5, #1214, by Devran Cosmo Uenal).
+- **Saved liveries get their picture.** The game encodes the livery's picture as JPEG and PNG,
+  and the emulator had no JPEG encoder and handed the encoder stale pixels. Some parts of the
+  picture can still have the wrong colour, and leaving the livery editor still shows error
+  CE-210717 (see Known problems).
+- **Contributed by Franseven:** the asynchronous compute rewind functions the game calls every
+  frame, UI text blending, UI text sampled narrower than the target it was drawn into (the smeared
+  text shadows), and ports of upstream fixes by nmzik (zero-stride buffer fetches, oversized image
+  uploads, NOP marker tags, depth DCC metadata). Thank you!
+- When the emulator closes because of a crash it could not report before (a stack overflow, a
+  C++ exception, an abort), the log now ends with the reason and where it happened, and the
+  `Perf:` lines show how much memory is in use.
+
 ## What's new (October 22, 2026)
 
 **All shaders are compiled again after this update** (pop-in the first time in each place, and a
@@ -223,9 +254,18 @@ Graphics and shaders:
   blotchy for the few minutes its material shaders compile the first time (see What's new). The
   reflections can still flicker a little and look a bit jagged, most of all right after switching
   between the cockpit and outside views.
-- Tokyo: at some times of day and weather (twilight and night), the picture turns green at some
-  tunnel exits and under some overpasses, most often in replays, and fades back once past them.
-- In replays, small red lights can show through walls.
+- Tokyo: at some times of day and weather (twilight and night), the picture can turn green at
+  some tunnel exits and under some overpasses, and fades back once past them. It depends on the
+  camera angle, so watching the same replay twice can give green once and not the other time.
+- Tokyo at night: some shadows on tunnel ceilings and walls move with the camera.
+- **Scapes:** the emulator can close by itself after about 10 to 15 minutes in Scapes, as the
+  next scene loads ([issue 11](https://github.com/usa-ratt/KytyPS5-GT7/issues/11)). The cause is found and the fix
+  is being tested.
+- **AMD graphics cards:** the game crashes at the GT logo, inside the AMD driver's shader compiler
+  ([issue 12](https://github.com/usa-ratt/KytyPS5-GT7/issues/12)). Being looked into.
+- **Livery editor:** leaving it shows error CE-210717 (the game uploads the livery to its online
+  service, which the emulator has no stand-in for), and some parts of a saved livery's picture can
+  have the wrong colour.
 - A graphics driver crash, seen after many license test retries
   ([issue 3](https://github.com/usa-ratt/KytyPS5-GT7/issues/3)), is not fixed yet. If it happens
   to you, please add this build's crash report and the zipped log to that issue: the report now
