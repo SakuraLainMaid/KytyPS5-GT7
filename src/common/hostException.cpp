@@ -1,5 +1,7 @@
 #include "common/hostException.h"
 
+#include "common/lastWords.h"
+
 #include <atomic>
 #include <cstdio>
 
@@ -112,6 +114,15 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	} else if (exception_record->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
 		info.type = ExceptionType::IllegalInstruction;
 	} else {
+		// Round 125: one that ends the process where no handler can be found is reported first.
+		uint64_t   parameters[4] {};
+		const auto count =
+		    exception_record->NumberParameters < 4 ? exception_record->NumberParameters : DWORD {4};
+		for (DWORD i = 0; i < count; i++) {
+			parameters[i] = exception_record->ExceptionInformation[i];
+		}
+		LastWords::ReportFirstChance(exception_record->ExceptionCode, info.exception_address,
+		                             parameters, count, exception->ContextRecord);
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 

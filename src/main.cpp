@@ -3,6 +3,7 @@
 #include "common/dateTime.h"
 #include "common/debug.h"
 #include "common/file.h"
+#include "common/lastWords.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -630,6 +631,9 @@ static int Main(int argc, char* argv[]) {
 #endif
 	VirtualMemory::Init();
 	InitializeThreads();
+	// After the address-space reservations, as its thread's stack must not land in the guest
+	// range: the report of an end no fault handler sees (round 125).
+	Common::LastWords::Install();
 #if defined(KYTY_PGO_GENERATE)
 	// After the address-space reservations: the thread's stack must not land in the guest range.
 	StartPgoDumps();
