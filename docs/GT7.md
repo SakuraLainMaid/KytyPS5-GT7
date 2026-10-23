@@ -60,6 +60,30 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 23, 2026, fifth build)
+
+No shaders are compiled again after this update. A few pipelines (draws that use
+alpha-to-coverage) compile once, so the first race after updating can stutter a little.
+
+- **Smoother races.** In a 5-lap race at Tokyo twilight against 11 AI cars the frame rate stayed
+  around 22 to 23 fps, rarely below 21 and often 23 to 24, in spots that used to drop to about 18.
+  What changed:
+  - When several of the game's threads read the same results of the graphics work at once, the
+    ones that find the data already fetched go on at once instead of waiting for the area around
+    it to download again.
+  - The memory tracker's locks are held much less, and memory protections from different threads
+    no longer queue behind one another (Franseven's ports of mainline changes).
+  - Fewer full GPU barriers (Franseven's port of a mainline change).
+- **Alpha-to-coverage** is now honoured: the edges of foliage, fences and other cut-out textures
+  are drawn the way the game asks (from mainline, ported by Franseven). `KYTY_ALPHA_TO_COVERAGE=0`
+  turns it off.
+- **The game's online requests fail the way they do on a PS5 with no internet.** Before, each one
+  failed with an emulator error (a bad handle). The emulator still never goes online.
+- The game's checks for a racing wheel now get a proper "no wheel connected" answer.
+- More fixes from Franseven's batch for other games: audio contexts no longer stall each other,
+  network functions some games call, images whose creation the driver refused, and an audio
+  format some games pass the other way round.
+
 ## What's new (October 23, 2026, fourth build)
 
 No shaders are compiled again after this update.
@@ -340,6 +364,10 @@ Graphics and shaders:
 - Tokyo at night: some shadows on tunnel ceilings and walls move with the camera.
 - **AMD graphics cards:** the game crashes at the GT logo, inside the AMD driver's shader compiler
   ([issue 12](https://github.com/usa-ratt/KytyPS5-GT7/issues/12)). Being looked into.
+- **Scapes:** the controls stop working after Olivier offers the drift photography tutorial
+  ([issue 19](https://github.com/usa-ratt/KytyPS5-GT7/issues/19)). The tutorial waits for the
+  game's online servers, which the emulator has no stand-in for, so the Menu Book "Take a Photo of
+  Your Car in Scapes" can't be finished yet. Closing the emulator is the only way out of it.
 - **Livery editor:** leaving it shows error CE-210717 (the game uploads the livery to its online
   service, which the emulator has no stand-in for), and some parts of a saved livery's picture can
   have the wrong colour.
@@ -360,7 +388,11 @@ Graphics and shaders:
   calls every frame, UI text blending (color One, alpha Zero over a source-alpha destination, with
   dead render-target exports no longer blocking it), UI text sampled narrower than the target it was
   drawn into (the text shadow smear), and ports of upstream fixes by nmzik (zero-stride buffer
-  fetches, oversized image uploads, NOP marker tags, depth DCC metadata).
+  fetches, oversized image uploads, NOP marker tags, depth DCC metadata). His second batch ported
+  mainline changes by nmzik (PM4 barriers, alpha-to-coverage, empty indirect dispatches, the
+  tiler's pipelines, audio system state, HTTP functions), Mr. Big Britches (the shared protection
+  lock, AudioOut2 context mutexes), NeySlim (lock-free dirty bits) and Arda Sahin (image usage),
+  plus his own fixes for storage buffer ranges, read-only buffer syncs and ATRAC9 configurations.
 
 ## Current state
 
