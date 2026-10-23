@@ -557,6 +557,19 @@ private:
 		return m_names.emplace(address, std::move(name)).first->second;
 	}
 
+	// Round 131: the inline frames at a return address and the function they are in, with their
+	// lines (Common::HostInlineChain), looked up at the call instruction (the byte before).
+	const std::string& Chain(uint64_t return_address) {
+		if (const auto it = m_chains.find(return_address); it != m_chains.end()) {
+			return it->second;
+		}
+		auto chain = HostInlineChain(return_address - 1);
+		if (chain.size() > 400) {
+			chain.resize(400);
+		}
+		return m_chains.emplace(return_address, std::move(chain)).first->second;
+	}
+
 	const std::string& Line(uint64_t address) {
 		if (const auto it = m_lines.find(address); it != m_lines.end()) {
 			return it->second;
@@ -644,7 +657,15 @@ private:
 				continue;
 			}
 			waited += count;
-			by_text[Joined(key)] += count;
+			// Round 131: where in the first emulator frame it waits, inline frames included (a
+			// lock taken in an inlined function shows only its caller otherwise).
+			auto text = Joined(key);
+			if (key.frames[1] != 0) {
+				if (const auto& chain = Chain(key.frames[1]); !chain.empty()) {
+					text += " [at " + chain + "]";
+				}
+			}
+			by_text[text] += count;
 		}
 		const auto  sorted = Sorted(by_text);
 		std::string out;
@@ -843,6 +864,9 @@ private:
 		if (m_lines.size() > 400'000) {
 			m_lines.clear();
 		}
+		if (m_chains.size() > 100'000) {
+			m_chains.clear();
+		}
 	}
 
 	std::vector<std::string>                  m_patterns;
@@ -852,6 +876,7 @@ private:
 	std::vector<std::unique_ptr<Target>>      m_targets;
 	std::unordered_map<uint64_t, std::string> m_names;
 	std::unordered_map<uint64_t, std::string> m_lines;
+	std::unordered_map<uint64_t, std::string> m_chains;
 };
 
 #endif

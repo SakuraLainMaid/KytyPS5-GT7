@@ -2,6 +2,7 @@
 
 #include "common/logging/log.h"
 #include "common/perfStats.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 
 #include <algorithm>
 #include <array>
@@ -26,6 +27,9 @@ struct Reporter {
 	uint64_t                              last_tsc    = 0;
 	uint64_t                              last_frames = 0;
 	uint64_t                              next_check  = 0;
+	// Round 131: the frame whose timing was decided last, and the timed frames at the last report.
+	uint64_t                                            timing_frame      = UINT64_MAX;
+	uint64_t                                            last_timed_frames = 0;
 	Totals                                last {};
 	std::array<uint64_t, PhaseCount + 1>  last_protect_cycles {};
 	std::array<uint64_t, PhaseCount + 1>  last_protect_count {};
@@ -148,6 +152,18 @@ bool EnabledFromEnvironment() {
 	return value == nullptr || value[0] != '0';
 }
 
+// Round 131: KYTY_GPU_PHASES_EVERY=<n> times the draws and dispatches of one frame in n (4 by
+// default; 1, every frame, as before). With KYTY_OP_STATS, which times whole operations, every
+// frame.
+uint64_t TimedEvery() {
+	static const uint64_t every = [] {
+		const char* value = std::getenv("KYTY_GPU_PHASES_EVERY");
+		const auto  n = value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : 4u;
+		return std::clamp<uint64_t>(n, 1u, 64u);
+	}();
+	return OpStatsOn() ? 1u : every;
+}
+
 } // namespace
 
 bool OpStatsOn() noexcept {
@@ -177,7 +193,9 @@ void Start() {
 	g_reporter.last_tsc   = Now();
 	g_reporter.next_check = g_reporter.last_tsc;
 	LOGF("GPU phases: every 10 s, a \"GPU phases\" line with the GPU thread's time by step of a "
-	     "draw and of a dispatch (KYTY_GPU_PHASES=0 turns it off)\n");
+	     "draw and of a dispatch (KYTY_GPU_PHASES=0 turns it off), the draws and dispatches of one "
+	     "frame in %" PRIu64 " timed (KYTY_GPU_PHASES_EVERY; F8's phases:all times every frame)\n",
+	     TimedEvery());
 	if (OpStatsOn()) {
 		LOGF("GPU phases: with it, \"Dispatch shaders\" and \"Draw targets\" lines: the GPU "
 		     "thread's time by dispatch shader and by draw target (KYTY_OP_STATS)\n");
@@ -187,6 +205,15 @@ void Start() {
 void ReportIfDue(uint64_t frames) {
 	if (!Detail::t_on) {
 		return;
+	}
+	if (frames != g_reporter.timing_frame) {
+		// Round 131: whether this frame's draws and dispatches are timed.
+		g_reporter.timing_frame = frames;
+		const auto every        = Bisect::PhaseTimingAll() ? uint64_t {1} : TimedEvery();
+		Detail::t_timed         = frames % every == 0;
+		if (Detail::t_timed) {
+			Detail::g_timed_frames++;
+		}
 	}
 	const auto tsc = Now();
 	// A clock read only every ~50 million cycles (~10 ms).
@@ -206,6 +233,7 @@ void ReportIfDue(uint64_t frames) {
 	for (size_t i = 0; i < PhaseCount; i++) {
 		delta.cycles[i] = totals.cycles[i] - g_reporter.last.cycles[i];
 		delta.count[i]  = totals.count[i] - g_reporter.last.count[i];
+		delta.timed[i]  = totals.timed[i] - g_reporter.last.timed[i];
 	}
 	std::array<uint64_t, PhaseCount + 1> protect_cycles {};
 	std::array<uint64_t, PhaseCount + 1> protect_count {};
@@ -242,12 +270,21 @@ void ReportIfDue(uint64_t frames) {
 	g_reporter.last_tsc    = tsc;
 	const auto new_frames  = frames - g_reporter.last_frames;
 	g_reporter.last_frames = frames;
+	const auto timed_frames      = Detail::g_timed_frames - g_reporter.last_timed_frames;
+	g_reporter.last_timed_frames = Detail::g_timed_frames;
 	if (cycles_per_us <= 0.0) {
 		return;
 	}
 
+	// A phase's time: its timed scopes' average times its count (round 131: the scopes of the
+	// frames not timed are counted only).
 	const auto us = [&](Phase phase) {
-		return static_cast<double>(delta.cycles[static_cast<size_t>(phase)]) / cycles_per_us;
+		const auto index = static_cast<size_t>(phase);
+		if (delta.timed[index] == 0) {
+			return 0.0;
+		}
+		return static_cast<double>(delta.cycles[index]) / cycles_per_us *
+		       static_cast<double>(delta.count[index]) / static_cast<double>(delta.timed[index]);
 	};
 	const auto count = [&](Phase phase) { return delta.count[static_cast<size_t>(phase)]; };
 	// Microseconds of `phase` per operation of `per`.
@@ -261,6 +298,9 @@ void ReportIfDue(uint64_t frames) {
 		line += fmt::format(" [{}]", step);
 	}
 	line += fmt::format(": {} frames", new_frames);
+	if (timed_frames != new_frames) {
+		line += fmt::format(" ({} timed)", timed_frames);
+	}
 
 	const auto steps = [&](Phase                                                total,
 	                       std::initializer_list<std::pair<const char*, Phase>> parts) {
@@ -389,8 +429,9 @@ void ReportIfDue(uint64_t frames) {
 		blocks.clear();
 	}
 	{
-		// Round 113: the slices by the kind of queue they ran, a frame.
-		const double frames_d = new_frames != 0 ? static_cast<double>(new_frames) : 1.0;
+		// Round 113: the slices by the kind of queue they ran, a frame (of the timed frames, which
+		// alone measure them: round 131).
+		const double frames_d = timed_frames != 0 ? static_cast<double>(timed_frames) : 1.0;
 		const auto   ms_frame = [&](uint64_t cycles) {
             return static_cast<double>(cycles) / cycles_per_us / 1000.0 / frames_d;
 		};

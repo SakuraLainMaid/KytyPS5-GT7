@@ -16,6 +16,11 @@ namespace Common {
 // its directory), from the PDB's line table; empty without one. Windows only; empty elsewhere.
 [[nodiscard]] std::string HostLine(uint64_t address);
 
+// Round 131: the functions inlined at `address`, innermost first, each with its source line, then
+// the function they are in with its line ("A (a.cpp:10) < B (b.h:20) < C (c.cpp:30)"); the
+// function and line alone without inline frames. Windows only; empty elsewhere.
+[[nodiscard]] std::string HostInlineChain(uint64_t address);
+
 } // namespace Common
 
 #endif // KYTY_COMMON_HOSTSYMBOLS_H_

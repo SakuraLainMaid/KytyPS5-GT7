@@ -102,6 +102,10 @@ constexpr size_t PhaseCount = static_cast<size_t>(Phase::Count);
 struct Totals {
 	std::array<uint64_t, PhaseCount> cycles {};
 	std::array<uint64_t, PhaseCount> count {};
+	// Round 131: the scopes of each phase that were timed, which `cycles` add up (all of them for
+	// a phase timed in every frame, AlwaysTimed; those of the timed frames for the others). The
+	// report takes a phase's time as its timed scopes' average times its count.
+	std::array<uint64_t, PhaseCount> timed {};
 	// The longest single scope of each phase since the last report (round 86; the report resets
 	// it).
 	std::array<uint64_t, PhaseCount> longest {};
@@ -110,6 +114,33 @@ struct Totals {
 namespace Detail {
 // Set on the GPU thread while the phases are on (Start).
 inline thread_local bool t_on = false;
+// Round 131: set on the GPU thread in the frames whose draws and dispatches are timed, one in
+// KYTY_GPU_PHASES_EVERY (4 by default; 1 times every frame, as before). Two reads of the
+// processor's clock for each of the ~30 steps of a draw took about 0.4 us of its 10 (a clock read
+// takes ~40 cycles on these processors). The steps are counted in every frame.
+inline thread_local bool t_timed = false;
+// The frames timed so far (GPU thread), for the report's per-frame figures of what only timed
+// frames measure (the slices by queue).
+inline uint64_t g_timed_frames = 0;
+// Phases timed in every frame: each takes long enough that the clock reads cost nothing beside
+// it, or is rare and wanted in each report as it happened (a compile, a lookup, a wait).
+[[nodiscard]] constexpr bool AlwaysTimed(Phase phase) noexcept {
+	switch (phase) {
+		case Phase::Process:
+		case Phase::Command:
+		case Phase::Protect:
+		case Phase::Flush:
+		case Phase::BdaWalk:
+		case Phase::SpecCheck:
+		case Phase::ShaderDisk:
+		case Phase::ShaderCompile:
+		case Phase::PipelineWait:
+		case Phase::PipelineCompile:
+		case Phase::PipelineProbe:
+		case Phase::BufferCreate: return true;
+		default: return false;
+	}
+}
 // Written by the GPU thread only.
 inline Totals g_totals;
 // The step a page protection change is charged to: the innermost open scope of a whole
@@ -143,9 +174,15 @@ inline void Add(Phase phase, uint64_t cycles) noexcept {
 	const auto index = static_cast<size_t>(phase);
 	Detail::g_totals.cycles[index] += cycles;
 	Detail::g_totals.count[index]++;
+	Detail::g_totals.timed[index]++;
 	if (cycles > Detail::g_totals.longest[index]) {
 		Detail::g_totals.longest[index] = cycles;
 	}
+}
+
+// Round 131: a scope of `phase` in a frame not timed: counted only.
+inline void AddUntimed(Phase phase) noexcept {
+	Detail::g_totals.count[static_cast<size_t>(phase)]++;
 }
 
 // Adds `n` to the count of `phase` without time (a count-only phase), on the GPU thread.
@@ -248,7 +285,8 @@ inline std::array<std::array<uint64_t, 6>, 2> g_queue_stats {};
 class QueueSlice {
 public:
 	explicit QueueSlice(bool compute) noexcept: m_compute(compute) {
-		if (!Detail::t_on) {
+		// What the draws and dispatches took is known in timed frames only (round 131).
+		if (!Detail::t_on || !Detail::t_timed) {
 			return;
 		}
 		m_draws           = CountOf(Phase::Draw);
@@ -282,53 +320,57 @@ private:
 	uint64_t m_dispatch_cycles = 0;
 };
 
-// Times its block on the GPU thread.
+// Times its block on the GPU thread (in timed frames, or always for an AlwaysTimed phase; it is
+// counted in every frame).
 class Scope {
 public:
-	explicit Scope(Phase phase) noexcept: m_phase(phase), m_start(Detail::t_on ? Now() : 0) {
-		if (m_start != 0) {
-			m_step = Detail::t_step;
-			if (Detail::ChargesProtects(phase)) {
-				Detail::t_step = phase;
-				m_set_step     = true;
-			}
-		}
-	}
+	explicit Scope(Phase phase) noexcept: m_phase(phase) { Begin(); }
 	~Scope() { End(); }
 	// Ends the timing before the block does (and its charge of protection changes).
 	void End() noexcept {
-		if (m_start != 0) {
-			const auto cycles = Now() - m_start;
-			Add(m_phase, cycles);
-			if (m_phase == Phase::Protect) {
-				Detail::g_protect_cycles[static_cast<size_t>(m_step)] += cycles;
-				Detail::g_protect_count[static_cast<size_t>(m_step)]++;
+		if (m_active) {
+			if (m_start != 0) {
+				const auto cycles = Now() - m_start;
+				Add(m_phase, cycles);
+				if (m_phase == Phase::Protect) {
+					Detail::g_protect_cycles[static_cast<size_t>(m_step)] += cycles;
+					Detail::g_protect_count[static_cast<size_t>(m_step)]++;
+				}
+			} else {
+				AddUntimed(m_phase);
 			}
-			m_start = 0;
+			m_active = false;
+			m_start  = 0;
 		}
 		RestoreStep();
 	}
 	// Drops the timing: the block is not counted.
 	void Cancel() noexcept {
-		m_start = 0;
+		m_active = false;
+		m_start  = 0;
 		RestoreStep();
 	}
 	// Times the same phase again from here (after an End); a second count.
 	void Restart() noexcept {
 		End();
-		m_start = Detail::t_on ? Now() : 0;
-		if (m_start != 0) {
-			m_step = Detail::t_step;
-			if (Detail::ChargesProtects(m_phase)) {
-				Detail::t_step = m_phase;
-				m_set_step     = true;
-			}
-		}
+		Begin();
 	}
 	Scope(const Scope&)            = delete;
 	Scope& operator=(const Scope&) = delete;
 
 private:
+	void Begin() noexcept {
+		if (!Detail::t_on) {
+			return;
+		}
+		m_active = true;
+		m_start  = Detail::t_timed || Detail::AlwaysTimed(m_phase) ? Now() : 0;
+		m_step   = Detail::t_step;
+		if (Detail::ChargesProtects(m_phase)) {
+			Detail::t_step = m_phase;
+			m_set_step     = true;
+		}
+	}
 	void RestoreStep() noexcept {
 		if (m_set_step) {
 			Detail::t_step = m_step;
@@ -337,8 +379,9 @@ private:
 	}
 
 	Phase    m_phase;
-	uint64_t m_start;
+	uint64_t m_start    = 0;
 	Phase    m_step     = Phase::Count; // t_step when it began
+	bool     m_active   = false;        // counted (the phases were on when it began)
 	bool     m_set_step = false;        // it set t_step (to restore when it ends)
 };
 
@@ -369,7 +412,7 @@ inline void SetOpKey(uint64_t key, uint64_t extra) noexcept {
 class OpStats {
 public:
 	explicit OpStats(bool dispatch) noexcept: m_dispatch(dispatch) {
-		if (!Detail::t_on || !OpStatsOn()) {
+		if (!Detail::t_on || !Detail::t_timed || !OpStatsOn()) {
 			return;
 		}
 		Detail::t_op_key = 0;

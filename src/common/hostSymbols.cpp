@@ -377,6 +377,98 @@ std::string HostLine(uint64_t address) {
 #endif
 }
 
+// Round 131: the functions inlined at `address`, innermost first, each with its line, then the
+// function they were inlined into with its line: "Mutex::Lock (threads.cpp:267) < RendererLock
+// (rendererLock.h:23) < RenderExecutor::DispatchDirectPart (renderCompute.cpp:1554)". The inline
+// frames come from dbghelp's inline-trace calls (looked up by name, as the MinGW headers lack
+// them); without them, the function and its line alone.
+std::string HostInlineChain(uint64_t address) {
+#ifdef _WIN32
+	using AddrIncludeInlineTrace = DWORD(WINAPI*)(HANDLE, DWORD64);
+	using QueryInlineTrace =
+	    BOOL(WINAPI*)(HANDLE, DWORD64, DWORD, DWORD64, DWORD64, LPDWORD, LPDWORD);
+	using FromInlineContext = BOOL(WINAPI*)(HANDLE, DWORD64, ULONG, PDWORD64, PSYMBOL_INFO);
+	using GetLineFromInlineContext =
+	    BOOL(WINAPI*)(HANDLE, DWORD64, ULONG, DWORD64, PDWORD, PIMAGEHLP_LINE64);
+	struct Calls {
+		AddrIncludeInlineTrace   include = nullptr;
+		QueryInlineTrace         query   = nullptr;
+		FromInlineContext        symbol  = nullptr;
+		GetLineFromInlineContext line    = nullptr;
+	};
+	static const Calls calls = [] {
+		Calls      found;
+		const auto module = GetModuleHandleA("dbghelp.dll");
+		if (module != nullptr) {
+			found.include = reinterpret_cast<AddrIncludeInlineTrace>(
+			    reinterpret_cast<void*>(GetProcAddress(module, "SymAddrIncludeInlineTrace")));
+			found.query = reinterpret_cast<QueryInlineTrace>(
+			    reinterpret_cast<void*>(GetProcAddress(module, "SymQueryInlineTrace")));
+			found.symbol = reinterpret_cast<FromInlineContext>(
+			    reinterpret_cast<void*>(GetProcAddress(module, "SymFromInlineContext")));
+			found.line = reinterpret_cast<GetLineFromInlineContext>(
+			    reinterpret_cast<void*>(GetProcAddress(module, "SymGetLineFromInlineContext")));
+		}
+		return found;
+	}();
+	const auto file_line = [](const IMAGEHLP_LINE64& line) {
+		std::string_view file(line.FileName);
+		if (const auto slash = file.find_last_of("\\/"); slash != std::string_view::npos) {
+			file.remove_prefix(slash + 1);
+		}
+		return fmt::format("{}:{}", file, line.LineNumber);
+	};
+	std::string chain;
+	{
+		const auto       process = SymbolProcess();
+		std::scoped_lock symbol_lock(g_symbol_mutex);
+		if (!InitializeSymbols(process)) {
+			return {};
+		}
+		const DWORD inlined = calls.include != nullptr && calls.query != nullptr &&
+		                              calls.symbol != nullptr && calls.line != nullptr
+		                          ? calls.include(process, address)
+		                          : 0u;
+		DWORD       context = 0;
+		DWORD       index   = 0;
+		if (inlined != 0 &&
+		    calls.query(process, address, 0, address, address, &context, &index) != FALSE) {
+			for (DWORD i = 0; i < inlined && i < 8; i++, context++) {
+				alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 256] {};
+				auto*                     symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+				symbol->SizeOfStruct             = sizeof(SYMBOL_INFO);
+				symbol->MaxNameLen               = 256;
+				DWORD64 displacement             = 0;
+				if (calls.symbol(process, address, context, &displacement, symbol) == FALSE) {
+					break;
+				}
+				chain += chain.empty() ? "" : " < ";
+				chain += symbol->Name;
+				IMAGEHLP_LINE64 line {};
+				line.SizeOfStruct = sizeof(line);
+				DWORD line_offset = 0;
+				if (calls.line(process, address, context, 0, &line_offset, &line) != FALSE &&
+				    line.FileName != nullptr) {
+					chain += " (" + file_line(line) + ")";
+				}
+			}
+		}
+	}
+	// The function the inline frames are in (HostSymbol and HostLine take the lock themselves).
+	auto outer = HostSymbol(address);
+	if (outer.empty()) {
+		return chain;
+	}
+	if (const auto line = HostLine(address); !line.empty()) {
+		outer += " (" + line + ")";
+	}
+	return chain.empty() ? outer : chain + " < " + outer;
+#else
+	(void)address;
+	return {};
+#endif
+}
+
 // The host call stack of the failing thread, so a fatal report names its caller instead of
 // only the file that noticed.
 std::string HostBacktrace() {
