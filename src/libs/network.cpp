@@ -38,6 +38,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -882,9 +883,29 @@ bool Network::HttpSetAuthEnabled(Id id, int enable) {
 	return false;
 }
 
+namespace NetCtl {
+static bool NetCtlConnected();
+} // namespace NetCtl
+
 namespace Net {
 
 LIB_NAME("Net", "Net");
+
+// KYTY_RESOLVER=old: a resolver needs a name, and host names are looked up on the host whatever
+// the network state, as before round 137.
+static bool ResolverOld() {
+	static const bool old = [] {
+		const char* value  = std::getenv("KYTY_RESOLVER");
+		const bool  result = value != nullptr && std::strcmp(value, "old") == 0;
+		LOGF("Net resolver: %s\n",
+		     result ? "a resolver needs a name, host names are looked up on the host "
+		              "(KYTY_RESOLVER=old)"
+		            : "resolvers without a name are made; host names are not looked up while the "
+		              "network is off (KYTY_RESOLVER=old: as before)");
+		return result;
+	}();
+	return old;
+}
 
 struct NetEtherAddr {
 	uint8_t data[6] = {0};
@@ -1449,13 +1470,15 @@ int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags) {
 	     "\t flags = %d\n",
 	     name != nullptr ? name : "<null>", memid, flags);
 
-	if (name == nullptr || flags != 0) {
+	// A game may leave the name out (the console makes the resolver): one whose lookups all
+	// failed as a bad resolver id passes none.
+	if (flags != 0 || (name == nullptr && ResolverOld())) {
 		return NET_ERROR_EINVAL;
 	}
 
 	EXIT_IF(g_net == nullptr);
 
-	const int id = g_net->ResolverCreate(name, memid);
+	const int id = g_net->ResolverCreate(name != nullptr ? name : "", memid);
 	if (id < 0) {
 		return NET_ERROR_RESOLVER_ENOSPACE;
 	}
@@ -1509,6 +1532,17 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 
 	if ((flags & 0x00010000) == 0 && NetInetPton(2, hostname, addr) == 1) {
 		return OK;
+	}
+
+	// The network is off for the game (NetCtl says disconnected): no DNS server, as on a console
+	// without a connection.
+	if (!ResolverOld() && !NetCtl::NetCtlConnected()) {
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true)) {
+			LOGF("Net lookup: %s and the others fail as with no DNS server: the network is off\n",
+			     hostname);
+		}
+		return NET_ERROR_RESOLVER_ENODNS;
 	}
 
 	if (!EnsureSocketBackend()) {
