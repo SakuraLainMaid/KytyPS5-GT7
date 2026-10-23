@@ -60,6 +60,18 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 23, 2026, sixth build)
+
+No shaders are compiled again after this update.
+
+- **No more crash in some replays** ([issue 18](https://github.com/usa-ratt/KytyPS5-GT7/issues/18)).
+  One tessellated draw in a replay used a setup the emulator doesn't support yet, and the
+  emulator closed. That draw is now skipped (something in the replay may be missing for a
+  moment), and the log names the setup ("Tessellation: ... not supported").
+- **A clearer start-up error on graphics cards that lack something the emulator needs**
+  ([issue 20](https://github.com/usa-ratt/KytyPS5-GT7/issues/20)): it now lists everything the
+  card is missing, not only the first thing.
+
 ## What's new (October 23, 2026, fifth build)
 
 No shaders are compiled again after this update. A few pipelines (draws that use
@@ -377,6 +389,9 @@ Graphics and shaders:
   names the graphics buffer involved.
 - In-game videos can play out of sync with their sound
   ([issue 4](https://github.com/usa-ratt/KytyPS5-GT7/issues/4)). Being looked into.
+- **Intel Arc graphics cards:** the emulator stops at start-up: the driver lacks fragment shader
+  barycentrics, which the emulator needs
+  ([issue 20](https://github.com/usa-ratt/KytyPS5-GT7/issues/20)). Being looked into.
 - **NVIDIA:** the driver's shader compiler can crash while it compiles new pipelines
   ([issue 18](https://github.com/usa-ratt/KytyPS5-GT7/issues/18)). Being looked into; the crash
   report names the pipeline.
