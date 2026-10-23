@@ -111,6 +111,8 @@ struct Step {
 	uint32_t          slow_gpu_us   = 0;
 	uint32_t          slow_fault_us = 0;
 	uint32_t          slow_read_us  = 0;
+	// Round 130.
+	bool              probe_sync = false;
 	std::string       cpu_set;          // empty: as at the start
 	std::string       name;             // for the screen and the picture's file name
 	std::string       text;             // name and actions, for the log
@@ -403,6 +405,10 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "buflen:old") {
 		step.buflen_old = true;
+		return true;
+	}
+	if (action == "probe:sync") {
+		step.probe_sync = true;
 		return true;
 	}
 	if (action == "bdasync:submission") {
@@ -1152,6 +1158,11 @@ float DepthEqualRelaxed() {
 bool BdaSyncSubmission() {
 	const auto* step = Current();
 	return step != nullptr && step->bdasync_submission;
+}
+
+bool PipelineProbeSync() {
+	const auto* step = Current();
+	return step != nullptr && step->probe_sync;
 }
 
 bool GbufferSync() {

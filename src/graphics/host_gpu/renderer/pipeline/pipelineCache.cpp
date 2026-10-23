@@ -1701,7 +1701,14 @@ struct PendingGraphicsPipeline {
 	vk::Pipeline                       pipeline = nullptr;
 	vk::Result                         result   = vk::Result::eSuccess;
 	std::atomic<bool>                  done {false};
+	// Round 130: true while a worker looks it up in the driver's caches alone (the GPU thread did
+	// that before); one they do not hold is then compiled like any other.
+	std::atomic<bool> looking_up {false};
 };
+
+// Round 130: a lookup's answer other than found or not found (the driver cannot answer), for the
+// GPU thread to stop asking (0: none yet).
+static std::atomic<int32_t> g_lookup_unanswered {0};
 
 // Round 92: pipelines the full, read-only cache files gave (lookups alone), for the save's line.
 static std::atomic<uint64_t> g_older_file_hits {0};
@@ -1756,23 +1763,71 @@ static void ReportGraphicsPipelineBuilt(uint64_t vs_hash, uint64_t ps_hash,
 	                    begin);
 }
 
+// Round 130, a worker: the pipeline from the driver's caches, looking it up alone (true), as the
+// GPU thread did before; it is compiled next when they do not hold it (job.older is then empty,
+// as they were asked).
+static bool LookUpPipeline(PendingGraphicsPipeline& job) {
+	const auto begin  = std::chrono::steady_clock::now();
+	auto       result = vk::Result::eSuccess;
+	if (!CreateFromOlderFiles(*job.build, job.older, &job.pipeline)) {
+		result = CreateGraphicsPipeline(*job.build, job.driver_cache, &job.pipeline, true);
+	}
+	const bool found = result == vk::Result::eSuccess && job.pipeline != nullptr;
+	if (!found && job.pipeline != nullptr) {
+		job.build->device.destroyPipeline(job.pipeline, nullptr);
+		job.pipeline = nullptr;
+	}
+	if (!found && result != vk::Result::eSuccess &&
+	    result != vk::Result::ePipelineCompileRequired) {
+		int32_t none = 0;
+		(void)g_lookup_unanswered.compare_exchange_strong(none, static_cast<int32_t>(result),
+		                                                  std::memory_order_relaxed);
+	}
+	GpuPhases::AddWorkerLookup(
+	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                              std::chrono::steady_clock::now() - begin)
+	                              .count()),
+	    found);
+	job.older = {};
+	if (found) {
+		job.result = vk::Result::eSuccess;
+		ReportGraphicsPipelineBuilt(job.vs_hash, job.ps_hash, begin);
+	}
+	job.looking_up.store(false, std::memory_order_release);
+	return found;
+}
+
 // Compiles graphics pipelines on worker threads. The driver compiled on the GPU thread, which
 // stopped the whole emulated GPU for seconds per new pipeline (103 slow pipelines, 170 s of a
 // 600 s first pass through the prologue).
 class PipelineCompiler {
 public:
-	explicit PipelineCompiler(uint32_t threads) {
+	// Round 130: `lookup_threads` more threads only look pipelines up in the driver's caches
+	// (the compile threads do too, before their compiles): a lookup is not kept waiting behind
+	// the compiles of a new track, which take about a second each.
+	PipelineCompiler(uint32_t threads, uint32_t lookup_threads) {
 		for (uint32_t i = 0; i < threads; i++) {
-			m_threads.emplace_back([this] { Run(); });
+			m_threads.emplace_back([this] { Run(false); });
 		}
+		for (uint32_t i = 0; i < lookup_threads; i++) {
+			m_threads.emplace_back([this] { Run(true); });
+		}
+		m_lookup_threads = lookup_threads;
 	}
 	~PipelineCompiler() { Stop(); }
 	KYTY_CLASS_NO_COPY(PipelineCompiler);
 
+	// Whether jobs may be looked up on the workers (lookup threads were made).
+	[[nodiscard]] bool LooksUp() const { return m_lookup_threads != 0; }
+
 	void Submit(std::shared_ptr<PendingGraphicsPipeline> job) {
+		const bool lookup = job->looking_up.load(std::memory_order_relaxed);
 		{
 			std::lock_guard lock(m_mutex);
-			m_queue.push_back(std::move(job));
+			(lookup ? m_lookups : m_queue).push_back(std::move(job));
+		}
+		if (lookup) {
+			m_lookup_work.notify_one();
 		}
 		m_work.notify_one();
 	}
@@ -1794,8 +1849,10 @@ public:
 			}
 			m_stopped = true;
 			m_queue.clear();
+			m_lookups.clear();
 		}
 		m_work.notify_all();
+		m_lookup_work.notify_all();
 		for (auto& thread: m_threads) {
 			thread.join();
 		}
@@ -1808,18 +1865,59 @@ public:
 	}
 
 private:
-	void Run() {
-		KYTY_PROFILER_THREAD("PipelineCompiler");
+	void Run(bool lookups_only) {
+		KYTY_PROFILER_THREAD(lookups_only ? "PipelineLookup" : "PipelineCompiler");
 		for (;;) {
 			std::shared_ptr<PendingGraphicsPipeline> job;
+			bool                                     lookup = false;
 			{
 				std::unique_lock lock(m_mutex);
-				m_work.wait(lock, [this] { return m_stopped || !m_queue.empty(); });
-				if (m_queue.empty()) {
+				if (lookups_only) {
+					m_lookup_work.wait(lock, [this] { return m_stopped || !m_lookups.empty(); });
+				} else {
+					m_work.wait(lock, [this] {
+						return m_stopped || !m_lookups.empty() || !m_queue.empty();
+					});
+				}
+				if (m_stopped) {
 					return;
 				}
-				job = std::move(m_queue.front());
-				m_queue.pop_front();
+				// Lookups first: each takes milliseconds, a compile about a second.
+				lookup     = !m_lookups.empty();
+				auto& from = lookup ? m_lookups : m_queue;
+				job        = std::move(from.front());
+				from.pop_front();
+			}
+			if (lookup) {
+				bool found = false;
+				{
+					Profiler::Phases zone;
+					zone.SetText("VS 0x%016" PRIx64 " PS 0x%016" PRIx64, job->vs_hash,
+					             job->ps_hash);
+					KYTY_PROFILER_PHASE(zone, "PipelineCompiler::LookUp",
+					                    profiler::colors::DeepOrangeA200);
+					found = LookUpPipeline(*job);
+				}
+				if (found) {
+					Profiler::Add(Profiler::Counter::PipelinesPending, -1);
+					{
+						std::lock_guard lock(m_mutex);
+						job->done.store(true, std::memory_order_release);
+					}
+					m_done.notify_all();
+					continue;
+				}
+				// Not in the caches: compiled like any other. Once the workers stop, the owner
+				// compiles it (FinishPending), as one still queued.
+				{
+					std::lock_guard lock(m_mutex);
+					if (m_stopped) {
+						continue;
+					}
+					m_queue.push_back(std::move(job));
+				}
+				m_work.notify_one();
+				continue;
 			}
 			{
 				Profiler::Phases zone;
@@ -1841,10 +1939,13 @@ private:
 
 	std::mutex                                           m_mutex;
 	std::condition_variable                              m_work;
+	std::condition_variable                              m_lookup_work;
 	std::condition_variable                              m_done;
 	std::deque<std::shared_ptr<PendingGraphicsPipeline>> m_queue;
+	std::deque<std::shared_ptr<PendingGraphicsPipeline>> m_lookups;
 	std::vector<std::thread>                             m_threads;
-	bool                                                 m_stopped = false;
+	uint32_t                                             m_lookup_threads = 0;
+	bool                                                 m_stopped        = false;
 };
 
 // Graphics shader translation on worker threads (plan.md P1; KYTY_ASYNC_TRANSLATION=0 translates
@@ -3921,15 +4022,35 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		         ? std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u,
 		                                32u)
 		         : std::clamp(std::thread::hardware_concurrency() / 3u, 2u, 10u);
-		m_compiler = std::make_unique<PipelineCompiler>(threads);
-		m_probe                      = g_pipeline_probe && graphics.pipeline_cache_control_enabled;
+		m_probe = g_pipeline_probe && graphics.pipeline_cache_control_enabled;
+		// Round 130: KYTY_PIPELINE_LOOKUP_THREADS=<n> threads more only look new pipelines up in
+		// the driver's caches (by default an eighth of the processors, 2 to 4; 0: the GPU
+		// thread looks them up, as before). The GPU thread took 8 ms a lookup in a race, the
+		// first lap's new pipelines 2-4 s of each 10 s: the first lap of each session was the
+		// slowest and froze. Only a draw into a target the game draws every frame
+		// (RedrawnTargetDraw) is left out until its lookup is done; another is looked up on the
+		// GPU thread still, as a picture drawn once would miss it.
+		const char*    lookup_value = std::getenv("KYTY_PIPELINE_LOOKUP_THREADS");
+		const uint32_t lookup_threads =
+		    !m_probe ? 0u
+		    : lookup_value != nullptr && *lookup_value != '\0'
+		        ? std::min<uint32_t>(static_cast<uint32_t>(std::strtoul(lookup_value, nullptr, 10)),
+		                             16u)
+		        : std::clamp(std::thread::hardware_concurrency() / 8u, 2u, 4u);
+		m_compiler                   = std::make_unique<PipelineCompiler>(threads, lookup_threads);
 		const uint32_t frame_wait_ms = g_pipeline_frame_wait_ms.value_or(m_probe ? 2u : 6u);
 		PipelineCacheLog("Vulkan pipelines: compiled on {} worker threads (wait {} ms for one, {} "
-		                 "ms a frame); the driver's caches asked first: {}",
+		                 "ms a frame); the driver's caches asked first: {}{}",
 		                 threads, g_pipeline_wait.count(), frame_wait_ms,
 		                 m_probe                                    ? "yes"
 		                 : !graphics.pipeline_cache_control_enabled ? "no (not supported)"
-		                                                            : "no (KYTY_PIPELINE_PROBE=0)");
+		                                                            : "no (KYTY_PIPELINE_PROBE=0)",
+		                 !m_probe ? ""
+		                 : lookup_threads != 0
+		                     ? fmt::format(", on {} lookup threads for draws into targets drawn "
+		                                   "every frame (round 130)",
+		                                   lookup_threads)
+		                     : std::string(", on the GPU thread (KYTY_PIPELINE_LOOKUP_THREADS=0)"));
 	}
 }
 
@@ -5353,7 +5474,13 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		}
 	}
 
-	const auto skip_draw = [&] {
+	const auto skip_draw = [&](const PendingGraphicsPipeline& job) -> Pipeline* {
+		if (job.looking_up.load(std::memory_order_acquire)) {
+			// Round 130: its lookup is not done yet (milliseconds).
+			GpuPhases::Count(GpuPhases::Phase::PipelineLookupSkip, 1);
+			Profiler::CommandZone::Annotate("skipped: pipeline looked up");
+			return nullptr;
+		}
 		GpuPhases::Count(GpuPhases::Phase::PipelineSkip, 1);
 		Profiler::Add(Profiler::Counter::SkippedPipelinePending);
 		Profiler::CommandZone::Annotate("skipped: pipeline compiling");
@@ -5384,7 +5511,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		auto& found = *iter->second;
 		if (found.pending && !FinishPending(found)) {
 			if (defer == PipelineDefer::Allowed) {
-				return skip_draw();
+				return skip_draw(*found.pending);
 			}
 			// A draw that may not be skipped waits for the compile another draw of the same
 			// pipeline sent to the background (round 87: more of those are sent now).
@@ -5426,8 +5553,20 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	const bool background = defer == PipelineDefer::Allowed &&
 	                        spirv_words > g_pipeline_sync_words && !layer_draw &&
 	                        m_compiler != nullptr && !m_compiler->Stopped();
+	// Round 130: a new pipeline of a draw into a target the game draws every frame is looked up
+	// on a worker (F8's probe:sync: on the GPU thread, as before), and the draw left out until
+	// that is done; a pipeline the caches do not hold is compiled next, as before.
+	if (const auto unanswered = g_lookup_unanswered.exchange(0, std::memory_order_relaxed);
+	    unanswered != 0 && m_probe) {
+		m_probe = false;
+		PipelineCacheLog("Vulkan pipelines: the driver's cache lookup returned {}; looking up no "
+		                 "more",
+		                 vk::to_string(static_cast<vk::Result>(unanswered)));
+	}
+	const bool lookup_async = background && m_probe && programs.redrawn_target &&
+	                          m_compiler->LooksUp() && !Bisect::PipelineProbeSync();
 	bool probed = false;
-	if (background && m_probe) {
+	if (background && m_probe && !lookup_async) {
 		// Round 87: a pipeline the driver has in its caches is created here at once, and one it
 		// would have to compile goes to a worker at once. Before, the GPU thread waited up to
 		// 20 ms for each new pipeline in case it was cached, and those of a new track take the
@@ -5473,6 +5612,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		}
 		job->vs_hash      = vs_hash;
 		job->ps_hash      = ps_hash;
+		job->looking_up.store(lookup_async, std::memory_order_relaxed);
 		cached->pending   = job;
 		Profiler::Add(Profiler::Counter::PipelinesPending);
 		m_compiler->Submit(job);
@@ -5484,7 +5624,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		EXIT_IF(!inserted);
 		auto& pipeline = *iter->second;
 		if (!FinishPending(pipeline)) {
-			return skip_draw();
+			return skip_draw(*job);
 		}
 		LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 		return &pipeline;

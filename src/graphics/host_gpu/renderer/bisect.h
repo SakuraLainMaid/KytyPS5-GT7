@@ -237,6 +237,9 @@
 //                on memory the GPU uses, busy
 //   slow:reads[:<us>]  a game thread's read of bytes the GPU wrote, which waits for them, waits
 //                <us> microseconds more (2500 by default)
+// and, round 130:
+//   probe:sync   a new pipeline is looked up in the driver's caches on the GPU thread, as before
+//                (KYTY_PIPELINE_LOOKUP_THREADS=0 for the whole run), not on a worker thread
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -361,6 +364,8 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] float DepthEqualRelaxed();
 // GPU thread: bdasync:submission.
 [[nodiscard]] bool BdaSyncSubmission();
+// GPU thread: probe:sync (round 130).
+[[nodiscard]] bool PipelineProbeSync();
 // GPU thread: gbuffer:sync; depthread:old (round 91).
 [[nodiscard]] bool GbufferSync();
 [[nodiscard]] bool DepthReadOld();

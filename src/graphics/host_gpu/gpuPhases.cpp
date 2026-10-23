@@ -474,20 +474,38 @@ void ReportIfDue(uint64_t frames) {
 			return fmt::format("{} {} in {:.0f} ms (longest {:.1f} ms)", name, count(phase),
 			                   us(phase) / 1000.0, longest_ms(phase));
 		};
+		// Round 130: the lookups made on worker threads since the last report.
+		const uint64_t worker_lookups =
+		    g_worker_lookups.count.exchange(0, std::memory_order_relaxed);
+		const uint64_t worker_us = g_worker_lookups.us.exchange(0, std::memory_order_relaxed);
+		const uint64_t worker_longest =
+		    g_worker_lookups.longest_us.exchange(0, std::memory_order_relaxed);
+		const uint64_t worker_found = g_worker_lookups.found.exchange(0, std::memory_order_relaxed);
 		if (count(Phase::ShaderDisk) + count(Phase::ShaderCompile) + count(Phase::PipelineWait) +
 		        count(Phase::PipelineCompile) + count(Phase::TranslationSkip) +
-		        count(Phase::PipelineSkip) + count(Phase::PipelineProbe) !=
+		        count(Phase::PipelineSkip) + count(Phase::PipelineProbe) +
+		        count(Phase::PipelineLookupSkip) + worker_lookups !=
 		    0) {
+			std::string workers;
+			if (worker_lookups + count(Phase::PipelineLookupSkip) != 0) {
+				workers = fmt::format(
+				    "; on worker threads pipeline cache lookups {} in {:.0f} ms (longest {:.1f} "
+				    "ms) (found {}, to compile {}), draws skipped while their pipeline was looked "
+				    "up {}",
+				    worker_lookups, static_cast<double>(worker_us) / 1000.0,
+				    static_cast<double>(worker_longest) / 1000.0, worker_found,
+				    worker_lookups - worker_found, count(Phase::PipelineLookupSkip));
+			}
 			LOGF("Shader work (%.1f s): on the GPU thread %s, %s, %s (found %" PRIu64
 			     ", to compile %" PRIu64 "), %s, %s; draws skipped while their shaders "
-			     "translated %" PRIu64 ", while their pipeline compiled %" PRIu64 "\n",
+			     "translated %" PRIu64 ", while their pipeline compiled %" PRIu64 "%s\n",
 			     seconds, work("disk cache reads", Phase::ShaderDisk).c_str(),
 			     work("translations and compiles", Phase::ShaderCompile).c_str(),
 			     work("pipeline cache lookups", Phase::PipelineProbe).c_str(),
 			     count(Phase::PipelineProbeHit), count(Phase::PipelineProbeMiss),
 			     work("pipeline waits", Phase::PipelineWait).c_str(),
 			     work("pipeline compiles", Phase::PipelineCompile).c_str(),
-			     count(Phase::TranslationSkip), count(Phase::PipelineSkip));
+			     count(Phase::TranslationSkip), count(Phase::PipelineSkip), workers.c_str());
 		}
 	}
 	if (OpStatsOn()) {

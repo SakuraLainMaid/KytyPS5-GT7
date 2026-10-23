@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_GPUPHASES_H_
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <unordered_map>
 
@@ -91,6 +92,8 @@ enum class Phase : uint32_t {
 	WaitPassed,   // (a count only) a WAIT_REG_MEM that passed
 	// Round 92.
 	BufferCreate, // a Vulkan buffer made with its memory (Buffer's constructor)
+	// Round 130: the driver's caches are asked on worker threads.
+	PipelineLookupSkip, // (a count only) a draw skipped while its pipeline was looked up
 	Count
 };
 
@@ -149,6 +152,28 @@ inline void Add(Phase phase, uint64_t cycles) noexcept {
 inline void Count(Phase phase, uint64_t n) noexcept {
 	if (Detail::t_on) {
 		Detail::g_totals.count[static_cast<size_t>(phase)] += n;
+	}
+}
+
+// Round 130: the pipeline cache lookups made on worker threads (any thread adds; the report takes
+// them every 10 s).
+struct WorkerLookups {
+	std::atomic<uint64_t> count {0};
+	std::atomic<uint64_t> us {0};
+	std::atomic<uint64_t> longest_us {0};
+	std::atomic<uint64_t> found {0};
+};
+inline WorkerLookups g_worker_lookups;
+
+inline void AddWorkerLookup(uint64_t us, bool found) noexcept {
+	g_worker_lookups.count.fetch_add(1, std::memory_order_relaxed);
+	g_worker_lookups.us.fetch_add(us, std::memory_order_relaxed);
+	if (found) {
+		g_worker_lookups.found.fetch_add(1, std::memory_order_relaxed);
+	}
+	auto longest = g_worker_lookups.longest_us.load(std::memory_order_relaxed);
+	while (us > longest && !g_worker_lookups.longest_us.compare_exchange_weak(
+	                           longest, us, std::memory_order_relaxed)) {
 	}
 }
 

@@ -285,8 +285,25 @@ vk::Sampler SamplerCache::FindOrCreate(const vk::SamplerCreateInfo& info) {
 			     why, m_nearest_reuses, m_vulkan_samplers.size(), m_variants.size());
 		}
 	};
+	// Any sampler of the same kind (compare, op and coordinates), the nearest in LOD of the first
+	// discrete state that has one.
+	const auto same_kind = [&]() -> vk::Sampler {
+		for (const auto& [other, list]: m_variants) {
+			if ((other[0] & SamplerKindBits) == (discrete[0] & SamplerKindBits) && !list.empty()) {
+				return nearest(list);
+			}
+		}
+		return nullptr;
+	};
 	if (m_vulkan_samplers.size() >= m_budget) {
-		if (const auto stand_in = nearest(variants); stand_in != nullptr) {
+		// Round 130: a new discrete state takes one of the same kind too, so the count stays at
+		// the budget (round 128 made those, up to the driver's limit: in a tester's 15 minutes of
+		// retries the game asked for some 2000 discrete states).
+		auto stand_in = nearest(variants);
+		if (stand_in == nullptr) {
+			stand_in = same_kind();
+		}
+		if (stand_in != nullptr) {
 			note_reuse("the budget is used up");
 			return stand_in;
 		}
@@ -297,10 +314,8 @@ vk::Sampler SamplerCache::FindOrCreate(const vk::SamplerCreateInfo& info) {
 		// The nearest of the same discrete state, or else any of the same kind (compare and
 		// coordinates), rather than ending the emulator.
 		auto stand_in = nearest(variants);
-		for (auto it = m_variants.begin(); stand_in == nullptr && it != m_variants.end(); ++it) {
-			if ((it->first[0] & SamplerKindBits) == (discrete[0] & SamplerKindBits)) {
-				stand_in = nearest(it->second);
-			}
+		if (stand_in == nullptr) {
+			stand_in = same_kind();
 		}
 		if (stand_in == nullptr) {
 			EXIT("vkCreateSampler failed: %s (%zu samplers made)\n", vk::to_string(result).c_str(),
