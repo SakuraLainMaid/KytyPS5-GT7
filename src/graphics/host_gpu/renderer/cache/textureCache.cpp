@@ -3400,9 +3400,34 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		image.dcc_clear_checked_tick  = current_tick;
 		image.dcc_clear_checked_first = first;
 		image.dcc_clear_checked_count = count;
+		// Round 139: not when something wrote the metadata since that check. A game can fast-clear
+		// the same target again in the same recording: a course layout screen draws each map
+		// into one multisampled target, its CMASK filled again before each, and a map drawn
+		// without a submission between it and the last was drawn over the one before (the check
+		// skipped here). The check (or the read of the bytes) then watches the slices, so a
+		// target bound again with its metadata untouched still skips it.
+		const auto slices = layers != 0 ? range.size / layers : 0;
 		if (already_resolved_this_tick &&
-		    !m_buffer_cache.IsRegionCpuModified(range.address, range.size)) {
+		    !m_buffer_cache.IsRegionCpuModified(range.address, range.size) &&
+		    (slices == 0 ||
+		     m_buffer_cache.MetadataUnwritten(range.address + slices * first, slices * count))) {
+			if (FrameGraph::Logging()) {
+				FrameGraph::Log("  color clear of 0x%012" PRIx64 " (%s 0x%012" PRIx64
+				                ", layers %u+%u): checked already in this recording, nothing wrote "
+				                "its metadata since",
+				                desc.info.data.address,
+				                desc.info.metadata.kind == ImageMetadataKind::Dcc ? "DCC" : "CMASK",
+				                range.address, first, count);
+			}
 			return;
+		}
+		if (already_resolved_this_tick && FrameGraph::Logging()) {
+			FrameGraph::Log("  color clear of 0x%012" PRIx64 " (%s 0x%012" PRIx64
+			                ", layers %u+%u): checked again in this recording, its metadata "
+			                "written since",
+			                desc.info.data.address,
+			                desc.info.metadata.kind == ImageMetadataKind::Dcc ? "DCC" : "CMASK",
+			                range.address, first, count);
 		}
 	}
 	// These one-mip surfaces use complete 4 KiB color metadata blocks.
@@ -3582,6 +3607,9 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			}
 		}
 	}
+	// Round 139: what was read here holds until something writes the slices again (after the
+	// expanded keys' own write above), so a binding later in this recording skips them.
+	m_buffer_cache.WatchMetadata(range.address + slice_size * first, slice_size * count);
 	report();
 }
 
