@@ -668,15 +668,39 @@ void BufferCache::ForgetUnmapped(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+// Round 132: KYTY_STORE_CLEAN=0 (or F8's storeclean:off): a GPU-thread store to CPU-clean watched
+// pages makes them CPU-dirty, as before (WriteClean).
+static bool StoreCleanEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_STORE_CLEAN");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled && !Bisect::StoreCleanOff();
+}
+
 bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 	if (!GuestGpu::IsGpuThread()) {
 		return false;
 	}
 	// Round 111: the GPU thread's stores (labels, WRITE_DATA) come after its deferred work.
 	FinishDeferredMemoryWork();
-	if (size == 0 || !GuestRange {vaddr, size}.Valid() ||
-	    !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
 		return false;
+	}
+	const bool gpu_written = m_memory_tracker.IsRegionGpuModified(vaddr, size);
+	if (!gpu_written) {
+		// Round 132: CPU-clean bytes; only worth it on pages watched for the CPU's writes (a
+		// writable page takes the store as it is).
+		if (!StoreCleanEnabled()) {
+			return false;
+		}
+		auto& pages = m_memory_tracker.Pages();
+		for (uint64_t page = vaddr & ~(TRACKER_PAGE_SIZE - 1); page < vaddr + size;
+		     page += TRACKER_PAGE_SIZE) {
+			if (!pages.IsWriteWatched(page)) {
+				return false;
+			}
+		}
 	}
 	{
 		// A download publishes the GPU's older value of these bytes when it lands.
@@ -707,6 +731,13 @@ bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 		}
 	}
 	m_texture_cache.InvalidateMemory(vaddr, size);
+	if (!gpu_written) {
+		// As a CPU write fault would tell them (RenderContext::InvalidateMemory).
+		if (m_clean_store_hook != nullptr) {
+			m_clean_store_hook(m_clean_store_user, vaddr, size);
+		}
+		GpuPhases::Count(GpuPhases::Phase::CleanStore, 1);
+	}
 	return true;
 }
 

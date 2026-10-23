@@ -366,12 +366,12 @@ void ReportIfDue(uint64_t frames) {
 	};
 	line += fmt::format(" | {} ({:.1f} regions, {:.1f} protects each; {} after a wait in their "
 	                    "submission, {} draws or dispatches after CPU writes left to the last one; "
-	                    "{} waits on memory passed), {}, {}",
+	                    "{} waits on memory passed), {}, {}, stores on watched pages {}",
 	                    counted("bda walks", Phase::BdaWalk), per_walk(Phase::BdaRegions),
 	                    per_walk(Phase::BdaProtects), count(Phase::BdaAfterWait),
 	                    count(Phase::BdaHeldBack), count(Phase::WaitPassed),
 	                    counted("spec checks", Phase::SpecCheck),
-	                    counted("buffers made", Phase::BufferCreate));
+	                    counted("buffers made", Phase::BufferCreate), count(Phase::CleanStore));
 	{
 		// The protection changes by the step they were made in, the costliest first (round 72).
 		std::array<size_t, PhaseCount + 1> order {};
@@ -536,6 +536,23 @@ void ReportIfDue(uint64_t frames) {
 				    worker_lookups, static_cast<double>(worker_us) / 1000.0,
 				    static_cast<double>(worker_longest) / 1000.0, worker_found,
 				    worker_lookups - worker_found, count(Phase::PipelineLookupSkip));
+				// Round 132: each lookup's average time by how many ran at once as it began.
+				std::string                          by;
+				constexpr std::array<const char*, 4> Names {"alone", "2-3", "4-7", "8+"};
+				for (size_t i = 0; i < Names.size(); i++) {
+					const auto n = g_worker_lookups.by_concurrency_count[i].exchange(
+					    0, std::memory_order_relaxed);
+					const auto t = g_worker_lookups.by_concurrency_us[i].exchange(
+					    0, std::memory_order_relaxed);
+					if (n != 0) {
+						by +=
+						    fmt::format("{}{} {} x {:.1f} ms", by.empty() ? "" : ", ", Names[i], n,
+						                static_cast<double>(t) / 1000.0 / static_cast<double>(n));
+					}
+				}
+				if (!by.empty()) {
+					workers += " (by lookups at once: " + by + ")";
+				}
 			}
 			LOGF("Shader work (%.1f s): on the GPU thread %s, %s, %s (found %" PRIu64
 			     ", to compile %" PRIu64 "), %s, %s; draws skipped while their shaders "

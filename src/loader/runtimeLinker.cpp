@@ -41,6 +41,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -969,6 +970,40 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			if (!frames.empty()) {
 				report +=
 				    "frames (each return address <- the 32 code bytes before it):" + frames + "\n";
+			}
+		}
+		// Round 132: what the registers holding guest addresses point at: 32 bytes there (read
+		// through the backing store, which no protection stops), whether that page holds bytes
+		// the emulator counts as GPU-written, and the emulator's own writes there in the last 10 s
+		// (downloads, fast readbacks, the GPU thread's stores). A null pointer the game read from
+		// its own memory may be one the emulator put there.
+		{
+			const std::pair<const char*, uint64_t> registers[] = {
+			    {"rax", info->rax}, {"rbx", info->rbx}, {"rcx", info->rcx}, {"rdx", info->rdx},
+			    {"rsi", info->rsi}, {"rdi", info->rdi}, {"rbp", info->rbp}, {"r8", info->r8},
+			    {"r9", info->r9},   {"r10", info->r10}, {"r11", info->r11}, {"r12", info->r12},
+			    {"r13", info->r13}, {"r14", info->r14}, {"r15", info->r15}};
+			std::string memory;
+			for (const auto& [name, value]: registers) {
+				const auto at = value & ~uint64_t {7};
+				if (at < 0x100000u) {
+					continue;
+				}
+				std::array<uint8_t, 32> bytes {};
+				if (!Libs::LibKernel::Memory::TryReadBacking(at, bytes.data(), bytes.size())) {
+					continue;
+				}
+				memory += fmt::format("\n {} {:016x}:", name, at);
+				for (const auto byte: bytes) {
+					memory += fmt::format(" {:02x}", byte);
+				}
+				memory += fmt::format(
+				    " | GPU-written page: {} | emulator writes: {}",
+				    Libs::LibKernel::Memory::IsGpuWrittenPage(at) ? "yes" : "no",
+				    Libs::LibKernel::Memory::DescribeJournal(at, bytes.size(), 10000, 6));
+			}
+			if (!memory.empty()) {
+				report += "memory at the registers' addresses:" + memory + "\n";
 			}
 		}
 		std::fputs(report.c_str(), stdout);

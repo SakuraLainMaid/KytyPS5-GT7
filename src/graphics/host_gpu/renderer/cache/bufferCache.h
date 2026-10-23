@@ -209,7 +209,18 @@ public:
 	// sides and no longer need a download. False when there is nothing to save (the page is not
 	// protected as GPU-written) or it would be wrong (a download of these bytes is in flight, or
 	// no cached buffer covers them); the caller then writes normally.
+	// Round 132: also on CPU-clean pages watched for the CPU's writes (read-only), which a cached
+	// buffer mirrors: both copies are written and the pages stay watched. Before, the store made
+	// them CPU-dirty and writable, and the next sync uploaded them and made them read-only again
+	// (about 330 times a frame in a race, mostly labels). KYTY_STORE_CLEAN=0 or F8's
+	// storeclean:off: not.
 	[[nodiscard]] bool              WriteClean(uint64_t vaddr, const void* data, uint64_t size);
+	// Round 132: told of each WriteClean store to CPU-clean watched pages (RenderContext: the
+	// bindless table's watches, which a CPU write fault tells otherwise).
+	void SetCleanStoreHook(void (*hook)(void* user, uint64_t vaddr, uint64_t size), void* user) {
+		m_clean_store_hook = hook;
+		m_clean_store_user = user;
+	}
 	// Round 111 (Bisect::AsyncMemorySync): returns once the page protections and upload reads
 	// left to the page manager's worker are done. The GPU thread calls it before its own stores
 	// to guest memory: a game thread that sees one must fault on what the GPU writes, and the
@@ -558,6 +569,8 @@ private:
 	StreamBuffer                                       m_download_buffer;
 	StreamBuffer                                       m_device_buffer;
 	TextureCache&                                      m_texture_cache;
+	void (*m_clean_store_hook)(void* user, uint64_t vaddr, uint64_t size)   = nullptr;
+	void*                                              m_clean_store_user   = nullptr;
 	uint64_t                                           m_total_used_memory = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;

@@ -1767,6 +1767,8 @@ static void ReportGraphicsPipelineBuilt(uint64_t vs_hash, uint64_t ps_hash,
 // GPU thread did before; it is compiled next when they do not hold it (job.older is then empty,
 // as they were asked).
 static bool LookUpPipeline(PendingGraphicsPipeline& job) {
+	const auto running =
+	    GpuPhases::g_worker_lookups.running.fetch_add(1, std::memory_order_relaxed) + 1u;
 	const auto begin  = std::chrono::steady_clock::now();
 	auto       result = vk::Result::eSuccess;
 	if (!CreateFromOlderFiles(*job.build, job.older, &job.pipeline)) {
@@ -1783,11 +1785,12 @@ static bool LookUpPipeline(PendingGraphicsPipeline& job) {
 		(void)g_lookup_unanswered.compare_exchange_strong(none, static_cast<int32_t>(result),
 		                                                  std::memory_order_relaxed);
 	}
+	GpuPhases::g_worker_lookups.running.fetch_sub(1, std::memory_order_relaxed);
 	GpuPhases::AddWorkerLookup(
 	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 	                              std::chrono::steady_clock::now() - begin)
 	                              .count()),
-	    found);
+	    found, running);
 	job.older = {};
 	if (found) {
 		job.result = vk::Result::eSuccess;

@@ -214,6 +214,13 @@ RenderContext::RenderContext(GraphicContext& graphics)
 	m_texture_cache.on_bindless_unregister = [this](ImageId id) {
 		m_bindless_table.OnImageUnregistered(id);
 	};
+	// Round 132: a GPU-thread store the buffer cache makes on watched CPU-clean pages
+	// (BufferCache::WriteClean) is a write the bindless table's watches must hear of.
+	m_buffer_cache.SetCleanStoreHook(
+	    [](void* user, uint64_t vaddr, uint64_t size) {
+		    static_cast<BindlessTable*>(user)->OnCpuWrite(vaddr, size);
+	    },
+	    &m_bindless_table);
 	m_texture_cache.on_image_release = [this](const Image& image) {
 		if (!m_bindless_table.Enabled()) {
 			return false;

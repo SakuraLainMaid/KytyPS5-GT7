@@ -18,6 +18,10 @@ int Wait64(volatile uint64_t* address, uint64_t expected, std::chrono::nanosecon
            signal_poll_func_t signal_poll = nullptr);
 int Wake(volatile void* address, int32_t count);
 
+// Round 132 (KYTY_BISECT's syncwait:old): the waits of round 131 and before, on Windows (with
+// KYTY_SYNC_WAIT=old they are used throughout).
+void SetOldWaits(bool old);
+
 } // namespace Libs::LibKernel::SyncOnAddress
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_KERNEL_SYNC_ON_ADDRESS_H_ */

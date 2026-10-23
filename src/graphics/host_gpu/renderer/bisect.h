@@ -243,6 +243,14 @@
 // and, round 131:
 //   phases:all   the GPU phases time the draws and dispatches of every frame, as before
 //                (KYTY_GPU_PHASES_EVERY=1 for the whole run), not of one frame in four
+// and, round 132 (each the way before round 132, for an A/B against the new defaults):
+//   memsync:sync  the GPU thread's syncs make their read-only protections and their uploads'
+//                reads themselves (KYTY_ASYNC_MEMORY_SYNC=0 for the whole run)
+//   syncwait:old  the game's waits on an address use the condition variable, with no spin
+//                (KYTY_SYNC_WAIT=old for the whole run)
+//   flush:16     a command buffer is submitted every 16 draws (64 now; KYTY_DRAW_FLUSH_INTERVAL)
+//   storeclean:off a GPU-thread store to watched CPU-clean pages makes them CPU-dirty
+//                (KYTY_STORE_CLEAN=0 for the whole run; BufferCache::WriteClean)
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -325,9 +333,10 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] bool ScanOneThread();
 // Any thread: hotpages, or KYTY_HOT_PAGES=1.
 [[nodiscard]] bool HotPages();
-// Round 111, any thread: memsync:async, or KYTY_ASYNC_MEMORY_SYNC=1: the read-only protections
-// the GPU thread's buffer syncs ask for and their uploads' reads are done on the page manager's
-// worker (PageManager::DeferScope, PostDeferred).
+// Round 111, any thread: the read-only protections the GPU thread's buffer syncs ask for and
+// their uploads' reads are done on the page manager's worker (PageManager::DeferScope,
+// PostDeferred): by default since round 132; not with KYTY_ASYNC_MEMORY_SYNC=0 or in a
+// memsync:sync step; always in a memsync:async step.
 [[nodiscard]] bool AsyncMemorySync();
 // Any thread: hiz:off.
 [[nodiscard]] bool HiZOff();
@@ -370,6 +379,8 @@ void RequestPicture(const std::string& name);
 // GPU thread: probe:sync (round 130); phases:all (round 131).
 [[nodiscard]] bool PipelineProbeSync();
 [[nodiscard]] bool PhaseTimingAll();
+// GPU thread: storeclean:off (round 132).
+[[nodiscard]] bool StoreCleanOff();
 // GPU thread: gbuffer:sync; depthread:old (round 91).
 [[nodiscard]] bool GbufferSync();
 [[nodiscard]] bool DepthReadOld();

@@ -94,6 +94,8 @@ enum class Phase : uint32_t {
 	BufferCreate, // a Vulkan buffer made with its memory (Buffer's constructor)
 	// Round 130: the driver's caches are asked on worker threads.
 	PipelineLookupSkip, // (a count only) a draw skipped while its pipeline was looked up
+	// Round 132.
+	CleanStore, // (a count only) a GPU-thread store to watched CPU-clean pages done on both copies
 	Count
 };
 
@@ -199,10 +201,22 @@ struct WorkerLookups {
 	std::atomic<uint64_t> us {0};
 	std::atomic<uint64_t> longest_us {0};
 	std::atomic<uint64_t> found {0};
+	// Round 132: by how many lookups ran at once when one began (1, 2-3, 4-7, 8 or more): each
+	// one's time grows with them when the driver serializes them.
+	std::array<std::atomic<uint64_t>, 4> by_concurrency_count {};
+	std::array<std::atomic<uint64_t>, 4> by_concurrency_us {};
+	std::atomic<uint32_t>                running {0};
 };
 inline WorkerLookups g_worker_lookups;
 
-inline void AddWorkerLookup(uint64_t us, bool found) noexcept {
+[[nodiscard]] constexpr size_t ConcurrencyBucket(uint32_t running) noexcept {
+	return running <= 1 ? 0u : running <= 3 ? 1u : running <= 7 ? 2u : 3u;
+}
+
+inline void AddWorkerLookup(uint64_t us, bool found, uint32_t running = 1) noexcept {
+	const auto bucket = ConcurrencyBucket(running);
+	g_worker_lookups.by_concurrency_count[bucket].fetch_add(1, std::memory_order_relaxed);
+	g_worker_lookups.by_concurrency_us[bucket].fetch_add(us, std::memory_order_relaxed);
 	g_worker_lookups.count.fetch_add(1, std::memory_order_relaxed);
 	g_worker_lookups.us.fetch_add(us, std::memory_order_relaxed);
 	if (found) {
