@@ -60,6 +60,21 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 23, 2026)
+
+No shaders are compiled again after this update.
+
+- **No more crash after many retries** ([issue 9](https://github.com/usa-ratt/KytyPS5-GT7/issues/9)). After about 10 minutes of
+  Circuit Experience retries the emulator ended. Every slightly different texture sampler the
+  game asked for (how a texture is filtered and wrapped) got a sampler of its own on the graphics
+  card, and none was freed, until the driver's limit (4000 on NVIDIA) was reached. Samplers that
+  come out the same are now shared, and the emulator stays under the limit: past it, the nearest
+  sampler already made stands in.
+- **No more crash on some depth and stencil settings** ([issue 8](https://github.com/usa-ratt/KytyPS5-GT7/issues/8)): a time trial
+  on a new track ended after 16 minutes on a setting the PC graphics card cannot reproduce
+  exactly. The emulator now draws the nearest setting it can, or leaves out that one draw, and
+  writes which setting it was into the log.
+
 ## What's new (October 22, 2026, third build)
 
 No shaders are compiled again after this update.
