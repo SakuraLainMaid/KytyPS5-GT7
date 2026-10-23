@@ -6,7 +6,11 @@
 #include "libs/padData.h"
 #include "loader/symbolDatabase.h"
 
+#include <cstddef>
+#include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
+#include <string>
 
 namespace Libs {
 
@@ -153,7 +157,20 @@ static int KYTY_SYSV_ABI PadClose(int handle) {
 	return OK;
 }
 
-// PPSA02385
+// KYTY_PAD_EXT=none: opening a special controller fails as not connected, instead of giving
+// handle 0 whose information says not connected.
+static bool PadExtNone() {
+	static const bool none = [] {
+		const char* value  = std::getenv("KYTY_PAD_EXT");
+		const bool  result = value != nullptr && std::strcmp(value, "none") == 0;
+		LOGF("Pad: special controllers: %s\n",
+		     result ? "opening one fails as not connected (KYTY_PAD_EXT=none)"
+		            : "opening one gives handle 0, whose information says not connected");
+		return result;
+	}();
+	return none;
+}
+
 static int KYTY_SYSV_ABI PadOpenExtStub(int user_id, int type, int index, const void* param) {
 	PRINT_NAME();
 
@@ -163,10 +180,39 @@ static int KYTY_SYSV_ABI PadOpenExtStub(int user_id, int type, int index, const 
 	     "\t param   = 0x%016" PRIx64 "\n",
 	     user_id, type, index, reinterpret_cast<uint64_t>(param));
 
+	if (PadExtNone()) {
+		return -2137915385; /* PAD_ERROR_DEVICE_NOT_CONNECTED, 0x80920007 */
+	}
 	return OK;
 }
 
-// PPSA02385
+// ScePadExtControllerInformation: the standard controller's information, then the special
+// controller's type and capabilities.
+struct PadExtControllerInformation {
+	float    touch_pixel_density;
+	uint16_t touch_resolution_x;
+	uint16_t touch_resolution_y;
+	uint8_t  stick_dead_zone_left;
+	uint8_t  stick_dead_zone_right;
+	uint8_t  connection_type;
+	uint8_t  connected_count;
+	bool     connected;
+	int32_t  device_class;
+	uint8_t  reserve[8];
+	uint16_t pad_type1;
+	uint16_t pad_type2;
+	uint8_t  capability;
+	union {
+		uint8_t quantity_of_selector_switch;
+		int32_t max_physical_wheel_angle;
+		uint8_t data[8];
+	};
+};
+static_assert(sizeof(PadExtControllerInformation) == 44);
+
+// The special controllers (wheels, sticks) a game opens with PadOpenExt: none is connected. The
+// information said nothing before round 136 (the caller kept whatever its buffer held, which could
+// read as a connected wheel); it now says not connected. The first calls log what the buffer held.
 static int KYTY_SYSV_ABI PadGetExtControllerInformationStub(int handle, void* info) {
 	PRINT_NAME();
 
@@ -174,6 +220,30 @@ static int KYTY_SYSV_ABI PadGetExtControllerInformationStub(int handle, void* in
 	     "\t info   = 0x%016" PRIx64 "\n",
 	     handle, reinterpret_cast<uint64_t>(info));
 
+	if (info == nullptr) {
+		return -2137915391; /* PAD_ERROR_INVALID_ARG, 0x80920001 */
+	}
+	static int logged = 0;
+	if (logged < 8) {
+		logged++;
+		const auto* bytes = static_cast<const uint8_t*>(info);
+		std::string held;
+		for (size_t i = 0; i < sizeof(PadExtControllerInformation); i++) {
+			held += fmt::format("{:02x}{}", bytes[i], i % 4 == 3 ? " " : "");
+		}
+		uint16_t type1 = 0;
+		uint16_t type2 = 0;
+		std::memcpy(&type1, bytes + offsetof(PadExtControllerInformation, pad_type1), 2);
+		std::memcpy(&type2, bytes + offsetof(PadExtControllerInformation, pad_type2), 2);
+		LOGF("Pad: special controller information of handle %d asked for: not connected (the "
+		     "buffer held %s: connected byte %u, type %u/%u)\n",
+		     handle, held.c_str(), bytes[offsetof(PadExtControllerInformation, connected)],
+		     static_cast<unsigned>(type1), static_cast<unsigned>(type2));
+	}
+	std::memset(info, 0, sizeof(PadExtControllerInformation));
+	if (PadExtNone()) {
+		return -2137915389; /* PAD_ERROR_INVALID_HANDLE, 0x80920003: none was opened */
+	}
 	return OK;
 }
 
