@@ -338,13 +338,17 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(device_features2.features.independentBlend, "independentBlend");
 		check_feature(device_features2.features.tessellationShader, "tessellationShader");
 
-		if (!skip_device) {
+		// Every missing extension is named, also on a device a missing feature rejected already,
+		// and a rejected device lists what it has (round 138: a report named only the first).
+		{
 			auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
 			    "vkEnumerateDeviceExtensionProperties",
 			    [&](uint32_t* count, vk::ExtensionProperties* values) {
 				    return device.enumerateDeviceExtensionProperties(nullptr, count, values);
 			    });
-			EXIT_NOT_IMPLEMENTED(available_extensions.empty());
+			if (available_extensions.empty()) {
+				reject("the device lists no extensions");
+			}
 
 			for (const char* ext: device_extensions) {
 				if (!HasExtension(available_extensions, ext)) {
