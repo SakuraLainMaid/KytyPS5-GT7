@@ -60,6 +60,16 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 23, 2026, seventh build)
+
+No shaders are compiled again after this update.
+
+- **Track maps on the layout selection screen are right.** When the list scrolled, a slot could
+  show two layouts' maps on top of each other, or none. The game draws every map into the same
+  small picture, one after another, and clears it before each one; the emulator checked such a
+  clear only once per batch of graphics work, so when two maps fell in the same batch the
+  second clear was skipped. It is now checked again whenever the game clears the picture again.
+
 ## What's new (October 23, 2026, sixth build)
 
 No shaders are compiled again after this update.
