@@ -5481,6 +5481,8 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		if (job.looking_up.load(std::memory_order_acquire)) {
 			// Round 130: its lookup is not done yet (milliseconds).
 			GpuPhases::Count(GpuPhases::Phase::PipelineLookupSkip, 1);
+			// Round 133: for the flip of this frame (GpuPhases::TakeFrameHold).
+			GpuPhases::NoteLookupSkip();
 			Profiler::CommandZone::Annotate("skipped: pipeline looked up");
 			return nullptr;
 		}

@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -234,6 +235,8 @@ private:
 		RequestState                state;
 		Graphics::Presenter::Frame* frame;
 		bool                        premultiplied_alpha;
+		// Round 133: the main display keeps the frame it shows (GpuPhases::TakeFrameHold).
+		bool hold = false;
 	};
 
 	Graphics::Presenter& m_presenter;
@@ -1116,6 +1119,10 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		return;
 	}
 	Graphics::Presenter::Frame* frame = nullptr;
+	// Round 133: a frame of the main display that left out many draws while their pipelines were
+	// looked up is not shown (the GPU thread, after the frame's draws).
+	const bool hold =
+	    !special && cfg->bus == VIDEO_OUT_BUS_TYPE_MAIN && Graphics::GpuPhases::TakeFrameHold();
 	if (special) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
 		                                       &buffer);
@@ -1142,6 +1149,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	}
 	prepared->frame = frame;
 	prepared->premultiplied_alpha = premultiplied_alpha;
+	prepared->hold                = hold;
 }
 
 void FlipQueue::Complete(uint64_t request_id) {
@@ -1246,7 +1254,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		if (r.id == group) {
 			due &= IsFlipDueLocked(*r.cfg, r.generation);
 		}
-		layers[i] = {r.frame, r.cfg->bus, r.premultiplied_alpha};
+		layers[i] = {r.frame, r.cfg->bus, r.premultiplied_alpha, r.hold};
 	}
 	if (due) {
 		m_presenter.Present(std::span(layers.data(), count));

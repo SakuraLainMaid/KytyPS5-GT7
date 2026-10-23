@@ -20,6 +20,9 @@ public:
 		Frame* frame;
 		int    bus;
 		bool   premultiplied_alpha;
+		// Round 133: the bus keeps the frame it shows, and this one is released unshown
+		// (GpuPhases::TakeFrameHold).
+		bool hold = false;
 	};
 
 	explicit Presenter(WindowContext& window);

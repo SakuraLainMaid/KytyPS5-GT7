@@ -709,6 +709,16 @@ bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 			return false;
 		}
 	}
+	// Round 133: an image write-back on its way puts the image's bytes in guest memory when it
+	// lands (on the priority thread), over this store: it goes the usual way, as a fast readback's
+	// read does (FastReadback).
+	if (const auto writebacks = m_texture_cache.PendingWriteBacks();
+	    !writebacks.empty() &&
+	    std::ranges::any_of(writebacks, [&](const std::pair<uint64_t, uint64_t>& pending) {
+		    return pending.first < vaddr + size && vaddr < pending.first + pending.second;
+	    })) {
+		return false;
+	}
 
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	// A caller that names its writes (a metadata clear) keeps its name.

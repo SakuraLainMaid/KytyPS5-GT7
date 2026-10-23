@@ -120,6 +120,7 @@ struct Step {
 	bool              memsync_sync   = false;
 	bool              syncwait_old   = false;
 	bool              storeclean_off = false;
+	bool              hold_off       = false; // hold:off (round 133)
 	std::string       cpu_set;          // empty: as at the start
 	std::string       name;             // for the screen and the picture's file name
 	std::string       text;             // name and actions, for the log
@@ -416,6 +417,10 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "storeclean:off") {
 		step.storeclean_off = true;
+		return true;
+	}
+	if (action == "hold:off") {
+		step.hold_off = true;
 		return true;
 	}
 	if (action == "memsync:sync") {
@@ -1192,6 +1197,11 @@ bool BdaSyncSubmission() {
 bool StoreCleanOff() {
 	const auto* step = Current();
 	return step != nullptr && step->storeclean_off;
+}
+
+bool FrameHoldOff() {
+	const auto* step = Current();
+	return step != nullptr && step->hold_off;
 }
 
 bool PhaseTimingAll() {

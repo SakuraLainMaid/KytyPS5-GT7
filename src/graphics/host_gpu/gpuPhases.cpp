@@ -174,6 +174,74 @@ bool OpStatsOn() noexcept {
 	return on;
 }
 
+bool TakeFrameHold() noexcept {
+	static const uint32_t threshold = [] {
+		const char* value = std::getenv("KYTY_HOLD_SKIPPED_DRAWS");
+		const auto n = value != nullptr && *value != '\0' ? std::strtoul(value, nullptr, 10) : 100u;
+		LOGF("Frame holds: a frame that left out %lu draws or more while their pipelines were "
+		     "looked up is not shown, the one before it stays (KYTY_HOLD_SKIPPED_DRAWS; 0 or F8's "
+		     "hold:off shows every frame)\n",
+		     n);
+		return static_cast<uint32_t>(n);
+	}();
+	constexpr uint32_t MaxInARow  = 2;
+	constexpr uint32_t ShownAfter = 8;
+	struct Holds {
+		std::chrono::steady_clock::time_point since    = std::chrono::steady_clock::now();
+		uint32_t                              in_a_row = 0;
+		uint32_t                              shown    = ShownAfter;
+		// Since the last line.
+		uint64_t frames   = 0;
+		uint64_t skipping = 0; // frames that left draws out
+		uint64_t skipped  = 0;
+		uint64_t most     = 0;
+		uint64_t over_32  = 0;
+		uint64_t over_100 = 0;
+		uint64_t over_300 = 0;
+		uint64_t held     = 0;
+	};
+	static Holds   s;
+	const uint64_t skips = g_frame_lookup_skips.exchange(0, std::memory_order_relaxed);
+	s.frames++;
+	if (skips != 0) {
+		s.skipping++;
+		s.skipped += skips;
+		s.most = std::max(s.most, skips);
+		s.over_32 += skips >= 32 ? 1u : 0u;
+		s.over_100 += skips >= 100 ? 1u : 0u;
+		s.over_300 += skips >= 300 ? 1u : 0u;
+	}
+	const bool hold = threshold != 0 && !Bisect::FrameHoldOff() && skips >= threshold &&
+	                  s.in_a_row < MaxInARow && (s.in_a_row != 0 || s.shown >= ShownAfter);
+	if (hold) {
+		s.in_a_row++;
+		s.shown = 0;
+		s.held++;
+	} else {
+		s.in_a_row = 0;
+		s.shown    = std::min(s.shown + 1u, ShownAfter);
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - s.since >= ReportInterval) {
+		if (s.skipped != 0) {
+			LOGF("Pipeline lookups (%.1f s): %" PRIu64 " draws left out while their pipelines were "
+			     "looked up, in %" PRIu64 " of %" PRIu64 " frames (most in one frame %" PRIu64
+			     "; frames with 32 or more %" PRIu64 ", 100 or more %" PRIu64
+			     ", 300 or more %" PRIu64 "); frames not shown (the one before stayed) %" PRIu64
+			     "\n",
+			     std::chrono::duration<double>(now - s.since).count(), s.skipped, s.skipping,
+			     s.frames, s.most, s.over_32, s.over_100, s.over_300, s.held);
+		}
+		const auto in_a_row = s.in_a_row;
+		const auto shown    = s.shown;
+		s                   = {};
+		s.since             = now;
+		s.in_a_row          = in_a_row;
+		s.shown             = shown;
+	}
+	return hold;
+}
+
 void NoteOp(bool dispatch, uint64_t key, uint64_t extra, uint64_t cycles, uint64_t bda_cycles,
             uint64_t protect_cycles) noexcept {
 	auto& group = (dispatch ? g_dispatch_groups : g_draw_groups)[key];

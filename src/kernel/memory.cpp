@@ -683,7 +683,10 @@ public:
 		return span->second > start ? std::min(end, span->second) - start : 0;
 	}
 
-	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
+	// Round 133: span_begin and span_end, when given, get the merged committed span the answer
+	// came from (KYTY_CLAMP_SPANS), for TryClampRangeSize's span memo; left alone otherwise.
+	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size, uint64_t* span_begin = nullptr,
+	                        uint64_t* span_end = nullptr) {
 		Common::LockGuard lock(m_mutex);
 
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
@@ -703,7 +706,14 @@ public:
 				return 0;
 			}
 			--span;
-			return virtual_addr < span->second ? std::min(size, span->second - virtual_addr) : 0;
+			if (virtual_addr >= span->second) {
+				return 0;
+			}
+			if (span_begin != nullptr && span_end != nullptr) {
+				*span_begin = span->first;
+				*span_end   = span->second;
+			}
+			return std::min(size, span->second - virtual_addr);
 		}
 
 		auto vma = m_ranges.upper_bound(virtual_addr);
@@ -1245,13 +1255,17 @@ struct JournalRing {
 };
 
 // Made by Initialize, before any thread could append (a write fault's handler among them).
-JournalRing<16384>* g_emulator_journal = nullptr;
-JournalRing<65536>* g_fault_journal    = nullptr;
+// Round 133: 131072 entries each (5 MB each; 16384 and 65536 before): at a race's rates the
+// emulator's ring held its writes of the last few seconds only, so a crash report's "none" said
+// little.
+constexpr size_t             JournalEntries     = 131072;
+JournalRing<JournalEntries>* g_emulator_journal = nullptr;
+JournalRing<JournalEntries>* g_fault_journal    = nullptr;
 
 void InitializeJournal() {
 	if (g_emulator_journal == nullptr) {
-		g_emulator_journal = new JournalRing<16384>();
-		g_fault_journal    = new JournalRing<65536>();
+		g_emulator_journal = new JournalRing<JournalEntries>();
+		g_fault_journal    = new JournalRing<JournalEntries>();
 	}
 }
 
@@ -1304,12 +1318,35 @@ void Collect(const JournalRing<N>& ring, uint64_t vaddr, uint64_t size, uint64_t
 			continue;
 		}
 		if (hit.time < since) {
-			continue; // older (stamped just before its slot was taken, a newer one may follow)
+			// Older (stamped just before its slot was taken, a newer one may follow). A second
+			// older than that, the rest are too (round 133: the rings are larger).
+			if (hit.time + 1000000000u < since) {
+				break;
+			}
+			continue;
 		}
 		if (hit.vaddr < vaddr + size && vaddr < hit.vaddr + hit.size) {
 			hits.push_back(hit);
 		}
 	}
+}
+
+// Round 133: how far back the ring reaches, in ns before `now` (UINT64_MAX: to the start of the
+// run, it has not wrapped).
+template <size_t N>
+uint64_t Reach(const JournalRing<N>& ring, uint64_t now) {
+	const auto next = ring.next.load(std::memory_order_acquire);
+	if (next <= N) {
+		return UINT64_MAX;
+	}
+	const auto& oldest = ring.entries[next & (N - 1)];
+	const auto  time   = oldest.time_ns.load(std::memory_order_relaxed);
+	return now > time ? now - time : 0;
+}
+
+std::string ReachText(uint64_t ns) {
+	return ns == UINT64_MAX ? std::string("since the start")
+	                        : fmt::format("for the last {:.1f} s", static_cast<double>(ns) / 1e9);
 }
 
 } // namespace
@@ -1375,7 +1412,13 @@ std::string DescribeJournal(uint64_t vaddr, uint64_t size, uint64_t ms, size_t m
 		Collect(*ring, vaddr, size, since, hits);
 	}
 	if (hits.empty()) {
-		return "none";
+		// Round 133: and how far back that holds.
+		if (g_emulator_journal == nullptr || g_fault_journal == nullptr) {
+			return "none";
+		}
+		return fmt::format("none (kept: the emulator's writes {}, the game's write faults {})",
+		                   ReachText(Reach(*g_emulator_journal, now)),
+		                   ReachText(Reach(*g_fault_journal, now)));
 	}
 	std::sort(hits.begin(), hits.end(),
 	          [](const JournalHit& a, const JournalHit& b) { return a.time > b.time; });
@@ -1492,8 +1535,36 @@ uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 	if (cached && answer.generation == generation && answer.vaddr == vaddr && answer.size == size) {
 		return answer.clamped;
 	}
-	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
+	// Round 133: the merged committed spans the last answers came from. A range inside one is
+	// whole without the lock and the search: a draw's buffers lie in a few large spans, and the
+	// answers above, by address and size, kept missing (1.4 % of the GPU thread in a race, its
+	// lock waits besides). A range that runs past its span takes the walk, which logs the cut.
+	struct Span {
+		uint64_t generation = 0;
+		uint64_t begin      = 0;
+		uint64_t end        = 0;
+	};
+	thread_local std::array<Span, 8> spans {};
+	thread_local uint32_t            next_span = 0;
+	if (cached && vaddr != 0 && size != 0 && size <= UINT64_MAX - vaddr) {
+		for (const auto& span: spans) {
+			if (span.generation == generation && vaddr >= span.begin && vaddr + size <= span.end) {
+				answer = {generation, vaddr, size, size};
+				return size;
+			}
+		}
+	}
+	uint64_t   span_begin   = 0;
+	uint64_t   span_end     = 0;
+	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size, &span_begin, &span_end);
 	answer                  = {generation, vaddr, size, clamped_size};
+	// A range past its span's end comes here again and again: its span is kept once.
+	if (cached && span_end > span_begin && std::ranges::none_of(spans, [&](const Span& span) {
+		    return span.generation == generation && span.begin == span_begin &&
+		           span.end == span_end;
+	    })) {
+		spans[next_span++ & 7u] = {generation, span_begin, span_end};
+	}
 	if (clamped_size != 0 && clamped_size != size) {
 		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
 		     " to 0x%016" PRIx64 "\n",
@@ -1578,6 +1649,11 @@ bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noex
 
 bool IsGpuWrittenPage(uint64_t fault_vaddr) noexcept {
 	return g_gpu_resources != nullptr && g_gpu_resources->IsGpuWrittenPage(fault_vaddr);
+}
+
+std::string DescribeGpuBytes(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr ? g_gpu_resources->DescribeGpuBytes(vaddr, size)
+	                                  : std::string("no GPU");
 }
 
 bool TryWriteGpuFaultingBytes(uint64_t pc, uint64_t fault_vaddr, uint64_t vaddr, const void* data,

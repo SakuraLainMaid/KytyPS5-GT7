@@ -59,6 +59,8 @@ public:
 	                                     uint64_t size) const noexcept;
 	// A game thread's write fault: whether its page is protected because the GPU wrote to it.
 	[[nodiscard]] bool IsGpuWrittenPage(uint64_t fault_vaddr) noexcept;
+	// Round 133, for a crash report (LibKernel::Memory::DescribeGpuBytes). Any thread.
+	[[nodiscard]] std::string DescribeGpuBytes(uint64_t vaddr, uint64_t size);
 	// A game thread's store at `pc` that faulted at fault_vaddr on such a page: written to both
 	// copies by the GPU thread (BufferCache::WriteClean), the page left protected. False to
 	// decline.

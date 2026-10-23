@@ -228,6 +228,20 @@ inline void AddWorkerLookup(uint64_t us, bool found, uint32_t running = 1) noexc
 	}
 }
 
+// Round 133: the draws left out while their pipelines were looked up (round 130) since the last
+// flip of the main display, for that flip (TakeFrameHold).
+inline std::atomic<uint32_t> g_frame_lookup_skips {0};
+inline void                  NoteLookupSkip() noexcept {
+    g_frame_lookup_skips.fetch_add(1, std::memory_order_relaxed);
+}
+
+// GPU thread, at a flip of the main display: whether the screen keeps the frame it shows instead
+// of this one, which left out KYTY_HOLD_SKIPPED_DRAWS draws or more (100 by default; 0: never)
+// while their pipelines were looked up. A burst of lookups at a race start left out most of the
+// track for a frame or two; that frame is not shown, at most two in a row, then eight frames
+// shown before the next. Notes the frame's left-out draws for the 10 s "Pipeline lookups" line.
+[[nodiscard]] bool TakeFrameHold() noexcept;
+
 namespace Detail {
 // Round 108: page protection changes by 64 KB block since the last report, by mode (GPU thread):
 // the blocks whose pages are protected over and over (the GPU writes them and the CPU touches

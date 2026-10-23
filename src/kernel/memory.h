@@ -193,6 +193,10 @@ bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data,
 // A game thread's write fault: whether the faulting page is protected because the GPU wrote to it
 // (rather than only watched for CPU writes).
 [[nodiscard]] bool IsGpuWrittenPage(uint64_t fault_vaddr) noexcept;
+// Round 133, for a crash report: the GPU's view of [vaddr, vaddr + size): whether its page holds
+// GPU-written bytes, whether these bytes are among them or being downloaded, and which accesses
+// to the page fault.
+[[nodiscard]] std::string DescribeGpuBytes(uint64_t vaddr, uint64_t size);
 // A game thread, for the store at `pc` that faulted at fault_vaddr on such a page: writes [vaddr,
 // vaddr + size) to both copies (guest memory and the GPU's) through the GPU thread and leaves the
 // page protected, instead of downloading what the GPU wrote there first. False to decline (the

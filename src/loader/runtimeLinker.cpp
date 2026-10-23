@@ -997,9 +997,10 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				for (const auto byte: bytes) {
 					memory += fmt::format(" {:02x}", byte);
 				}
+				// Round 133: the GPU's view of the bytes themselves, not only of their page.
 				memory += fmt::format(
-				    " | GPU-written page: {} | emulator writes: {}",
-				    Libs::LibKernel::Memory::IsGpuWrittenPage(at) ? "yes" : "no",
+				    " | GPU: {} | emulator writes: {}",
+				    Libs::LibKernel::Memory::DescribeGpuBytes(at, bytes.size()),
 				    Libs::LibKernel::Memory::DescribeJournal(at, bytes.size(), 10000, 6));
 			}
 			if (!memory.empty()) {

@@ -251,6 +251,10 @@
 //   flush:16     a command buffer is submitted every 16 draws (64 now; KYTY_DRAW_FLUSH_INTERVAL)
 //   storeclean:off a GPU-thread store to watched CPU-clean pages makes them CPU-dirty
 //                (KYTY_STORE_CLEAN=0 for the whole run; BufferCache::WriteClean)
+// and, round 133:
+//   hold:off     every frame is shown, also one that left out many draws while their pipelines
+//                were looked up (KYTY_HOLD_SKIPPED_DRAWS=0 for the whole run;
+//                GpuPhases::TakeFrameHold)
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -381,6 +385,8 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] bool PhaseTimingAll();
 // GPU thread: storeclean:off (round 132).
 [[nodiscard]] bool StoreCleanOff();
+// GPU thread: hold:off (round 133).
+[[nodiscard]] bool FrameHoldOff();
 // GPU thread: gbuffer:sync; depthread:old (round 91).
 [[nodiscard]] bool GbufferSync();
 [[nodiscard]] bool DepthReadOld();
