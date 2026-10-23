@@ -447,8 +447,13 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 		// Use nativeArguments so Qt does not re-quote the /K command string.
 		process->setProgram(CMD_EXE);
 		process->setArguments({});
-		process->setNativeArguments(QStringLiteral("/K \"") +
-		                            BuildWinCmdKCommand(interpreter, args) + QLatin1Char('"'));
+		// Round 134: the console then shows the emulator's exit code, also after an end without
+		// a crash report (a crash inside the graphics driver: the log just stops). "call" expands
+		// %errorlevel% after the emulator has run, not when the line is read.
+		process->setNativeArguments(
+		    QStringLiteral("/K \"") + BuildWinCmdKCommand(interpreter, args) +
+		    QStringLiteral(
+		        " & echo. & call echo The emulator ended with exit code %^errorlevel%\""));
 	}
 #else
 	process->setProgram(interpreter);

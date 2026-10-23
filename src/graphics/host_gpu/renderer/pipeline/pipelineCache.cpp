@@ -1704,6 +1704,9 @@ struct PendingGraphicsPipeline {
 	// Round 130: true while a worker looks it up in the driver's caches alone (the GPU thread did
 	// that before); one they do not hold is then compiled like any other.
 	std::atomic<bool> looking_up {false};
+	// Round 134: compiled (not found by a lookup alone): new in the driver cache, for a save
+	// during play (set before done).
+	bool compiled = false;
 };
 
 // Round 130: a lookup's answer other than found or not found (the driver cannot answer), for the
@@ -1929,6 +1932,7 @@ private:
 				const auto begin = std::chrono::steady_clock::now();
 				job->result = CreateThroughCacheFiles(*job->build, job->older, job->driver_cache,
 				                                      &job->pipeline);
+				job->compiled    = true;
 				ReportGraphicsPipelineBuilt(job->vs_hash, job->ps_hash, begin);
 				Profiler::Add(Profiler::Counter::PipelinesPending, -1);
 			}
@@ -2039,6 +2043,79 @@ private:
 	std::deque<std::shared_ptr<TranslationJob>> m_queue;
 	std::vector<std::thread>                    m_threads;
 	bool                                        m_stopped = false;
+};
+
+// Round 134: a shader disk cache file read on a worker thread (DiskReaders): the GPU thread read
+// each on its own, two a shader new to the session, while the draw waited. A race start read
+// about 3,000 at 7 ms each on a first run after a build (22 s of the GPU thread, the freezes of
+// lap 1), at 1 ms on the next run. A deferrable 3D draw is skipped until its read is done, as it
+// is while its shader translates.
+struct DiskRead {
+	std::vector<uint8_t> key;
+	std::vector<uint8_t> payload;
+	bool                 found = false;
+	std::atomic<bool>    done {false};
+};
+
+class DiskReaders {
+public:
+	DiskReaders(ShaderDiskCache::Store& store, uint32_t threads): m_store(store) {
+		for (uint32_t i = 0; i < threads; i++) {
+			m_threads.emplace_back([this] { Run(); });
+		}
+	}
+	~DiskReaders() {
+		{
+			std::lock_guard lock(m_mutex);
+			m_stopped = true;
+			m_queue.clear();
+		}
+		m_work.notify_all();
+		for (auto& thread: m_threads) {
+			thread.join();
+		}
+	}
+	KYTY_CLASS_NO_COPY(DiskReaders);
+
+	void Submit(std::shared_ptr<DiskRead> job) {
+		{
+			std::lock_guard lock(m_mutex);
+			m_queue.push_back(std::move(job));
+		}
+		m_work.notify_one();
+	}
+
+private:
+	void Run() {
+		KYTY_PROFILER_THREAD("ShaderDiskRead");
+		for (;;) {
+			std::shared_ptr<DiskRead> job;
+			{
+				std::unique_lock lock(m_mutex);
+				m_work.wait(lock, [this] { return m_stopped || !m_queue.empty(); });
+				if (m_queue.empty()) {
+					return;
+				}
+				job = std::move(m_queue.front());
+				m_queue.pop_front();
+			}
+			const auto begin = std::chrono::steady_clock::now();
+			job->found       = m_store.Load(job->key, job->payload);
+			GpuPhases::AddWorkerDiskRead(
+			    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+			                              std::chrono::steady_clock::now() - begin)
+			                              .count()),
+			    job->found);
+			job->done.store(true, std::memory_order_release);
+		}
+	}
+
+	ShaderDiskCache::Store&               m_store;
+	std::mutex                            m_mutex;
+	std::condition_variable               m_work;
+	std::deque<std::shared_ptr<DiskRead>> m_queue;
+	std::vector<std::thread>              m_threads;
+	bool                                  m_stopped = false;
 };
 
 // Vertex and pixel SRT refresh in parallel (plan.md P10, after Jetsku's draw-prep S3, c7c4da45).
@@ -2763,16 +2840,34 @@ struct PipelineCache::ProgramCache {
 		std::vector<uint8_t> permutation_key;
 		std::vector<uint8_t> cached_permutation;
 		if (disk != nullptr) {
-			const GpuPhases::Scope disk_phase(GpuPhases::Phase::ShaderDisk);
+			GpuPhases::Scope disk_phase(GpuPhases::Phase::ShaderDisk);
 			Profiler::Phases disk_zone;
 			disk_zone.SetText("%s 0x%016" PRIx64, stage_name, params.hash);
 			KYTY_PROFILER_PHASE(disk_zone, "Shader disk cache", profiler::colors::CyanA700);
 			BuildSourceKey(source_key, compile_code, params, options, input_info);
+			// Round 134: a deferrable 3D draw's records are read on the workers (DiskReaders).
+			const bool read_async =
+			    disk_readers != nullptr && defer_translation && stage != ShaderType::Compute;
+			const auto skip_for_read = [&] {
+				disk_phase.Cancel();
+				GpuPhases::Count(GpuPhases::Phase::DiskReadSkip, 1);
+				Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": reading its shader",
+				                                StageLabel(stage), params.hash);
+			};
 			if (entry == programs.end()) {
-				CountDiskLookup();
 				std::vector<uint8_t>          payload;
 				ShaderDiskCache::SourceRecord record;
-				if (!disk->Load(source_key, payload)) {
+				bool                          loaded = false;
+				if (read_async) {
+					if (TakeDiskRead(source_key, payload, loaded) != DiskReadState::Ready) {
+						skip_for_read();
+						return ShaderProgram {};
+					}
+				} else {
+					loaded = disk->Load(source_key, payload);
+				}
+				CountDiskLookup();
+				if (!loaded) {
 					disk->counters.source_misses++;
 				} else if (disk_verify) {
 					disk->counters.source_hits++;
@@ -2809,7 +2904,16 @@ struct PipelineCache::ProgramCache {
 				                    push_data_cursor);
 				std::vector<uint8_t>               payload;
 				ShaderDiskCache::PermutationRecord record;
-				if (!disk->Load(permutation_key, payload)) {
+				bool                               loaded = false;
+				if (read_async) {
+					if (TakeDiskRead(permutation_key, payload, loaded) != DiskReadState::Ready) {
+						skip_for_read();
+						return ShaderProgram {};
+					}
+				} else {
+					loaded = disk->Load(permutation_key, payload);
+				}
+				if (!loaded) {
 					disk->counters.permutation_misses++;
 				} else if (disk_verify) {
 					disk->counters.permutation_hits++;
@@ -3110,6 +3214,19 @@ struct PipelineCache::ProgramCache {
 			translators = std::make_unique<TranslationWorkers>(threads);
 			PipelineCacheLog("Shader translation: graphics shaders of 3D draws on {} worker threads",
 			                 threads);
+			// Round 134: KYTY_SHADER_READ_THREADS=<n> (default 4; 0 reads on the GPU thread, as
+			// before) read the disk cache's files of 3D draws' shaders.
+			const char* reads_value = std::getenv("KYTY_SHADER_READ_THREADS");
+			const auto  read_threads =
+                reads_value != nullptr && *reads_value != '\0'
+			         ? static_cast<uint32_t>(std::strtoul(reads_value, nullptr, 10))
+			         : 4u;
+			if (disk != nullptr && read_threads != 0 && !disk_verify) {
+				disk_readers = std::make_unique<DiskReaders>(*disk, std::min(read_threads, 16u));
+				PipelineCacheLog("Shader disk cache: files of 3D draws' shaders read on {} worker "
+				                 "threads (KYTY_SHADER_READ_THREADS)",
+				                 std::min(read_threads, 16u));
+			}
 		}
 		if (g_stage_prep_parallel) {
 			stage_prep = std::make_unique<StagePrepWorker>();
@@ -3549,8 +3666,41 @@ struct PipelineCache::ProgramCache {
 	uint64_t                                                    prep_declined   = 0;
 	uint64_t                                                    prep_mismatches = 0;
 	std::unique_ptr<StagePrepWorker>                            stage_prep;
+	// Round 134: shader disk cache reads in progress on the workers (DiskReaders), by key.
+	std::unordered_map<std::string, std::shared_ptr<DiskRead>> disk_reads;
+	std::unique_ptr<DiskReaders>                               disk_readers;
 	// Last: destroyed first, so its threads have stopped before anything else goes.
 	std::unique_ptr<TranslationWorkers>                         translators;
+
+	// Round 134, GPU thread: the record under `key` read on a worker. Ready: the read is done
+	// (`found` says whether the file held it, `payload` has it); otherwise the read is on its way
+	// (asked for now, or before), and the draw waits by being skipped.
+	enum class DiskReadState : uint8_t { Ready, Reading };
+	DiskReadState TakeDiskRead(std::span<const uint8_t> key, std::vector<uint8_t>& payload,
+	                           bool& found) {
+		std::string name(reinterpret_cast<const char*>(key.data()), key.size());
+		const auto  it = disk_reads.find(name);
+		if (it == disk_reads.end()) {
+			if (disk_reads.size() >= 8192) {
+				// Reads nobody took (a permutation the next draw did not ask for again).
+				std::erase_if(disk_reads, [](const auto& read) {
+					return read.second->done.load(std::memory_order_acquire);
+				});
+			}
+			auto job = std::make_shared<DiskRead>();
+			job->key.assign(key.begin(), key.end());
+			disk_reads.emplace(std::move(name), job);
+			disk_readers->Submit(std::move(job));
+			return DiskReadState::Reading;
+		}
+		if (!it->second->done.load(std::memory_order_acquire)) {
+			return DiskReadState::Reading;
+		}
+		found   = it->second->found;
+		payload = std::move(it->second->payload);
+		disk_reads.erase(it);
+		return DiskReadState::Ready;
+	}
 
 	// A stage's program entry as Get would find it, or null (not translated yet, skipped).
 	template <typename InputInfo>
@@ -4300,7 +4450,14 @@ void PipelineCache::InitializeDriverCache() {
 }
 
 void PipelineCache::Save() {
-	m_saved = true;
+	{
+		// Round 134: no save during play starts from now, and one still writing finishes first.
+		std::lock_guard lock(m_save_mutex);
+		m_saved = true;
+		if (m_save_thread.joinable()) {
+			m_save_thread.join();
+		}
+	}
 	m_program_cache->FlushDisk();
 	// No worker may use the driver caches once they are destroyed below; later pipelines are
 	// compiled on the GPU thread (FinishPending).
@@ -4331,6 +4488,20 @@ void PipelineCache::Save() {
 		return;
 	}
 
+	size_t bytes = 0;
+	switch (WriteDriverCacheFile(false, bytes)) {
+		case CacheWrite::Saved:
+		case CacheWrite::Unchanged:
+		case CacheWrite::TooLarge: ReleaseDriverCache(still_compiling); break;
+		case CacheWrite::Failed: break;
+	}
+}
+
+// Save's write of the driver cache to its file, and round 134's saves during play
+// (MaybeSaveDuringPlay, on a thread of their own): those leave a cache past the size a file may
+// hold to the save at the exit, which marks the file full.
+PipelineCache::CacheWrite PipelineCache::WriteDriverCacheFile(bool during_play, size_t& bytes) {
+	bytes                     = 0;
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
@@ -4343,10 +4514,12 @@ void PipelineCache::Save() {
 		}
 		if (size == m_driver_cache_loaded) {
 			// No pipeline was added: the file stays as it is (it was written at the exits before).
-			PipelineCacheLog("Vulkan pipeline cache: {} has no new pipelines; not written again",
-			                 Common::PathToString(m_driver_cache_path));
-			ReleaseDriverCache(still_compiling);
-			return;
+			if (!during_play) {
+				PipelineCacheLog(
+				    "Vulkan pipeline cache: {} has no new pipelines; not written again",
+				    Common::PathToString(m_driver_cache_path));
+			}
+			return CacheWrite::Unchanged;
 		}
 		payload.resize(size);
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
@@ -4358,13 +4531,17 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
 		                 vk::to_string(result), size);
-		return;
+		return CacheWrite::Failed;
 	}
 	payload.resize(size);
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (prefix.size() + payload.size() > DriverCacheMaxBytes) {
+		if (during_play) {
+			// The save at the exit says so and marks the file full.
+			return CacheWrite::TooLarge;
+		}
 		// The next run would refuse a file this large and compile everything again (round 64's
 		// runs, after the file passed the old 1 GiB limit). The file already there stays.
 		PipelineCacheLog("Vulkan pipeline cache: {} MB is past the {} MB a file may hold; not "
@@ -4374,12 +4551,11 @@ void PipelineCache::Save() {
 		if (marker.Create(DriverCacheFullMarker(m_driver_cache_path))) {
 			marker.Close();
 		}
-		ReleaseDriverCache(still_compiling);
-		return;
+		return CacheWrite::TooLarge;
 	}
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return;
+		return CacheWrite::Failed;
 	}
 	auto temp_path = m_driver_cache_path;
 	temp_path += ".tmp";
@@ -4396,16 +4572,65 @@ void PipelineCache::Save() {
 	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
-		return;
+		return CacheWrite::Failed;
 	}
-	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
-	                 Common::PathToString(m_driver_cache_path));
+	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}{}", payload.size(),
+	                 Common::PathToString(m_driver_cache_path),
+	                 during_play ? " during play (KYTY_PIPELINE_SAVE_MINUTES)" : "");
 	if (const auto marker = DriverCacheFullMarker(m_driver_cache_path);
 	    Common::File::IsFileExisting(marker)) {
 		std::error_code error;
 		std::filesystem::remove(marker, error);
 	}
-	ReleaseDriverCache(still_compiling);
+	// The file holds this much now: a save with nothing added since leaves it.
+	m_driver_cache_loaded = payload.size();
+	bytes                 = payload.size();
+	return CacheWrite::Saved;
+}
+
+// Round 134: every KYTY_PIPELINE_SAVE_MINUTES (5 by default; 0: only at the exit), once 100 new
+// pipelines or more were compiled since the last save, the driver cache is written to its file on
+// a thread of its own. It was saved only when the emulator closed normally: a player whose
+// sessions ended in crashes started each one from the same 793 MB cache and compiled 1,700 to
+// 4,750 pipelines again every time (2026-10-23).
+void PipelineCache::MaybeSaveDuringPlay() {
+	static const uint32_t minutes = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_SAVE_MINUTES");
+		return value != nullptr && *value != '\0'
+		           ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10))
+		           : 5u;
+	}();
+	constexpr uint64_t MinNewPipelines = 100;
+	m_new_since_save++;
+	const auto now = std::chrono::steady_clock::now();
+	if (m_last_save == std::chrono::steady_clock::time_point {}) {
+		m_last_save = now;
+	}
+	if (minutes == 0 || m_new_since_save < MinNewPipelines ||
+	    now - m_last_save < std::chrono::minutes(minutes) ||
+	    m_save_running.load(std::memory_order_acquire)) {
+		return;
+	}
+	std::lock_guard lock(m_save_mutex);
+	if (m_saved || m_driver_cache == nullptr || m_driver_cache_path.empty()) {
+		return;
+	}
+	if (m_save_thread.joinable()) {
+		m_save_thread.join();
+	}
+	const auto pipelines = m_new_since_save;
+	m_new_since_save     = 0;
+	m_last_save          = now;
+	m_save_running.store(true, std::memory_order_release);
+	m_save_thread = std::thread([this, pipelines] {
+		Common::LowerThreadPriority();
+		size_t     bytes  = 0;
+		const auto result = WriteDriverCacheFile(true, bytes);
+		if (result == CacheWrite::Saved) {
+			PipelineCacheLog("Vulkan pipeline cache: {} new pipelines in that save", pipelines);
+		}
+		m_save_running.store(false, std::memory_order_release);
+	});
 }
 
 void PipelineCache::ReleaseDriverCache(size_t still_compiling) {
@@ -5245,8 +5470,13 @@ bool PipelineCache::FinishPending(Pipeline& pipeline) {
 		job.done.store(true, std::memory_order_release);
 	}
 	EXIT_NOT_IMPLEMENTED(job.result != vk::Result::eSuccess || job.pipeline == nullptr);
-	pipeline.pipeline = job.pipeline;
+	pipeline.pipeline   = job.pipeline;
+	const bool compiled = job.compiled;
 	pipeline.pending.reset();
+	// Round 134: a new pipeline in the driver cache, kept by a save during play.
+	if (compiled) {
+		MaybeSaveDuringPlay();
+	}
 	return true;
 }
 

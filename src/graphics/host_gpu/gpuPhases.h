@@ -96,6 +96,8 @@ enum class Phase : uint32_t {
 	PipelineLookupSkip, // (a count only) a draw skipped while its pipeline was looked up
 	// Round 132.
 	CleanStore, // (a count only) a GPU-thread store to watched CPU-clean pages done on both copies
+	// Round 134: shader disk cache files read on worker threads.
+	DiskReadSkip, // (a count only) a draw skipped while its shader's records were read from disk
 	Count
 };
 
@@ -224,6 +226,28 @@ inline void AddWorkerLookup(uint64_t us, bool found, uint32_t running = 1) noexc
 	}
 	auto longest = g_worker_lookups.longest_us.load(std::memory_order_relaxed);
 	while (us > longest && !g_worker_lookups.longest_us.compare_exchange_weak(
+	                           longest, us, std::memory_order_relaxed)) {
+	}
+}
+
+// Round 134: the shader disk cache reads made on worker threads (any thread adds; the report
+// takes them every 10 s).
+struct WorkerDiskReads {
+	std::atomic<uint64_t> count {0};
+	std::atomic<uint64_t> us {0};
+	std::atomic<uint64_t> longest_us {0};
+	std::atomic<uint64_t> found {0};
+};
+inline WorkerDiskReads g_worker_disk_reads;
+
+inline void AddWorkerDiskRead(uint64_t us, bool found) noexcept {
+	g_worker_disk_reads.count.fetch_add(1, std::memory_order_relaxed);
+	g_worker_disk_reads.us.fetch_add(us, std::memory_order_relaxed);
+	if (found) {
+		g_worker_disk_reads.found.fetch_add(1, std::memory_order_relaxed);
+	}
+	auto longest = g_worker_disk_reads.longest_us.load(std::memory_order_relaxed);
+	while (us > longest && !g_worker_disk_reads.longest_us.compare_exchange_weak(
 	                           longest, us, std::memory_order_relaxed)) {
 	}
 }

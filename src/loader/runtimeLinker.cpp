@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/crashNote.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/guestWatch.h"
@@ -921,6 +922,15 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// in the emulator's own code is found from its code bytes and the map file.
 		std::string report = "--- Guest fault context ---\n";
 		report += fmt::format("thread: {}\n", thread_name);
+		// Round 134: a host thread's name, and what it was doing when that is noted: a crash in
+		// the graphics driver while it compiled a pipeline names the pipeline.
+		if (Libs::LibKernel::PthreadSelfOrNull() == nullptr) {
+			report += fmt::format("host thread: {}\n", Common::PerfStats::ThreadNameOf(
+			                                               Common::PerfStats::CurrentOsThreadId()));
+		}
+		if (const char* note = Common::CrashNote(); note[0] != '\0') {
+			report += fmt::format("doing: {}\n", note);
+		}
 		report += fmt::format("rax={:016x} rbx={:016x} rcx={:016x} rdx={:016x}\n"
 		                      "rsi={:016x} rdi={:016x} rbp={:016x} rsp={:016x}\n"
 		                      "r8 ={:016x} r9 ={:016x} r10={:016x} r11={:016x}\n"

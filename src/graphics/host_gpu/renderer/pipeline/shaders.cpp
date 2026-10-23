@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/crashNote.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -20,6 +21,7 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -798,7 +800,14 @@ vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build,
 	if (cache_only) {
 		info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
 	}
-	const auto result =
+	// Round 134: a crash in the driver names the pipeline it was making (Common::CrashNote).
+	std::array<char, 160> note {};
+	(void)std::snprintf(note.data(), note.size(),
+	                    "the graphics driver %s the graphics pipeline VS 0x%016" PRIx64
+	                    " PS 0x%016" PRIx64,
+	                    cache_only ? "looked up" : "compiled", build.vs_hash, build.ps_hash);
+	const Common::CrashNoteScope crash_note(note.data());
+	const auto                   result =
 	    build.device.createGraphicsPipelines(driver_cache, 1, &info, nullptr, pipeline);
 	// On the GPU thread, a slow pipeline stops every queue.
 	if (const auto create_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -952,6 +961,12 @@ bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		}
 		result = vk::Result::eErrorOutOfHostMemory;
 	} else if (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) {
+		// Round 134: a crash in the driver names the pipeline it was compiling.
+		std::array<char, 160> note {};
+		(void)std::snprintf(note.data(), note.size(),
+		                    "the graphics driver compiled the compute pipeline CS 0x%016" PRIx64,
+		                    shader_hash);
+		const Common::CrashNoteScope crash_note(note.data());
 		result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 		                                                &pipeline.pipeline);
 	}

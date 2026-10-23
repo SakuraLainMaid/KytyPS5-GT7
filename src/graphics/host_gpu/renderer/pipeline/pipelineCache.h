@@ -11,12 +11,15 @@
 #include "graphics/shader/shaderCompiler.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -384,6 +387,12 @@ private:
 	const std::vector<uint32_t>* PendingExpansion(uint64_t shader_hash) const;
 	// Save, done with the driver cache: destroyed, or kept while background compiles use it.
 	void ReleaseDriverCache(size_t still_compiling);
+	// Round 134: the write of the driver cache to its file (Save's, and the saves during play).
+	enum class CacheWrite : uint8_t { Saved, Unchanged, TooLarge, Failed };
+	CacheWrite WriteDriverCacheFile(bool during_play, size_t& bytes);
+	// GPU thread, for each new pipeline taken from a background compile: a save during play when
+	// one is due (KYTY_PIPELINE_SAVE_MINUTES).
+	void MaybeSaveDuringPlay();
 	struct ProgramCache;
 
 	// GetGraphicsPrograms' stage inputs from the registers (shared with DrawPrepDescribeGraphics;
@@ -473,6 +482,13 @@ private:
 	std::chrono::steady_clock::time_point m_backlog_begin {};
 	std::chrono::steady_clock::time_point m_backlog_last_report {};
 	bool                                  m_saved = false;
+	// Round 134: the saves of the driver cache during play (MaybeSaveDuringPlay), each on a thread
+	// of its own; Save waits for one still writing.
+	std::mutex                            m_save_mutex;
+	std::thread                           m_save_thread;
+	std::atomic<bool>                     m_save_running {false};
+	std::chrono::steady_clock::time_point m_last_save {};
+	uint64_t                              m_new_since_save = 0;
 	// Round 99: the shaders whose call is partitioned (by hash), their partitions' programs (by
 	// id: their pipelines compile alongside each other), and when the next new partition's SPIR-V
 	// may be made (GetComputeProgram).

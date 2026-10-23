@@ -590,10 +590,19 @@ void ReportIfDue(uint64_t frames) {
 		const uint64_t worker_longest =
 		    g_worker_lookups.longest_us.exchange(0, std::memory_order_relaxed);
 		const uint64_t worker_found = g_worker_lookups.found.exchange(0, std::memory_order_relaxed);
+		// Round 134: the shader disk cache reads made on worker threads.
+		const uint64_t disk_reads =
+		    g_worker_disk_reads.count.exchange(0, std::memory_order_relaxed);
+		const uint64_t disk_us = g_worker_disk_reads.us.exchange(0, std::memory_order_relaxed);
+		const uint64_t disk_longest =
+		    g_worker_disk_reads.longest_us.exchange(0, std::memory_order_relaxed);
+		const uint64_t disk_found =
+		    g_worker_disk_reads.found.exchange(0, std::memory_order_relaxed);
 		if (count(Phase::ShaderDisk) + count(Phase::ShaderCompile) + count(Phase::PipelineWait) +
 		        count(Phase::PipelineCompile) + count(Phase::TranslationSkip) +
 		        count(Phase::PipelineSkip) + count(Phase::PipelineProbe) +
-		        count(Phase::PipelineLookupSkip) + worker_lookups !=
+		        count(Phase::PipelineLookupSkip) + worker_lookups + disk_reads +
+		        count(Phase::DiskReadSkip) !=
 		    0) {
 			std::string workers;
 			if (worker_lookups + count(Phase::PipelineLookupSkip) != 0) {
@@ -621,6 +630,14 @@ void ReportIfDue(uint64_t frames) {
 				if (!by.empty()) {
 					workers += " (by lookups at once: " + by + ")";
 				}
+			}
+			if (disk_reads + count(Phase::DiskReadSkip) != 0) {
+				workers += fmt::format(
+				    "; on worker threads shader disk cache reads {} in {:.0f} ms (longest {:.1f} "
+				    "ms) ({} found), draws skipped while their shaders were read {}",
+				    disk_reads, static_cast<double>(disk_us) / 1000.0,
+				    static_cast<double>(disk_longest) / 1000.0, disk_found,
+				    count(Phase::DiskReadSkip));
 			}
 			LOGF("Shader work (%.1f s): on the GPU thread %s, %s, %s (found %" PRIu64
 			     ", to compile %" PRIu64 "), %s, %s; draws skipped while their shaders "
