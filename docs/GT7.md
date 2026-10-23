@@ -60,6 +60,27 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 23, 2026, fourth build)
+
+No shaders are compiled again after this update.
+
+- **No more hard freezes at the start of a race.** The emulator read each shader the game used for
+  the first time in a session from its shader cache on disk on the same thread that runs the
+  game's graphics work. On some runs each read took 7 ms, and the start of a race reads about
+  3,000: 22 seconds of the race, most of it in lap 1. These reads now run on 4 helper threads, and
+  a draw whose shader is still being read is left out for a frame or two instead.
+- **No more "the whole track flickers away" at the start of a race.** When hundreds of new
+  pipelines are looked up at once, a frame could be drawn with most of the track missing. Such a
+  frame (one that left out 100 draws or more) is no longer shown; the frame before it stays on the
+  screen instead. `KYTY_HOLD_SKIPPED_DRAWS=0` shows every frame again.
+- **Compiled pipelines are kept after a crash.** They were saved only when the emulator closed
+  normally, so a crash threw away every pipeline the session had compiled, and the next session
+  compiled them all again (thousands, on a new track). They are now also saved every 5 minutes
+  while you play. `KYTY_PIPELINE_SAVE_MINUTES` sets how often (0: only when closing).
+- **Crash reports say more.** A crash inside the graphics driver while it compiles a pipeline
+  names the pipeline, and a crash in the game's own code shows the state of the exact memory it
+  was using. The launcher's console window now prints the emulator's exit code when it ends.
+
 ## What's new (October 23, 2026, third build)
 
 No shaders are compiled again after this update.
