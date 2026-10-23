@@ -349,8 +349,9 @@ Graphics and shaders:
   names the graphics buffer involved.
 - In-game videos can play out of sync with their sound
   ([issue 4](https://github.com/usa-ratt/KytyPS5-GT7/issues/4)). Being looked into.
-- Once, in a race on a new track in the chase view, most of the track disappeared after it had
-  loaded (cars and some objects stayed); switching to the cockpit view and back brought it back.
+- **NVIDIA:** the driver's shader compiler can crash while it compiles new pipelines
+  ([issue 18](https://github.com/usa-ratt/KytyPS5-GT7/issues/18)). Being looked into; the crash
+  report names the pipeline.
 - If a loading screen still never ends, please open an issue with the log.
 
 ## Credits
