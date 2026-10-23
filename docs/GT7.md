@@ -60,6 +60,19 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 23, 2026, second build)
+
+No shaders are compiled again after this update.
+
+- **A smoother first lap.** In a race, the first lap of each session was the roughest, with
+  freezes of up to a second, and laps got better from the second on. The emulator looked up each
+  new pipeline (the compiled form of a draw's shaders and settings) in its cache on disk on the
+  same thread that runs the game's graphics work, and on a track each lookup took 4 to 8 ms: about
+  13 seconds of a 5-lap race at Tokyo against 11 AI cars, nearly all in lap 1. The lookups now run
+  on 4 extra threads while the graphics work goes on, and in the same race lap 1 had two short
+  stutters. Something new on screen can show up a frame or two late on lap 1 while its lookup
+  finishes. `KYTY_PIPELINE_LOOKUP_THREADS=0` brings back the old way.
+
 ## What's new (October 23, 2026)
 
 No shaders are compiled again after this update.
