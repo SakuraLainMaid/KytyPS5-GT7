@@ -199,6 +199,9 @@ public:
 	[[nodiscard]] bool AddressWritesSeen() const noexcept {
 		return m_address_writes_seen.load(std::memory_order_relaxed);
 	}
+	// GPU thread: a command that stores through shader addresses may still be on the GPU, so guest
+	// memory may not hold its stores yet (they mark no range to download).
+	[[nodiscard]] bool              AddressWritesInFlight();
 	void                            ProcessFaultBuffer();
 	void                            NoteDmaShader(uint64_t hash, std::string label) {
         m_fault_manager.NoteDmaShader(hash, std::move(label));
@@ -341,7 +344,8 @@ public:
 	// game-thread downloads by writer: how long after the write, and how often the GPU had already
 	// run it (`done_tick`: the last tick known done), which is what readahead can save.
 	static void RecordGpuWriter(uint64_t vaddr, uint64_t size, uint64_t shader, uint64_t tick);
-	static void ReportGameThreadDownload(uint64_t vaddr, uint64_t bytes, uint64_t done_tick);
+	static void ReportGameThreadDownload(uint64_t vaddr, uint64_t bytes, uint64_t done_tick,
+	                                     uint64_t now_ns);
 
 	// Readahead (KYTY_READAHEAD=1, or KYTY_BISECT's readahead): the ranges game threads had to
 	// download (ReadMemoryStep) are learned in 64 KB blocks, and when the GPU writes into them
@@ -421,8 +425,10 @@ private:
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// One readback attempt on the GPU thread: 0 when done, else the tick to wait for.
+	// `writer_wait`: the caller may wait for an unfinished writer's command buffer instead of a
+	// download (readwait:writer, once a read).
 	[[nodiscard]] uint64_t ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
-	                                      bool from_gpu_thread, bool async);
+	                                      bool from_gpu_thread, bool async, bool writer_wait);
 	// A game thread's read (ReadMemoryStep, GPU thread) of [window_begin, window_end): the
 	// GPU-written bytes of the window from ticks the GPU has finished are copied on the readback
 	// queue and waited for there, then put in guest memory, and the window's pages that hold no
@@ -523,6 +529,45 @@ private:
 	void NoteMetadataWrite(uint64_t vaddr, uint64_t size);
 	// Set by a fast readback that let the access go on (GPU thread), for ReadMemory's counts.
 	bool m_fast_step = false;
+	// Round 135: what a ReadMemoryStep did, read back by ReadMemory's command on the GPU thread
+	// (the counts by instruction and the wait to make), and why the last FastReadback copied
+	// nothing (with the tick of the faulting pages' writer when the GPU was still running it).
+	enum class ReadOutcome : uint8_t {
+		None,
+		Direct,     // nothing to do (a write to memory no buffer covers)
+		Bitmap,     // the write bitmap's wait (RefineWithWriteBitmap)
+		Lifted,     // the pages held no GPU-written bytes: lifted
+		LiftWaited, // the same, once a download of them on its way lands
+		Clean,      // the pages were current already: another thread's read lifted them
+		Fast,       // copied on the readback queue (FastReadback)
+		WaitWriter, // waits for its writer's command buffer, then asks again (readwait:writer)
+		Download,   // downloaded behind the renderer's queue
+		Nothing,    // went to download, and nothing was left to download
+		Count
+	};
+	enum class FastRefusal : uint8_t {
+		None,
+		Unavailable, // no readback queue, or turned off
+		Downloading, // a download or an image write-back of the faulting pages on its way
+		Address,     // a command storing through shader addresses is still on the GPU
+		Recording,   // the faulting pages' writer is in the command buffer being recorded
+		InFlight,    // ... in one submitted and not finished
+		Other,       // outside the buffer, the write bitmap's, or the copy could not be made
+		Nothing,     // no GPU-written bytes it could copy in the window
+		TooBig,
+		Count
+	};
+	ReadOutcome m_step_outcome     = ReadOutcome::None;
+	FastRefusal m_fast_refusal     = FastRefusal::None;
+	uint64_t    m_fast_writer_tick = 0; // InFlight with no other refusal on the faulting pages
+	uint32_t    m_fast_left        = 0; // Nothing: ranges elsewhere in the window it left
+	// The ticks around the last refusal: the writer's (the latest of the faulting pages'), the one
+	// being recorded and the last one known done, for the counts (GPU thread).
+	uint64_t m_fast_refused_tick = 0;
+	uint64_t m_fast_current_tick = 0;
+	uint64_t m_fast_known_tick   = 0;
+	// The bytes the last ReadMemoryStep recorded a download of (GPU thread).
+	uint64_t m_step_bytes = 0;
 	// GpuThreadFastReads is alive (GPU thread only).
 	bool m_gpu_thread_fast_reads = false;
 	// Readahead (ReadaheadEnabled), GPU thread only: the blocks learned in this generation and

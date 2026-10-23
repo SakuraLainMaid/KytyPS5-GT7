@@ -70,6 +70,17 @@ static bool AjmAt9ConfigDataValid(const uint8_t* config_data) {
 	return config_data[0] == 0xfeu && (config_data[1] & 1u) == 0;
 }
 
+// Some games hand the decoder job the configuration as a stored little-endian word
+// (30 c0 72 fe): the 0xFE sync byte is its last byte. LibAtrac9 reads stream order, so the word
+// has to be turned round before it is validated or decoded. Normalizing an already-normalized
+// configuration is a no-op, which keeps the reset path that re-passes m_config_data honest.
+static void AjmAt9NormalizeConfig(const uint8_t* in, uint8_t* out) {
+	std::memcpy(out, in, ATRAC9_CONFIG_DATA_SIZE);
+	if (out[0] != 0xfeu && out[ATRAC9_CONFIG_DATA_SIZE - 1] == 0xfeu) {
+		std::reverse(out, out + ATRAC9_CONFIG_DATA_SIZE);
+	}
+}
+
 [[nodiscard]] static bool AjmAt9IsVibrationConfig(const uint8_t* config_data) {
 	return ((config_data[1] >> 1u) & 7u) >= 6u;
 }
@@ -332,7 +343,9 @@ private:
 			result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
 			return false;
 		}
-		if (!AjmAt9ConfigDataValid(config_data)) {
+		uint8_t config[ATRAC9_CONFIG_DATA_SIZE];
+		AjmAt9NormalizeConfig(config_data, config);
+		if (!AjmAt9ConfigDataValid(config)) {
 			LOGF("AJM ATRAC9: invalid config data %02x %02x %02x %02x\n", config_data[0],
 			     config_data[1], config_data[2], config_data[3]);
 			m_is_initialized = false;
@@ -340,9 +353,9 @@ private:
 			return false;
 		}
 
-		std::memcpy(m_config_data, config_data, ATRAC9_CONFIG_DATA_SIZE);
+		std::memcpy(m_config_data, config, ATRAC9_CONFIG_DATA_SIZE);
 		m_has_config = true;
-		if (AjmAt9IsVibrationConfig(config_data)) {
+		if (AjmAt9IsVibrationConfig(config)) {
 			LOGF("AJM ATRAC9: vibration config %02x %02x %02x %02x decoded as %s\n", config_data[0],
 			     config_data[1], config_data[2], config_data[3],
 			     ((config_data[1] >> 1u) & 7u) == 7u ? "dual mono" : "mono");

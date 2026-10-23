@@ -49,6 +49,12 @@ public:
 	// buffer spanning hundreds of clean regions is answered from a few words. False is
 	// conservative.
 	[[nodiscard]] bool IsRangeCpuCleanHint(uint64_t vaddr, uint64_t size) const noexcept;
+	// Answered from the regions' published copies of their bits, without their locks (mainline
+	// #1284): exact on the GPU thread, which alone changes GPU-dirty bits and clears CPU-dirty
+	// ones; other threads only add CPU-dirty pages, under the lock and before the page becomes
+	// writable. Other threads' queries (the fault handler's IsGpuWrittenPage, crash reports) may
+	// see a moment-old answer, which their callers check again under the lock (WriteClean,
+	// InvalidateRegion).
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// A CPU write fault's release of [vaddr, vaddr + size) at once: each tracker region of it is
@@ -200,6 +206,9 @@ public:
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
 		CheckNotInUploadCallback();
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			if (!manager->IsModifiedUnlocked<DirtySource::Gpu>(offset, bytes)) {
+				return;
+			}
 			std::scoped_lock lock(manager->lock);
 			const auto       address = manager->GetCpuAddr() + offset;
 			manager->template ForEachModifiedRange<DirtySource::Gpu, false>(address, bytes, func);
@@ -245,6 +254,10 @@ public:
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			const bool summary_clean = !manager->MaybeModified<DirtySource::Cpu>();
 			if (!is_written && g_tracker_skip_clean && summary_clean) {
+				return;
+			}
+			// A written range takes every lock: they stay held until it is marked GPU-dirty.
+			if (!is_written && !manager->IsModifiedUnlocked<DirtySource::Cpu>(offset, bytes)) {
 				return;
 			}
 			manager->lock.lock();

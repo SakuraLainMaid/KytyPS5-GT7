@@ -574,6 +574,8 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	build.multisampling.sampleShadingEnable  = static_params.sample_shading_enable ? VK_TRUE : VK_FALSE;
 	build.multisampling.rasterizationSamples = vulkan_sample_count(static_params.samples);
 	build.multisampling.minSampleShading     = 1.0f;
+	build.multisampling.alphaToCoverageEnable =
+	    static_params.alpha_to_coverage_enable ? VK_TRUE : VK_FALSE;
 
 	auto& color_blend_attachment = build.color_blend;
 	for (uint32_t i = 0; i < rendering.color_count; i++) {

@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -155,6 +156,7 @@ public:
 		m_cpu_dirty.Fill();
 		m_writable.Fill();
 		m_readable.Fill();
+		PublishDirtyBits();
 	}
 
 	KYTY_CLASS_NO_COPY(RegionManager);
@@ -173,6 +175,29 @@ public:
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
 		return GetBits<source>().FirstRangeFrom(start).first < end;
 	}
+	// IsModified without the lock (mainline #1284), for the GPU thread, which owns the GPU-dirty
+	// bits and clears CPU-dirty bits. Other threads only set CPU-dirty bits, under the lock and
+	// before the page becomes writable, so a clean answer cannot miss a write already made.
+	template <DirtySource source>
+	[[nodiscard]] bool IsModifiedUnlocked(uint64_t offset, uint64_t size) const {
+		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		const auto& words       = source == DirtySource::Cpu ? m_cpu_words : m_gpu_words;
+		const auto  first       = start / 64;
+		const auto  last        = (end - 1) / 64;
+		for (auto word = first; word <= last; word++) {
+			auto bits = words[word].load(std::memory_order_acquire);
+			if (word == first) {
+				bits &= ~uint64_t {0} << (start % 64);
+			}
+			if (word == last && end % 64 != 0) {
+				bits &= (uint64_t {1} << (end % 64)) - 1;
+			}
+			if (bits != 0) {
+				return true;
+			}
+		}
+		return false;
+	}
 
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
@@ -190,6 +215,7 @@ public:
 		auto& bits = GetBits<source>();
 		if constexpr (enable) {
 			bits.SetRange(start, end);
+			PublishDirtyBits();
 			StoreSummary<source>(true);
 			if constexpr (source == DirtySource::Cpu) {
 				NoteBdaPending();
@@ -200,6 +226,7 @@ public:
 			}
 		} else {
 			bits.UnsetRange(start, end);
+			PublishDirtyBits();
 			if (bits.None()) {
 				StoreSummary<source>(false);
 			}
@@ -229,6 +256,7 @@ public:
 		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
+			PublishDirtyBits();
 			if (bits.None()) {
 				StoreSummary<source>(false);
 			}
@@ -256,6 +284,7 @@ public:
 		}
 		RegionBits mask(bits, start, end);
 		bits.UnsetRange(start, end);
+		PublishDirtyBits();
 		if (bits.None()) {
 			StoreSummary<DirtySource::Cpu>(false);
 		}
@@ -374,6 +403,7 @@ public:
 		const auto count = dirty.Count();
 		if (count != 0) {
 			m_cpu_dirty |= dirty;
+			PublishDirtyBits();
 			StoreSummary<DirtySource::Cpu>(true);
 			UpdateCpuProtection();
 		}
@@ -420,6 +450,14 @@ private:
 		}
 	}
 
+	// After every change of m_cpu_dirty or m_gpu_dirty, with the lock held.
+	void PublishDirtyBits() {
+		for (size_t word = 0; word < RegionBits::kWordCount; word++) {
+			m_cpu_words[word].store(m_cpu_dirty.Word(word), std::memory_order_release);
+			m_gpu_words[word].store(m_gpu_dirty.Word(word), std::memory_order_release);
+		}
+	}
+
 	template <bool track, bool is_read>
 	void UpdateProtection() {
 		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
@@ -440,6 +478,7 @@ private:
 			return 0;
 		}
 		m_cpu_dirty |= dirty;
+		PublishDirtyBits();
 		StoreSummary<DirtySource::Cpu>(true);
 		NoteBdaPending();
 		g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
@@ -517,6 +556,9 @@ private:
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
+	// Copies of the dirty bits for IsModifiedUnlocked, stored under the lock.
+	std::array<std::atomic<uint64_t>, RegionBits::kWordCount> m_cpu_words {};
+	std::array<std::atomic<uint64_t>, RegionBits::kWordCount> m_gpu_words {};
 	// The constructor fills m_cpu_dirty, so the CPU summary starts true.
 	std::atomic<bool> m_cpu_maybe_dirty {true};
 	std::atomic<bool> m_gpu_maybe_dirty {false};

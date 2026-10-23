@@ -989,7 +989,16 @@ public:
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
+		// Shared (mainline #1815): the page tracker protects from every faulting game thread and
+		// from the GPU thread, and this only reads m_mapped; the page manager's region lock
+		// already orders changes to the same pages. Everything that changes m_mapped, and the
+		// game's own mprotect, still takes the lock exclusively (and these too with
+		// KYTY_BISECT's protect:exclusive, to compare).
+		if (ProtectLockExclusive()) {
+			std::unique_lock lock(m_mutex);
+			return ProtectMappedUnlocked(vaddr, size, mode, true);
+		}
+		std::shared_lock lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode, true);
 	}
 
@@ -1690,7 +1699,7 @@ private:
 #endif
 	}
 
-	std::mutex                                 m_mutex;
+	std::shared_mutex                           m_mutex;
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;

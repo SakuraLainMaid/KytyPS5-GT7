@@ -813,6 +813,241 @@ static const bool g_async_readback = [] {
 static std::atomic<uint64_t> g_reads_direct {0};
 static std::atomic<uint64_t> g_reads_waited {0};
 
+// Round 135, KYTY_CLEAN_PAGE=old (or KYTY_BISECT's cleanpage:old): a fault on pages another
+// thread's read made current since downloads the rest of its window and waits for it, as before.
+static bool CleanPageOld() {
+	static const bool old = [] {
+		const char* value = std::getenv("KYTY_CLEAN_PAGE");
+		return value != nullptr && std::strcmp(value, "old") == 0;
+	}();
+	return old || Bisect::CleanPageOld();
+}
+
+// Round 135, KYTY_READ_WAIT=writer (or KYTY_BISECT's readwait:writer): a game thread's read of
+// bytes whose writer the GPU is still running waits for that writer's command buffer, then copies
+// them on the readback queue, instead of downloading them behind the renderer's queue.
+static bool ReadWaitWriter() {
+	static const bool writer = [] {
+		const char* value = std::getenv("KYTY_READ_WAIT");
+		return value != nullptr && std::strcmp(value, "writer") == 0;
+	}();
+	return writer || Bisect::ReadWaitWriter();
+}
+
+namespace {
+
+// Round 135: game threads' reads of GPU-written memory (ReadMemory) by the instruction whose fault
+// asked for them (Common::PerfStats::t_fault_pc; 0: not from a fault), with how each went (its
+// first step) and how long the thread was held, and every 10 s the costliest ("Reads of
+// GPU-written memory" lines). Only while the Perf lines are on.
+constexpr size_t kReadOutcomes = 10;
+constexpr size_t kFastRefusals = 9;
+
+constexpr std::array<const char*, kReadOutcomes> kReadOutcomeNames {
+    "?",                             // None
+    "nothing to do",                 // Direct
+    "write bitmap waits",            // Bitmap
+    "lifted",                        // Lifted
+    "lifted once a download landed", // LiftWaited
+    "current already",               // Clean
+    "copied at once",                // Fast
+    "waited for the writer",         // WaitWriter
+    "downloaded",                    // Download
+    "nothing left to download"};     // Nothing
+constexpr std::array<const char*, kFastRefusals> kFastRefusalNames {
+    "?",                       // None
+    "no readback queue",       // Unavailable
+    "a download on its way",   // Downloading
+    "shader address stores",   // Address
+    "writer being recorded",   // Recording
+    "writer on the GPU",       // InFlight
+    "other",                   // Other
+    "nothing to copy at once", // Nothing
+    "too big"};                // TooBig
+
+struct ReadSite {
+	uint64_t                            count      = 0;
+	uint64_t                            ns         = 0;
+	uint64_t                            longest_ns = 0;
+	uint64_t                            last_vaddr = 0;
+	uint32_t                            tid        = 0;
+	std::array<uint64_t, kReadOutcomes> outcomes {};
+	std::array<uint64_t, kReadOutcomes> outcome_ns {};
+	// Downloads by why the fast readback did not copy, and their time.
+	std::array<uint64_t, kFastRefusals> downloads {};
+	std::array<uint64_t, kFastRefusals> download_ns {};
+	uint64_t                            download_bytes = 0;
+	// Downloads whose faulting pages' writer the GPU was running: how many command buffers it
+	// still had to finish before the writer's, and before the download's.
+	uint64_t inflight       = 0;
+	uint64_t writer_ahead   = 0;
+	uint64_t download_ahead = 0;
+	// Downloads a fast readback found nothing to copy for, with ranges left elsewhere in the
+	// window (still being written).
+	uint64_t nothing_left = 0;
+	// Writer waits (readwait:writer) whose next step copied at once.
+	uint64_t writer_then_fast = 0;
+};
+
+struct ReadSiteNote {
+	uint64_t pc             = 0;
+	uint64_t vaddr          = 0;
+	uint64_t ns             = 0;
+	size_t   outcome        = 0;
+	size_t   refusal        = 0;
+	uint64_t bytes          = 0;
+	uint64_t writer_ahead   = 0;
+	uint64_t download_ahead = 0;
+	bool     inflight       = false;
+	bool     left           = false;
+	bool     then_fast      = false;
+};
+
+std::mutex                                                    g_read_sites_mutex;
+std::map<std::string, std::unordered_map<uint64_t, ReadSite>> g_read_sites;
+uint64_t                                                      g_read_sites_since_ns = 0;
+
+// " 1160 reads, 5300 ms (4.57 ms each, longest 14.0): lifted 60 (0.21 ms each), ..."
+std::string DescribeReadOutcomes(const ReadSite& site) {
+	const auto ms   = [](uint64_t ns) { return static_cast<double>(ns) / 1e6; };
+	auto       text = fmt::format(
+        " {} reads, {:.0f} ms ({:.2f} ms each, longest {:.1f}):", site.count, ms(site.ns),
+        site.count == 0 ? 0.0 : ms(site.ns) / static_cast<double>(site.count), ms(site.longest_ns));
+	bool first = true;
+	for (size_t outcome = 1; outcome < kReadOutcomes; outcome++) {
+		const auto count = site.outcomes[outcome];
+		if (count == 0) {
+			continue;
+		}
+		text +=
+		    fmt::format("{} {} {} ({:.2f} ms each)", first ? "" : ",", kReadOutcomeNames[outcome],
+		                count, ms(site.outcome_ns[outcome]) / static_cast<double>(count));
+		first = false;
+		if (outcome == 7 && site.writer_then_fast != 0) {
+			text += fmt::format(" then copied at once {}", site.writer_then_fast);
+		}
+		if (outcome == 8) {
+			// The downloads by why the fast readback did not copy.
+			std::string why;
+			for (size_t refusal = 1; refusal < kFastRefusals; refusal++) {
+				if (site.downloads[refusal] == 0) {
+					continue;
+				}
+				why += fmt::format("{}{} {} ({:.2f} ms each)", why.empty() ? "" : ", ",
+				                   kFastRefusalNames[refusal], site.downloads[refusal],
+				                   ms(site.download_ns[refusal]) /
+				                       static_cast<double>(site.downloads[refusal]));
+			}
+			if (site.inflight != 0) {
+				why += fmt::format(
+				    "; with the writer on the GPU, it had {:.1f} command buffers "
+				    "to finish before the writer's, {:.1f} before the download's",
+				    static_cast<double>(site.writer_ahead) / static_cast<double>(site.inflight),
+				    static_cast<double>(site.download_ahead) / static_cast<double>(site.inflight));
+			}
+			if (site.nothing_left != 0) {
+				why += fmt::format("; {} of them for ranges elsewhere in the window only",
+				                   site.nothing_left);
+			}
+			text += fmt::format(" [{}{:.1f} KB each]", why.empty() ? std::string() : why + "; ",
+			                    static_cast<double>(site.download_bytes) / 1024.0 /
+			                        static_cast<double>(count));
+		}
+	}
+	return text;
+}
+
+std::string DescribeReadSite(uint64_t pc, const ReadSite& site) {
+	return (pc == 0 ? std::string("not from a fault")
+	                : fmt::format("0x{:016x} ({}, at 0x{:x})", pc,
+	                              Common::PerfStats::ThreadNameOf(site.tid), site.last_vaddr)) +
+	       DescribeReadOutcomes(site);
+}
+
+void NoteReadSite(const ReadSiteNote& note) {
+	// The Perf line's configuration (KYTY_BISECT's step, "<step> base" in the A/B's other half):
+	// each has its own counts.
+	auto configuration = Common::PerfStats::Configuration();
+	std::map<std::string, std::unordered_map<uint64_t, ReadSite>> report;
+	uint64_t                                                      seconds_ns = 0;
+	uint64_t                                                      now        = 0;
+	{
+		std::lock_guard lock(g_read_sites_mutex);
+		// Inside the lock: a thread that read the clock before another reported would find the
+		// report's start after its own time.
+		now = StallWatch::NowNs();
+		if (g_read_sites_since_ns == 0) {
+			g_read_sites_since_ns = now;
+		}
+		auto& sites = g_read_sites[std::move(configuration)];
+		if (sites.size() < 4096 || sites.contains(note.pc)) {
+			auto& site = sites[note.pc];
+			site.count++;
+			site.ns += note.ns;
+			site.longest_ns = std::max(site.longest_ns, note.ns);
+			site.last_vaddr = note.vaddr;
+			site.tid        = Common::PerfStats::CurrentOsThreadId();
+			if (note.outcome < kReadOutcomes) {
+				site.outcomes[note.outcome]++;
+				site.outcome_ns[note.outcome] += note.ns;
+			}
+			if (note.outcome == 8 && note.refusal < kFastRefusals) {
+				site.downloads[note.refusal]++;
+				site.download_ns[note.refusal] += note.ns;
+				site.download_bytes += note.bytes;
+				if (note.inflight) {
+					site.inflight++;
+					site.writer_ahead += note.writer_ahead;
+					site.download_ahead += note.download_ahead;
+				}
+				site.nothing_left += note.left ? 1u : 0u;
+			}
+			site.writer_then_fast += note.then_fast ? 1u : 0u;
+		}
+		if (now - g_read_sites_since_ns < 10'000'000'000ull) {
+			return;
+		}
+		seconds_ns = now - g_read_sites_since_ns;
+		report.swap(g_read_sites);
+		g_read_sites_since_ns = now;
+	}
+	for (const auto& [name, sites]: report) {
+		ReadSite                                   total;
+		std::vector<std::pair<uint64_t, ReadSite>> sorted(sites.begin(), sites.end());
+		for (const auto& [pc, site]: sorted) {
+			total.count += site.count;
+			total.ns += site.ns;
+			total.longest_ns = std::max(total.longest_ns, site.longest_ns);
+			for (size_t i = 0; i < kReadOutcomes; i++) {
+				total.outcomes[i] += site.outcomes[i];
+				total.outcome_ns[i] += site.outcome_ns[i];
+			}
+			for (size_t i = 0; i < kFastRefusals; i++) {
+				total.downloads[i] += site.downloads[i];
+				total.download_ns[i] += site.download_ns[i];
+			}
+			total.download_bytes += site.download_bytes;
+			total.inflight += site.inflight;
+			total.writer_ahead += site.writer_ahead;
+			total.download_ahead += site.download_ahead;
+			total.nothing_left += site.nothing_left;
+			total.writer_then_fast += site.writer_then_fast;
+		}
+		std::ranges::sort(sorted,
+		                  [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+		const auto tag = name.empty() ? std::string() : " [" + name + "]";
+		LOGF("Reads of GPU-written memory (%.0f s)%s: %zu instructions,%s\n",
+		     static_cast<double>(seconds_ns) / 1e9, tag.c_str(), sorted.size(),
+		     DescribeReadOutcomes(total).c_str());
+		for (size_t i = 0; i < std::min<size_t>(sorted.size(), 6); i++) {
+			LOGF("Reads of GPU-written memory #%zu%s: %s\n", i + 1, tag.c_str(),
+			     DescribeReadSite(sorted[i].first, sorted[i].second).c_str());
+		}
+	}
+}
+
+} // namespace
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	KYTY_PROFILER_FUNCTION();
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
@@ -820,6 +1055,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	static_assert(static_cast<size_t>(ReadOutcome::Count) == kReadOutcomes);
+	static_assert(static_cast<size_t>(FastRefusal::Count) == kFastRefusals);
+	static_assert(static_cast<size_t>(ReadOutcome::WaitWriter) == 7 &&
+	              static_cast<size_t>(ReadOutcome::Download) == 8);
 	const bool from_gpu_thread = GuestGpu::IsGpuThread();
 	const bool async           = g_async_readback && !from_gpu_thread;
 	// KYTY_PERF: what a game thread's access waits for (the "Perf GPU:" line).
@@ -829,57 +1068,105 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
                                          std::chrono::steady_clock::now().time_since_epoch())
 		                                  .count());
 	};
-	uint64_t pickup_ns    = 0;
-	uint64_t record_ns    = 0;
-	uint64_t wait_ns      = 0;
-	uint64_t ticks_behind = 0;
-	uint32_t steps        = 0;
-	bool     fast         = false; // a fast readback copied its bytes (FastReadback)
+	const auto started      = measure ? now_ns() : 0;
+	uint64_t   pickup_ns    = 0;
+	uint64_t   record_ns    = 0;
+	uint64_t   wait_ns      = 0;
+	uint64_t   ticks_behind = 0;
+	uint32_t   steps        = 0;
+	bool       fast         = false; // a fast readback copied its bytes (FastReadback)
+	// Round 135: what the first step did, for the counts by instruction, and whether a writer
+	// wait (readwait:writer, once a read) may be asked for.
+	bool         writer_wait = async && ReadWaitWriter();
+	ReadSiteNote note;
+	note.pc    = Common::PerfStats::t_fault_pc;
+	note.vaddr = vaddr;
 	for (;;) {
-		uint64_t   wait_tick = 0;
-		uint64_t   taken_up  = 0;
-		uint64_t   recorded  = 0;
-		uint64_t   behind    = 0;
-		const auto sent      = measure ? now_ns() : 0;
-		m_scheduler.Context().GetGpu().SendCommandSync(
-		    [this, vaddr, size, is_write, from_gpu_thread, async, measure, &now_ns, &wait_tick,
-		     &taken_up, &recorded, &behind, &fast] {
-			    if (measure) {
-				    taken_up     = now_ns();
-				    auto& master = m_scheduler.GetMasterSemaphore();
-				    master.Refresh();
-				    const auto current = m_scheduler.CurrentTick();
-				    const auto done    = master.KnownGpuTick();
-				    behind             = current > done ? current - done - 1 : 0;
-			    }
-			    wait_tick = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async);
-			    fast      = fast || std::exchange(m_fast_step, false);
-			    if (measure) {
-				    recorded = now_ns();
-			    }
-		    });
+		// What a step did, filled on the GPU thread.
+		struct Step {
+			uint64_t    wait_tick = 0;
+			uint64_t    taken_up  = 0;
+			uint64_t    recorded  = 0;
+			uint64_t    behind    = 0;
+			ReadOutcome outcome   = ReadOutcome::None;
+			FastRefusal refusal   = FastRefusal::None;
+			uint64_t    bytes     = 0;
+			uint64_t    writer    = 0; // the refused writer's tick
+			uint64_t    current   = 0;
+			uint64_t    known     = 0;
+			uint32_t    left      = 0;
+		} step;
+		const auto sent = measure ? now_ns() : 0;
+		m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write,
+		                                                from_gpu_thread, async, measure,
+		                                                writer_wait, &now_ns, &step, &fast] {
+			if (measure) {
+				step.taken_up = now_ns();
+				auto& master  = m_scheduler.GetMasterSemaphore();
+				master.Refresh();
+				const auto current = m_scheduler.CurrentTick();
+				const auto done    = master.KnownGpuTick();
+				step.behind        = current > done ? current - done - 1 : 0;
+			}
+			m_step_bytes = 0;
+			step.wait_tick =
+			    ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async, writer_wait);
+			fast         = fast || std::exchange(m_fast_step, false);
+			step.outcome = m_step_outcome;
+			step.refusal = m_fast_refusal;
+			step.bytes   = m_step_bytes;
+			step.writer  = m_fast_refused_tick;
+			step.current = m_fast_current_tick;
+			step.known   = m_fast_known_tick;
+			step.left    = m_fast_left;
+			if (measure) {
+				step.recorded = now_ns();
+			}
+		});
 		if (measure) {
-			pickup_ns += taken_up - sent;
-			record_ns += recorded - taken_up;
+			pickup_ns += step.taken_up - sent;
+			record_ns += step.recorded - step.taken_up;
 			if (steps == 0) {
-				ticks_behind = behind;
+				ticks_behind = step.behind;
 			}
 		}
+		if (steps == 0) {
+			note.outcome = static_cast<size_t>(step.outcome);
+			note.refusal = static_cast<size_t>(step.refusal);
+			note.bytes   = step.bytes;
+			if (step.refusal == FastRefusal::InFlight && step.writer > step.known) {
+				note.inflight       = true;
+				note.writer_ahead   = step.writer - step.known;
+				note.download_ahead = step.current > step.known ? step.current - step.known : 0;
+			}
+			note.left = step.refusal == FastRefusal::Nothing && step.left != 0;
+		} else if (steps == 1 && note.outcome == static_cast<size_t>(ReadOutcome::WaitWriter)) {
+			note.then_fast = step.outcome == ReadOutcome::Fast;
+		}
 		steps++;
-		if (wait_tick == 0) {
+		if (step.wait_tick == 0) {
 			break;
 		}
 		const auto wait_from  = measure ? now_ns() : 0;
 		const auto known      = m_scheduler.GetMasterSemaphore().KnownGpuTick();
 		const auto stall_from = StallWatch::NowNs();
-		m_scheduler.WaitPriorityOperations(wait_tick);
-		m_scheduler.OnWaited(wait_tick, known, StallWatch::NowNs() - stall_from);
+		if (step.outcome == ReadOutcome::WaitWriter) {
+			// The writer's command buffer, submitted already; then the read asks again, its
+			// bytes now final (one such wait a read).
+			writer_wait = false;
+			m_scheduler.GetMasterSemaphore().Wait(step.wait_tick);
+		} else {
+			m_scheduler.WaitPriorityOperations(step.wait_tick);
+		}
+		m_scheduler.OnWaited(step.wait_tick, known, StallWatch::NowNs() - stall_from);
 		if (measure) {
 			wait_ns += now_ns() - wait_from;
 		}
 	}
 	if (measure) {
 		Common::PerfStats::AddReadback(pickup_ns, record_ns, wait_ns, steps, ticks_behind);
+		note.ns = now_ns() - started;
+		NoteReadSite(note);
 	}
 	if (!from_gpu_thread) {
 		// A fast readback's bytes were not in memory yet either.
@@ -1010,6 +1297,13 @@ struct FastReadbackReport {
 
 bool BufferCache::FastReadback(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t window_begin,
                                uint64_t window_end, bool is_write) {
+	// Round 135: why nothing was copied, for ReadMemoryStep (readwait:writer) and the counts.
+	m_fast_refusal      = FastRefusal::Unavailable;
+	m_fast_writer_tick  = 0;
+	m_fast_left         = 0;
+	m_fast_refused_tick = 0;
+	m_fast_current_tick = 0;
+	m_fast_known_tick   = 0;
 	if (m_readback_queue == nullptr || !m_readback_queue->Available() || !FastReadbackEnabled() ||
 	    window_end <= window_begin) {
 		return false;
@@ -1040,18 +1334,22 @@ bool BufferCache::FastReadback(Buffer& buffer, uint64_t vaddr, uint64_t size, ui
 		if (m_downloading_ranges.Intersects(page_begin, page_end - page_begin) ||
 		    (!writebacks.empty() && under_writeback(page_begin, page_end))) {
 			stats.downloading++;
+			m_fast_refusal = FastRefusal::Downloading;
 			return false;
 		}
 	}
 	auto& master = m_scheduler.GetMasterSemaphore();
 	master.Refresh();
-	const auto known   = master.KnownGpuTick();
-	const auto current = m_scheduler.CurrentTick();
+	const auto known    = master.KnownGpuTick();
+	const auto current  = m_scheduler.CurrentTick();
+	m_fast_current_tick = current;
+	m_fast_known_tick   = known;
 	if (m_address_write_tick > known && !Bisect::FastReadbackAnyAddress()) {
 		// A command still on the GPU stores through shader addresses, which mark no range: these
 		// bytes may be among its stores, which a download behind it takes. (KYTY_BISECT's
 		// fastread:any copies anyway, to measure what this costs.)
 		stats.address++;
+		m_fast_refusal = FastRefusal::Address;
 		return false;
 	}
 
@@ -1066,6 +1364,11 @@ bool BufferCache::FastReadback(Buffer& buffer, uint64_t vaddr, uint64_t size, ui
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total = 0;
 	uint64_t                    left  = 0;
+	// Round 135: the faulting pages' refused ranges: the latest writer tick among them, the
+	// latest among those the GPU is running, and whether one was refused for another reason.
+	uint64_t faulting_tick     = 0;
+	uint64_t faulting_inflight = 0;
+	bool     faulting_blocked  = false;
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    window_begin, window_end - window_begin, [&](uint64_t address, uint64_t bytes) noexcept {
 		    std::shared_lock lock(m_dirty_ranges_mutex);
@@ -1089,6 +1392,14 @@ bool BufferCache::FastReadback(Buffer& buffer, uint64_t vaddr, uint64_t size, ui
 				    return;
 			    }
 			    const bool faulting = start < page_end && end > page_begin;
+			    if (faulting) {
+				    faulting_tick = std::max(faulting_tick, tick);
+				    if (reason == Refusal::InFlight) {
+					    faulting_inflight = std::max(faulting_inflight, tick);
+				    } else {
+					    faulting_blocked = true;
+				    }
+			    }
 			    const bool bitmap =
 			        m_write_bitmap != nullptr && m_bitmap_tracked.Intersects(start, end - start);
 			    if (refusal == Refusal::None && (faulting || reason == Refusal::Other)) {
@@ -1099,19 +1410,40 @@ bool BufferCache::FastReadback(Buffer& buffer, uint64_t vaddr, uint64_t size, ui
 			    left++;
 		    });
 	    });
+	m_fast_refused_tick = faulting_tick;
 	switch (refusal) {
 		case Refusal::None: break;
-		case Refusal::Recording: stats.recording++; return false;
-		case Refusal::InFlight: stats.in_flight++; return false;
-		case Refusal::Downloading: stats.downloading++; return false;
-		case Refusal::Other: stats.other++; return false;
+		case Refusal::Recording:
+			stats.recording++;
+			m_fast_refusal = FastRefusal::Recording;
+			return false;
+		case Refusal::InFlight:
+			stats.in_flight++;
+			m_fast_refusal = FastRefusal::InFlight;
+			// Only unfinished writers on the faulting pages: once the GPU has run the latest of
+			// them, the next try can copy (readwait:writer).
+			if (!faulting_blocked && faulting_inflight > known && faulting_inflight < current) {
+				m_fast_writer_tick = faulting_inflight;
+			}
+			return false;
+		case Refusal::Downloading:
+			stats.downloading++;
+			m_fast_refusal = FastRefusal::Downloading;
+			return false;
+		case Refusal::Other:
+			stats.other++;
+			m_fast_refusal = FastRefusal::Other;
+			return false;
 	}
 	if (copies.empty()) {
 		stats.nothing++;
+		m_fast_refusal = FastRefusal::Nothing;
+		m_fast_left    = static_cast<uint32_t>(std::min<uint64_t>(left, UINT32_MAX));
 		return false;
 	}
 	if (total > m_readback_queue->Capacity()) {
 		stats.too_big++;
+		m_fast_refusal = FastRefusal::TooBig;
 		return false;
 	}
 	// After every tick the GPU is known to have finished, not only the copied ranges' writers (all
@@ -1121,6 +1453,7 @@ bool BufferCache::FastReadback(Buffer& buffer, uint64_t vaddr, uint64_t size, ui
 	const uint8_t* bytes = m_readback_queue->Copy(buffer.Handle(), copies, total, known, waited_ns);
 	if (bytes == nullptr) {
 		stats.other++;
+		m_fast_refusal = FastRefusal::Other;
 		return false;
 	}
 	// Into guest memory, as a download's publication puts them (DownloadBufferCopies).
@@ -1164,7 +1497,8 @@ bool BufferCache::FastReadback(Buffer& buffer, uint64_t vaddr, uint64_t size, ui
 	if (is_write) {
 		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 	}
-	m_fast_step = true;
+	m_fast_step    = true;
+	m_fast_refusal = FastRefusal::None;
 	stats.done++;
 	stats.bytes += total;
 	stats.wait_ns += waited_ns;
@@ -1175,7 +1509,9 @@ bool BufferCache::FastReadback(Buffer& buffer, uint64_t vaddr, uint64_t size, ui
 }
 
 uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
-                                     bool from_gpu_thread, bool async) {
+                                     bool from_gpu_thread, bool async, bool writer_wait) {
+	m_step_outcome = ReadOutcome::Direct;
+	m_fast_refusal = FastRefusal::None;
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return 0;
 	}
@@ -1222,13 +1558,57 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 	// labels.
 	// GPU write bitmap: pages of tracked bindings the GPU did not write lose their GPU-written
 	// bytes here, so the window below downloads only what was written, or nothing.
-	if (uint64_t wait_tick = 0; RefineWithWriteBitmap(buffer, vaddr, size, async, wait_tick)) {
-		return wait_tick;
-	}
 	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
-	if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin) &&
-	    !HasGpuDirtyBytes(page_begin, page_end - page_begin)) {
+	const bool page_gpu   = m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin);
+	// Round 135: the pages are neither GPU-written for the tracker nor hold GPU-written bytes,
+	// bytes of a download on its way or bytes an image write-back still to land puts there:
+	// another thread's read of the window made them current between this fault and this step
+	// (game threads read the same results at the same time: "nothing to copy at once" was a
+	// fifth of the fast readbacks in a race). The access needs nothing. Before, the window's
+	// other GPU-written ranges were downloaded behind the renderer's queue and waited for, though
+	// they were not this access's (KYTY_CLEAN_PAGE=old, cleanpage:old). Before the write
+	// bitmap's refinement, which takes the window's written pages as downloaded.
+	if (!page_gpu && !CleanPageOld()) {
+		bool busy = false;
+		{
+			std::shared_lock lock(m_dirty_ranges_mutex);
+			busy = HasGpuDirtyBytes(page_begin, page_end - page_begin) ||
+			       m_downloading_ranges.Intersects(page_begin, page_end - page_begin);
+		}
+		if (!busy) {
+			const auto writebacks = m_texture_cache.PendingWriteBacks();
+			busy =
+			    std::ranges::any_of(writebacks, [&](const std::pair<uint64_t, uint64_t>& pending) {
+				    return pending.first < page_end && page_begin < pending.first + pending.second;
+			    });
+		}
+		if (!busy) {
+			if (!from_gpu_thread && ReadaheadEnabled()) {
+				// As the lifted pages below: the window's blocks stay learned while game threads
+				// keep reading them.
+				LearnReadahead(page_begin, page_end, true);
+			}
+			if (is_write) {
+				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			}
+			m_step_outcome = ReadOutcome::Clean;
+			static std::atomic<uint64_t> clean {0};
+			if (const auto n = clean.fetch_add(1, std::memory_order_relaxed) + 1;
+			    std::has_single_bit(n) && n >= 64) {
+				LOGF("ReadMemory: %" PRIu64 " faults on pages another read had made current went "
+				     "on at once (round 135; cleanpage:old waits as before)\n",
+				     n);
+			}
+			return 0;
+		}
+	}
+	if (uint64_t wait_tick = 0; RefineWithWriteBitmap(buffer, vaddr, size, async, wait_tick)) {
+		m_step_outcome = ReadOutcome::Bitmap;
+		return wait_tick;
+	}
+	if (page_gpu && !HasGpuDirtyBytes(page_begin, page_end - page_begin)) {
+		m_step_outcome = ReadOutcome::Lifted;
 		// An asynchronous readback of these bytes may not be in guest memory yet: the access
 		// must not see the older bytes, so it waits for that publication first.
 		bool downloading = false;
@@ -1249,6 +1629,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 				}
 			}
 			if (async) {
+				m_step_outcome = ReadOutcome::LiftWaited;
 				return m_last_async_download_tick;
 			}
 			m_scheduler.WaitPriorityOperations(m_last_async_download_tick);
@@ -1324,6 +1705,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 	    from_gpu_thread && m_gpu_thread_fast_reads && !Bisect::FlipCheckOld();
 	if ((async || gpu_thread_fast) &&
 	    FastReadback(buffer, vaddr, size, window_begin, window_end, is_write)) {
+		m_step_outcome = ReadOutcome::Fast;
 		if (gpu_thread_fast) {
 			static std::atomic<uint64_t> fast_reads {0};
 			const auto                   n = fast_reads.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1335,17 +1717,48 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 		}
 		return 0;
 	}
+	// Round 135 (KYTY_READ_WAIT=writer, readwait:writer): the faulting pages' bytes are only
+	// waiting for writers the GPU is running: the caller waits for the latest one's command
+	// buffer, which the GPU runs before the ones recorded since, and asks again; its bytes are
+	// then copied at once. A download here would come after all of those.
+	// Not with pages the write bitmap tracks in the window: the refinement above took their
+	// written pages as downloaded with it, so they are downloaded now.
+	if (async && writer_wait && m_fast_refusal == FastRefusal::InFlight &&
+	    m_fast_writer_tick != 0 && [&] {
+		    std::shared_lock lock(m_dirty_ranges_mutex);
+		    return m_write_bitmap == nullptr ||
+		           !m_bitmap_tracked.Intersects(window_begin, window_end - window_begin);
+	    }()) {
+		m_step_outcome = ReadOutcome::WaitWriter;
+		return m_fast_writer_tick;
+	}
+	// The downloads game threads wait for, by writer (the fast readbacks are not among them),
+	// with the bytes downloaded (round 135; the window's size before), and the time and the GPU's
+	// progress from before the download (a synchronous one, or a ring that wraps, waits).
+	uint64_t report_known = 0;
+	uint64_t report_ns    = 0;
 	if (!from_gpu_thread) {
-		// The downloads game threads wait for, by writer (the fast readbacks are not among them).
 		auto& master = m_scheduler.GetMasterSemaphore();
 		master.Refresh();
-		ReportGameThreadDownload(vaddr, window_end - window_begin, master.KnownGpuTick());
+		report_known = master.KnownGpuTick();
+		report_ns    = StallWatch::NowNs();
 	}
+	const auto report_download = [&](uint64_t bytes) {
+		if (!from_gpu_thread) {
+			ReportGameThreadDownload(vaddr, bytes, report_known, report_ns);
+		}
+	};
+	uint64_t downloaded = 0;
+	m_step_outcome      = ReadOutcome::Nothing;
 	if (async) {
 		// The download publishes when its tick completes; the page stays protected until the
 		// caller's next step finds its bytes downloaded and lifts it.
 		auto tick = m_scheduler.CurrentTick();
-		if (DownloadBufferMemory<true>(buffer, window_begin, window_end - window_begin)) {
+		if (DownloadBufferMemory<true>(buffer, window_begin, window_end - window_begin,
+		                               &downloaded)) {
+			m_step_outcome = ReadOutcome::Download;
+			m_step_bytes   = downloaded;
+			report_download(downloaded);
 			// The tick of the last copy, not of the first: a download ring that wraps within this
 			// recording submits it (StreamBuffer::WaitPendingOperations), and the later copies
 			// and their publication then land in the next tick. A caller waiting for the earlier
@@ -1361,7 +1774,11 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 			m_last_async_download_tick = std::max(m_last_async_download_tick, tick);
 			return tick;
 		}
-	} else if (DownloadBufferMemory<false>(buffer, window_begin, window_end - window_begin)) {
+	} else if (DownloadBufferMemory<false>(buffer, window_begin, window_end - window_begin,
+	                                       &downloaded)) {
+		m_step_outcome = ReadOutcome::Download;
+		m_step_bytes   = downloaded;
+		report_download(downloaded);
 		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 	}
 	if (is_write) {
@@ -1600,6 +2017,14 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
                                     bool is_texel_buffer) {
 	KYTY_PROFILER_FUNCTION();
 	const GpuPhases::Scope phase(GpuPhases::Phase::BufferSync);
+	// Most calls (~22k a frame in a race) read a range whose tracker regions are all clean: what
+	// ForEachUploadRange finds for it is nothing to copy. Answer from the lock-free summary bitmap
+	// without the protection defer scope, the copy list, the lambdas and their profiler zones.
+	if (!is_written && !is_texel_buffer && g_tracker_skip_clean && g_tracker_bitmap &&
+	    m_memory_tracker.IsRangeCpuCleanHint(vaddr, size)) {
+		RecordSync(size, false, false, 0.0);
+		return false;
+	}
 	// Timing every call cost ~2 % of the GPU thread (two performance-counter reads); SyncStats
 	// times the tracker walk only with KYTY_SYNC_STATS=1.
 	static const bool timed = std::getenv("KYTY_SYNC_STATS") != nullptr;
@@ -2062,9 +2487,9 @@ std::string BufferCache::GpuWritersOf(uint64_t vaddr, uint64_t size) {
 	return text;
 }
 
-void BufferCache::ReportGameThreadDownload(uint64_t vaddr, uint64_t bytes, uint64_t done_tick) {
+void BufferCache::ReportGameThreadDownload(uint64_t vaddr, uint64_t bytes, uint64_t done_tick,
+                                           uint64_t now) {
 	Common::PerfStats::AddDownload(bytes);
-	const auto       now = StallWatch::NowNs();
 	std::lock_guard  lock(g_writers_mutex);
 	uint64_t         shader = UINT64_MAX; // no record
 	const GpuWriter* writer = nullptr;
@@ -2700,6 +3125,10 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
+}
+
+bool BufferCache::AddressWritesInFlight() {
+	return m_address_write_tick != 0 && !m_scheduler.IsFree(m_address_write_tick);
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {

@@ -109,6 +109,12 @@ public:
 	                          uint64_t& end);
 	static void SetGpuTimesForTests(GpuTimes times);
 
+	// Round 135, the reporter thread (the Perf GPU line): the host GPU's work on this timeline
+	// since the last call, from its command buffers' timestamps: how much of that time it ran one
+	// of them, their GPU time, the gaps between them, and how long they took from their hand-over
+	// to their submission (the recording thread). Empty when there is nothing to tell.
+	[[nodiscard]] std::string BusyText();
+
 private:
 	static constexpr uint64_t Slots      = 8192;
 	static constexpr size_t   MaxShaders = 4;
@@ -151,9 +157,12 @@ private:
 	std::string         m_name;
 	vk::QueryPool       m_pool      = nullptr;
 	double              m_period_ns = 1.0;
-	mutable std::mutex  m_mutex; // m_records, m_last_closed
+	mutable std::mutex  m_mutex; // m_records, m_last_closed, m_busy_*
 	std::vector<Record> m_records;
 	uint64_t            m_last_closed = 0;
+	// BusyText: the last tick it counted, and that command buffer's GPU end.
+	uint64_t m_busy_tick = 0;
+	uint64_t m_busy_end  = 0;
 	// The owner's command buffer in progress.
 	Content  m_open;
 	uint64_t m_open_tick = 0;

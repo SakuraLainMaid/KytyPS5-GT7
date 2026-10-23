@@ -1067,7 +1067,9 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::SuspendPoint:
 			FrameGraph::OnFrameBoundary(m_renderer.GetBufferCache());
 			m_renderer.GetTextureCache().TraceFrameEnd();
-			cp.EmitGlobalBarrier();
+			if (GlobalPm4Barriers()) {
+				cp.EmitGlobalBarrier();
+			}
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
 			    [ready = m_suspend_point_ready] { ready->release(); });
 			cp.BufferFlush();
@@ -1918,6 +1920,19 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 	                 interrupt_context_id);
 }
 
+bool GuestGpu::GlobalPm4Barriers() {
+	static const bool whole_run = [] {
+		const char* value = std::getenv("KYTY_PM4_BARRIERS");
+		const bool  on    = value != nullptr && std::strcmp(value, "global") == 0;
+		LOGF("PM4 barriers: %s (KYTY_PM4_BARRIERS=global, or KYTY_BISECT's barriers:global, for "
+		     "the full barriers of before round 135)\n",
+		     on ? "a full barrier at each cache flush, RELEASE_MEM and suspend point"
+		        : "the renderer's resource barriers only");
+		return on;
+	}();
+	return whole_run || Bisect::GlobalPm4Barriers();
+}
+
 void CommandProcessor::EmitGlobalBarrier() {
 	const RendererLock lock(m_renderer.GetMutex());
 
@@ -1949,21 +1964,22 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 	}
 
 	const auto valid_cache_event_index = event_index == 0x00000000 || event_index == 0x00000007;
+	// Partial flushes and cache writebacks only order GPU work, which the renderer's resource
+	// barriers already order (mainline 70668fbd; KYTY_PM4_BARRIERS=global records the full
+	// barrier of before).
 	switch (event_type) {
 		// CsPartialFlush, GsPartialFlush, PsPartialFlush.
 		case 0x00000007:
 		case 0x0000000f:
-		case 0x00000010: EmitGlobalBarrier(); break;
-		// CbDbDataWritebackInvalidate, CbDataWritebackInvalidate.
+		case 0x00000010:
+			if (GuestGpu::GlobalPm4Barriers()) {
+				EmitGlobalBarrier();
+			}
+			break;
+		// CbDbDataWritebackInvalidate, CbDataWritebackInvalidate, DbDataWritebackInvalidate,
+		// DbMetadataWritebackInvalidate, CbMetadataWritebackInvalidate.
 		case 0x00000016:
 		case 0x00000031:
-			if (!valid_cache_event_index) {
-				EXIT("unknown event type: 0x%08" PRIx32 ", 0x%08" PRIx32 "\n", event_type,
-				     event_index);
-			}
-			EmitGlobalBarrier();
-			break;
-		// DbDataWritebackInvalidate, DbMetadataWritebackInvalidate, CbMetadataWritebackInvalidate.
 		case 0x0000002a:
 		case 0x0000002c:
 		case 0x0000002e:
@@ -1971,7 +1987,9 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				EXIT("unknown event type: 0x%08" PRIx32 ", 0x%08" PRIx32 "\n", event_type,
 				     event_index);
 			}
-			EmitGlobalBarrier();
+			if (GuestGpu::GlobalPm4Barriers()) {
+				EmitGlobalBarrier();
+			}
 			break;
 		case 0x0000000d:
 		case 0x0000000e:

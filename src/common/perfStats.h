@@ -90,6 +90,10 @@ inline void AddFault(uint64_t nanoseconds, bool read, bool emulated) {
 		Detail::AddFaultSlow(nanoseconds, read, emulated);
 	}
 }
+// Round 135: the guest instruction whose access fault the calling thread is handling (the
+// exception handler sets it around the graphics side's handling), 0 outside one: the reads of
+// GPU-written memory are counted by instruction (BufferCache::ReadMemory).
+inline thread_local uint64_t t_fault_pc = 0;
 // A game thread's access to GPU-written memory that went through the GPU thread
 // (BufferCache::ReadMemory): the time until the GPU thread took the request up and the time it
 // spent on it (all its steps), the time the access then waited for downloads to land, the steps,

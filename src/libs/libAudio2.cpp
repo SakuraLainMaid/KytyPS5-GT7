@@ -187,6 +187,8 @@ struct AudioOut2PortStateEntry {
 	bool                   used          = false;
 	AudioOut2PortHandle    handle        = 0;
 	AudioOut2ContextHandle context       = 0;
+	// The context's slot (g_audioout2_contexts), whose output mutex a push of the context holds.
+	size_t                 context_slot  = 0;
 	AudioOut2UserHandle    user          = 0;
 	uint16_t               port_type     = 0;
 	uint32_t               data_format   = 0;
@@ -221,8 +223,10 @@ struct AudioOut2LatencyState {
 static Common::Mutex                              g_audioout2_context_mutex;
 static std::array<AudioOut2ContextState, 16>      g_audioout2_contexts;
 static Common::Mutex                              g_audioout2_port_mutex;
-// Held while a push outputs copies of the ports' PCM, and to close a port's handle.
-static Common::Mutex                              g_audioout2_output_mutex;
+// One per context slot: held while a push of that context outputs copies of its ports' PCM, and
+// waited on before closing that context's handles. Per context, so a push pacing in the backend
+// does not stall the other contexts (mainline b46eeb78, #1745).
+static std::array<Common::Mutex, 16> g_audioout2_output_mutexes;
 // Room for a context with 512 object ports (the music) and its other ports. A port's handle holds
 // its slot in the low bits (AUDIOOUT2_PORT_SLOT_BITS), so finding it takes no search: the game's
 // mixer sets every port's attributes for every grain.
@@ -262,6 +266,10 @@ static AudioOut2ContextState* audioout2_find_context_locked(AudioOut2ContextHand
 	}
 
 	return nullptr;
+}
+
+static Common::Mutex& audioout2_output_mutex(const AudioOut2ContextState& context) {
+	return g_audioout2_output_mutexes[&context - g_audioout2_contexts.data()];
 }
 
 static uint32_t audioout2_grain_micros(uint32_t grains) {
@@ -431,12 +439,13 @@ static void audioout2_mix_object(float* mix, uint32_t frames,
 	}
 }
 
-static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking) {
+static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, Common::Mutex& output_mutex,
+                                          bool blocking) {
 	// The backend consumes the buffers synchronously, but can block while pacing SDL's queue
 	// (a grain, or up to 200 ms while it drains). The PCM is copied out under the port lock, so
 	// the game's mixer, which hands over the next buffers through PortSetAttributes, is not held
-	// for that time: it produced audio at ~60 % of real time in the jungle. The output lock keeps
-	// the port handles open until the backend returns.
+	// for that time: it produced audio at ~60 % of real time in the jungle. The context's output
+	// lock keeps its port handles open until the backend returns, without stalling other contexts.
 	// The object ports (round 114: they were dropped, and with them the music) are mixed into one
 	// stereo grain under the port lock and output on the context's object output after the others.
 	thread_local std::vector<std::vector<uint8_t>>         buffers;
@@ -445,7 +454,7 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 	thread_local std::vector<AudioInternal::OutputParam> params;
 	params.clear();
 
-	Common::LockGuard output_lock(g_audioout2_output_mutex);
+	Common::LockGuard output_lock(output_mutex);
 	int               object_handle = 0;
 	uint32_t          grains        = 512;
 	{
@@ -499,8 +508,8 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 
 static void audioout2_close_audio_handle(int audio_handle) {
 	if (audio_handle > 0) {
-		// Not while a push still outputs through the handle (see audioout2_queue_context_audio).
-		Common::LockGuard output_lock(g_audioout2_output_mutex);
+		// A published handle is closed only after taking it out of the tables and waiting on its
+		// context's output mutex (see audioout2_queue_context_audio).
 		AudioInternal::AudioOutClose(audio_handle);
 	}
 }
@@ -602,7 +611,8 @@ int KYTY_SYSV_ABI AudioOut2ContextDestroy(AudioOut2ContextHandle ctx) {
 	size_t                                   audio_handles_num = 0;
 
 	g_audioout2_context_mutex.Lock();
-	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
+	auto* state = audioout2_find_context_locked(ctx);
+	if (state != nullptr) {
 		if (state->object_audio_handle > 0) {
 			audio_handles[audio_handles_num++] = state->object_audio_handle;
 		}
@@ -621,6 +631,10 @@ int KYTY_SYSV_ABI AudioOut2ContextDestroy(AudioOut2ContextHandle ctx) {
 	}
 	g_audioout2_port_mutex.Unlock();
 
+	if (state != nullptr) {
+		// Wait for an in-flight push that may still use the handles.
+		Common::LockGuard wait(audioout2_output_mutex(*state));
+	}
 	for (size_t i = 0; i < audio_handles_num; i++) {
 		audioout2_close_audio_handle(audio_handles[i]);
 	}
@@ -724,9 +738,10 @@ static int audioout2_push_device_queue(AudioOut2ContextHandle ctx, uint32_t bloc
 			state->queued++;
 			const auto depth = state->queue_depth;
 			const auto grain = state->num_grains;
+			auto&      output_mutex = audioout2_output_mutex(*state);
 			g_audioout2_context_mutex.Unlock();
 			// The level paces the pushes: the device takes the grain at once.
-			audioout2_queue_context_audio(ctx, device_us < 0 && blocking != 0);
+			audioout2_queue_context_audio(ctx, output_mutex, device_us < 0 && blocking != 0);
 			// A blocking push returns once the queue has room for the next grain. The game's pushing
 			// thread wakes the mixer right after each push, and the mixer renders only when it sees
 			// room: returning with the queue full left the mixer asleep until the next frame woke
@@ -777,8 +792,9 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 				if (state->queued < state->queue_depth) {
 					state->queued++;
 				}
+				auto& output_mutex = audioout2_output_mutex(*state);
 				g_audioout2_context_mutex.Unlock();
-				audioout2_queue_context_audio(ctx, blocking != 0);
+				audioout2_queue_context_audio(ctx, output_mutex, blocking != 0);
 				return OK;
 			}
 		}
@@ -871,6 +887,7 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 		port_state->used          = true;
 		port_state->handle        = next_port;
 		port_state->context       = ctx;
+		port_state->context_slot = static_cast<size_t>(context_state - g_audioout2_contexts.data());
 		port_state->user          = params->user_handle;
 		port_state->port_type     = params->port_type;
 		port_state->data_format   = params->data_format;
@@ -924,14 +941,21 @@ int KYTY_SYSV_ABI AudioOut2PortDestroy(AudioOut2PortHandle port) {
 	PRINT_NAME();
 	LOGF("\t port = 0x%016" PRIx64 "\n", port);
 
-	int audio_handle = 0;
+	int    audio_handle = 0;
+	size_t context_slot = 0;
 	g_audioout2_port_mutex.Lock();
 	if (auto* state = audioout2_find_port_locked(port); state != nullptr) {
 		audio_handle = state->audio_handle;
+		context_slot = state->context_slot;
 		*state       = AudioOut2PortStateEntry {};
 	}
 	g_audioout2_port_mutex.Unlock();
 
+	if (audio_handle > 0 && context_slot < g_audioout2_output_mutexes.size()) {
+		// Wait for an in-flight push that may still use the handle: its context's slot, also when
+		// the context was destroyed meanwhile (a push of it may still be outputting).
+		Common::LockGuard wait(g_audioout2_output_mutexes[context_slot]);
+	}
 	audioout2_close_audio_handle(audio_handle);
 
 	return OK;

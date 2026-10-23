@@ -181,8 +181,7 @@ bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 		if (g_tracker_skip_clean && !manager->MaybeModified<DirtySource::Cpu>()) {
 			return false;
 		}
-		std::scoped_lock lock(manager->lock);
-		return manager->IsModified<DirtySource::Cpu>(offset, bytes);
+		return manager->IsModifiedUnlocked<DirtySource::Cpu>(offset, bytes);
 	});
 }
 
@@ -192,8 +191,7 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 		if (g_tracker_skip_clean && !manager->MaybeModified<DirtySource::Gpu>()) {
 			return false;
 		}
-		std::scoped_lock lock(manager->lock);
-		return manager->IsModified<DirtySource::Gpu>(offset, bytes);
+		return manager->IsModifiedUnlocked<DirtySource::Gpu>(offset, bytes);
 	});
 }
 
@@ -287,6 +285,9 @@ void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		if (!manager->IsModifiedUnlocked<DirtySource::Gpu>(offset, bytes)) {
+			return;
+		}
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Gpu, false>(manager->GetCpuAddr() + offset, bytes);
 	});

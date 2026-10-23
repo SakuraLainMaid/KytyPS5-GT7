@@ -121,6 +121,22 @@ std::string MemoryText() {
 	return g_memory_text;
 }
 
+// The Perf GPU line's end: the video memory figures, then the host GPU's work on the renderer's
+// timeline since the last line (round 135, Timeline::BusyText).
+std::string ExtraText() {
+	auto text = MemoryText();
+	// The registry's lock keeps the timeline alive through its call (a timeline leaves the
+	// registry in its destructor).
+	std::scoped_lock lock(g_registry_mutex);
+	for (auto* timeline: g_registry) {
+		if (timeline->Name() == "render") {
+			text += timeline->BusyText();
+			break;
+		}
+	}
+	return text;
+}
+
 } // namespace
 
 void UpdateMemoryText(const GraphicContext& graphics) {
@@ -158,7 +174,7 @@ void UpdateMemoryText(const GraphicContext& graphics) {
 		g_memory_text = std::move(text);
 	}
 	static std::once_flag registered;
-	std::call_once(registered, [] { Common::PerfStats::SetExtraReporter(&MemoryText); });
+	std::call_once(registered, [] { Common::PerfStats::SetExtraReporter(&ExtraText); });
 }
 
 bool Enabled() {
@@ -356,6 +372,151 @@ void Timeline::Collect(uint64_t first, uint64_t last, std::vector<Row>& rows) co
 		}
 		latest_begin = row.gpu_begin;
 	}
+}
+
+std::string Timeline::BusyText() {
+	if (!m_pool || !Enabled()) {
+		return {};
+	}
+	// The command buffers closed since the last call (at most what the ring still holds), with
+	// their hand-over and submission times.
+	struct Brief {
+		uint64_t tick      = 0;
+		uint64_t closed_ns = 0;
+		uint64_t queued_ns = 0;
+	};
+	std::vector<Brief> briefs;
+	uint64_t           reference_end = 0;
+	{
+		std::scoped_lock lock(m_mutex);
+		const auto       last  = m_last_closed;
+		const auto       floor = last > Slots - 64 ? last - (Slots - 64) : 1;
+		const auto       first = std::max(m_busy_tick + 1, floor);
+		if (last == 0 || first > last) {
+			return {};
+		}
+		briefs.reserve(static_cast<size_t>(last - first + 1));
+		for (auto tick = first; tick <= last; tick++) {
+			const auto& record = m_records[tick % Slots];
+			if (record.tick == tick) {
+				briefs.push_back({tick, record.closed_ns, record.queued_ns});
+			}
+		}
+		// The last call's end, the start of this span, unless command buffers closed since then
+		// were overwritten in the ring before they were counted (their time would be in the span
+		// and not in the busy time): then the span starts with the first one counted.
+		reference_end = m_busy_tick == 0 || first == m_busy_tick + 1 ? m_busy_end : 0;
+	}
+	if (briefs.empty()) {
+		return {};
+	}
+	// Their timestamps (begin, its availability, end, its availability), read a run of slots at a
+	// time. The GPU runs one timeline's command buffers in tick order: the ones it has finished
+	// come first, and a slot not run again yet still holds the times of the tick Slots before
+	// (they go back in time).
+	struct Times {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		bool     done  = false;
+	};
+	std::vector<Times> times(briefs.size());
+	{
+		std::vector<uint64_t> values;
+		size_t                index = 0;
+		while (index < briefs.size()) {
+			const auto first_slot = briefs[index].tick % Slots;
+			size_t     run        = 1;
+			while (index + run < briefs.size() &&
+			       briefs[index + run].tick == briefs[index].tick + run &&
+			       first_slot + run < Slots) {
+				run++;
+			}
+			values.assign(run * 4, 0);
+			const auto result = m_graphics.device.getQueryPoolResults(
+			    m_pool, static_cast<uint32_t>(first_slot * 2u), static_cast<uint32_t>(run * 2u),
+			    values.size() * sizeof(uint64_t), values.data(), sizeof(uint64_t) * 2,
+			    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+			if (result == vk::Result::eSuccess || result == vk::Result::eNotReady) {
+				for (size_t i = 0; i < run; i++) {
+					const auto* v = values.data() + i * 4;
+					auto&       t = times[index + i];
+					t.done        = v[1] != 0 && v[3] != 0 && v[2] >= v[0];
+					t.begin       = static_cast<uint64_t>(static_cast<double>(v[0]) * m_period_ns);
+					t.end         = static_cast<uint64_t>(static_cast<double>(v[2]) * m_period_ns);
+				}
+			}
+			index += run;
+		}
+	}
+	// The finished prefix: each one's times after the one before's.
+	size_t   counted       = 0;
+	uint64_t first_begin   = 0;
+	uint64_t last_end      = 0;
+	uint64_t busy_ns       = 0;
+	uint64_t gpu_ns        = 0;
+	uint64_t gaps          = 0; // idle gaps of half a millisecond or more
+	uint64_t gap_ns        = 0;
+	uint64_t latency_ns    = 0; // hand-over to submission
+	uint64_t latency_max   = 0;
+	uint64_t latency_count = 0;
+	uint64_t covered       = reference_end;
+	uint64_t latest_begin  = 0;
+	for (size_t i = 0; i < briefs.size(); i++) {
+		const auto& t = times[i];
+		if (!t.done || t.begin < latest_begin || (reference_end != 0 && t.end < reference_end)) {
+			break;
+		}
+		latest_begin = t.begin;
+		if (counted == 0) {
+			// The span starts at the last call's end, as the busy time below does (what ran
+			// before it was counted then).
+			first_begin = reference_end != 0 ? reference_end : t.begin;
+		}
+		if (covered != 0 && t.begin > covered && t.begin - covered >= Millisecond / 2) {
+			gaps++;
+			gap_ns += t.begin - covered;
+		}
+		const auto from = std::max(t.begin, covered);
+		if (t.end > from) {
+			busy_ns += t.end - from;
+		}
+		gpu_ns += t.end - t.begin;
+		covered           = std::max(covered, t.end);
+		last_end          = std::max(last_end, t.end);
+		const auto& brief = briefs[i];
+		if (brief.queued_ns >= brief.closed_ns && brief.closed_ns != 0) {
+			const auto latency = brief.queued_ns - brief.closed_ns;
+			latency_ns += latency;
+			latency_max = std::max(latency_max, latency);
+			latency_count++;
+		}
+		counted++;
+	}
+	if (counted == 0) {
+		return {};
+	}
+	{
+		std::scoped_lock lock(m_mutex);
+		m_busy_tick = briefs[counted - 1].tick;
+		m_busy_end  = last_end;
+	}
+	const auto span = last_end > first_begin ? last_end - first_begin : 0;
+	if (span == 0) {
+		return {};
+	}
+	return fmt::format(
+	    " | host GPU ({}): busy {:.0f}% of {:.1f} s, {} command buffers ({:.3f} ms each on the "
+	    "GPU), "
+	    "{} idle gaps of 0.5 ms or more ({:.0f} ms in all); from hand-over to submission {:.2f} ms "
+	    "(longest {:.1f})",
+	    m_name, 100.0 * static_cast<double>(busy_ns) / static_cast<double>(span),
+	    static_cast<double>(span) / 1e9, counted,
+	    static_cast<double>(gpu_ns) / 1e6 / static_cast<double>(counted), gaps,
+	    static_cast<double>(gap_ns) / 1e6,
+	    latency_count == 0
+	        ? 0.0
+	        : static_cast<double>(latency_ns) / 1e6 / static_cast<double>(latency_count),
+	    static_cast<double>(latency_max) / 1e6);
 }
 
 std::string Timeline::Describe(const Content& content) const {

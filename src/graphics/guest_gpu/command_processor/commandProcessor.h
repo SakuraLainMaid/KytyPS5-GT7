@@ -140,6 +140,10 @@ public:
 	                       uint32_t value);
 	void PrepareCpuFlip(uint64_t request_id);
 	void SynchronizeGpu();
+	// Round 135: the full barrier the PM4 cache flushes, RELEASE_MEM and suspend points recorded
+	// before (mainline 70668fbd dropped them; the renderer's resource barriers order the work), now
+	// only with KYTY_PM4_BARRIERS=global or KYTY_BISECT's barriers:global, to compare
+	// (GuestGpu::GlobalPm4Barriers).
 	void EmitGlobalBarrier();
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,

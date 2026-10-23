@@ -28,6 +28,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -252,6 +253,19 @@ static bool BackingCopyLocked() {
 		return value != nullptr && value[0] == '1';
 	}();
 	return always || g_backing_copy_locked_step.load(std::memory_order_relaxed);
+}
+
+// Round 135, KYTY_BISECT's protect:exclusive (KYTY_PROTECT_LOCK=exclusive for the whole run): the
+// page tracker's protections take the address space's lock exclusively, as before mainline #1815
+// let them share it.
+static std::atomic<bool> g_protect_exclusive_step {false};
+
+static bool ProtectLockExclusive() {
+	static const bool always = [] {
+		const char* value = std::getenv("KYTY_PROTECT_LOCK");
+		return value != nullptr && std::strcmp(value, "exclusive") == 0;
+	}();
+	return always || g_protect_exclusive_step.load(std::memory_order_relaxed);
 }
 
 #include "memoryAddressSpace.inc"
@@ -3405,6 +3419,10 @@ DirectMemoryUse GetDirectMemoryUse() {
 
 void SetBackingCopyLocked(bool locked) {
 	g_backing_copy_locked_step.store(locked, std::memory_order_relaxed);
+}
+
+void SetProtectLockExclusive(bool exclusive) {
+	g_protect_exclusive_step.store(exclusive, std::memory_order_relaxed);
 }
 
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {

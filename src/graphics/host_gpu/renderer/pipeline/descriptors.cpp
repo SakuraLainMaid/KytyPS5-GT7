@@ -3554,6 +3554,14 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		    program.info.buffers[resource].written) {
 			size = SparseWriteSize(m_context, program.shader_hash, address, requested_size, size);
 		}
+		{
+			// A range past the device limit would EXIT in NativeStorageBuffer (a game binds one).
+			const auto& graphics = m_context.GetGraphics();
+			size                 = std::min(
+                size,
+                uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
+                    (graphics.StorageMinAlignment() - 1));
+		}
 		if (size == 0) {
 			// Nothing is mapped at the base yet. Streaming titles bind regions they back later (a
 			// dispatch can precede the mapping by thousands of calls), and an unbacked region reads

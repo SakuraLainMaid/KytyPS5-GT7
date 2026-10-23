@@ -126,6 +126,8 @@ private:
 	            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
 	            std::span<Dispatch> dispatches, bool clear_target);
 	[[nodiscard]] vk::Pipeline GetPipeline(uint32_t slot);
+	[[nodiscard]] vk::Pipeline CreatePipeline(std::span<const uint32_t>     code,
+	                                          const vk::SpecializationInfo* specialization) const;
 
 	GraphicContext&                         m_graphics;
 	CommandScheduler&                       m_scheduler;
