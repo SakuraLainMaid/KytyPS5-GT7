@@ -60,6 +60,25 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 23, 2026, third build)
+
+No shaders are compiled again after this update.
+
+- **Faster races, about 1.5 fps.** Two settings that won in A/B tests are now on by default, measured
+  in a 5-lap race at Tokyo against 11 AI cars:
+  - Memory protection changes the graphics work asks for now run on a helper thread, instead of
+    holding up the thread that runs the game's graphics work: +0.6 fps.
+  - Draws go to the graphics card in batches of 64 instead of 16: +1.0 fps.
+- **Fewer memory protection round trips.** When the emulator writes a small value into memory the
+  game is watching (mostly "done" markers), it now writes it in place instead of unprotecting and
+  protecting that memory again.
+- **Helper threads wake up at once on Windows.** Waking a sleeping game helper thread could take
+  up to half a millisecond; it now takes about 6 microseconds. The frame rate didn't change
+  measurably.
+- **More detail in crash reports.** When the game's own code crashes, the report now shows the
+  memory at the addresses it was using, whether the graphics card writes that memory, and what the
+  emulator itself wrote there in the last few seconds.
+
 ## What's new (October 23, 2026, second build)
 
 No shaders are compiled again after this update.
