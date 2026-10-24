@@ -157,7 +157,8 @@ static void PrintUsage() {
 	::printf("  --skip-shaders <hash,...>            Skip the draws and dispatches of these guest shaders\n"
 	         "                                       (hex hashes, as logged).\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	::printf("  --redzone                            Protect the guest SysV red zone.\n");
+	::printf("  --redzone                            Protect the guest SysV red zone (default).\n");
+	::printf("  --no-redzone                         Do not protect the guest SysV red zone.\n");
 #endif
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
@@ -258,6 +259,13 @@ static bool ParseUserId(const std::string& value, int32_t& out) {
 
 static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help) {
 	show_help = false;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Round 149: red zone protection is on unless --no-redzone is given. Guest code may keep data
+	// in the 128 bytes below rsp (the SysV red zone); Windows writes its exception frames there,
+	// and the emulator raises exceptions all the time for memory tracking (issue 25). Set here,
+	// not in ConfigOptions, whose header the shader cache key covers.
+	options.config.red_zone_protection_enabled = true;
+#endif
 
 	for (int i = 1; i < argc; i++) {
 		std::string arg = std::string(argv[i]);
@@ -319,6 +327,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (arg == "--redzone") {
 			options.config.red_zone_protection_enabled = true;
+			continue;
+		}
+		if (arg == "--no-redzone") {
+			options.config.red_zone_protection_enabled = false;
 			continue;
 		}
 #endif

@@ -119,9 +119,9 @@ public:
 	bool                   fullscreen_enabled          = false;
 	bool                   hide_cursor_enabled         = false;
 	bool                   readback_linear_images      = false;
-	bool                   tessellation_enabled        = false;
+	bool                   tessellation_enabled        = true;
 	bool                   trophy_enabled              = true;
-	bool                   bindless_images_enabled     = false;
+	bool                   bindless_images_enabled     = true;
 	bool                   reflections_half_rate       = false;
 	QString                skip_shader_hashes;
 	int                    vblank_frequency            = 60;
@@ -133,13 +133,13 @@ public:
 	QString                shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
 	QString                command_buffer_dump_folder  = "_Buffers";
-	LogDirection           printf_direction            = LogDirection::Silent;
+	LogDirection           printf_direction            = LogDirection::File;
 	QString                printf_output_file          = "_kyty.txt";
 	bool                   profiler_enabled            = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   amd_cpu_enabled             = false;
 #if defined(_WIN32)
-	bool red_zone_protection_enabled = false;
+	bool red_zone_protection_enabled = true;
 #endif
 	QStringList host_input_mapping;
 
@@ -191,6 +191,13 @@ public:
 		game_status     = other.game_status;
 		game_comment    = other.game_comment;
 	}
+
+	// The settings the game was tested with (the docs list them) are the defaults. A configuration
+	// saved before they were (no "recommended_settings" key, or an older number) gets them once
+	// when it is read; the next save stores RECOMMENDED_SETTINGS_VERSION, and the user's changes
+	// after that stay.
+	static constexpr int RECOMMENDED_SETTINGS_VERSION = 1;
+	void                 ApplyRecommendedSettings();
 
 	void WriteSettings(QSettings* s) const;
 	void ReadSettings(QSettings* s);

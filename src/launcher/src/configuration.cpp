@@ -98,10 +98,37 @@ void Configuration::WriteSettings(QSettings* s) const {
 	s->setValue("game_path", game_path);
 	s->setValue("custom_settings", QVariant::fromValue(custom_settings).toString());
 	s->setValue("host_input_mapping", host_input_mapping);
+	s->setValue("recommended_settings", RECOMMENDED_SETTINGS_VERSION);
+}
+
+void Configuration::ApplyRecommendedSettings() {
+	// The ones that cause problems when they are off: car bodies are drawn wrong without
+	// tessellation, the ray tracing mode needs bindless textures, crashes on Windows without red
+	// zone protection (issue 25), and no _kyty.txt for a bug report without the log file. The
+	// debugging options cost frame rate. Screen, window and controller choices stay.
+	tessellation_enabled     = true;
+	bindless_images_enabled  = true;
+	readback_linear_images   = false;
+	shader_optimization_type = ShaderOptimizationType::Performance;
+	printf_direction         = LogDirection::File;
+	if (printf_output_file.trimmed().isEmpty()) {
+		printf_output_file = QStringLiteral("_kyty.txt");
+	}
+	vulkan_validation_enabled   = false;
+	shader_validation_enabled   = false;
+	command_buffer_dump_enabled = false;
+	profiler_enabled            = false;
+	renderdoc_enabled           = false;
+#if defined(_WIN32)
+	red_zone_protection_enabled = true;
+#endif
 }
 
 void Configuration::ReadSettings(QSettings* s) {
 	ReadGameSettingsValues(*s);
+	if (s->value("recommended_settings", 0).toInt() < RECOMMENDED_SETTINGS_VERSION) {
+		ApplyRecommendedSettings();
+	}
 	name               = s->value("name").toString();
 	basedir            = s->value("basedir").toString();
 	game_path          = s->value("game_path").toString();
