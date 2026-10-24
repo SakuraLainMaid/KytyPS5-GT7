@@ -60,6 +60,18 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 24, 2026, third build)
+
+No shaders are compiled again after this update. Nothing changes unless the test setting below is
+set.
+
+- **AMD graphics cards:** a new test setting for the crash at the GT logo
+  ([issue 21](https://github.com/usa-ratt/KytyPS5-GT7/issues/21)). The AMD driver crashes while
+  it compiles the emulator's mesh shaders (they draw the game's text and a few other things).
+  `KYTY_MESH_TEST` (`empty`, `noguest`, `nolayer`, `nocull` or `fixedcount`) takes one part out of
+  every mesh shader before the driver sees it, to find the part the driver fails on. The steps are
+  in issue 21. With the setting on, the text is missing or looks wrong.
+
 ## What's new (October 24, 2026, second build)
 
 No shaders are compiled again after this update.
