@@ -22,7 +22,9 @@ void PreferPerformanceCores(const char* name);
 // sharing the largest L3 cache, and every other thread the rest: Windows CPU sets) and
 // "gpufrequency" (the other way round). Round 84: "gpucore", as "gpuvcache" but with the GPU
 // thread alone on one logical processor of the V-Cache die's last core, whose other logical
-// processor no thread of the process is given.
+// processor no thread of the process is given. "gpucoregame": as "gpucore", but the other GPU-side
+// threads on one more core of that die only, its remaining cores to the game's threads too, and
+// the background threads (LowerThreadPriority's) outside that die.
 bool SetProcessCpuSet(const char* which, std::string* description);
 
 // The placement the run starts with: KYTY_CPU_SET when it is set; otherwise, round 80,
@@ -39,7 +41,8 @@ void RegisterGpuSideThread(const char* name);
 
 // Round 117: the calling thread runs below normal priority, so that the game's threads go first
 // (background work such as the driver's compiles of big shaders). Windows:
-// THREAD_PRIORITY_BELOW_NORMAL; Linux: a nice value of 5; a no-op elsewhere.
+// THREAD_PRIORITY_BELOW_NORMAL, and placed with SetProcessCpuSet's "gpucoregame"; Linux: a nice
+// value of 5; a no-op elsewhere.
 void LowerThreadPriority();
 
 } // namespace Common

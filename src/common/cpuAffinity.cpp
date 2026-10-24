@@ -104,6 +104,10 @@ std::vector<ULONG> g_split_gpu_ids;
 // "gpucore" (round 84): the GPU thread's own set, one logical processor of a core no other
 // thread of the process is placed on.
 std::vector<ULONG> g_split_gpu_thread_ids;
+// "gpucoregame": the background threads' set (LowerThreadPriority's: the pipeline compilers), the
+// processors outside the largest L3 cache, and those threads.
+std::vector<ULONG>  g_split_background_ids;
+std::vector<HANDLE> g_background_threads;
 
 // The thread the GPU thread's own set goes to ("gpucore").
 bool IsGpuThread(const std::string& name) {
@@ -222,9 +226,28 @@ void ClearSplit() {
 		                         thread.own_sets.empty() ? nullptr : thread.own_sets.data(),
 		                         static_cast<ULONG>(thread.own_sets.size()));
 	}
+	for (const auto handle: g_background_threads) {
+		SetThreadSelectedCpuSets(handle, nullptr, 0);
+	}
 	g_split_applied = false;
 	g_split_gpu_ids.clear();
 	g_split_gpu_thread_ids.clear();
+	g_split_background_ids.clear();
+}
+
+// A background thread (LowerThreadPriority): placed with "gpucoregame", now or when it applies.
+void RegisterBackgroundThread() {
+	HANDLE handle = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION,
+	                           FALSE, GetCurrentThreadId());
+	if (handle == nullptr) {
+		return;
+	}
+	std::lock_guard lock(g_gpu_side_mutex);
+	if (g_split_applied && !g_split_background_ids.empty()) {
+		SetThreadSelectedCpuSets(handle, g_split_background_ids.data(),
+		                         static_cast<ULONG>(g_split_background_ids.size()));
+	}
+	g_background_threads.push_back(handle);
 }
 
 } // namespace
@@ -345,7 +368,8 @@ bool SetProcessCpuSet(const char* which, std::string* description) {
 	const std::string name(which);
 	DWORD_PTR         mask = 0;
 	std::string       what;
-	if (name == "gpuvcache" || name == "gpufrequency" || name == "gpucore") {
+	if (name == "gpuvcache" || name == "gpufrequency" || name == "gpucore" ||
+	    name == "gpucoregame") {
 		if (caches.size() < 2) {
 			describe(
 			    fmt::format("not changed: the processors share {} L3 cache(s)", caches.size()));
@@ -356,29 +380,46 @@ bool SetProcessCpuSet(const char* which, std::string* description) {
 		const DWORD_PTR vcache   = largest->mask;
 		const DWORD_PTR others   = system_mask & ~vcache;
 		const DWORD_PTR gpu_side = name == "gpufrequency" ? others : vcache;
-		const DWORD_PTR rest     = name == "gpufrequency" ? vcache : others;
+		DWORD_PTR       rest     = name == "gpufrequency" ? vcache : others;
 		// "gpucore" (round 84): as "gpuvcache", but the GPU thread alone on the last core of the
 		// V-Cache die (one of its logical processors; the core's other one, its SMT sibling, is
 		// left to no thread of the process), the other GPU-side threads on the die's other cores.
 		// The GPU thread is the emulator's bottleneck; a sibling's work slows a core's other
 		// thread by up to a third.
-		DWORD_PTR gpu        = gpu_side;
-		DWORD_PTR gpu_thread = 0;
-		if (name == "gpucore") {
+		// "gpucoregame" (2026-10-24): as "gpucore", but the other GPU-side threads on one more
+		// core only, the die's remaining cores to the game's threads as well as the other
+		// processors, and the background threads (the pipeline compilers) on the other
+		// processors alone. On a mobile Ryzen AI 9 HX 370 (4 Zen 5 cores, 16 MB L3, beside 8 Zen 5c
+		// cores, 8 MB) "gpucore" took the GPU thread from ~45 to ~33 us an operation, but left
+		// the game's threads, its faults' handlers among them, on the slower Zen 5c cores beside
+		// six compilers: the game stuttered.
+		const bool game_cores = name == "gpucoregame";
+		DWORD_PTR  gpu        = gpu_side;
+		DWORD_PTR  gpu_thread = 0;
+		DWORD_PTR  background = 0;
+		DWORD_PTR  gpu_core   = 0;
+		if (name == "gpucore" || game_cores) {
 			const auto cores = CoresIn(gpu_side);
-			if (cores.size() < 2) {
+			if (cores.size() < (game_cores ? 3u : 2u)) {
 				describe(fmt::format("not changed: {} whole core(s) share the largest L3 cache",
 				                     cores.size()));
 				return false;
 			}
 			const auto core = cores.back();
+			gpu_core        = core;
 			gpu_thread      = core & (~core + 1u); // its lowest logical processor
-			gpu             = gpu_side & ~core;
+			gpu             = game_cores ? cores[cores.size() - 2] : gpu_side & ~core;
+			if (game_cores) {
+				rest       = system_mask & ~core & ~gpu;
+				background = others;
+			}
 		}
 		const auto gpu_ids        = CpuSetIds(gpu);
 		const auto rest_ids       = CpuSetIds(rest);
+		const auto background_ids = background != 0 ? CpuSetIds(background) : std::vector<ULONG> {};
 		const auto gpu_thread_ids = gpu_thread != 0 ? CpuSetIds(gpu_thread) : std::vector<ULONG> {};
-		if (gpu_ids.empty() || rest_ids.empty() || (gpu_thread != 0 && gpu_thread_ids.empty())) {
+		if (gpu_ids.empty() || rest_ids.empty() || (gpu_thread != 0 && gpu_thread_ids.empty()) ||
+		    (background != 0 && background_ids.empty())) {
 			describe("not changed: no CPU sets");
 			return false;
 		}
@@ -392,6 +433,12 @@ bool SetProcessCpuSet(const char* which, std::string* description) {
 		g_split_applied        = true;
 		g_split_gpu_ids        = gpu_ids;
 		g_split_gpu_thread_ids = gpu_thread_ids;
+		g_split_background_ids = background_ids;
+		for (const auto handle: g_background_threads) {
+			SetThreadSelectedCpuSets(handle,
+			                         background_ids.empty() ? nullptr : background_ids.data(),
+			                         static_cast<ULONG>(background_ids.size()));
+		}
 		std::string threads;
 		size_t      placed = 0;
 		for (const auto& thread: g_gpu_side_threads) {
@@ -414,9 +461,14 @@ bool SetProcessCpuSet(const char* which, std::string* description) {
 		    gpu_thread != 0
 		        ? fmt::format(" and the GPU thread alone on processor 0x{:x} of the core 0x{:x} "
 		                      "no other thread uses",
-		                      gpu_thread, gpu_side & ~gpu)
+		                      gpu_thread, gpu_core)
 		        : std::string(),
 		    count(rest), rest));
+		if (background != 0 && description != nullptr) {
+			*description += fmt::format(", the background threads (pipeline compilers) the {} "
+			                            "processors outside it (mask 0x{:x})",
+			                            count(background), background);
+		}
 		return true;
 	}
 	ClearSplit();
@@ -446,7 +498,7 @@ bool SetProcessCpuSet(const char* which, std::string* description) {
 		                        : std::string("the processors outside the largest L3 cache");
 	} else {
 		describe("not changed: KYTY_CPU_SET takes vcache, frequency, all, gpuvcache, gpufrequency, "
-		         "gpucore or off");
+		         "gpucore, gpucoregame or off");
 		return false;
 	}
 	if (mask == 0 || SetProcessAffinityMask(GetCurrentProcess(), mask) == FALSE) {
@@ -555,6 +607,7 @@ std::string StartCpuSet(std::string* reason) {
 void LowerThreadPriority() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+	RegisterBackgroundThread();
 #elif !defined(__APPLE__)
 	(void)setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 5);
 #endif
