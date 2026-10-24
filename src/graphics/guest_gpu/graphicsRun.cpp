@@ -977,6 +977,20 @@ void GuestGpu::ThreadRun(void* data) {
 	}
 }
 
+// KYTY_FLUSH_BEFORE_GC=0 records the garbage collectors' work at the end of a submission into the
+// command buffer of its last commands, as before. By default that command buffer is submitted
+// first, readahead's downloads with it (the before-flush hook), so a game thread's read of what
+// those commands wrote does not wait behind the collectors' image write-backs: in a GT7 race the
+// 14 KB a compute dispatch wrote for a game thread came 70-310 ms after the dispatch, behind
+// 10-180 MB of images written back and retiled in the same command buffer (2026-10-24).
+static bool FlushBeforeGc() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_FLUSH_BEFORE_GC");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
@@ -1047,6 +1061,9 @@ bool GuestGpu::Process(Submission& submission) {
 			submission.progressed = progressed;
 			if (progressed) {
 				if (complete) {
+					if (FlushBeforeGc()) {
+						cp.BufferFlush();
+					}
 					m_renderer.RunGarbageCollector();
 				}
 				cp.BufferFlush();
@@ -1075,6 +1092,9 @@ bool GuestGpu::Process(Submission& submission) {
 			submission.progressed = submission.command_execution.MadeProgress();
 			if (submission.progressed) {
 				if (complete) {
+					if (FlushBeforeGc()) {
+						cp.BufferFlush();
+					}
 					m_renderer.RunGarbageCollector();
 				}
 				cp.BufferFlush();
