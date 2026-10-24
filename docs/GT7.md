@@ -60,6 +60,18 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 24, 2026, second build)
+
+No shaders are compiled again after this update.
+
+- **No more crash at a race start with a vblank frequency of 120**
+  ([issue 22](https://github.com/usa-ratt/KytyPS5-GT7/issues/22)). With 120 set in the launcher,
+  the game offers its 120 Hz option; with it on, the game switches its output picture to
+  2240x1260 when a race starts, in a compressed layout the emulator did not accept yet ("unsupported
+  or invalid video-out surface attributes"). It does now. The 120 Hz mode doesn't raise the frame
+  rate in the emulator (about the same as at 60 Hz in a test), so 60 stays the recommended
+  setting.
+
 ## What's new (October 24, 2026)
 
 No shaders are compiled again after this update.
