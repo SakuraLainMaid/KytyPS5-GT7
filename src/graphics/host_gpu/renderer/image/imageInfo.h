@@ -52,7 +52,15 @@ enum class ColorTransform : uint32_t { None, SwapBgra16, Reverse10_11_11 };
 	return transform == ColorTransform::Reverse10_11_11 ? Guest10_11_11ToHost(word) : word;
 }
 
-enum class VideoOutCompression : uint8_t { Uncompressed, Dcc256_256_0, Dcc256_64_64, Unsupported };
+// DCC of a video-out buffer, named by its CB_DCC_CONTROL block sizes: maximum uncompressed,
+// maximum compressed, independent blocks (0: none).
+enum class VideoOutCompression : uint8_t {
+	Uncompressed,
+	Dcc256_256_0,
+	Dcc256_64_64,
+	Dcc128_128_128,
+	Unsupported
+};
 
 enum class ImageMetadataKind : uint8_t { None, Htile, Dcc, Cmask };
 
@@ -360,6 +368,10 @@ ClassifyVideoOutCompression(bool compressed, uint64_t metadata_address, uint32_t
                             uint64_t dcc_clear_color) noexcept {
 	constexpr uint32_t DCC_256_256_0 = 0x00000048u;
 	constexpr uint32_t DCC_256_64_64 = 0x00000208u;
+	// Round 147: 128-byte blocks, independent (INDEPENDENT_128B_BLOCKS, bit 20). A game told the
+	// output runs at 120 Hz (a vblank frequency of 120) registered its video-out buffers again with
+	// these, at 2240x1260, when a race started (issue 22).
+	constexpr uint32_t DCC_128_128_128 = 0x00100024u;
 	if (!compressed) {
 		return metadata_address == 0 && dcc_control == 0 && dcc_clear_color == 0
 		           ? VideoOutCompression::Uncompressed
@@ -371,6 +383,7 @@ ClassifyVideoOutCompression(bool compressed, uint64_t metadata_address, uint32_t
 	switch (dcc_control) {
 		case DCC_256_256_0: return VideoOutCompression::Dcc256_256_0;
 		case DCC_256_64_64: return VideoOutCompression::Dcc256_64_64;
+		case DCC_128_128_128: return VideoOutCompression::Dcc128_128_128;
 		default: return VideoOutCompression::Unsupported;
 	}
 }

@@ -556,7 +556,12 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	    attribute.tiling_mode != 0 || attribute.pad0 != 0 || attribute.reserved1[0] != 0 ||
 	    attribute.reserved1[1] != 0 || attribute.reserved1[2] != 0 || buffer.data_address == 0 ||
 	    compression == Graphics::VideoOutCompression::Unsupported) {
-		EXIT("unsupported or invalid video-out surface attributes\n");
+		// Round 147: what was not accepted, for the report.
+		EXIT("unsupported or invalid video-out surface attributes: %ux%u, category %d, DCC control "
+		     "0x%08x%s, data 0x%" PRIx64 ", metadata 0x%" PRIx64 "\n",
+		     attribute.width, attribute.height, category, attribute.dcc_control,
+		     compression == Graphics::VideoOutCompression::Unsupported ? " (not supported)" : "",
+		     buffer.data_address, buffer.metadata_address);
 	}
 	Graphics::VideoOutPixelFormatInfo pixel_format {};
 	if (!Graphics::DecodeVideoOutPixelFormat(attribute.pixel_format, pixel_format)) {
