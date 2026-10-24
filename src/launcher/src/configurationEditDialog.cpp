@@ -541,7 +541,7 @@ void ConfigurationEditDialog::InitPages() {
 		if (row >= 0 && row != m_pages->currentIndex()) {
 			m_pages->setCurrentIndex(row);
 			if (auto* page = qobject_cast<PsScrollArea*>(m_pages->currentWidget()); page != nullptr) {
-				page->verticalScrollBar()->setValue(0);
+				page->JumpTo(0);
 			}
 			// The whole page at once, rising a little as it fades in: its contents, as the scroll
 			// area itself neither fades (its viewport paints on its own) nor stays where it is put

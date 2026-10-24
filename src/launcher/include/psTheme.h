@@ -131,6 +131,8 @@ public:
 	explicit PsScrollArea(QWidget* parent = nullptr);
 
 	void ScrollTo(int value);
+	// At once, stopping a glide.
+	void JumpTo(int value);
 	void EnsureVisibleSmooth(QWidget* child, int margin = 24);
 	// The page's focus outline: it glides to `row` (or fades in on it), and fades out once no
 	// row has the focus.

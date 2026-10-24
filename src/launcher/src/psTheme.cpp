@@ -668,6 +668,12 @@ void PsScrollArea::ScrollTo(int value) {
 	m_animation->start();
 }
 
+void PsScrollArea::JumpTo(int value) {
+	m_animation->stop();
+	m_target = value;
+	verticalScrollBar()->setValue(value);
+}
+
 void PsScrollArea::EnsureVisibleSmooth(QWidget* child, int margin) {
 	if (widget() == nullptr || !widget()->isAncestorOf(child)) {
 		return;

@@ -303,8 +303,8 @@ public:
 		scroll->setWidget(m_list);
 		layout->addWidget(scroll, 1);
 
-		connect(m_filter, &QComboBox::currentIndexChanged, this, [this] { Fill(); });
-		connect(m_sort, &QComboBox::currentIndexChanged, this, [this] { Fill(); });
+		connect(m_filter, &QComboBox::currentIndexChanged, this, [this] { Fill(); }, Qt::QueuedConnection);
+		connect(m_sort, &QComboBox::currentIndexChanged, this, [this] { Fill(); }, Qt::QueuedConnection);
 		Fill();
 	}
 
@@ -359,7 +359,10 @@ private:
 		const bool had_focus = m_list->isAncestorOf(QApplication::focusWidget());
 		m_cards.clear();
 		while (auto* item = m_list_layout->takeAt(0)) {
-			delete item->widget();
+			if (auto* widget = item->widget(); widget != nullptr) {
+				widget->hide();
+				widget->deleteLater(); // it may be inside an event of its own
+			}
 			delete item;
 		}
 		const auto filter = static_cast<Filter>(m_filter->currentIndex());
@@ -398,7 +401,7 @@ private:
 			m_list_layout->addWidget(none);
 		}
 		m_list_layout->addStretch(1);
-		m_scroll->verticalScrollBar()->setValue(0);
+		m_scroll->JumpTo(0); // a glide still going would take the list back down
 		if (had_focus || isVisible()) {
 			FocusFirst();
 		}
