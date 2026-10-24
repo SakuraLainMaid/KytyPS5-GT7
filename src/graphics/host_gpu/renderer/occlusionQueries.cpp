@@ -44,6 +44,7 @@ struct State {
 	uint64_t                              counted     = 0;
 	uint64_t                              full        = 0; // draws not counted: the ring was full
 	uint64_t                              unavailable = 0; // queries read without a result
+	uint64_t                              skipped     = 0; // draws skipped, counted as visible
 	std::vector<uint32_t>                 controls;        // DB_COUNT_CONTROL values drawn with
 	uint32_t                              last_control   = UINT32_MAX;
 	uint64_t                              synthetic      = 0; // dumps before any draw counted
@@ -151,11 +152,12 @@ void LogWindow() {
 	LOGF("Occlusion queries: %" PRIu64 " dumps and %" PRIu64 " draws counted in the last %.0f s "
 	     "(%" PRIu64 " dumps written, %" PRIu64 " draws counted in all; %" PRIu64
 	     " not counted: the queries ran out; %" PRIu64 " read without a result; %" PRIu64
+	     " skipped while compiling, counted visible; %" PRIu64
 	     " dumps synthetic, before any draw counted); the counter at %" PRIu64
 	     " samples; DB_COUNT_CONTROL values drawn with: %s; %s queries\n",
 	     state.window_dumps, state.window_counted,
 	     std::chrono::duration<double>(now - state.since).count(), state.written, state.counted,
-	     state.full, state.unavailable, state.synthetic, state.total,
+	     state.full, state.unavailable, state.skipped, state.synthetic, state.total,
 	     controls.empty() ? "none" : controls.c_str(), state.precise ? "precise" : "not precise");
 	state.since          = now;
 	state.window_dumps   = 0;
@@ -238,6 +240,20 @@ void EndDraw(const CommandRecorder& recorder, int32_t slot) {
 		return;
 	}
 	recorder.endQuery(GetState().pool, static_cast<uint32_t>(slot));
+}
+
+void SkippedDraw(RenderContext& context, uint32_t db_count_control) {
+	if (!Enabled() || !Counting(db_count_control) || GetState().failed) {
+		return;
+	}
+	// ponytail: a fixed count, not the draw's real coverage; enough for "visible" tests, a lens
+	// flare sized by samples flickers until the pipeline is ready.
+	constexpr uint64_t SkippedSamples = 1024u;
+	// Deferred like a dump, so a dump recorded before this draw does not see the samples.
+	context.GetCommandScheduler().DeferPriorityOperation([target = &context] {
+		(void)target->GetGpu().TrySendCommand([] { GetState().total += SkippedSamples; });
+	});
+	GetState().skipped++;
 }
 
 bool Dump(RenderContext& context, uint64_t address) {

@@ -33,6 +33,11 @@ namespace Libs::Graphics::OcclusionQueries {
 void BeginDraw(const CommandRecorder& recorder, int32_t slot);
 void EndDraw(const CommandRecorder& recorder, int32_t slot);
 
+// GPU thread: a draw not recorded (its shaders or pipeline still compiling) while DB_COUNT_CONTROL
+// counts. It counts as visible: with 0 samples the game culls the object as occluded and never
+// draws it again, so it stays missing after its pipeline is ready.
+void SkippedDraw(RenderContext& context, uint32_t db_count_control);
+
 // GPU thread: a PIXEL_PIPE_STAT_DUMP to `address` (8-byte aligned). False until a draw has
 // counted samples (DB_COUNT_CONTROL never counted): the caller writes the synthetic counters
 // then, so a game that counts some other way keeps its lights.

@@ -2123,6 +2123,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	RefreshShaders(buffer, draw, color_output_mask, state);
 	LogDrawCensus(buffer, draw, state);
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
+		OcclusionQueries::SkippedDraw(m_context, buffer.GetRegisters().GetDbCountControl());
 		if (FrameGraph::Logging()) {
 			FrameGraph::Log("  not drawn: no %s program (vs 0x%012" PRIx64 " ps 0x%012" PRIx64 ")",
 			                !state.programs.vertex[0] ? "vertex" : "pixel",
@@ -2789,6 +2790,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    primitive_restart_enable, state.programs, defer);
 	}
 	if (deferred_pipeline == nullptr) {
+		OcclusionQueries::SkippedDraw(m_context, buffer.GetRegisters().GetDbCountControl());
 		if (FrameGraph::Logging()) {
 			FrameGraph::Log("  skipped: its pipeline is still compiling");
 		}

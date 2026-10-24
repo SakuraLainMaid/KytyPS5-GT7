@@ -13,6 +13,8 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -42,6 +44,27 @@ bool ScaleReferenceClock(uint64_t host_ticks, uint64_t host_frequency, uint64_t&
 	return true;
 }
 
+// Round 141, a test: KYTY_GPU_CLOCK_SCALE=<factor> (default 1) runs the GPU reference clock the
+// guest reads (end-of-pipe and COPY_DATA timestamps) at that speed from its first read. The
+// timestamps are taken when the GPU thread reaches the packet, so a frame's span is how long this
+// thread took over it; a game that sizes its work by that span sees it shrink by the factor.
+static double ReferenceClockScale() {
+	static const double scale = [] {
+		const char* value  = std::getenv("KYTY_GPU_CLOCK_SCALE");
+		double      parsed = value != nullptr ? std::strtod(value, nullptr) : 1.0;
+		if (!(parsed >= 0.01 && parsed <= 100.0)) {
+			parsed = 1.0;
+		}
+		if (parsed != 1.0) {
+			LOGF("GPU reference clock: runs at %.3f of real time from its first read "
+			     "(KYTY_GPU_CLOCK_SCALE)\n",
+			     parsed);
+		}
+		return parsed;
+	}();
+	return scale;
+}
+
 uint64_t ReadReferenceClock() {
 	const auto host_frequency = LibKernel::KernelGetTscFrequency();
 	const auto host_ticks     = LibKernel::KernelReadTsc();
@@ -49,6 +72,14 @@ uint64_t ReadReferenceClock() {
 	if (!ScaleReferenceClock(host_ticks, host_frequency, value)) {
 		EXIT("cannot scale host clock, ticks=0x%016" PRIx64 " frequency=%" PRIu64 "\n", host_ticks,
 		     host_frequency);
+	}
+	if (const double scale = ReferenceClockScale(); scale != 1.0) {
+		static std::atomic<uint64_t> base {0};
+		uint64_t                     first = 0;
+		if (!base.compare_exchange_strong(first, value)) {
+			value = first + static_cast<uint64_t>(
+			                    static_cast<double>(value > first ? value - first : 0) * scale);
+		}
 	}
 	return value;
 }

@@ -443,6 +443,8 @@ private:
 	std::vector<vk::PipelineCache> m_driver_older;
 	// Round 96: driver caches Save let go of while background compiles still used them.
 	std::vector<vk::PipelineCache> m_driver_cache_parked;
+	// Unoptimized pipelines replaced by their optimized ones (FinishPending), destroyed at the end.
+	std::vector<vk::Pipeline> m_quick_retired;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
@@ -536,7 +538,7 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 // up in its caches: vk::Result::ePipelineCompileRequired when it would have to compile it.
 vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build,
                                   vk::PipelineCache driver_cache, vk::Pipeline* pipeline,
-                                  bool cache_only = false);
+                                  bool cache_only = false, bool no_optimization = false);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,
                             const PipelineVertexInputState&        vertex_input,

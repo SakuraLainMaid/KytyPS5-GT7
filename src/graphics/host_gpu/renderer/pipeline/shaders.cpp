@@ -796,11 +796,14 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 
 vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build,
                                   vk::PipelineCache driver_cache, vk::Pipeline* pipeline,
-                                  bool cache_only) {
+                                  bool cache_only, bool no_optimization) {
 	const auto create_begin = std::chrono::steady_clock::now();
 	auto       info         = build.pipeline_info;
 	if (cache_only) {
 		info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+	}
+	if (no_optimization) {
+		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
 	}
 	// Round 134: a crash in the driver names the pipeline it was making (Common::CrashNote).
 	std::array<char, 160> note {};
