@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <span>
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
@@ -235,11 +236,46 @@ std::set<int> LoadUnlocks(const std::filesystem::path& path) {
 	return unlocked;
 }
 
+std::map<int, int64_t> LoadUnlockTimes(const std::filesystem::path& path) {
+	File file(path, File::Mode::Read);
+	if (file.IsInvalid() || file.Size() > MaxUnlocksSize) {
+		return {};
+	}
+	const auto bytes = file.ReadWholeBuffer();
+	const auto json  = Json::parse(bytes.begin(), bytes.end(), nullptr, false);
+	if (!json.is_object() || !json.contains("unlockTimes") || !json["unlockTimes"].is_object()) {
+		return {};
+	}
+	std::map<int, int64_t> times;
+	for (const auto& [key, value]: json["unlockTimes"].items()) {
+		const auto id = ReadId(Json(key));
+		if (id >= 0 && value.is_number_integer()) {
+			times[id] = value.get<int64_t>();
+		}
+	}
+	return times;
+}
+
 bool SaveUnlocks(const std::filesystem::path& path, const std::set<int>& unlocked) {
 	if (path.empty() || !File::CreateDirectories(path.parent_path())) {
 		return false;
 	}
-	const auto text      = Json {{"unlockedTrophies", unlocked}}.dump();
+	// Trophies the file lists without a time were unlocked before times were kept: they stay
+	// without one rather than get today's date.
+	const auto known    = LoadUnlockTimes(path);
+	const auto previous = LoadUnlocks(path);
+	const auto now   = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+	                     .count();
+	Json times = Json::object();
+	for (const auto id: unlocked) {
+		if (const auto found = known.find(id); found != known.end()) {
+			times[std::to_string(id)] = found->second;
+		} else if (!previous.contains(id)) {
+			times[std::to_string(id)] = static_cast<int64_t>(now);
+		}
+	}
+	const auto text      = Json {{"unlockedTrophies", unlocked}, {"unlockTimes", times}}.dump();
 	auto       temporary = path;
 	temporary += ".tmp";
 	File file;

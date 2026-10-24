@@ -3,6 +3,7 @@
 #include <SDL3/SDL.h>
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -22,7 +23,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <deque>
+#include <filesystem>
+#include <set>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -706,6 +710,80 @@ struct SystemOverlay::Impl {
 		style.WindowRounding = 10.0f;
 		style.FrameRounding  = 6.0f;
 		style.ItemSpacing    = {8.0f, 8.0f};
+		LoadFonts();
+	}
+
+	// ImGui's default font has Latin glyphs only: trophy names, dialogs and IME text in Chinese,
+	// Japanese, Korean or Thai showed as "?". A system UI font goes first, the others are merged
+	// into it (ImGui rasterises glyphs on demand, so the large CJK fonts cost little), in an order
+	// set by the console language where the scripts share code points (Han characters have
+	// Japanese, Simplified and Traditional Chinese forms). KYTY_OVERLAY_FONT=<file> replaces the
+	// first font. Elsewhere than Windows, only that variable adds a font.
+	static void LoadFonts() {
+		auto&                    io = ImGui::GetIO();
+		std::vector<std::string> fonts;
+		if (const char* value = std::getenv("KYTY_OVERLAY_FONT"); value != nullptr && *value != 0) {
+			fonts.emplace_back(value);
+		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		const char*       windir = std::getenv("WINDIR");
+		const std::string dir    = std::string(windir != nullptr ? windir : "C:\\Windows") + "\\Fonts\\";
+		std::vector<const char*> names {"segoeui.ttf"};
+		switch (Config::GetConsoleLanguage()) {
+			case 0: names.insert(names.end(), {"YuGothM.ttc", "meiryo.ttc", "msyh.ttc"}); break;
+			case 9: names.insert(names.end(), {"malgun.ttf", "msyh.ttc"}); break;
+			case 10: names.insert(names.end(), {"msjh.ttc", "msyh.ttc"}); break;
+			default: names.insert(names.end(), {"msyh.ttc", "msjh.ttc", "YuGothM.ttc"}); break;
+		}
+		names.insert(names.end(), {"malgun.ttf", "LeelawUI.ttf", "seguisym.ttf"});
+		for (const auto* name: names) {
+			fonts.push_back(dir + name);
+		}
+#endif
+		std::string           loaded;
+		std::set<std::string> seen;
+		bool                  first = true;
+		for (const auto& path: fonts) {
+			std::error_code error;
+			if (!seen.insert(path).second || !std::filesystem::is_regular_file(path, error)) {
+				continue;
+			}
+			ImFontConfig config;
+			config.MergeMode = !first;
+			if (io.Fonts->AddFontFromFileTTF(path.c_str(), 18.0f, &config) == nullptr) {
+				continue;
+			}
+			loaded += (first ? "" : ", ") + std::filesystem::path(path).filename().string();
+			first = false;
+		}
+		if (first) {
+			io.Fonts->AddFontDefault();
+			LOGF("System overlay: ImGui's default font (Latin only)\n");
+			return;
+		}
+		LOGF("System overlay fonts: %s\n", loaded.c_str());
+	}
+
+	// The toast's texts in the console language (Japanese, Korean, Chinese; English otherwise).
+	struct TrophyTexts {
+		const char*                earned;
+		std::array<const char*, 4> grades; // platinum, gold, silver, bronze
+	};
+	static TrophyTexts TrophyTextsFor(uint32_t language) {
+		const auto u8 = [](const char8_t* text) { return reinterpret_cast<const char*>(text); };
+		switch (language) {
+			case 0:
+				return {u8(u8"トロフィーを獲得しました"),
+				        {u8(u8"プラチナ"), u8(u8"ゴールド"), u8(u8"シルバー"), u8(u8"ブロンズ")}};
+			case 9:
+				return {u8(u8"트로피를 획득했습니다"),
+				        {u8(u8"플래티넘"), u8(u8"골드"), u8(u8"실버"), u8(u8"브론즈")}};
+			case 10:
+				return {u8(u8"已獲得獎盃"), {u8(u8"白金"), u8(u8"金"), u8(u8"銀"), u8(u8"銅")}};
+			case 11:
+				return {u8(u8"已获得奖杯"), {u8(u8"白金"), u8(u8"金"), u8(u8"银"), u8(u8"铜")}};
+			default: return {"Trophy earned", {"Platinum", "Gold", "Silver", "Bronze"}};
+		}
 	}
 
 	void PlayTrophySound() {
@@ -1171,13 +1249,14 @@ struct SystemOverlay::Impl {
 		                                (trophy_notification_image ? 112.0f : 18.0f) * screen_scale,
 		                            top_left.y + 18.0f * screen_scale};
 		draw->PushClipRect(top_left, {bottom_right.x - 12.0f * screen_scale, bottom_right.y}, true);
+		const auto texts = TrophyTextsFor(Config::GetConsoleLanguage());
 		draw->AddText(nullptr, 13.0f * screen_scale, text_position,
-		              IM_COL32(232, 203, 139, static_cast<int>(255.0f * alpha)), "Trophy earned");
+		              IM_COL32(232, 203, 139, static_cast<int>(255.0f * alpha)), texts.earned);
 		draw->AddText(nullptr, 21.0f * screen_scale,
 		              {text_position.x, text_position.y + 22.0f * screen_scale},
 		              IM_COL32(255, 255, 255, static_cast<int>(255.0f * alpha)),
 		              trophy_notification->name.c_str());
-		constexpr std::array GRADE_LABELS {"Platinum", "Gold", "Silver", "Bronze"};
+		const auto&          GRADE_LABELS = texts.grades;
 		constexpr std::array GRADE_COLORS {
 		    IM_COL32(161, 225, 245, 255), IM_COL32(255, 207, 82, 255), IM_COL32(211, 220, 232, 255),
 		    IM_COL32(211, 142, 91, 255)};

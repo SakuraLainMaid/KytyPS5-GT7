@@ -41,6 +41,10 @@ struct Package {
                                                 std::string_view title_id, int user_id,
                                                 uint32_t service_label);
 [[nodiscard]] std::set<int>         LoadUnlocks(const std::filesystem::path& path);
+// When each trophy was unlocked, in seconds since 1970 (UTC). Files from before the times were
+// kept have none; the trophies they list have no entry.
+[[nodiscard]] std::map<int, int64_t> LoadUnlockTimes(const std::filesystem::path& path);
+// Keeps the times the file has, and gives the trophies new to it the current time.
 [[nodiscard]] bool SaveUnlocks(const std::filesystem::path& path, const std::set<int>& unlocked);
 
 } // namespace Common::Trophies
