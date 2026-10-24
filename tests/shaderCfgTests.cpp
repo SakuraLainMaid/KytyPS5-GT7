@@ -1042,7 +1042,8 @@ void EnsureConfigInitialized() {
     Config::Load(options);
     subsystems.Initialize<Log::Lifecycle>();
     ShaderInit();
-    config_initialized = true;
+	ShaderRecompiler::Spirv::SetEmitNames(true); // Checks find variables and functions by OpName.
+	config_initialized = true;
   }
 }
 
@@ -1923,6 +1924,64 @@ void TestNggVertexEntryState() {
           "NGG wave size was lost during translation");
     CheckSpirvBinaryValidates(result.spirv);
   }
+}
+
+void TestNativeDataCacheInvalidation() {
+	using namespace ShaderRecompiler;
+	// Captured f5edf70dbb1f6057:0x194 and 0x1a4, each followed by S_WAITCNT.
+	const std::array cache_ops = {0xe1c40000u, 0u,          0xbf8c0000u,     0xe1c80000u,
+	                              0u,          0xbf8c0000u, EncodeSopp(0x01)};
+	Decoder::Program decoded;
+	Decoder::DecodeProgram(cache_ops, decoded);
+	for (const uint32_t index: {0u, 2u}) {
+		const auto& inst = decoded.instructions[index];
+		Check(inst.opcode == (index == 0 ? Decoder::Opcode::BUFFER_GL0_INV
+		                                 : Decoder::Opcode::BUFFER_GL1_INV) &&
+		          inst.word_count == 2 && inst.src_count == 0 && inst.data_dwords == 0 &&
+		          inst.dst.kind == Decoder::OperandKind::Unknown,
+		      "RDNA2 cache invalidation acquired a buffer operand or lost its encoding");
+	}
+
+	auto options    = MakeCompileOptions(ShaderType::Compute);
+	options.dump_ir = true;
+	ShaderComputeInputInfo compute {};
+	compute.threads_num[1] = compute.threads_num[2] = 1;
+	options.input_info.compute                      = &compute;
+	for (const uint32_t wave_size: {32u, 64u}) {
+		compute.threads_num[0] = compute.wave_size = options.wave_size = wave_size;
+		const auto minimal = RecompileForTest(cache_ops, options);
+		CheckSpirvBinaryValidates(minimal.spirv);
+		Check(minimal.program.info.buffers.empty(),
+		      "cache invalidation introduced a phantom buffer binding");
+		const auto source = DisassembleSpirvBinary(minimal.spirv);
+		const auto first  = source.find("OpMemoryBarrier %uint_1 %uint_2114");
+		const auto second = source.find("OpMemoryBarrier %uint_1 %uint_2114", first + 1);
+		Check(first != std::string::npos && second != std::string::npos &&
+		          source.find("OpMemoryBarrier", second + 1) == std::string::npos &&
+		          source.find("OpControlBarrier") == std::string::npos,
+		      "cache invalidation must fence device memory once per wave without convergence");
+
+		const std::array reload = {
+		    EncodeMubuf0(0x1c, 0, false),
+		    EncodeMubuf1(0, 0, 0),
+		    0xe1c40000u,
+		    0u,
+		    0xbf8c0000u,
+		    EncodeMubuf0(0x0c, 0, false),
+		    EncodeMubuf1(1, 0, 0),
+		    EncodeMubuf0(0x1c, 4, false),
+		    EncodeMubuf1(1, 0, 0),
+		    EncodeSopp(0x01),
+		};
+		const auto result = RecompileForTest(reload, options);
+		CheckSpirvBinaryValidates(result.spirv);
+		const auto store = result.ir_dump.find("StoreBufferU32");
+		const auto fence = result.ir_dump.find("DataCacheInvalidate");
+		const auto load  = result.ir_dump.find("LoadBufferU32");
+		Check(store < fence && fence < load && load != std::string::npos &&
+		          DisassembleSpirvBinary(result.spirv).find(" Coherent") != std::string::npos,
+		      "plain buffer reload lost its cache fence order or coherent visibility");
+	}
 }
 
 void TestNativeStoreCompletion() {
@@ -6707,6 +6766,18 @@ void TestPixelAncillaryLayerInput() {
     CheckSpirvBinaryValidates(wqm_result.spirv);
   }
 
+  uint32_t dpp[] = {
+	  EncodeVop3Word0(0x148, 6), EncodeVop3Word1(5 + 256, 128 + 16, 128 + 11),
+	  EncodeVop1(0x01, 5, 250),  EncodeVop1Dpp(6) | (1u << 19u), // Bound-zero DPP overwrite.
+	  EncodeExp0(0x00, 0x1),     EncodeExp1(5, 0, 0, 0),
+	  EncodeSopp(0x01),
+  };
+  auto dpp_result = RecompileForTest(dpp, options);
+  Check(ProgramHasInput(dpp_result.program, StageInputKind::Layer) &&
+	        !ProgramHasInput(dpp_result.program, StageInputKind::PackedAncillary),
+	    "DPP write retained the old ancillary register value");
+  CheckSpirvBinaryValidates(dpp_result.spirv);
+
   const uint32_t loop[] = {
       EncodeSop1(0x04, 8, 126),  // Save the original EXEC mask.
       EncodeSop1(0x0a, 126, 8),   // Widen for helper lanes.
@@ -6760,6 +6831,9 @@ void TestPixelAncillaryLayerInput() {
   shader[5] = EncodeExp1(6, 7, 5, 0);
   ExpectFatal([&] { (void)RecompileForTest(shader, options); },
               "direct raw ancillary export was silently replaced after field lowering");
+  dpp[3] = EncodeVop1Dpp(6); // Without BOUND_CTRL, lanes with inactive sources keep the value.
+  ExpectFatal([&] { (void)RecompileForTest(dpp, options); },
+	          "DPP write without BOUND_CTRL silently replaced the ancillary value");
 #endif
 }
 
@@ -10206,44 +10280,40 @@ void TestComputeDispatchWaveSize() {
 }
 
 void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
-  const uint32_t shader[] = {
-      EncodeMubuf0(0x0c),
-      EncodeMubuf1(0, 0, 1), // buffer_load_dword
-                             // v0
-      EncodeMubuf0(0x1c, 0, false),
-      EncodeMubuf1(0, 12, 0),
-      EncodeSopp(0x01),
-  };
+	const uint32_t shader[] = {
+	    EncodeVopc(0xd4, 0 + 256, 1), // v_cmpx_gt_u32 v0, v1
+	    EncodeMubuf0(0x0c),
+	    EncodeMubuf1(0, 0, 1), // buffer_load_dword
+	                           // v0
+	    EncodeMubuf0(0x1c, 0, false),
+	    EncodeMubuf1(0, 12, 0),
+	    EncodeSopp(0x01),
+	};
 
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
+	auto options    = MakeCompileOptions(ShaderType::Compute);
+	options.dump_ir = true;
 
-  auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("BUFFER_LOAD_DWORD") != std::string::npos),
-        "buffer load guard regression did not decode MUBUF load");
-  CheckSpirvBinaryValidates(result.spirv);
+	auto result = RecompileForTest(shader, options);
+	Check((result.decoded_dump.find("BUFFER_LOAD_DWORD") != std::string::npos),
+	      "buffer load guard regression did not decode MUBUF load");
+	CheckSpirvBinaryValidates(result.spirv);
 
-  const auto source = DisassembleSpirvBinary(result.spirv);
-  const auto exec_branch =
-      source.find("OpBranchConditional", 0);
-  // The bound length comes from shader data rather than OpArrayLength
-  // (rendering_menu.patch); the bounds check is the unsigned compare against it.
-  const auto array_length =
-      source.find("OpULessThan", 0);
-  const auto bounds_branch = source.find("OpBranchConditional", array_length);
-  const auto element_access = source.find("OpAccessChain %_ptr_StorageBuffer_uint", 0);
-  Check(exec_branch != std::string::npos,
-        "buffer load SPIR-V lacks EXEC guard branch");
-  Check(array_length != std::string::npos,
-        "buffer load SPIR-V lacks storage buffer array-length bounds check");
-  Check(bounds_branch != std::string::npos,
-        "buffer load SPIR-V lacks storage buffer bounds branch");
-  Check(element_access != std::string::npos,
-        "buffer load SPIR-V lacks storage element access");
-  Check(exec_branch < array_length,
-        "buffer load bounds check was emitted outside EXEC guard");
-  Check(bounds_branch < element_access,
-        "buffer load storage element pointer was formed before bounds guard");
+	const auto source      = DisassembleSpirvBinary(result.spirv);
+	const auto exec_branch = source.find("OpBranchConditional", 0);
+	// The bound length comes from shader data rather than OpArrayLength
+	// (rendering_menu.patch); the bounds check is the unsigned compare against it.
+	const auto array_length   = source.find("OpULessThan", 0);
+	const auto bounds_branch  = source.find("OpBranchConditional", array_length);
+	const auto element_access = source.find("OpAccessChain %_ptr_StorageBuffer_uint", 0);
+	Check(exec_branch != std::string::npos, "buffer load SPIR-V lacks EXEC guard branch");
+	Check(array_length != std::string::npos,
+	      "buffer load SPIR-V lacks storage buffer array-length bounds check");
+	Check(bounds_branch != std::string::npos,
+	      "buffer load SPIR-V lacks storage buffer bounds branch");
+	Check(element_access != std::string::npos, "buffer load SPIR-V lacks storage element access");
+	Check(exec_branch < array_length, "buffer load bounds check was emitted outside EXEC guard");
+	Check(bounds_branch < element_access,
+	      "buffer load storage element pointer was formed before bounds guard");
 }
 
 void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
@@ -11360,9 +11430,8 @@ void TestNewShaderRecompilerSetpcJumpTable() {
         "S_SETPC_B64 jump table did not retain both targets");
   Check(jump->terminator.indirect_selector_values.size() == 2,
         "S_SETPC_B64 jump table did not retain selector mapping");
-  Check(
-      (result.ir_dump.find("SLoadDword") == std::string::npos),
-      "S_SETPC_B64 jump table load was reflected as a raw scalar buffer load");
+  Check((result.ir_dump.find("LoadAddressU32") == std::string::npos),
+	    "S_SETPC_B64 jump table load was reflected as a raw scalar buffer load");
   Check(SpirvContainsOpcode(result.spirv, 251),
         "dispatcher SPIR-V lacks OpSwitch");
   CheckSpirvBinaryValidates(result.spirv);
@@ -11422,70 +11491,65 @@ void TestNewShaderRecompilerPrunesUnreachableSetpcMetadata() {
         "unreachable S_SETPC metadata suppressed a reachable scalar load component");
 }
 
-void TestNewShaderRecompilerSetpcDwordJumpTable() {
-  const uint32_t shader[] = {
-      EncodeSopp(0x02, 1),             // skip one unreachable block
-      EncodeSMovB32(100, 129),         // unreachable
-      EncodeSop2(0x07, 106, 0, 130),   // s_min_u32 vcc_lo, s0, 2
-      EncodeSop2(0x1e, 106, 106, 130), // s_lshl_b32 vcc_lo, vcc_lo, 2
-      EncodeSop1(0x1f, 4, 0),          // s_getpc_b64 s[4:5]
-      EncodeSop2(0x00, 4, 4, 255),     // s_add_u32 s4, s4, literal
-      0x00000034u,
-      EncodeSop2(0x04, 5, 5, 128), // s_addc_u32 s5, s5, 0
-      EncodeSmem0(0x00, 6, 2),
-      (106u << 25u) | 4u,          // s_load_dword s6, s[4:5], vcc_lo offset:4
-      EncodeSopp(0x0c, 0),         // s_waitcnt 0
-      EncodeSop2(0x01, 4, 4, 6),   // s_sub_u32 s4, s4, s6
-      EncodeSop2(0x05, 5, 5, 128), // s_subb_u32 s5, s5, 0
-      EncodeSop1(0x20, 0, 4),      // s_setpc_b64 s[4:5]
-      EncodeSMovB32(1, 129),       // case 0
-      EncodeSopp(0x02, 1),
-      EncodeSMovB32(2, 129), // case 1
-      EncodeSopp(0x01, 0),
-      0u,
-      0x00000010u,
-      0x00000008u,
-      0x00000010u, // table at pc 0x44, targets relative backward from pc 0x40
-  };
+// offset_sgpr 106 aliases the vcc_lo selector, like a game's
+// s_load_dword s17, s[22:23], s17.
+void TestNewShaderRecompilerSetpcDwordJumpTable(uint32_t offset_sgpr) {
+	const uint32_t shader[] = {
+	    EncodeSopp(0x02, 1),             // skip one unreachable block
+	    EncodeSMovB32(100, 129),         // unreachable
+	    EncodeSop2(0x07, 106, 0, 130),   // s_min_u32 vcc_lo, s0, 2
+	    EncodeSop2(0x1e, 106, 106, 130), // s_lshl_b32 vcc_lo, vcc_lo, 2
+	    EncodeSop1(0x1f, 4, 0),          // s_getpc_b64 s[4:5]
+	    EncodeSop2(0x00, 4, 4, 255),     // s_add_u32 s4, s4, literal
+	    0x00000034u,
+	    EncodeSop2(0x04, 5, 5, 128), // s_addc_u32 s5, s5, 0
+	    EncodeSmem0(0x00, offset_sgpr, 2),
+	    (106u << 25u) | 4u,                  // s_load_dword offset, s[4:5], vcc_lo offset:4
+	    EncodeSopp(0x0c, 0),                 // s_waitcnt 0
+	    EncodeSop2(0x01, 4, 4, offset_sgpr), // s_sub_u32 s4, s4, offset
+	    EncodeSop2(0x05, 5, 5, 128),         // s_subb_u32 s5, s5, 0
+	    EncodeSop1(0x20, 0, 4),              // s_setpc_b64 s[4:5]
+	    EncodeSMovB32(1, 129),               // case 0
+	    EncodeSopp(0x02, 1),
+	    EncodeSMovB32(2, 129), // case 1
+	    EncodeSopp(0x01, 0),
+	    0u,
+	    0x00000010u,
+	    0x00000008u,
+	    0x00000010u, // table at pc 0x4c, targets relative backward from pc 0x48
+	};
 
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
+	auto options    = MakeCompileOptions(ShaderType::Compute);
+	options.dump_ir = true;
 
-  auto result = RecompileForTest(shader, options);
-  Check((result.ir_dump.find("mode=dispatcher") != std::string::npos),
-        "subtractive S_SETPC_B64 table did not select dispatcher fallback");
-  const auto jump = std::find_if(
-      result.program.block_info.begin(),
-      result.program.block_info.end(), [](const auto &block) {
-        return !block.terminator.indirect_targets.empty();
-      });
-  const auto block_pc = [&](uint32_t id) {
-    const auto block =
-        std::find_if(result.program.block_info.begin(),
-                     result.program.block_info.end(),
-                     [=](const auto &info) { return info.id == id; });
-    return block != result.program.block_info.end() ? block->start_pc
-                                                            : UINT32_MAX;
-  };
-  Check(jump != result.program.block_info.end() &&
-            jump->terminator.indirect_targets.size() == 2 &&
-            jump->terminator.indirect_target_pcs ==
-                std::vector<uint32_t>({0x38u, 0x40u}) &&
-            jump->terminator.indirect_selector_values ==
-                std::vector<uint32_t>({0u, 4u, 8u}) &&
-            jump->terminator.indirect_selector_targets.size() == 3 &&
-            block_pc(jump->terminator.indirect_selector_targets[0]) == 0x38u &&
-            block_pc(jump->terminator.indirect_selector_targets[1]) == 0x40u &&
-            block_pc(jump->terminator.indirect_selector_targets[2]) == 0x38u &&
-            std::ranges::none_of(
-                result.program.block_info,
-                [](const auto &info) { return info.start_pc == 0x04u; }),
-        "subtractive S_SETPC_B64 table targets or selector mapping changed");
-  Check((result.ir_dump.find("SLoadDword") == std::string::npos),
-        "subtractive S_SETPC_B64 table load reached normal IR");
-  Check(SpirvContainsOpcode(result.spirv, 251),
-        "subtractive S_SETPC_B64 dispatcher lacks OpSwitch");
-  CheckSpirvBinaryValidates(result.spirv);
+	auto result = RecompileForTest(shader, options);
+	Check((result.ir_dump.find("mode=dispatcher") != std::string::npos),
+	      "subtractive S_SETPC_B64 table did not select dispatcher fallback");
+	const auto jump =
+	    std::find_if(result.program.block_info.begin(), result.program.block_info.end(),
+	                 [](const auto& block) { return !block.terminator.indirect_targets.empty(); });
+	const auto block_pc = [&](uint32_t id) {
+		const auto block =
+		    std::find_if(result.program.block_info.begin(), result.program.block_info.end(),
+		                 [=](const auto& info) { return info.id == id; });
+		return block != result.program.block_info.end() ? block->start_pc : UINT32_MAX;
+	};
+	Check(jump != result.program.block_info.end() &&
+	          jump->terminator.indirect_targets.size() == 2 &&
+	          jump->terminator.indirect_target_pcs == std::vector<uint32_t>({0x38u, 0x40u}) &&
+	          jump->terminator.indirect_selector_values == std::vector<uint32_t>({0u, 4u, 8u}) &&
+	          jump->terminator.indirect_selector_targets.size() == 3 &&
+	          block_pc(jump->terminator.indirect_selector_targets[0]) == 0x38u &&
+	          block_pc(jump->terminator.indirect_selector_targets[1]) == 0x40u &&
+	          block_pc(jump->terminator.indirect_selector_targets[2]) == 0x38u &&
+	          std::ranges::none_of(result.program.block_info,
+	                               [](const auto& info) { return info.start_pc == 0x04u; }),
+	      "subtractive S_SETPC_B64 table targets or selector mapping changed");
+	Check((result.ir_dump.find("LoadAddressU32") == std::string::npos),
+	      "subtractive S_SETPC_B64 table load reached normal IR");
+	Check(SpirvContainsOpcode(result.spirv, 251),
+	      "subtractive S_SETPC_B64 dispatcher lacks OpSwitch");
+	CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestNewShaderRecompilerExpVertexOutputs() {
@@ -15286,6 +15350,7 @@ int main() {
   TestImageAddressOperands();
   TestDeadImageAccessKeepsNoImageIndex();
   TestSopkCompareImmediateExtension();
+  TestNativeDataCacheInvalidation();
   TestNativeStoreCompletion();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16();
@@ -15369,7 +15434,8 @@ int main() {
   TestEmbeddedVertexFormatSwizzle();
   TestNewShaderRecompilerSetpcJumpTable();
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
-  TestNewShaderRecompilerSetpcDwordJumpTable();
+  TestNewShaderRecompilerSetpcDwordJumpTable(6);
+  TestNewShaderRecompilerSetpcDwordJumpTable(106);
   TestTypedEntryStateIsMinimal();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestFinalSsaRejectsRegisterStatePseudos();

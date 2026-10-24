@@ -5604,22 +5604,42 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 			using MixedSamples       = GraphicContext::MixedAttachmentSamples;
 			const auto     mixed     = m_graphics.mixed_attachment_samples;
 			const uint32_t color_samples = attachment_samples;
-			const bool     allowed   = mixed == MixedSamples::Amd ||
-			                     (mixed == MixedSamples::Nv && color_samples < depth_samples);
-			if (!allowed) {
-				EXIT("mixed color/depth sample counts are unsupported on this GPU: color %u, "
-				     "depth %u (needs VK_AMD_mixed_attachment_samples, or "
-				     "VK_NV_framebuffer_mixed_samples with color <= depth)\n",
-				     color_samples, depth_samples);
-			}
-			rendering.color_samples = color_samples;
-			rendering.depth_samples = depth_samples;
-			attachment_samples      = std::max(color_samples, depth_samples);
-			static std::atomic_bool logged = false;
-			if (!logged.exchange(true, std::memory_order_relaxed)) {
-				LOGF("Pipeline: mixed attachment samples (%s): color %u, depth %u, raster %u\n",
-				     mixed == MixedSamples::Amd ? "AMD" : "NV", color_samples, depth_samples,
-				     attachment_samples);
+			uint32_t       resolvable_samples = 0;
+			if (m_graphics.AcceptsMixedSamples(color_samples, depth_samples)) {
+				rendering.color_samples        = color_samples;
+				rendering.depth_samples        = depth_samples;
+				attachment_samples             = std::max(color_samples, depth_samples);
+				static std::atomic_bool logged = false;
+				if (!logged.exchange(true, std::memory_order_relaxed)) {
+					LOGF("Pipeline: mixed attachment samples (%s): color %u, depth %u, raster %u\n",
+					     mixed == MixedSamples::Amd ? "AMD" : "NV", color_samples, depth_samples,
+					     attachment_samples);
+				}
+			} else if (MsColorTargetsResolvable(colors, resolvable_samples) &&
+			           EmulatesColorAtDepthSamples(false, resolvable_samples, depth_samples)) {
+				// The color is 1-sample and the depth is not: render the color into a temporary
+				// image at the depth sample count and resolve it (renderDraw.cpp). Every
+				// attachment then shares one sample count, so depth stays attached.
+				attachment_samples             = depth_samples;
+				static std::atomic_bool logged = false;
+				if (!logged.exchange(true, std::memory_order_relaxed)) {
+					LOGF("Pipeline: emulated EQAA: color %u rendered at %u samples and resolved\n",
+					     color_samples, depth_samples);
+				}
+			} else {
+				// ponytail: no mixed-sample extension on the host (RenderDoc hides
+				// VK_NV_framebuffer_mixed_samples). Vulkan needs one sample count for all
+				// attachments, so render this draw without depth instead of ending the emulator.
+				// Ceiling: no depth test/write for these draws; renderDraw.cpp drops the
+				// attachment to match.
+				rendering.depth_format         = vk::Format::eUndefined;
+				rendering.stencil_format       = vk::Format::eUndefined;
+				static std::atomic_bool warned = false;
+				if (!warned.exchange(true, std::memory_order_relaxed)) {
+					LOGF("Pipeline: no mixed-sample support: rendering color %u / depth %u draws "
+					     "without depth\n",
+					     color_samples, depth_samples);
+				}
 			}
 		}
 	}

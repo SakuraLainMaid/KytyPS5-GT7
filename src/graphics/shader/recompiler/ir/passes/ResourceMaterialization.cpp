@@ -141,6 +141,7 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 	    type != Prospero::ImageType::kColor2DMsaa) {
 		return false;
 	}
+	if (!IsValidImageSwizzle(words[3] & 0xfffu)) return false;
 	const bool array = type == Prospero::ImageType::kColor1DArray ||
 	                   type == Prospero::ImageType::kColor2DArray ||
 	                   type == Prospero::ImageType::kColor2DMsaaArray ||
@@ -148,15 +149,15 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 	if (array && ((words[4] >> 16u) & 0x1fffu) > (words[4] & 0x1fffu)) {
 		return false;
 	}
+	const auto base_level = (words[3] >> 12u) & 0xfu;
+	const auto last_level = (words[3] >> 16u) & 0xfu;
 	if (type == Prospero::ImageType::kColor2DMsaa ||
 	    type == Prospero::ImageType::kColor2DMsaaArray) {
-		const auto base_level = (descriptor.dwords[3] >> 12u) & 0xfu;
-		const auto fragments  = (descriptor.dwords[3] >> 16u) & 0xfu;
 		const auto max_mip    = (descriptor.dwords[5] >> 4u) & 0xfu;
-		return base_level == 0 && fragments >= 1 && fragments <= 3 &&
-		       (r128 || max_mip == fragments);
+		return base_level == 0 && last_level >= 1 && last_level <= 3 &&
+		       (r128 || max_mip == last_level);
 	}
-	return true;
+	return base_level <= last_level;
 }
 
 uint32_t DescriptorImageSwizzle(const DescriptorValue& descriptor) {
@@ -191,7 +192,7 @@ uint32_t ImageMipCount(const ImageResource& image, const DescriptorValue& descri
 	}
 	const auto base = (descriptor.dwords[3] >> 12u) & 0xfu;
 	const auto last = (descriptor.dwords[3] >> 16u) & 0xfu;
-	return base <= last ? last - base + 1u : 0u;
+	return last - base + 1u;
 }
 
 bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResource& result) {
@@ -603,10 +604,6 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return SpecializationFail(fmt::format("image resource {} has an invalid class", i));
 		}
 		image.mip_count = ImageMipCount(base, descriptor);
-		if (image.mip_count == 0u) {
-			return SpecializationFail(
-			    fmt::format("image descriptor {} has an invalid mip range", i));
-		}
 		if (NullImageDescriptor(descriptor)) {
 			image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
 			                                  : Prospero::TextureNumericClass::Float;
@@ -669,7 +666,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		if (storage) {
 			if ((!raw_sint_storage && !base.atomic &&
 			     image.numeric_class == Prospero::TextureNumericClass::Sint) ||
-			    image.numeric_class == Prospero::TextureNumericClass::Unsupported) {
+			    image.numeric_class == Prospero::TextureNumericClass::Unsupported ||
+			    // Stores re-pack only raw uint bitfields (PackImageTexel).
+			    (image.conversion_format != Prospero::BufferFormat::kInvalid &&
+			     Format::GetFormatComponentType(format) != Format::ComponentType::Uint)) {
 				return SpecializationFail(
 				    fmt::format("storage image descriptor {} uses unsupported format {}", i,
 				                static_cast<uint32_t>(format)));

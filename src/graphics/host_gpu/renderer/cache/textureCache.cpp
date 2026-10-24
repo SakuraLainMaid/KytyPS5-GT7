@@ -2168,6 +2168,30 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (requested.IsBlock() && !cached.info.IsBlock()) {
 			return {ExpandImage(requested, cached_id)};
 		}
+		// A 1x1x1 texel read as 2D by one shader and 3D by another has the same guest bytes in
+		// either type: keep both native images instead of recreating one per request (a menu
+		// did this ~110 times a frame). Only for clean, untouched-by-GPU single texels.
+		if (requested.IsVolume() != cached.info.IsVolume() && requested.type != cached.info.type &&
+		    requested.data.size == cached.info.data.size && requested.extent.width == 1 &&
+		    requested.extent.height == 1 && requested.extent.depth == 1 &&
+		    cached.info.extent.width == 1 && cached.info.extent.height == 1 &&
+		    cached.info.extent.depth == 1 && requested.resources == cached.info.resources &&
+		    requested.resources.levels == 1 && requested.resources.layers == 1 &&
+		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format) &&
+		    !cached.IsGpuModified() && !cached.binding.is_target && [&] {
+			    size_t owners = 0;
+			    ForEachPage(requested.data.address, 1, [&](uint64_t page) {
+				    if (const auto* list = m_image_page_table.Find(page)) {
+					    owners = list->size();
+				    }
+			    });
+			    return owners < 4;
+		    }()) {
+			// Compatible formats only: an incompatible one still goes through the replace path
+			// below, which frees the old image. Keeping every format/type pair alive piled
+			// >127 owners on this page (PageManager write-watcher overflow).
+			return {merged_id};
+		}
 		// Volume depth is not an array-layer count. A larger depth can retain the
 		// same block-slice layout while requiring a larger native image.
 		if ((requested.IsVolume() || cached.info.IsVolume()) &&
@@ -4984,7 +5008,8 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 		pending->ranges.emplace_back(range.address, range.size);
 	}
 	m_scheduler.DeferPriorityOperation([download, dedicated, range, mapped, offset, guard,
-	                                    readback_guard, guest_hash, landed_flag, pending] {
+	                                    readback_guard, guest_hash, landed_flag, pending, evicting,
+	                                    buffer_cache = &m_buffer_cache] {
 		struct Landed {
 			const std::shared_ptr<std::atomic<bool>>& flag;
 			~Landed() {
@@ -5034,6 +5059,14 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 		const LibKernel::Memory::WriteSourceScope source(
 		    LibKernel::Memory::WriteSource::ImageWriteBack);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		// Round 140 (from Franseven): the backing write takes no write fault, so cached buffers
+		// over these bytes (a pool the image lives in) still hold the old ones while the tracker
+		// holds them clean (grass vertices wrong after a race, then a time trial). Evicted images
+		// only: a kept image's pages turned CPU-dirty would upload this copy over GPU pixels
+		// drawn since it was recorded.
+		if (evicting && buffer_cache->RedirtyMapped(range.address, range.size) != 0) {
+			buffer_cache->MarkMappedPending(range.address, range.size);
+		}
 		if (readback_guard) {
 			NoteLandedReadback(range.address, mapped, range.size);
 			NoteReadbackLanded(range.address, mapped, range.size, false);

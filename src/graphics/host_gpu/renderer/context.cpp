@@ -213,6 +213,9 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 		    attachment.is_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
 		colors[i].storeOp                 = vk::AttachmentStoreOp::eStore;
 		colors[i].clearValue.color.uint32 = attachment.clear_value;
+		colors[i].resolveMode             = attachment.resolve_mode;
+		colors[i].resolveImageView        = attachment.resolve_image_view;
+		colors[i].resolveImageLayout      = attachment.resolve_image_layout;
 	}
 
 	const auto&                 depth_stencil = state.depth_stencil_attachment;

@@ -12,6 +12,10 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv {
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
                                   ShaderStageInputInfo input_info);
 
+// OpName is emitted with graphics debug dumps, or always once this is set (tests find variables
+// and functions by name).
+void SetEmitNames(bool enabled);
+
 // Optional image features of the device, set once by the device layer.
 struct HostImageFeatures {
 	// shaderResourceMinLod: the MinLod image operand, used for IMAGE_SAMPLE*_CL.

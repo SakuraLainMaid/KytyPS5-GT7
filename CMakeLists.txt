@@ -426,6 +426,7 @@ set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms_depth.frag"
 	"${gpu_tiler_shader_dir}/gpu_blit_ms_depth_sample0.frag"
 	"${gpu_tiler_shader_dir}/gpu_blit_ms_stencil_sample0.frag"
+	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms.frag"
 	"${gpu_tiler_shader_dir}/gpu_video_out_overlay.frag"
 	"${gpu_tiler_shader_dir}/color_clear_check.comp"
 	"${gpu_tiler_shader_dir}/gpu_conditional_clear_float.frag"
