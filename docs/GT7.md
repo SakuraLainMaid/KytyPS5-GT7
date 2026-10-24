@@ -60,6 +60,37 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 23, 2026, eighth build)
+
+The shaders are compiled again once after this update (the shader translator changed): the first
+menu and the first race take longer than usual.
+
+- **The thin line up the sky is gone, and the track is one shade on both sides of it.** The sky
+  and the reflections come from cube maps (six square faces). The emulator samples each face as a
+  flat picture, and with the game's "wrap" setting the filtering at a face's edge blended in the
+  opposite edge of the same face: a thin line along each face edge, and a step in the track's
+  reflection. The console ignores that setting for cube maps; the emulator now keeps each face's
+  filtering inside the face (`KYTY_CUBE_EDGE_CLAMP=0` turns it off).
+- **Fixes from Franseven's review of the shader translator** (thank you), several ported from
+  mainline (nmzik, Mr. Big Britches, Andre Michi, Nawid3333): NaN and denormal handling, branches
+  of wave64 shaders on 32-lane cards with missing lanes, V_READFIRSTLANE with no active lane,
+  saturate and float-to-integer clamping, bit-field inserts in descriptors, cube coordinates,
+  more texture formats sampled (draws using formats 30 and 32 are no longer skipped), textures
+  with an invalid mip range read as empty instead of skipping the draw, and the same SPIR-V on
+  every run.
+- **Grass after a race, then a Time Trial, is right** (Franseven): an image written back to
+  memory now makes the buffers over the same memory upload it again.
+- **Cards and tools without mixed-sample support** (RenderDoc; Intel Arc too, most likely) no
+  longer end the emulator at the start of a race (Franseven): those draws render their colour at
+  the depth's sample count and resolve it.
+- **Objects that were still compiling no longer stay missing** (Franseven): a draw skipped while
+  its pipeline compiles counts as visible to the game's visibility tests, so the game keeps
+  drawing it. Pipeline compiles now go to what is on screen first, and the backlog runs on two
+  low-priority threads instead of slowing the game.
+- `KYTY_PIPELINE_QUICK=1` (off by default) draws a new object at once with an unoptimized
+  pipeline while the optimized one compiles: no invisible cars on a fresh cache, at some cost in
+  frame rate until the optimized ones are in.
+
 ## What's new (October 23, 2026, seventh build)
 
 No shaders are compiled again after this update.
