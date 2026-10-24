@@ -10,6 +10,7 @@
 #include "inputMappingDialog.h"
 #include "mainDialog.h"
 #include "patchesDialog.h"
+#include "psHomeView.h"
 #include "trophyViewerDialog.h"
 
 #include <QAbstractItemModel>
@@ -45,6 +46,8 @@
 #include <QSet>
 #include <QSettings>
 #include <QSignalBlocker>
+#include <QStackedWidget>
+#include <QDateTime>
 #include <QStyle>
 #include <QToolButton>
 #include <QTreeWidget>
@@ -255,6 +258,7 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	        &ConfigurationListWidget::ApplyCompatibility);
 
 	m_ui->cfgs_list->setDragDropMode(QAbstractItemView::NoDragDrop);
+	InitHomeView();
 
 	ReadSettings();
 	if (m_compatibility->IsLocal()) {
@@ -767,7 +771,7 @@ void ConfigurationListWidget::edit_configuration() {
 	connect(&dlg, &ConfigurationEditDialog::PreviewControllerColor, this,
 	        &ConfigurationListWidget::PreviewControllerColor);
 
-	if (dlg.exec() == QDialog::Accepted) {
+	if (ExecDialog(dlg) == QDialog::Accepted) {
 		info->custom_settings           = true;
 		item->GetInfo().custom_settings = true;
 		auto game_path                  = info->game_path;
@@ -813,7 +817,7 @@ void ConfigurationListWidget::edit_global_settings() {
 	connect(&dlg, &ConfigurationEditDialog::ExportGameSettings, this,
 	        [this, &dlg]() { ExportGameSettings(&dlg); });
 
-	if (dlg.exec() == QDialog::Accepted) {
+	if (ExecDialog(dlg) == QDialog::Accepted) {
 		m_global_info.CopyEmulatorSettingsFrom(info);
 		m_global_info.controller     = info.controller;
 		const auto game_dirs         = NormalizeGameDirectories(dlg.GetGameDirectories());
@@ -955,7 +959,7 @@ void ConfigurationListWidget::ExportGameSettings(QWidget* parent) const {
 
 void ConfigurationListWidget::edit_input_mapping() {
 	InputMappingDialog dialog(m_global_info.host_input_mapping, this);
-	if (dialog.exec() == QDialog::Accepted) {
+	if (ExecDialog(dialog) == QDialog::Accepted) {
 		m_global_info.host_input_mapping = dialog.Mapping();
 		WriteSettings();
 	}
@@ -969,7 +973,8 @@ void ConfigurationListWidget::ViewTrophies() {
 	}
 
 	const auto config = CreateConfiguration(*item);
-	TrophyViewerDialog::ShowForGame(config.get(), m_runtime_directory, this);
+	TrophyViewerDialog::ShowForGame(config.get(), m_runtime_directory, this,
+	                                [this](QDialog& dialog) { return ExecDialog(dialog); });
 }
 
 void ConfigurationListWidget::open_game_folder() {
@@ -1063,6 +1068,211 @@ void ConfigurationListWidget::remove_save_data() {
 	}
 }
 
+// The settings key of when a game was last started from the launcher.
+static QString RecentKey(const QString& game_path) {
+	return QStringLiteral("recent/") +
+	       QString::fromLatin1(game_path.toUtf8().toBase64(QByteArray::Base64UrlEncoding |
+	                                                       QByteArray::OmitTrailingEquals));
+}
+
+// The settings key of the picture shown as a game's logo on the home view.
+static QString LogoKey(const QString& game_path) {
+	return QStringLiteral("logo/") +
+	       QString::fromLatin1(game_path.toUtf8().toBase64(QByteArray::Base64UrlEncoding |
+	                                                       QByteArray::OmitTrailingEquals));
+}
+
+int ConfigurationListWidget::ExecDialog(QDialog& dialog) {
+	return IsHomeView() ? m_home->RunPage(&dialog) : dialog.exec();
+}
+
+void ConfigurationListWidget::SetRunEnabled(bool flag) {
+	m_run_enabled = flag;
+	if (m_home != nullptr) {
+		m_home->SetPlayEnabled(flag);
+	}
+}
+
+void ConfigurationListWidget::InitHomeView() {
+	m_home       = new PsHomeView(this);
+	m_view_stack = new QStackedWidget(this);
+	m_ui->verticalLayout->replaceWidget(m_ui->cfgs_list, m_view_stack);
+	m_view_stack->addWidget(m_home);
+	m_view_stack->addWidget(m_ui->cfgs_list);
+
+	m_view_button = new QToolButton(this);
+	m_view_button->setCheckable(true);
+	m_view_button->setToolTip(tr("Switch between the home view and the game list"));
+	m_ui->horizontalLayout->insertWidget(0, m_view_button);
+	connect(m_view_button, &QToolButton::toggled, this, [this](bool list) { SetHomeView(!list); });
+
+	// The tree is the model: the home view follows its items, order, filter and selection.
+	m_home_refresh = new QTimer(this);
+	m_home_refresh->setSingleShot(true);
+	m_home_refresh->setInterval(0);
+	connect(m_home_refresh, &QTimer::timeout, this, &ConfigurationListWidget::RefreshHomeView);
+	auto* model = m_ui->cfgs_list->model();
+	for (const auto signal: {&QAbstractItemModel::rowsInserted, &QAbstractItemModel::rowsRemoved}) {
+		connect(model, signal, m_home_refresh, qOverload<>(&QTimer::start));
+	}
+	connect(model, &QAbstractItemModel::dataChanged, m_home_refresh, qOverload<>(&QTimer::start));
+	connect(model, &QAbstractItemModel::layoutChanged, m_home_refresh, qOverload<>(&QTimer::start));
+	connect(model, &QAbstractItemModel::modelReset, m_home_refresh, qOverload<>(&QTimer::start));
+	connect(m_ui->cfgs_list, &QTreeWidget::currentItemChanged, this,
+	        [this](QTreeWidgetItem* current) {
+		        m_home->SetSelected(static_cast<ConfigurationItem*>(current));
+	        });
+
+	connect(m_home, &PsHomeView::SelectionChanged, this, [this](ConfigurationItem* item) {
+		m_ui->cfgs_list->setCurrentItem(item);
+	});
+	connect(m_home, &PsHomeView::PlayRequested, this, [this] {
+		if (m_selected_item != nullptr && m_run_enabled) {
+			emit Run();
+		}
+	});
+	connect(m_home, &PsHomeView::SettingsRequested, this,
+	        &ConfigurationListWidget::edit_configuration);
+	connect(m_home, &PsHomeView::TrophiesRequested, this, &ConfigurationListWidget::ViewTrophies);
+	connect(m_home, &PsHomeView::OptionsRequested, this,
+	        [this] { ShowItemMenu(m_selected_item); });
+	connect(m_home, &PsHomeView::MinimizeRequested, this, [this] { window()->showMinimized(); });
+	connect(m_home, &PsHomeView::MaximizeRequested, this, [this] {
+		if (window()->isMaximized()) {
+			window()->showNormal();
+		} else {
+			window()->showMaximized();
+		}
+	});
+	connect(m_home, &PsHomeView::CloseRequested, this, [this] { window()->close(); });
+	// The home view's Games tab lists the games played last first.
+	connect(this, &ConfigurationListWidget::Run, this, [this] {
+		if (m_selected_item != nullptr) {
+			auto settings = QSettings(QSettings::UserScope, QStringLiteral("Kyty"),
+			                          QStringLiteral("LauncherView"));
+			settings.setValue(RecentKey(m_selected_item->GetInfo().game_path),
+			                  QDateTime::currentSecsSinceEpoch());
+			m_trophy_counts.remove(m_selected_item->GetInfo().game_path);
+			m_home_refresh->start();
+		}
+	});
+	connect(m_home, &PsHomeView::SearchTextChanged, m_ui->search_line_edit, &QLineEdit::setText);
+	connect(m_home, &PsHomeView::RefreshRequested, m_ui->refresh_action, &QAction::trigger);
+	connect(m_home, &PsHomeView::InputMappingRequested, this,
+	        &ConfigurationListWidget::edit_input_mapping);
+	connect(m_home, &PsHomeView::GlobalSettingsRequested, this,
+	        &ConfigurationListWidget::edit_global_settings);
+	connect(m_home, &PsHomeView::ListViewRequested, this,
+	        [this] { m_view_button->setChecked(true); });
+	m_list_margins = {m_ui->gridLayout->contentsMargins(), m_ui->horizontalLayout_2->contentsMargins(),
+	                  m_ui->verticalLayout->contentsMargins()};
+	m_list_spacing = m_ui->verticalLayout->spacing();
+	// The toolbar's spacer asks for no height, so the row has none when its widgets are hidden.
+	for (int index = 0; index < m_ui->horizontalLayout->count(); index++) {
+		if (auto* spacer = m_ui->horizontalLayout->itemAt(index)->spacerItem(); spacer != nullptr) {
+			spacer->changeSize(spacer->sizeHint().width(), 0, QSizePolicy::Expanding,
+			                   QSizePolicy::Minimum);
+		}
+	}
+
+	// The view it opens in is a setting (the themes' section); the list unless chosen otherwise.
+	const bool list =
+	    QSettings(QSettings::UserScope, QStringLiteral("Kyty"), QStringLiteral("LauncherView"))
+	        .value(QStringLiteral("default_view"), QStringLiteral("list"))
+	        .toString() != QStringLiteral("home");
+	m_view_button->setChecked(list);
+	SetHomeView(!list);
+}
+
+bool ConfigurationListWidget::IsHomeView() const {
+	return m_view_stack != nullptr && m_view_stack->currentWidget() == m_home;
+}
+
+void ConfigurationListWidget::SetHomeView(bool home) {
+	// The home view has the toolbar's tools in its own top bar and fills the widget, edge to
+	// edge; the list has the toolbar and the margins.
+	const auto show_toolbar = [this](bool shown) {
+		for (int index = 0; index < m_ui->horizontalLayout->count(); index++) {
+			if (auto* widget = m_ui->horizontalLayout->itemAt(index)->widget(); widget != nullptr) {
+				widget->setVisible(shown);
+			}
+		}
+		m_ui->gridLayout->setContentsMargins(shown ? m_list_margins[0] : QMargins());
+		m_ui->horizontalLayout_2->setContentsMargins(shown ? m_list_margins[1] : QMargins());
+		m_ui->verticalLayout->setContentsMargins(shown ? m_list_margins[2] : QMargins());
+		m_ui->verticalLayout->setSpacing(shown ? m_list_spacing : 0);
+	};
+	if (!home) {
+		show_toolbar(true);
+	}
+	// Focus first goes to the button: a page being hidden hands focus to the next widget, which
+	// in the tree is a row's comment field, and a row whose field takes focus becomes current.
+	if (m_view_button->isVisible()) {
+		m_view_button->setFocus(Qt::OtherFocusReason);
+	}
+	m_view_stack->setCurrentWidget(home ? static_cast<QWidget*>(m_home) : m_ui->cfgs_list);
+	m_view_button->setText(home ? tr("List") : tr("Home"));
+	// The home view's window has no frame: its top bar has the window's buttons, and it moves
+	// and resizes the window itself.
+	if (auto* main_window = window(); main_window != nullptr && main_window != this &&
+	                                  main_window->windowFlags().testFlag(Qt::FramelessWindowHint) != home) {
+		const bool shown = main_window->isVisible();
+		const auto state = main_window->windowState();
+		main_window->setWindowFlag(Qt::FramelessWindowHint, home);
+		if (shown) {
+			main_window->setWindowState(state);
+			main_window->show();
+		}
+	}
+	m_home->SetFrameless(home);
+	if (home) {
+		show_toolbar(false);
+		RefreshHomeView();
+		m_home->setFocus();
+	} else {
+		m_ui->cfgs_list->setFocus(Qt::OtherFocusReason);
+	}
+	emit HomeViewChanged(home);
+}
+
+void ConfigurationListWidget::RefreshHomeView() {
+	if (m_home == nullptr || m_view_stack->currentWidget() != m_home) {
+		return;
+	}
+	std::vector<PsHomeView::Game> games;
+	const auto settings =
+	    QSettings(QSettings::UserScope, QStringLiteral("Kyty"), QStringLiteral("LauncherView"));
+	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
+		auto* item = static_cast<ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(index));
+		if (item == nullptr || item->isHidden()) {
+			continue;
+		}
+		const auto& info = item->GetInfo();
+		QStringList details {info.title_id};
+		if (!info.gameVersion.isEmpty()) {
+			details.append(tr("Version %1").arg(info.gameVersion));
+		}
+		PsHomeView::Game game {item, info.name, details.join(QStringLiteral("  \u00B7  ")),
+		                       info.basedir, TrophyViewerDialog::HasTrophyData(&info),
+		                       settings.value(RecentKey(info.game_path), 0).toLongLong()};
+		game.logo = settings.value(LogoKey(info.game_path)).toString();
+		if (game.has_trophies) {
+			auto counts = m_trophy_counts.find(info.game_path);
+			if (counts == m_trophy_counts.end()) {
+				counts = m_trophy_counts.insert(
+				    info.game_path, TrophyViewerDialog::Count(*CreateConfiguration(*item),
+				                                              m_runtime_directory));
+			}
+			game.trophies_earned = counts->first;
+			game.trophies_total  = counts->second;
+		}
+		games.push_back(std::move(game));
+	}
+	m_home->SetUserName(m_global_info.user_name);
+	m_home->SetPlayEnabled(m_run_enabled);
+	m_home->SetGames(std::move(games), m_selected_item);
+}
+
 void ConfigurationListWidget::filter_configurations(const QString& text) {
 	const auto query              = text.trimmed();
 	const bool has_query          = !query.isEmpty();
@@ -1089,6 +1299,8 @@ void ConfigurationListWidget::filter_configurations(const QString& text) {
 		m_ui->cfgs_list->setCurrentItem(nullptr);
 		SelectItem(nullptr);
 	}
+	// Hiding items changes no model data: the home view is told here.
+	m_home_refresh->start();
 }
 
 void ConfigurationListWidget::SelectItem(QTreeWidgetItem* witem) {
@@ -1125,8 +1337,14 @@ void ConfigurationListWidget::show_context_menu(const QPoint& pos) {
 		m_ui->cfgs_list->setCurrentItem(item);
 		SelectItem(item);
 	}
+	ShowItemMenu(item);
+}
 
-	QMenu      menu;
+// A game's menu (none: the list's), at the cursor: the tree's context menu and the home view's
+// options button.
+void ConfigurationListWidget::ShowItemMenu(ConfigurationItem* item) {
+	m_item_menu = std::make_unique<QMenu>();
+	auto&      menu = *m_item_menu;
 	const auto save_data_dirs = item != nullptr ? GetSaveDataDirs(item->GetInfo()) : QStringList();
 	const bool has_trophy_data =
 	    item != nullptr && TrophyViewerDialog::HasTrophyData(&item->GetInfo());
@@ -1188,5 +1406,37 @@ void ConfigurationListWidget::show_context_menu(const QPoint& pos) {
 		action_run->setDisabled(true);
 	}
 
+	// The home view shows the menu as its options panel, with its logo picture; the list, as a
+	// context menu.
+	if (IsHomeView()) {
+		if (item != nullptr) {
+			const auto game_path = item->GetInfo().game_path;
+			auto       settings  = QSettings(QSettings::UserScope, QStringLiteral("Kyty"),
+			                                 QStringLiteral("LauncherView"));
+			const bool has_logo  = settings.contains(LogoKey(game_path));
+			menu.addSeparator();
+			connect(menu.addAction(tr("Set logo picture...")), &QAction::triggered, this,
+			        [this, game_path] {
+				        const auto path = QFileDialog::getOpenFileName(
+				            this, tr("Logo picture (a PNG with a transparent background)"), {},
+				            tr("Images (*.png *.webp *.jpg *.jpeg)"));
+				        if (!path.isEmpty()) {
+					        QSettings(QSettings::UserScope, QStringLiteral("Kyty"),
+					                  QStringLiteral("LauncherView"))
+					            .setValue(LogoKey(game_path), path);
+					        RefreshHomeView();
+				        }
+			        });
+			auto* remove_logo = menu.addAction(tr("Remove logo picture"));
+			remove_logo->setEnabled(has_logo);
+			connect(remove_logo, &QAction::triggered, this, [this, game_path] {
+				QSettings(QSettings::UserScope, QStringLiteral("Kyty"), QStringLiteral("LauncherView"))
+				    .remove(LogoKey(game_path));
+				RefreshHomeView();
+			});
+		}
+		m_home->ShowOptions(item != nullptr ? item->GetInfo().name : tr("Options"), menu.actions());
+		return;
+	}
 	menu.exec(QCursor::pos());
 }

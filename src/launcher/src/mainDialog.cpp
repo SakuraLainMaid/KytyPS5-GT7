@@ -119,7 +119,12 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_ui->check_updates_link->setVisible(UpdateChecker::IsSupported());
 	m_ui->check_updates_on_startup->setVisible(UpdateChecker::IsSupported());
 
-	main_dialog->setWindowFlags(Qt::Dialog /*| Qt::MSWindowsFixedSizeDialogHint*/);
+	// The home view draws its own window buttons on a frameless window; the list has the
+	// system's frame, with the minimize and maximize buttons as well.
+	main_dialog->setWindowFlags(Qt::Dialog | Qt::WindowMinMaxButtonsHint |
+	                            Qt::WindowCloseButtonHint |
+	                            (m_ui->widget->IsHomeView() ? Qt::FramelessWindowHint
+	                                                        : Qt::WindowFlags()));
 
 	connect(main_dialog, &MainDialog::Start, this, &MainDialogPrivate::FindInterpreter,
 	        Qt::QueuedConnection);
@@ -131,6 +136,19 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 		        }
 	        });
 	connect(m_ui->widget, &ConfigurationListWidget::Run, this, &MainDialogPrivate::Run);
+	// The home view fills the window, edge to edge: the status lines and margins go with it.
+	const auto home_view = [this, margins = m_ui->gridLayout->contentsMargins(),
+	                        spacing = m_ui->verticalLayout_5->spacing()](bool home) {
+		for (auto* widget: std::initializer_list<QWidget*> {
+		         m_ui->label_settings_file, m_ui->label_Interpreter, m_ui->label_Version,
+		         m_ui->check_updates_link, m_ui->check_updates_on_startup}) {
+			widget->setVisible(!home);
+		}
+		m_ui->gridLayout->setContentsMargins(home ? QMargins() : margins);
+		m_ui->verticalLayout_5->setSpacing(home ? 0 : spacing);
+	};
+	connect(m_ui->widget, &ConfigurationListWidget::HomeViewChanged, this, home_view);
+	home_view(m_ui->widget->IsHomeView());
 	connect(m_ui->check_updates_link, &QLabel::linkActivated, this,
 	        [this](const QString&) { m_update_checker->Check(true); });
 	connect(m_update_checker, &UpdateChecker::CheckingChanged, m_ui->check_updates_link,

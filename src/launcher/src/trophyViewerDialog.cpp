@@ -4,6 +4,7 @@
 #include "common/trophies.h"
 #include "configuration.h"
 #include "gameContent.h"
+#include "psTheme.h"
 
 #include <QComboBox>
 #include <QDateTime>
@@ -17,7 +18,12 @@
 #include <QPixmap>
 #include <QProgressBar>
 #include <QRegularExpression>
+#include <QApplication>
+#include <QKeyEvent>
 #include <QScrollArea>
+#include <QTabBar>
+#include <QScrollBar>
+#include <QStyle>
 #include <QStringList>
 #include <QTabBar>
 #include <QTabWidget>
@@ -86,7 +92,7 @@ QDialog, QScrollArea, QScrollArea > QWidget > QWidget { background: #10131a; col
 QTabWidget::pane { border: 0; }
 QTabBar::tab { background: #1a1f2b; color: #9aa3b5; padding: 6px 16px; border-radius: 4px; margin: 2px; }
 QTabBar::tab:selected { background: #2a3142; color: #ffffff; }
-QFrame#card { background: #1a1f2b; border-radius: 10px; }
+QFrame#card { background: #1a1f2b; border: 2px solid transparent; border-radius: 10px; }
 QFrame#card[earned="true"] { background: #1e2533; }
 QLabel#title { font-size: 22px; font-weight: 600; }
 QLabel#name { font-size: 15px; font-weight: 600; }
@@ -113,6 +119,7 @@ static QWidget* MakeCard(const Entry& entry, QWidget* parent) {
 
 	auto* card = new QFrame(parent);
 	card->setObjectName(QStringLiteral("card"));
+	card->setFocusPolicy(Qt::StrongFocus);
 	card->setProperty("earned", entry.earned);
 	auto* layout = new QHBoxLayout(card);
 	layout->setContentsMargins(12, 10, 16, 10);
@@ -276,10 +283,17 @@ public:
 		counts->addWidget(m_filter);
 		m_sort = new QComboBox(this);
 		m_sort->addItems({tr("Default order"), tr("Grade"), tr("Recently earned")});
+		// The cards keep the focus; left and right change the filter, Y the order.
+		m_filter->setFocusPolicy(Qt::NoFocus);
+		m_sort->setFocusPolicy(Qt::NoFocus);
+		m_filter->setToolTip(tr("Left / Right"));
+		m_sort->setToolTip(tr("Y"));
 		counts->addWidget(m_sort);
 		layout->addLayout(counts);
 
-		auto* scroll = new QScrollArea(this);
+		auto* scroll = new PsScrollArea(this);
+		m_scroll     = scroll;
+		scroll->SetRingRadius(10.0); // the cards' corners
 		scroll->setWidgetResizable(true);
 		scroll->setFrameShape(QFrame::NoFrame);
 		m_list = new QWidget(scroll);
@@ -294,8 +308,56 @@ public:
 		Fill();
 	}
 
+	// The first card takes the focus (when the page is shown, or the list filled again).
+	void FocusFirst() {
+		if (!m_cards.empty()) {
+			m_cards.front()->setFocus(Qt::OtherFocusReason);
+		}
+	}
+
+protected:
+	void showEvent(QShowEvent* event) override {
+		QWidget::showEvent(event);
+		FocusFirst();
+	}
+
+	bool eventFilter(QObject* watched, QEvent* event) override {
+		auto* card = qobject_cast<QWidget*>(watched);
+		const auto at = std::find(m_cards.begin(), m_cards.end(), card);
+		if (at == m_cards.end()) {
+			return QWidget::eventFilter(watched, event);
+		}
+		if (event->type() == QEvent::FocusIn) {
+			m_scroll->FocusRow(card);
+			m_scroll->EnsureVisibleSmooth(card, 12);
+		} else if (event->type() == QEvent::FocusOut) {
+			m_scroll->UnfocusRow(card);
+		} else if (event->type() == QEvent::KeyPress) {
+			const int key  = static_cast<QKeyEvent*>(event)->key();
+			const int step = key == Qt::Key_Down ? 1 : key == Qt::Key_Up ? -1 : 0;
+			if (step != 0) {
+				const auto index = std::clamp<std::ptrdiff_t>((at - m_cards.begin()) + step, 0,
+				                                              static_cast<std::ptrdiff_t>(m_cards.size()) - 1);
+				m_cards[index]->setFocus(step > 0 ? Qt::TabFocusReason : Qt::BacktabFocusReason);
+				return true;
+			}
+			if (key == Qt::Key_Left || key == Qt::Key_Right) {
+				const int count = m_filter->count();
+				m_filter->setCurrentIndex((m_filter->currentIndex() + (key == Qt::Key_Right ? 1 : count - 1)) % count);
+				return true;
+			}
+			if (key == Qt::Key_Y) {
+				m_sort->setCurrentIndex((m_sort->currentIndex() + 1) % m_sort->count());
+				return true;
+			}
+		}
+		return QWidget::eventFilter(watched, event);
+	}
+
 private:
 	void Fill() {
+		const bool had_focus = m_list->isAncestorOf(QApplication::focusWidget());
+		m_cards.clear();
 		while (auto* item = m_list_layout->takeAt(0)) {
 			delete item->widget();
 			delete item;
@@ -324,7 +386,10 @@ private:
 			});
 		}
 		for (const auto* entry: shown) {
-			m_list_layout->addWidget(MakeCard(*entry, m_list));
+			auto* card = MakeCard(*entry, m_list);
+			card->installEventFilter(this);
+			m_cards.push_back(card);
+			m_list_layout->addWidget(card);
 		}
 		if (shown.empty()) {
 			auto* none = new QLabel(tr("No trophies here."), m_list);
@@ -333,6 +398,10 @@ private:
 			m_list_layout->addWidget(none);
 		}
 		m_list_layout->addStretch(1);
+		m_scroll->verticalScrollBar()->setValue(0);
+		if (had_focus || isVisible()) {
+			FocusFirst();
+		}
 	}
 
 	Common::Trophies::Package m_package;
@@ -341,18 +410,28 @@ private:
 	QComboBox*                m_sort        = nullptr;
 	QWidget*                  m_list        = nullptr;
 	QVBoxLayout*              m_list_layout = nullptr;
+	PsScrollArea*             m_scroll      = nullptr;
+	std::vector<QWidget*>     m_cards;
 };
 
 } // namespace
 
 TrophyViewerDialog::TrophyViewerDialog(QWidget* parent): QDialog(parent) {
 	setWindowTitle(tr("Trophies"));
-	setStyleSheet(QString::fromLatin1(StyleSheet));
+	// Over the theme's colours, as the rest of the launcher.
+	const auto theme = PsTheme::Current();
+	setStyleSheet(QString::fromLatin1(StyleSheet) +
+	              QStringLiteral("QDialog { background: qlineargradient(x1:0, y1:0, x2:1, y2:1, "
+	                             "stop:0 %1, stop:1 %2); }")
+	                  .arg(theme.top.name(), theme.bottom.name()));
+	setAttribute(Qt::WA_StyledBackground);
 	resize(820, 680);
 
 	auto* layout = new QVBoxLayout(this);
 
 	m_tabs = new QTabWidget(this);
+	m_tabs->setFocusPolicy(Qt::NoFocus);
+	m_tabs->tabBar()->setFocusPolicy(Qt::NoFocus); // the cards keep the focus; L1 / R1 change tabs
 	m_tabs->setDocumentMode(true);
 	layout->addWidget(m_tabs, 1);
 
@@ -365,8 +444,42 @@ bool TrophyViewerDialog::HasTrophyData(const Configuration* info) {
 	return !FindTrophyFiles(info).isEmpty();
 }
 
+std::pair<std::array<int, 4>, std::array<int, 4>>
+TrophyViewerDialog::Count(const Configuration& info, const QString& runtime_directory) {
+	std::array<int, 4> earned {}, total {};
+	const auto         reader = Common::OpenArchive(GameContent::ToPath(info.basedir));
+	for (const auto& file: FindTrophyFiles(&info)) {
+		const auto package =
+		    Common::Trophies::LoadPackage(GameContent::ToPath(file), info.console_language);
+		const auto label = TrophyFilePattern.match(QFileInfo(file).fileName()).captured(1).toUInt();
+		const auto unlocked = Common::Trophies::LoadUnlocks(Common::Trophies::UnlocksPath(
+		    GameContent::ToPath(runtime_directory), info.title_id.toStdString(), info.user_id, label));
+		for (const auto& [id, trophy]: package.trophies) {
+			if (trophy.grade < 1 || trophy.grade > 4) {
+				continue;
+			}
+			total[trophy.grade - 1]++;
+			if (unlocked.contains(id)) {
+				earned[trophy.grade - 1]++;
+			}
+		}
+	}
+	return {earned, total};
+}
+
+void TrophyViewerDialog::keyPressEvent(QKeyEvent* event) {
+	if (m_tabs != nullptr && m_tabs->count() > 1 &&
+	    (event->key() == Qt::Key_PageUp || event->key() == Qt::Key_PageDown)) {
+		const int count = m_tabs->count();
+		m_tabs->setCurrentIndex((m_tabs->currentIndex() + (event->key() == Qt::Key_PageDown ? 1 : count - 1)) %
+		                        count);
+		return;
+	}
+	QDialog::keyPressEvent(event);
+}
+
 void TrophyViewerDialog::ShowForGame(const Configuration* info, const QString& runtime_directory,
-                                     QWidget* parent) {
+                                     QWidget* parent, const std::function<int(QDialog&)>& exec) {
 	if (info == nullptr) {
 		return;
 	}
@@ -382,7 +495,11 @@ void TrophyViewerDialog::ShowForGame(const Configuration* info, const QString& r
 		return;
 	}
 
-	dlg.exec();
+	if (exec) {
+		exec(dlg);
+	} else {
+		dlg.exec();
+	}
 }
 
 bool TrophyViewerDialog::LoadGame(const Configuration& info, const QString& runtime_directory,

@@ -3,7 +3,11 @@
 
 #include "configuration.h"
 
+#include <QHash>
 #include <QMap>
+#include <QMargins>
+
+#include <array>
 #include <QString>
 #include <QStringList>
 #include <QWidget>
@@ -12,6 +16,12 @@
 
 class ConfigurationItem;
 class CompatibilityDatabase;
+class PsHomeView;
+class QDialog;
+class QMenu;
+class QStackedWidget;
+class QTimer;
+class QToolButton;
 class QEvent;
 class QTreeWidgetItem;
 class QPoint;
@@ -27,7 +37,7 @@ public:
 	explicit ConfigurationListWidget(QWidget* parent = nullptr);
 	~ConfigurationListWidget() override;
 
-	void SetRunEnabled(bool flag) { m_run_enabled = flag; }
+	void SetRunEnabled(bool flag);
 	void SetRuntimeDirectory(const QString& directory) { m_runtime_directory = directory; }
 
 	[[nodiscard]] const ConfigurationItem* GetSelectedItem() const { return m_selected_item; }
@@ -40,6 +50,8 @@ public:
 	[[nodiscard]] std::unique_ptr<Configuration>
 	CreateConfiguration(const ConfigurationItem& item) const;
 
+	[[nodiscard]] bool IsHomeView() const;
+
 	bool EnsureGameDirectory();
 	void ScanGameDirectory();
 	void ViewTrophies();
@@ -48,6 +60,8 @@ signals:
 
 	void Run();
 	void Select();
+	// The home view fills the window: the main dialog hides its status lines around it.
+	void HomeViewChanged(bool home);
 	void PreviewControllerColor(const QString& color);
 
 protected:
@@ -76,6 +90,14 @@ private:
 	void               ImportGameSettings(QWidget* parent);
 	void               ExportGameSettings(QWidget* parent) const;
 	[[nodiscard]] bool HasValidGameDirectory() const;
+	// The console-style home view, an alternative to the tree (PsHomeView).
+	void InitHomeView();
+	void SetHomeView(bool home);
+	void RefreshHomeView();
+	void ShowItemMenu(ConfigurationItem* item);
+	// A dialog, modally: inside the home view (sliding in over it) when that is shown, as its own
+	// window otherwise. Returns its result, as QDialog::exec().
+	int  ExecDialog(QDialog& dialog);
 
 	ConfigurationItem*            m_selected_item = nullptr;
 	bool                          m_run_enabled   = true;
@@ -86,6 +108,17 @@ private:
 	Configuration                 m_global_info;
 	QMap<QString, Configuration*> m_custom_infos;
 	CompatibilityDatabase*        m_compatibility = nullptr;
+	PsHomeView*                   m_home          = nullptr;
+	QStackedWidget*               m_view_stack    = nullptr;
+	QToolButton*                  m_view_button   = nullptr;
+	QTimer*                       m_home_refresh  = nullptr;
+	// The list's margins and spacing, which the edge-to-edge home view sets to nothing.
+	std::array<QMargins, 3>       m_list_margins;
+	// The last game menu, kept while the home view's options panel shows its actions.
+	std::unique_ptr<QMenu>        m_item_menu;
+	// The home view's trophy counts by game path, read again after a game has run.
+	QHash<QString, std::pair<std::array<int, 4>, std::array<int, 4>>> m_trophy_counts;
+	int                           m_list_spacing = 0;
 };
 
 #endif // CONFIGURATION_LIST_WIDGET_H

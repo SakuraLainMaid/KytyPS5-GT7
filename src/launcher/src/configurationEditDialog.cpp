@@ -3,9 +3,16 @@
 #include "common/emulatorConfig.h"
 #include "configuration.h"
 #include "mandatoryLineEdit.h"
+#include "psGlyphs.h"
+#include "psTheme.h"
 #include <SDL3/SDL.h>
 
 #include <QAbstractItemView>
+#include <QApplication>
+#include <QTimer>
+#include <QStringList>
+
+#include <thread>
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QComboBox>
@@ -13,13 +20,18 @@
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFormLayout>
+#include <QKeyEvent>
+#include <QSignalBlocker>
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLayout>
 #include <QLineEdit>
 #include <QListView>
+#include <QLabel>
 #include <QListWidget>
+#include <QStackedWidget>
 #include <QMenu>
 #include <QMessageBox>
 #include <QPushButton>
@@ -37,6 +49,7 @@
 #include <QtAlgorithms>
 
 #include <algorithm>
+#include <memory>
 
 #if QT_CONFIG(vulkan)
 #include <QVulkanInstance>
@@ -131,7 +144,7 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
       m_info(info) {
 	m_ui->setupUi(this);
 	InitGameDirectories();
-	InitScrollArea();
+	InitPages();
 	// Small screens: the scroll area takes what does not fit, so the dialog itself can be small.
 	setMinimumSize(480, 320);
 	m_ui->comboBox_gt7_render_patch->addItem(tr("Off"), QString {});
@@ -151,7 +164,16 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	m_ui->settings_button->setVisible(false);
 
 	connect(m_ui->ok_button, &QPushButton::clicked, this, &ConfigurationEditDialog::save);
-	connect(m_ui->cancel_button, &QPushButton::clicked, this, &QDialog::reject);
+	// Enter (the pad's cross) acts on the focused row, never saves through a default button.
+	for (auto* button: findChildren<QPushButton*>()) {
+		button->setDefault(false);
+		button->setAutoDefault(false);
+	}
+	for (auto* button: {m_ui->ok_button, m_ui->cancel_button, m_ui->clear_button, m_ui->settings_button}) {
+		button->setFocusPolicy(Qt::NoFocus);
+	}
+	// Cancel closes the settings from either level (reject() steps back a level).
+	connect(m_ui->cancel_button, &QPushButton::clicked, this, [this] { done(QDialog::Rejected); });
 	connect(m_ui->clear_button, &QPushButton::clicked, this, &ConfigurationEditDialog::clear);
 	connect(m_ui->button_controller_color, &QPushButton::clicked, this, [this]() {
 		const auto current = m_ui->button_controller_color->property("controllerColor").toString();
@@ -193,46 +215,418 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	const bool restored = restoreGeometry(g_last_geometry);
 
 	Init(info);
+	UpdateNavigation();
 	FitToScreen(restored);
 }
 
-void ConfigurationEditDialog::InitScrollArea() {
-	// Everything above the buttons moves into a scroll area: the sections, the game folders and
-	// the controller settings (in the same places of a grid of their own).
-	auto* content = new QWidget;
-	auto* grid    = new QGridLayout(content);
-	grid->setContentsMargins(0, 0, 0, 0);
-	grid->setHorizontalSpacing(m_ui->gridLayout->horizontalSpacing());
-	grid->setVerticalSpacing(m_ui->gridLayout->verticalSpacing());
-	m_ui->gridLayout->removeItem(m_ui->sectionsLayout);
-	m_ui->sectionsLayout->setParent(nullptr);
-	grid->addLayout(m_ui->sectionsLayout, 0, 0, 1, 2);
-	m_ui->gridLayout->removeWidget(m_game_dirs_group);
-	grid->addWidget(m_game_dirs_group, 1, 0, 1, 1);
-	m_ui->gridLayout->removeWidget(m_ui->controller_group);
-	grid->addWidget(m_ui->controller_group, 1, 1, 1, 1);
-	grid->setRowStretch(2, 1);
+// The console's Settings app: the sections in a list on the left, the chosen one's page on the
+// right (each scrolls on its own), in its dark style.
+constexpr char SettingsStyle[] = R"(
+QDialog#ConfigurationEditDialog {
+	background: qradialgradient(cx:0.12, cy:-0.05, radius:1.25, fx:0.12, fy:-0.05,
+	                            stop:0 @light, stop:0.45 @top, stop:1 @bottom);
+}
+QLabel#settingsTitle { color: #e9eaee; font-size: 30px; font-weight: 300; }
+QListWidget#settingsHome, QListWidget#settingsNav {
+	background: transparent; border: 0; outline: 0; color: #d8dbe2; font-size: 17px;
+}
+QListWidget#settingsHome::item {
+	border: 2px solid transparent; border-bottom: 1px solid rgba(255,255,255,28); padding-left: 18px;
+}
+QListWidget#settingsNav::item { border: 2px solid transparent; padding-left: 26px; }
+QListWidget#settingsHome::item:selected, QListWidget#settingsNav::item:selected {
+	background: transparent; color: #ffffff; /* the frame is a FocusRing that glides between items */
+}
+QListWidget#settingsHome::item:hover:!selected, QListWidget#settingsNav::item:hover:!selected {
+	background: rgba(255,255,255,10);
+}
+QScrollArea#settingsPage, QWidget#settingsPageContent { background: transparent; }
+QGroupBox { border: 0; margin: 0; padding: 0; background: transparent; color: #d8dbe2; }
+QLabel { color: #d8dbe2; font-size: 15px; }
+QWidget#settingsRow { border: 2px solid transparent; border-bottom: 1px solid rgba(255,255,255,28);
+                      min-height: 30px; }
+QWidget#settingsRow:hover { background: rgba(255,255,255,10); }
+QWidget#settingsRow[focused="true"] { border-radius: 4px; }
+QWidget#settingsRow QLabel { font-size: 16px; }
+QLabel#settingsValue { color: rgba(216,219,226,150); }
+QWidget#settingsRow QLabel#settingsValue:disabled { color: rgba(216,219,226,70); }
+QLabel#settingsNote { color: rgba(216,219,226,150); padding: 12px 16px; }
+QWidget#settingsRow QLabel:disabled { color: rgba(216,219,226,90); }
+QLineEdit, QComboBox, QSpinBox { background: rgba(255,255,255,14); color: #e9eaee;
+                                  border: 1px solid rgba(255,255,255,40); border-radius: 4px;
+                                  padding: 6px 10px; min-height: 24px; font-size: 14px; }
+QComboBox QAbstractItemView { background: #26272d; color: #e9eaee; selection-background-color: #3d8bfd; }
+QListWidget { background: rgba(255,255,255,10); color: #e9eaee; border: 1px solid rgba(255,255,255,30);
+              border-radius: 4px; }
+QPushButton { background: rgba(255,255,255,22); color: #ffffff; border: 0; border-radius: 18px;
+              padding: 8px 22px; font-size: 14px; }
+QPushButton:hover { background: rgba(255,255,255,40); }
+QPushButton#ok_button { background: #ffffff; color: #0b0d12; font-weight: 700; }
+QPushButton#ok_button:hover { background: #e9edf5; }
+)";
 
-	m_scroll = new QScrollArea(this);
-	m_scroll->setWidgetResizable(true);
-	m_scroll->setFrameShape(QFrame::NoFrame);
-	m_scroll->setWidget(content);
-	m_ui->gridLayout->addWidget(m_scroll, 0, 0, 2, 2);
+// The settings' style sheet in the theme's colours.
+static QString SettingsStyleSheet(const PsTheme& theme) {
+	return QString::fromLatin1(SettingsStyle)
+	    .replace(QStringLiteral("@light"), theme.top.lighter(170).name())
+	    .replace(QStringLiteral("@top"), theme.top.name())
+	    .replace(QStringLiteral("@bottom"), theme.bottom.name());
+}
+
+// The launcher's own section: the theme of the home view and of these settings, applied as it is
+// chosen (it is the launcher's, not a game's, so Save and Cancel leave it alone).
+QGroupBox* ConfigurationEditDialog::CreateThemesGroup() {
+	auto* group = new QGroupBox(tr("Themes"), this);
+	auto* form  = new QFormLayout(group);
+	form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+	form->setVerticalSpacing(14);
+
+	auto* start_view = new QComboBox(group);
+	start_view->addItem(tr("Game list"), QStringLiteral("list"));
+	start_view->addItem(tr("Home (console style)"), QStringLiteral("home"));
+	start_view->setToolTip(tr("How the launcher opens. The button in its toolbar switches views at any time."));
+	{
+		const QSettings view_settings(QSettings::UserScope, QStringLiteral("Kyty"), QStringLiteral("LauncherView"));
+		start_view->setCurrentIndex(
+		    std::max(0, start_view->findData(view_settings.value(QStringLiteral("default_view"),
+		                                                         QStringLiteral("list")))));
+	}
+	connect(start_view, &QComboBox::currentIndexChanged, group, [start_view] {
+		QSettings(QSettings::UserScope, QStringLiteral("Kyty"), QStringLiteral("LauncherView"))
+		    .setValue(QStringLiteral("default_view"), start_view->currentData());
+	});
+	form->addRow(tr("Default view:"), start_view);
+
+	const auto current = PsTheme::Current();
+	auto*      themes  = new QComboBox(group);
+	for (const auto& id: PsTheme::PresetIds()) {
+		themes->addItem(PsTheme::Preset(id).name, id);
+	}
+	themes->setCurrentIndex(std::max(0, themes->findData(current.id)));
+	form->addRow(tr("Theme:"), themes);
+
+	auto* picture_row    = new QHBoxLayout;
+	auto* picture_label  = new QLabel(current.image.isEmpty() ? tr("No picture")
+	                                                          : QFileInfo(current.image).fileName(),
+	                                  group);
+	auto* picture_button = new QPushButton(tr("Choose picture..."), group);
+	picture_row->addWidget(picture_label, 1);
+	picture_row->addWidget(picture_button);
+	form->addRow(tr("Custom picture:"), picture_row);
+
+	auto* accent_row    = new QHBoxLayout;
+	auto* accent_button = new QPushButton(group);
+	auto* accent_reset  = new QPushButton(tr("Theme's own"), group);
+	accent_row->addWidget(accent_button);
+	accent_row->addWidget(accent_reset);
+	accent_row->addStretch(1);
+	form->addRow(tr("Accent colour:"), accent_row);
+
+	// The chosen picture and accent (an invalid colour: the theme's own).
+	struct State {
+		QString image;
+		QColor  accent;
+	};
+	auto       state = std::make_shared<State>();
+	state->image     = QSettings(QSettings::UserScope, QStringLiteral("Kyty"),
+	                             QStringLiteral("LauncherView"))
+	                   .value(QStringLiteral("theme/image"))
+	                   .toString();
+	if (const QColor accent(QSettings(QSettings::UserScope, QStringLiteral("Kyty"),
+	                                  QStringLiteral("LauncherView"))
+	                            .value(QStringLiteral("theme/accent"))
+	                            .toString());
+	    accent.isValid()) {
+		state->accent = accent;
+	}
+	const auto show_accent = [accent_button, themes, state] {
+		const auto color = state->accent.isValid()
+		                       ? state->accent
+		                       : PsTheme::Preset(themes->currentData().toString()).accent;
+		accent_button->setText(color.name().toUpper());
+		accent_button->setStyleSheet(
+		    QStringLiteral("QPushButton { background: %1; color: %2; }")
+		        .arg(color.name(), color.lightness() < 140 ? QStringLiteral("white")
+		                                                   : QStringLiteral("black")));
+	};
+	const auto apply = [themes, state, show_accent] {
+		PsTheme::Save(themes->currentData().toString(), state->image, state->accent);
+		show_accent();
+	};
+	show_accent();
+	connect(themes, &QComboBox::currentIndexChanged, group, apply);
+	connect(picture_button, &QPushButton::clicked, group, [this, themes, picture_label, state, apply] {
+		const auto path = QFileDialog::getOpenFileName(
+		    this, tr("Theme picture"), {}, tr("Images (*.png *.jpg *.jpeg *.webp *.bmp)"));
+		if (path.isEmpty()) {
+			return;
+		}
+		state->image = path;
+		picture_label->setText(QFileInfo(path).fileName());
+		const QSignalBlocker blocker(themes);
+		themes->setCurrentIndex(themes->findData(QStringLiteral("custom")));
+		apply();
+	});
+	connect(accent_button, &QPushButton::clicked, group, [this, themes, state, apply] {
+		const auto color = QColorDialog::getColor(
+		    state->accent.isValid() ? state->accent
+		                            : PsTheme::Preset(themes->currentData().toString()).accent,
+		    this, tr("Accent colour"));
+		if (color.isValid()) {
+			state->accent = color;
+			apply();
+		}
+	});
+	connect(accent_reset, &QPushButton::clicked, group, [state, apply] {
+		state->accent = QColor();
+		apply();
+	});
+	return group;
+}
+
+// Keys between the settings' two columns: Right from the list of sections into the page,
+// Left from a switch in the page back to the list.
+class SettingsColumnKeys final: public QObject {
+public:
+	SettingsColumnKeys(QListWidget* nav, QStackedWidget* pages, QObject* parent)
+	    : QObject(parent), m_nav(nav), m_pages(pages) {}
+
+protected:
+	bool eventFilter(QObject* watched, QEvent* event) override {
+		if (event->type() != QEvent::KeyPress) {
+			return QObject::eventFilter(watched, event);
+		}
+		const int key = static_cast<QKeyEvent*>(event)->key();
+		if (watched == m_nav && (key == Qt::Key_Right || key == Qt::Key_Return || key == Qt::Key_Enter)) {
+			auto* page = m_pages->currentWidget();
+			for (auto* widget: page->findChildren<QWidget*>()) {
+				if ((widget->focusPolicy() & Qt::TabFocus) != 0 && widget->isVisibleTo(page) &&
+				    widget->isEnabled() && qobject_cast<QCheckBox*>(widget) == nullptr) {
+					widget->setFocus(Qt::TabFocusReason);
+					return true;
+				}
+			}
+		} else if (watched != m_nav && key == Qt::Key_Left &&
+		           (qobject_cast<PsSwitch*>(watched) != nullptr || qobject_cast<PsChoiceRow*>(watched) != nullptr ||
+		            qobject_cast<QLineEdit*>(watched) != nullptr)) {
+			m_nav->setFocus(Qt::BacktabFocusReason);
+			return true;
+		}
+		return QObject::eventFilter(watched, event);
+	}
+
+private:
+	QListWidget*    m_nav;
+	QStackedWidget* m_pages;
+};
+
+void ConfigurationEditDialog::InitPages() {
+	setStyleSheet(SettingsStyleSheet(PsTheme::Current()));
+	connect(&PsThemeNotifier::Instance(), &PsThemeNotifier::Changed, this,
+	        [this] { setStyleSheet(SettingsStyleSheet(PsTheme::Current())); });
+	auto* themes_group = CreateThemesGroup();
+	const std::vector<std::pair<QGroupBox*, PsGlyph>> groups {
+	    {m_ui->user_profile_group, PsGlyph::User},     {m_ui->graphics_group, PsGlyph::Display},
+	    {m_ui->console_group, PsGlyph::Console},        {m_ui->tuning_group, PsGlyph::Gauge},
+	    {m_ui->audio_group, PsGlyph::Speaker},          {m_ui->controller_group, PsGlyph::Gamepad},
+	    {m_game_dirs_group, PsGlyph::Folder},           {m_ui->notifications_group, PsGlyph::Bell},
+	    {themes_group, PsGlyph::Image},                {m_ui->compatibility_group, PsGlyph::Puzzle},
+	    {m_ui->debug_group, PsGlyph::Bug}};
+
+	// The first level: the sections, each with its icon, in a list down the middle.
+	m_home = new QListWidget(this);
+	m_home->setObjectName(QStringLiteral("settingsHome"));
+	m_home->setIconSize(QSize(26, 26));
+	m_home->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+	// The second level: the sections down the left, the chosen one's page on the right.
+	m_nav = new QListWidget(this);
+	m_nav->setObjectName(QStringLiteral("settingsNav"));
+	m_nav->setFixedWidth(300);
+	m_nav->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+	m_pages = new QStackedWidget(this);
+
+	for (const auto& [group, glyph]: groups) {
+		// The group leaves the form's grid for a page of its own.
+		if (auto* parent_layout = group->parentWidget() != nullptr ? group->parentWidget()->layout()
+		                                                          : nullptr;
+		    parent_layout != nullptr) {
+			parent_layout->removeWidget(group);
+		}
+		m_ui->sectionsLayout->removeWidget(group);
+		m_ui->gridLayout->removeWidget(group);
+		const auto title = group->title().replace(QStringLiteral("&&"), QStringLiteral("&"));
+		group->setTitle({});
+
+		auto* page = new PsScrollArea(m_pages);
+		page->setObjectName(QStringLiteral("settingsPage"));
+		page->setWidgetResizable(true);
+		page->setFrameShape(QFrame::NoFrame);
+		auto* content = new QWidget(page);
+		content->setObjectName(QStringLiteral("settingsPageContent"));
+		auto* layout = new QVBoxLayout(content);
+		layout->setContentsMargins(36, 4, 36, 16);
+		group->setParent(content);
+		layout->addWidget(group);
+		layout->addStretch(1);
+		page->setWidget(content);
+		m_pages->addWidget(page);
+
+		auto* home_item = new QListWidgetItem(PsGlyphIcon(glyph, 26), title, m_home);
+		home_item->setSizeHint(QSize(0, 64));
+		auto* nav_item = new QListWidgetItem(title, m_nav);
+		nav_item->setSizeHint(QSize(0, 62));
+		m_page_groups.push_back(group);
+	}
+	// The console's list of rows in place of the form: switches, choices, fields.
+	for (const auto& [group, glyph]: groups) {
+		if (group != m_game_dirs_group) {
+			BuildSettingsRows(group);
+		}
+	}
+	auto* column_keys = new SettingsColumnKeys(m_nav, m_pages, this);
+	m_nav->installEventFilter(column_keys);
+	for (auto* widget: m_pages->findChildren<QWidget*>()) {
+		if (qobject_cast<PsSwitch*>(widget) != nullptr || qobject_cast<PsChoiceRow*>(widget) != nullptr ||
+		    qobject_cast<QLineEdit*>(widget) != nullptr) {
+			widget->installEventFilter(column_keys);
+		}
+	}
+	// The form's grid of sections is empty now.
+	m_ui->gridLayout->removeItem(m_ui->sectionsLayout);
+	delete m_ui->sectionsLayout;
+	m_ui->sectionsLayout = nullptr;
+
+	m_levels = new QStackedWidget(this);
+
+	auto* home        = new QWidget(m_levels);
+	auto* home_layout = new QVBoxLayout(home);
+	home_layout->setContentsMargins(40, 20, 40, 0);
+	auto* home_title = new QLabel(tr("Settings"), home);
+	home_title->setObjectName(QStringLiteral("settingsTitle"));
+	home_layout->addWidget(home_title);
+	auto* home_row = new QHBoxLayout;
+	home_row->addStretch(1);
+	home_row->addWidget(m_home, 6);
+	home_row->addStretch(1);
+	home_layout->addSpacing(18);
+	home_layout->addLayout(home_row, 1);
+	m_levels->addWidget(home);
+
+	auto* section        = new QWidget(m_levels);
+	auto* section_layout = new QVBoxLayout(section);
+	section_layout->setContentsMargins(40, 20, 40, 0);
+	m_section_title = new QLabel(section);
+	m_section_title->setObjectName(QStringLiteral("settingsTitle"));
+	section_layout->addWidget(m_section_title);
+	section_layout->addSpacing(18);
+	auto* section_row = new QHBoxLayout;
+	section_row->setSpacing(24);
+	section_row->addWidget(m_nav);
+	section_row->addWidget(m_pages, 1);
+	section_layout->addLayout(section_row, 1);
+	m_levels->addWidget(section);
+
+	m_ui->gridLayout->addWidget(m_levels, 0, 0, 2, 2);
+
+	const auto open = [this](QListWidgetItem* item) {
+		if (item != nullptr) {
+			m_nav->setCurrentRow(m_home->row(item));
+			PsSwitchStack(m_levels, 1, true);
+			m_nav->setFocus();
+		}
+	};
+	connect(m_home, &QListWidget::itemClicked, this, open);
+	connect(m_home, &QListWidget::itemActivated, this, open);
+	connect(m_nav, &QListWidget::currentRowChanged, this, [this](int row) {
+		if (row >= 0 && row != m_pages->currentIndex()) {
+			m_pages->setCurrentIndex(row);
+			if (auto* page = qobject_cast<PsScrollArea*>(m_pages->currentWidget()); page != nullptr) {
+				page->verticalScrollBar()->setValue(0);
+			}
+			// The whole page at once, rising a little as it fades in: its contents, as the scroll
+			// area itself neither fades (its viewport paints on its own) nor stays where it is put
+			// (the stack lays it out).
+			if (auto* page = qobject_cast<PsScrollArea*>(m_pages->currentWidget());
+			    page != nullptr && page->widget() != nullptr) {
+				PsAnimateIn(page->widget(), QPoint(0, 26), 320);
+			}
+			m_section_title->setText(m_nav->item(row)->text());
+		} else if (row >= 0) {
+			m_section_title->setText(m_nav->item(row)->text());
+		}
+	});
+	PsAttachFocusRing(m_home);
+	PsAttachFocusRing(m_nav);
+	UpdateNavigation();
+	m_home->setFocus();
+}
+
+// Shown (as a page or a window), the focus goes to the current level's list once the caller is
+// done placing it.
+void ConfigurationEditDialog::showEvent(QShowEvent* event) {
+	QDialog::showEvent(event);
+	QTimer::singleShot(0, this, [this] {
+		if (m_levels == nullptr) {
+			return;
+		}
+		if (m_levels->currentIndex() == 0) {
+			m_home->setFocus(Qt::OtherFocusReason);
+		} else if (auto* focus = QApplication::focusWidget(); focus == nullptr || !isAncestorOf(focus)) {
+			m_nav->setFocus(Qt::OtherFocusReason);
+		}
+	});
+}
+
+// The menu key (the pad's Options) saves, as the Save button.
+void ConfigurationEditDialog::keyPressEvent(QKeyEvent* event) {
+	if (event->key() == Qt::Key_Menu) {
+		m_ui->ok_button->click();
+		return;
+	}
+	QDialog::keyPressEvent(event);
+}
+
+// Escape (or the gamepad's back) from a section goes back to the list of sections, as on the
+// console; from the list it closes the settings.
+void ConfigurationEditDialog::reject() {
+	if (m_levels != nullptr && m_levels->currentIndex() == 1) {
+		m_home->setCurrentRow(m_nav->currentRow());
+		PsSwitchStack(m_levels, 0, false);
+		m_home->setFocus();
+		return;
+	}
+	QDialog::reject();
+}
+
+// A section whose group is hidden (the controller and the game folders outside the global
+// settings) has no entry in the list.
+void ConfigurationEditDialog::UpdateNavigation() {
+	int first_shown = -1;
+	for (int i = 0; i < static_cast<int>(m_page_groups.size()); i++) {
+		const bool hidden = m_page_groups[i]->isHidden();
+		m_nav->item(i)->setHidden(hidden);
+		m_home->item(i)->setHidden(hidden);
+		if (!hidden && first_shown < 0) {
+			first_shown = i;
+		}
+	}
+	for (auto* list: {m_nav, m_home}) {
+		if ((list->currentRow() < 0 || list->item(list->currentRow())->isHidden()) &&
+		    first_shown >= 0) {
+			list->setCurrentRow(first_shown);
+		}
+	}
 }
 
 void ConfigurationEditDialog::FitToScreen(bool restored) {
 	auto* where = screen();
-	if (where == nullptr || m_scroll == nullptr) {
+	if (where == nullptr || m_pages == nullptr) {
 		return;
 	}
 	layout()->activate();
 	// Room for the window frame and title bar, which the geometry leaves out.
 	const auto available = where->availableGeometry().adjusted(8, 40, -8, -8);
-	// All the content without scrolling: the dialog's own hint with the content's in place of
-	// the scroll area's, and a vertical scroll bar's width in case it is needed after all.
-	const auto content = m_scroll->widget()->sizeHint();
-	auto       wanted  = layout()->sizeHint() - m_scroll->sizeHint() + content +
-	              QSize(m_scroll->verticalScrollBar()->sizeHint().width(), 0);
+	auto       wanted    = QSize(1040, 700);
 	if (restored) {
 		wanted = size(); // The size the user left it at, within the screen below.
 	}
@@ -289,22 +683,32 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	microphone->clear();
 	microphone->addItem(tr("None"), QString {});
 	microphone->setToolTip(tr("Microphone used by games. None supplies silence."));
-	if (SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+	// The microphones, listed on a thread of their own: the audio subsystem sets up and tears down
+	// COM on the thread it runs on, which would take the launcher's gamepad input with it.
+	QStringList microphones;
+	QString     audio_error;
+	std::thread([&microphones, &audio_error] {
+		if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+			audio_error = QString::fromUtf8(SDL_GetError());
+			return;
+		}
 		int                device_count = 0;
 		SDL_AudioDeviceID* devices      = SDL_GetAudioRecordingDevices(&device_count);
 		for (int i = 0; i < device_count; i++) {
 			if (const auto* device = SDL_GetAudioDeviceName(devices[i]); device != nullptr) {
-				const auto name = QString::fromUtf8(device);
-				if (microphone->findData(name) < 0) {
-					microphone->addItem(name, name);
-				}
+				microphones.append(QString::fromUtf8(device));
 			}
 		}
 		SDL_free(devices);
 		SDL_QuitSubSystem(SDL_INIT_AUDIO);
-	} else {
-		microphone->setToolTip(tr("Microphones could not be listed: %1")
-		                           .arg(QString::fromUtf8(SDL_GetError())));
+	}).join();
+	for (const auto& name: microphones) {
+		if (microphone->findData(name) < 0) {
+			microphone->addItem(name, name);
+		}
+	}
+	if (!audio_error.isEmpty()) {
+		microphone->setToolTip(tr("Microphones could not be listed: %1").arg(audio_error));
 	}
 	if (microphone->findData(info.audio_input_device) < 0) {
 		microphone->addItem(tr("%1 (unavailable)").arg(info.audio_input_device),
@@ -461,6 +865,7 @@ void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs) {
 	m_game_dirs_group->setVisible(true);
 	m_ui->controller_group->setVisible(true);
 	update_game_directory_buttons();
+	UpdateNavigation();
 	FitToScreen(false);
 }
 
@@ -498,12 +903,16 @@ void ConfigurationEditDialog::AddGameDirectoryItem(const QString& dir) {
 
 void ConfigurationEditDialog::moveEvent(QMoveEvent* event) {
 	QDialog::moveEvent(event);
-	g_last_geometry = saveGeometry();
+	if (isWindow()) { // inside the home view it is a page, not a window to remember
+		g_last_geometry = saveGeometry();
+	}
 }
 
 void ConfigurationEditDialog::resizeEvent(QResizeEvent* event) {
 	QDialog::resizeEvent(event);
-	g_last_geometry = saveGeometry();
+	if (isWindow()) {
+		g_last_geometry = saveGeometry();
+	}
 }
 
 static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, bool global_settings) {
