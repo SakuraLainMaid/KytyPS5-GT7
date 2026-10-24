@@ -4935,6 +4935,33 @@ void NoteReflectionCubeTarget(uint64_t address) {
 	g_reflection_cubes[g_reflection_cube_count++] = address;
 }
 
+// Round 143: KYTY_PS_BARYCENTRICS=0 leaves a pixel shader's raw barycentric registers (the I/J
+// VGPRs the hardware fills) unset, so they read as 0 and the shader declares no gl_BaryCoordKHR
+// for them; "mesh" does it only for pixel shaders drawn with a mesh shader. Interpolated inputs
+// do not need these registers (V_INTERP_P2 reads the attribute itself); shaders that interpolate
+// by hand from them come out flat. A test for drivers whose shader compiler fails on
+// barycentrics: an AMD driver crashes building the first mesh pipeline (issue 21).
+enum class RawBarycentrics : uint8_t { Keep, Mesh, Off };
+
+static RawBarycentrics RawBarycentricsMode() {
+	static const RawBarycentrics mode = [] {
+		const char*     value  = std::getenv("KYTY_PS_BARYCENTRICS");
+		RawBarycentrics result = RawBarycentrics::Keep;
+		if (value != nullptr && std::strcmp(value, "0") == 0) {
+			result = RawBarycentrics::Off;
+		} else if (value != nullptr && std::strcmp(value, "mesh") == 0) {
+			result = RawBarycentrics::Mesh;
+		}
+		const char* text = result == RawBarycentrics::Off    ? "read as 0 in every pixel shader"
+		                   : result == RawBarycentrics::Mesh ? "read as 0 with mesh shaders"
+		                                                     : "from the host's barycentrics";
+		::printf("Pixel shaders: raw barycentric registers %s (KYTY_PS_BARYCENTRICS)\n", text);
+		LOGF("Pixel shaders: raw barycentric registers %s (KYTY_PS_BARYCENTRICS)\n", text);
+		return result;
+	}();
+	return mode;
+}
+
 bool PipelineCache::DescribeGraphicsStages(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
@@ -5015,6 +5042,12 @@ bool PipelineCache::DescribeGraphicsStages(
 			LOGF("Half-float stores: %s\n", mode);
 		});
 		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		if (const auto raw = RawBarycentricsMode();
+		    raw == RawBarycentrics::Off || (raw == RawBarycentrics::Mesh && mesh_active)) {
+			// Part of the program key: the default keeps its translations.
+			pixel_info.ps_perspective_center_vgpr   = UINT32_MAX;
+			pixel_info.ps_perspective_centroid_vgpr = UINT32_MAX;
+		}
 		// SPI_SHADER_COL_FORMAT describes export packing, not the attachment numeric type.
 		// In particular, 32-bit exports can carry raw integer material data.
 		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
