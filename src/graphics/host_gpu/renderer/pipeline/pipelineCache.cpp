@@ -4812,8 +4812,8 @@ bool SmallColorTargetDraw(const HW::Context& context) {
 // time, several times every 10 s, all race long (2026-10-18, warm86: up to 38 s of 42). A draw
 // into such a target may be skipped while its shaders translate or its pipeline compiles: it
 // misses a frame or a few, not a picture drawn once. Such a target is a reflection cube (learned
-// by renderDraw.cpp) the game has drawn in two frames or more, or one drawn in at least three of
-// six frames in a row at some time, when the draw tests against a depth target bound with it,
+// by renderDraw.cpp; drawn in two frames or more until round 146), or one drawn in at least three
+// of six frames in a row at some time, when the draw tests against a depth target bound with it,
 // with a test that can fail or a depth write (a 3D pass: the depth test enable alone is not
 // enough, the lost glyphs above had it set). The second holds until the target goes unused for
 // 32 frames; the cube's count is kept for good (round 88): the race start had none of the frames
@@ -4940,7 +4940,11 @@ bool RedrawnTargetDraw(const HW::Context& context) {
 		return false;
 	}
 	if (ReflectionCubeDraw(context)) {
-		return frames.frames >= 2;
+		// Round 146: from its first frame. A race start can draw its cube for the first time in
+		// the session: on a cold cache (a new car or track after a shader reset) its draws
+		// compiled 33 pipelines on the GPU thread, 26 s of a 51 s freeze before the countdown.
+		// The cube is drawn again the next frame.
+		return true;
 	}
 	return (frames.steady && DepthTestedDraw(context)) || GbufferPassDraw(context);
 }
