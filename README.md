@@ -1,5 +1,11 @@
 # KytyPS5
 
+> **This is the GT7 Stage 1 fork** of [usa-ratt/KytyPS5-GT7](https://github.com/usa-ratt/KytyPS5-GT7):
+> Gran Turismo 7 tuned for laptops with 6 GB of video memory, plus launcher switches for the new
+> options and GT7's 1080p/1440p render patches in [`patches/`](patches). See
+> **[STAGE1.md](STAGE1.md)** (in Chinese) for what changed and how to use it. Everything below is the
+> upstream README.
+
 [![Build KytyPS5 (Windows)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Windows%29&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Build KytyPS5 (Linux)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Linux%29&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Build KytyPS5 (macOS)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28macOS%29&label=Build%20KytyPS5%20%28macOS%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
