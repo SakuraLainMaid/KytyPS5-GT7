@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
+#include "graphics/host_gpu/renderer/pipeline/spirvMeshTest.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -806,6 +807,36 @@ bool ValidateShaderSpirvNow(const char* label, uint64_t shader_hash,
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
                          const std::vector<uint32_t>& spirv) {
 	return !Config::ShaderValidationEnabled() || ValidateShaderSpirvNow(label, shader_hash, spirv);
+}
+
+// Round 148: KYTY_MESH_TEST's copy of a mesh shader (spirvMeshTest.h), checked by the SPIR-V
+// validator; empty when the shader runs as it is.
+static std::vector<uint32_t> MeshTestVariant(const ShaderRecompiler::CompileOptions& options,
+                                             const std::vector<uint32_t>&            spirv) {
+	const auto                   flags   = MeshTestSetting();
+	auto                         variant = SpirvMeshTest(spirv, flags);
+	static std::atomic<uint32_t> logged {0};
+	const bool                   log = logged.fetch_add(1, std::memory_order_relaxed) < 64;
+	if (variant.empty()) {
+		if (log) {
+			LOGF("KYTY_MESH_TEST: mesh shader 0x%016" PRIx64 " has nothing to take out (%s)\n",
+			     options.shader_hash, MeshTestNames(flags).c_str());
+		}
+		return {};
+	}
+	if (!ValidateShaderSpirvNow(options.dump_label, options.shader_hash, variant)) {
+		LOGF("KYTY_MESH_TEST: the copy of mesh shader 0x%016" PRIx64
+		     " is not valid SPIR-V; the shader runs as it is\n",
+		     options.shader_hash);
+		return {};
+	}
+	if (log) {
+		LOGF("KYTY_MESH_TEST: mesh shader 0x%016" PRIx64
+		     " runs as a copy (%s): %zu words, was %zu\n",
+		     options.shader_hash, MeshTestNames(flags).c_str(), variant.size(), spirv.size());
+	}
+	DumpShaderSpirv("ms_test", options.shader_hash, variant);
+	return variant;
 }
 
 // What SpirvWithoutSampleId learns from parsing a module (SPIRV-Tools tells literal operands from
@@ -2522,7 +2553,14 @@ struct PipelineCache::ProgramCache {
 		    ExactFloatShader(options.shader_hash)) {
 			exact = ExactFloatVariant(options, spirv);
 		}
-		const auto module = CompileSPV(exact.empty() ? spirv : exact, device);
+		std::vector<uint32_t> mesh_test;
+		if (options.stage == ShaderType::Mesh && MeshTestSetting() != 0) {
+			mesh_test = MeshTestVariant(options, exact.empty() ? spirv : exact);
+		}
+		const auto module = CompileSPV(!mesh_test.empty() ? mesh_test
+		                               : exact.empty()    ? spirv
+		                                                  : exact,
+		                               device);
 		EXIT_IF(module == nullptr);
 		vk::ShaderModule pixel_rate_module = nullptr;
 		if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
