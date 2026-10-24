@@ -255,6 +255,18 @@
 //   hold:off     every frame is shown, also one that left out many draws while their pipelines
 //                were looked up (KYTY_HOLD_SKIPPED_DRAWS=0 for the whole run;
 //                GpuPhases::TakeFrameHold)
+// and, round 135 (BufferCache::ReadMemoryStep):
+//   cleanpage:old  a game thread's fault on a page another thread's read has just made current
+//                downloads the rest of its window and waits for it, as before (KYTY_CLEAN_PAGE=old
+//                for the whole run)
+//   readwait:writer a game thread's read of bytes whose writer the GPU is still running waits for
+//                that command buffer and then copies them on the readback queue, instead of a
+//                download behind every command buffer recorded since (KYTY_READ_WAIT=writer for
+//                the whole run)
+//   barriers:global the PM4 cache flushes, RELEASE_MEM and suspend points record a full barrier,
+//                as before round 135 (KYTY_PM4_BARRIERS=global for the whole run)
+//   protect:exclusive the page tracker's protections take the address space's lock exclusively,
+//                as before round 135 (KYTY_PROTECT_LOCK=exclusive for the whole run)
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -387,6 +399,11 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] bool StoreCleanOff();
 // GPU thread: hold:off (round 133).
 [[nodiscard]] bool FrameHoldOff();
+// GPU thread: cleanpage:old, readwait:writer, barriers:global (round 135; protect:exclusive is
+// applied to the kernel's memory, LibKernel::Memory::SetProtectLockExclusive).
+[[nodiscard]] bool CleanPageOld();
+[[nodiscard]] bool ReadWaitWriter();
+[[nodiscard]] bool GlobalPm4Barriers();
 // GPU thread: gbuffer:sync; depthread:old (round 91).
 [[nodiscard]] bool GbufferSync();
 [[nodiscard]] bool DepthReadOld();

@@ -511,7 +511,6 @@ struct ShaderInfo {
 	static constexpr uint32_t MaxBuffers      = 256;
 	static constexpr uint32_t MaxImages       = 512;
 	static constexpr uint32_t MaxSamplers     = 128;
-	static constexpr uint32_t MaxSampledPairs = 512;
 
 	std::vector<BufferResource>      buffers;
 	std::vector<ImageResource>       images;

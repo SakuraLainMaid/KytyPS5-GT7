@@ -1997,6 +1997,19 @@ void RenderExecutor::DispatchIndirectPart(uint64_t submit_id, CommandBuffer& buf
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
 	}
+	// Empty dispatch whose arguments no GPU write can still change: nothing to prepare (no program
+	// lookup, bindings or argument sync). Read from the backing only when no byte is GPU-dirty and
+	// no command storing through shader addresses (which marks no range) is still on the GPU.
+	if (vk::DispatchIndirectCommand skip_args {};
+	    !m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(skip_args)) &&
+	    !m_context.GetBufferCache().AddressWritesInFlight() &&
+	    Libs::LibKernel::Memory::TryReadBacking(args_addr, &skip_args, sizeof(skip_args)) &&
+	    (skip_args.x == 0 || skip_args.y == 0 || skip_args.z == 0)) {
+		if (FrameGraph::Logging()) {
+			FrameGraph::Log("  not run: empty arguments");
+		}
+		return;
+	}
 	if (EarlyDispatchSkip() && PipelineCache::IsSkipListed(cs_regs.cs_regs.data_addr)) {
 		Profiler::Add(Profiler::Counter::SkippedSkipList);
 		if (FrameGraph::Logging()) {

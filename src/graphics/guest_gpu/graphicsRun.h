@@ -44,6 +44,10 @@ public:
 	// COND_INDIRECT_BUFFER) see the recorded value through ReadLabel.
 	// KYTY_LABELS_AT_COMPLETION=1 enables it.
 	[[nodiscard]] static bool LabelsAtCompletion();
+	// Round 135: whether the PM4 cache flushes, RELEASE_MEM and suspend points record the full
+	// barrier of before (KYTY_PM4_BARRIERS=global, or KYTY_BISECT's barriers:global), and draws
+	// that write buffers go without the write-hazard barrier the change gave them.
+	[[nodiscard]] static bool GlobalPm4Barriers();
 	// Whether any label write has been deferred (so ReadLabel must consult the pending ones).
 	[[nodiscard]] static bool LabelsDeferred() noexcept;
 	// GPU thread.

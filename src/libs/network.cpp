@@ -38,6 +38,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -176,6 +177,7 @@ public:
 	bool HttpValidTemplate(Id tmpl_id);
 	bool HttpValidConnection(Id conn_id);
 	bool HttpValidRequest(Id req_id);
+	bool HttpValidBase(Id id);
 	Id HttpCreateConnection(Id tmpl_id, const char* server_name, const char* scheme, uint16_t port,
 	                        bool enable_keep_alive);
 	Id HttpCreateConnectionWithURL(Id tmpl_id, const char* url, bool enable_keep_alive);
@@ -448,6 +450,12 @@ bool Network::HttpValidRequest(Id req_id) {
 	return (req_id.GetType() == Id::Type::Request && req_id.GetId() >= 0 &&
 	        static_cast<size_t>(req_id.GetId()) < m_requests.size() &&
 	        m_requests[req_id.GetId()].used);
+}
+
+bool Network::HttpValidBase(Id id) {
+	Common::LockGuard lock(m_mutex);
+
+	return FindHttpBase(id, true) != nullptr;
 }
 
 Network::HttpBase* Network::FindHttpBase(Id id, bool include_request) {
@@ -875,9 +883,29 @@ bool Network::HttpSetAuthEnabled(Id id, int enable) {
 	return false;
 }
 
+namespace NetCtl {
+static bool NetCtlConnected();
+} // namespace NetCtl
+
 namespace Net {
 
 LIB_NAME("Net", "Net");
+
+// KYTY_RESOLVER=old: a resolver needs a name, and host names are looked up on the host whatever
+// the network state, as before round 137.
+static bool ResolverOld() {
+	static const bool old = [] {
+		const char* value  = std::getenv("KYTY_RESOLVER");
+		const bool  result = value != nullptr && std::strcmp(value, "old") == 0;
+		LOGF("Net resolver: %s\n",
+		     result ? "a resolver needs a name, host names are looked up on the host "
+		              "(KYTY_RESOLVER=old)"
+		            : "resolvers without a name are made; host names are not looked up while the "
+		              "network is off (KYTY_RESOLVER=old: as before)");
+		return result;
+	}();
+	return old;
+}
 
 struct NetEtherAddr {
 	uint8_t data[6] = {0};
@@ -1442,13 +1470,15 @@ int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags) {
 	     "\t flags = %d\n",
 	     name != nullptr ? name : "<null>", memid, flags);
 
-	if (name == nullptr || flags != 0) {
+	// A game may leave the name out (the console makes the resolver): one whose lookups all
+	// failed as a bad resolver id passes none.
+	if (flags != 0 || (name == nullptr && ResolverOld())) {
 		return NET_ERROR_EINVAL;
 	}
 
 	EXIT_IF(g_net == nullptr);
 
-	const int id = g_net->ResolverCreate(name, memid);
+	const int id = g_net->ResolverCreate(name != nullptr ? name : "", memid);
 	if (id < 0) {
 		return NET_ERROR_RESOLVER_ENOSPACE;
 	}
@@ -1502,6 +1532,17 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 
 	if ((flags & 0x00010000) == 0 && NetInetPton(2, hostname, addr) == 1) {
 		return OK;
+	}
+
+	// The network is off for the game (NetCtl says disconnected): no DNS server, as on a console
+	// without a connection.
+	if (!ResolverOld() && !NetCtl::NetCtlConnected()) {
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true)) {
+			LOGF("Net lookup: %s and the others fail as with no DNS server: the network is off\n",
+			     hostname);
+		}
+		return NET_ERROR_RESOLVER_ENODNS;
 	}
 
 	if (!EnsureSocketBackend()) {
@@ -2972,6 +3013,143 @@ int KYTY_SYSV_ABI HttpSetAuthEnabled(int id, int enable) {
 	     id, enable);
 
 	if (!g_net->HttpSetAuthEnabled(Network::Id(id), enable)) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+static int HttpCheckBase(int id) {
+	EXIT_IF(g_net == nullptr);
+
+	return g_net->HttpValidBase(Network::Id(id)) ? OK : HTTP_ERROR_INVALID_ID;
+}
+
+int KYTY_SYSV_ABI HttpSetRedirectCallback(int id, void* /*cbfunc*/, void* /*user_arg*/) {
+	PRINT_NAME();
+
+	LOGF("\t id = %d\n", id);
+
+	return HttpCheckBase(id);
+}
+
+int KYTY_SYSV_ABI HttpSetCookieRecvCallback(int id, void* /*cbfunc*/, void* /*user_arg*/) {
+	PRINT_NAME();
+
+	LOGF("\t id = %d\n", id);
+
+	return HttpCheckBase(id);
+}
+
+int KYTY_SYSV_ABI HttpSetRequestStatusCallback(int id, void* /*cbfunc*/, void* /*user_arg*/) {
+	PRINT_NAME();
+
+	LOGF("\t id = %d\n", id);
+
+	return HttpCheckBase(id);
+}
+
+int KYTY_SYSV_ABI HttpSetInflateGZIPEnabled(int id, int is_enable) {
+	PRINT_NAME();
+
+	LOGF("\t id        = %d\n"
+	     "\t is_enable = %d\n",
+	     id, is_enable);
+
+	return HttpCheckBase(id);
+}
+
+int KYTY_SYSV_ABI HttpSetChunkedTransferEnabled(int id, int is_enabled) {
+	PRINT_NAME();
+
+	LOGF("\t id         = %d\n"
+	     "\t is_enabled = %d\n",
+	     id, is_enabled);
+
+	EXIT_IF(g_net == nullptr);
+
+	if (is_enabled != 0 && is_enabled != 1) {
+		return HTTP_ERROR_INVALID_VALUE;
+	}
+
+	if (!g_net->HttpValidRequest(Network::Id(id))) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpsLoadCert(int http_ctx_id, int ca_cert_num, const void** /*ca_list*/,
+                                const void* /*cert*/, const void* /*priv_key*/) {
+	PRINT_NAME();
+
+	LOGF("\t http_ctx_id = %d\n"
+	     "\t ca_cert_num = %d\n",
+	     http_ctx_id, ca_cert_num);
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->HttpValid(Network::Id(http_ctx_id))) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpsUnloadCert(int http_ctx_id) {
+	PRINT_NAME();
+
+	LOGF("\t http_ctx_id = %d\n", http_ctx_id);
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->HttpValid(Network::Id(http_ctx_id))) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpsGetSslError(int request_id, int32_t* err_num, uint32_t* detail) {
+	PRINT_NAME();
+
+	LOGF("\t request_id = %d\n"
+	     "\t err_num    = 0x%016" PRIx64 "\n"
+	     "\t detail     = 0x%016" PRIx64 "\n",
+	     request_id, reinterpret_cast<uint64_t>(err_num), reinterpret_cast<uint64_t>(detail));
+
+	if (err_num == nullptr || detail == nullptr) {
+		return HTTP_ERROR_INVALID_VALUE;
+	}
+
+	*err_num = 0;
+	*detail  = 0;
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->HttpValidRequest(Network::Id(request_id))) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpGetLastErrno(int request_id, int* err_num) {
+	PRINT_NAME();
+
+	LOGF("\t request_id = %d\n"
+	     "\t err_num    = 0x%016" PRIx64 "\n",
+	     request_id, reinterpret_cast<uint64_t>(err_num));
+
+	if (err_num == nullptr) {
+		return HTTP_ERROR_INVALID_VALUE;
+	}
+
+	*err_num = 0;
+
+	EXIT_IF(g_net == nullptr);
+
+	if (!g_net->HttpValidRequest(Network::Id(request_id))) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 

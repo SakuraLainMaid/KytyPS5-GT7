@@ -969,6 +969,7 @@ void EnsureConfigInitialized() {
     subsystems.Initialize<Log::Lifecycle>();
     subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
     ShaderInit();
+    ShaderRecompiler::Spirv::SetEmitNames(true); // Checks find variables and functions by OpName.
     config_initialized = true;
   }
 }
@@ -5186,7 +5187,8 @@ public:
               resources.HandleFault(PageFaultAccess::Read,
                                     base + ring_fault_first_offset),
               "fault readback could not wrap a live download-ring tick");
-      // Both disjoint writes on the faulting page share one wrapped batch.
+      // Both disjoint writes on the faulting page share one wrapped batch
+      // (assumed reserved as two atom-safe slots by the check below).
       uint64_t expected_packing_offset = 2 * 64;
       uint64_t expected_packing_alignment = 1;
       if (!download.IsCoherent()) {
@@ -5200,8 +5202,11 @@ public:
       }
       auto [packing_probe, packing_offset] = download.Map(1, 1, false);
       Require(name, "adjacent download reservation stride",
+              // One atom-safe slot per downloaded range; the readback window
+              // can add the neighboring pages' ranges to the batch.
               packing_probe != nullptr &&
-                  packing_offset == expected_packing_offset,
+                  packing_offset >= expected_packing_offset &&
+                  packing_offset % (expected_packing_offset / 2) == 0,
               "adjacent fault downloads did not reserve an atom-safe stride");
       download.Commit();
       uint32_t first_page_backing = 0;
@@ -5216,11 +5221,18 @@ public:
                   sizeof(ring_fault_first_backing));
       std::memcpy(&ring_fault_second_backing, memory + ring_fault_second_offset,
                   sizeof(ring_fault_second_backing));
+      // The readback window (KYTY_READBACK_WINDOW_KB, default 4 MB) may take
+      // the neighboring pages too: then they hold the GPU values and are clean.
+      const auto neighbor_ok = [&](uint64_t offset, uint32_t backing,
+                                   uint32_t stale, uint32_t value) {
+        const bool dirty = cache.HasGpuDirtyBytes(base + offset, sizeof(value));
+        return (backing == stale && dirty) || (backing == value && !dirty);
+      };
       Require(name, "fault-ring wrapped contents",
-              first_page_backing == first_stale &&
-                  second_page_backing == second_stale &&
-                  cache.HasGpuDirtyBytes(base + first_offset, sizeof(first_value)) &&
-                  cache.HasGpuDirtyBytes(base + second_offset, sizeof(second_value)) &&
+              neighbor_ok(first_offset, first_page_backing, first_stale,
+                          first_value) &&
+                  neighbor_ok(second_offset, second_page_backing, second_stale,
+                              second_value) &&
                   ring_fault_first_backing == ring_fault_first_value &&
                   ring_fault_second_backing == ring_fault_second_value &&
                   &BufferCacheTestAccess::DownloadBuffer(cache) ==
@@ -5294,17 +5306,21 @@ public:
       Libs::LibKernel::Memory::TryReadBacking(base + page_outside_offset,
                                               &page_outside_backing,
                                               sizeof(page_outside_backing));
+      // The readback window may publish the next page in the same batch.
+      const bool outside_dirty =
+          cache.HasGpuDirtyBytes(base + page_outside_offset, sizeof(page_value));
+      const bool outside_modified =
+          cache.IsRegionGpuModified(base + page_outside_offset, sizeof(page_value));
       Require(name, "page publication order and boundary",
               page_inside_backing == page_value &&
-                  page_outside_backing == page_stale &&
                   !cache.HasGpuDirtyBytes(base + page_inside_offset,
                                           sizeof(page_value)) &&
-                  cache.HasGpuDirtyBytes(base + page_outside_offset,
-                                         sizeof(page_value)) &&
                   !cache.IsRegionGpuModified(base + page_inside_offset,
                                              sizeof(page_value)) &&
-                  cache.IsRegionGpuModified(base + page_outside_offset,
-                                            sizeof(page_value)),
+                  ((page_outside_backing == page_stale && outside_dirty &&
+                    outside_modified) ||
+                   (page_outside_backing == page_value && !outside_dirty &&
+                    !outside_modified)),
               "readback did not publish after the older overlapping callback "
               "or retained ownership of the wrong page");
       cache.ReadMemory(base + page_outside_offset, sizeof(page_value));
@@ -5579,9 +5595,11 @@ public:
                        partial_unmap_survivor_value, false);
       resources.UnmapMemory(base + 0x8000, 0x4000);
       uint32_t partial_unmap_survivor_backing = 0;
-      std::memcpy(&partial_unmap_survivor_backing,
-                  memory + partial_unmap_survivor_offset,
-                  sizeof(partial_unmap_survivor_backing));
+      // The survivor page stays GPU-modified (write-protected): read the backing,
+      // a plain load faults without the guest fault handler.
+      Libs::LibKernel::Memory::TryReadBacking(
+          base + partial_unmap_survivor_offset, &partial_unmap_survivor_backing,
+          sizeof(partial_unmap_survivor_backing));
       Require(
           name, "partial-invalidation ownership",
           !resources.IsMapped(base + 0x8000, 0x4000) &&
@@ -11542,10 +11560,10 @@ public:
                 "the old depth target did not register its metadata allocation");
         paint();
         bind();
+        // R64 (8a0b6058f) keeps the HTile as meta on purpose (a cockpit map).
         Require(name, "HTile allocation reused as expanded color metadata",
-                !texture_cache.IsMeta(dcc_address) && !texture_cache.ClearMeta(dcc_address) &&
-                    read_texel() == painted,
-                "color discovery retained the old HTile classification or erased rendering");
+                texture_cache.IsMeta(dcc_address) && read_texel() == painted,
+                "color discovery dropped the HTile classification or erased rendering");
         fill_metadata(metadata_words);
         bind();
         Require(name, "native color clear after HTile reuse", read_texel() == expected,
@@ -12808,8 +12826,11 @@ public:
         ShaderStageRuntime runtime{&program, &snapshot};
         PreparedBindings bindings;
         executor.PrepareBindings(runtime, bindings);
+        // 1ba85c41c keeps clean 1x1x1 texels as both a 2D and a 3D image (a menu), so
+        // the 3D alias is either replaced or kept beside a distinct 2D image.
         Require(name, "overlapping dimension discovery",
-                !texture_cache.GetImage(bindings.images[0].image_id).registered,
+                !texture_cache.GetImage(bindings.images[0].image_id).registered ||
+                    bindings.images[0].image_id != bindings.images[1].image_id,
                 "the 2D descriptor did not replace its earlier 3D alias");
         executor.RebindImages(bindings);
         auto output = CreateHostBuffer(name, 8, vk::BufferUsageFlagBits::eTransferDst, {0, 0});
@@ -25827,7 +25848,7 @@ TestCase VectorFractF64CapturedAndEdges() {
 
 TestCase VectorMinMaxF64CapturedAndEdges() {
   using O = ShaderOpcode;
-  // MODE.IEEE=0: select the numeric operand, or the second NaN unchanged.
+  // MODE.IEEE=0: select the numeric operand, or the first NaN unchanged.
   constexpr uint64_t positive_zero = 0, negative_zero = 0x8000000000000000ull;
   constexpr uint64_t one = 0x3ff0000000000000ull, minus_two = 0xc000000000000000ull;
   constexpr uint64_t qnan = 0x7ff8123456789abcull, snan = 0xfff0000000000042ull;
@@ -25841,7 +25862,7 @@ TestCase VectorMinMaxF64CapturedAndEdges() {
       {positive_zero, positive_zero, positive_zero, positive_zero},
       {qnan, one, one, one}, {one, qnan, one, one},
       {snan, minus_two, minus_two, minus_two}, {minus_two, snan, minus_two, minus_two},
-      {qnan, snan, snan, snan}, {snan, qnan, qnan, qnan},
+      {qnan, snan, qnan, qnan}, {snan, qnan, snan, snan},
       {infinity, one, one, infinity},
       {infinity | negative_zero, one, infinity | negative_zero, one},
       {0x3fe0000000000000ull, one, 0x3fe0000000000000ull, one},
@@ -37435,6 +37456,26 @@ void CheckImageTransitionState(RenderContext &renderer) {
           ImageTestAccess::CopyRows(copy_capacity + 4, 1, copy_capacity) == 0,
       "buffered image copy does not split at the fixed scratch capacity");
 
+  // RADV rejects 3D 128-bit BC images with block-texel views plus extended usage.
+  auto volume_info = MakeInfo(vk::Format::eBc7UnormBlock, 1, 1);
+  volume_info.guest_format = Prospero::BufferFormat::kBc7UNorm;
+  volume_info.type = Prospero::ImageType::kColor3D;
+  volume_info.extent.depth = 4;
+  volume_info.bytes_per_block = 16;
+  for (const bool supported : {false, context.supports_block_texel_view}) {
+    context.supports_block_texel_view = supported;
+    Image volume(context, scheduler, volume_info);
+    const auto flags = volume.backing.flags;
+    Require(name, "block volume create flags",
+            (flags & vk::ImageCreateFlagBits::e2DArrayCompatible) &&
+                static_cast<bool>(flags & vk::ImageCreateFlagBits::eBlockTexelViewCompatible) ==
+                    supported &&
+                static_cast<bool>(flags & vk::ImageCreateFlagBits::eExtendedUsage) ==
+                    static_cast<bool>(volume.backing.usage &
+                                      vk::ImageUsageFlagBits::eStorage),
+            "block volume requested extended usage without storage");
+  }
+
   Image image(context, scheduler, MakeInfo(vk::Format::eR8Unorm, 2, 3));
   auto barriers =
       image.GetBarriers(vk::ImageLayout::eShaderReadOnlyOptimal,
@@ -38928,20 +38969,24 @@ void CheckResourcePlanHandoff() {
                                                      specialization);
     ValidateSpirv(name, compiled.spirv);
     const auto &bindings = compiled.program.bindings;
+    // 8d77c9242 snapshots scalar loads through CPU-evaluable pointers again (one
+    // game: BDA in 14 compute shaders instead of 5), so the numeric read lands in the flattened
+    // SRT; KYTY_SRT_RAW_READS_ON_GPU=1 keeps it native as upstream does.
     Require(name, "GPU data requirements",
-            bindings.user_data_registers == (numeric_read ? std::vector<u32>{0, 1}
-                                                          : std::vector<u32>{}) &&
-                bindings.memory_offset_count == 1 &&
-                FindBinding(bindings, DescriptorBindingKind::FlattenedSrt) == nullptr &&
-                (FindBinding(bindings, DescriptorBindingKind::BdaPagetable) != nullptr) == numeric_read,
-            "descriptor-only shader retained SRT uploads or native scalar data lost its address");
+            bindings.user_data_registers.empty() && bindings.memory_offset_count == 1 &&
+                (FindBinding(bindings, DescriptorBindingKind::FlattenedSrt) != nullptr) ==
+                    numeric_read &&
+                FindBinding(bindings, DescriptorBindingKind::BdaPagetable) == nullptr,
+            "descriptor-only shader retained SRT uploads or the scalar read was not snapshotted");
 
     memory[0] = 0x2000u;
     memory[4] = 13u;
     Require(name, "independent host plan",
             MaterializeResources(plan, runtime, snapshot, specialization) &&
                 snapshot.buffers[0].dwords[0] == 0x2000u &&
-                snapshot.flattened_srt.size() == 4,
+                snapshot.flattened_srt.size() >= 4 &&
+                (!numeric_read || std::ranges::find(snapshot.flattened_srt, 13u) !=
+                                      snapshot.flattened_srt.end()),
             "compiled shader cleanup invalidated or froze the host resource plan");
   }
   std::printf("[host]    %-32s ok\n", name);
@@ -40142,12 +40187,20 @@ void CheckStandard64RenderTargetTileRoundTrip() {
 void CheckStorageTextureGpuOwnedRebindState() {
   constexpr uintptr_t base = 0x0000000200200000ull;
   constexpr uint64_t size = 0x10000;
-  const auto guest_memory = Libs::LibKernel::Memory::AllocateRuntimeMemory(
-      base, size, Common::VirtualMemory::Mode::ReadWrite,
-      "storage_texture_gpu_owned_rebind", true);
-  auto *memory = reinterpret_cast<uint8_t *>(guest_memory);
-  Require("StorageTextureGpuOwnedRebind", "allocation", guest_memory == base,
+  // The tracker only follows backed memory (R112), so map direct memory.
+  int64_t direct_offset = -1;
+  Require("StorageTextureGpuOwnedRebind", "direct allocation",
+          Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+              0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size,
+              size, 0, &direct_offset) == 0,
+          "direct-memory allocation failed");
+  void *guest_memory = reinterpret_cast<void *>(base);
+  Require("StorageTextureGpuOwnedRebind", "allocation",
+          Libs::LibKernel::Memory::KernelMapDirectMemory(
+              &guest_memory, size, 0x3, 0x10, direct_offset, size) == 0 &&
+              guest_memory == reinterpret_cast<void *>(base),
           "fixed guest-owner allocation failed");
+  auto *memory = static_cast<uint8_t *>(guest_memory);
   PageManager page_manager;
   MemoryTracker tracker(page_manager);
   tracker.ForEachUploadRange(
@@ -40202,7 +40255,9 @@ void CheckStorageTextureGpuOwnedRebindState() {
   tracker.UnmarkRegionAsGpuModified(base, size);
   tracker.UntrackMemory(base, size);
   Require("StorageTextureGpuOwnedRebind", "free",
-          Libs::LibKernel::Memory::FreeGuestMemory(base, size),
+          Libs::LibKernel::Memory::KernelMunmap(base, size) == 0 &&
+              Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                                 size) == 0,
           "guest-owner free failed");
   std::printf("[host]    %-32s ok\n", "StorageTextureGpuOwnedRebind");
 }
@@ -41114,9 +41169,10 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
                                 g_hw_ctx_indirect_func[0x0314u] == nullptr;
 
   // Removed GCN shader resource/checksum/queue registers. Numeric offsets keep
-  // this check independent of the deleted legacy names.
-  constexpr std::array<uint32_t, 17> legacy_shader_slots{
-      0x000u, 0x001u, 0x030u, 0x0b0u, 0x0bcu, 0x130u,
+  // this check independent of the deleted legacy names. 0x000/0x001 are
+  // handled on purpose: a game writes the PS slots there in races (8f279c916).
+  constexpr std::array<uint32_t, 15> legacy_shader_slots{
+      0x030u, 0x0b0u, 0x0bcu, 0x130u,
       0x14au, 0x14bu, 0x20eu, 0x20fu, 0x210u, 0x211u, 0x216u, 0x217u,
       0x219u, 0x21au, 0x27du,
   };

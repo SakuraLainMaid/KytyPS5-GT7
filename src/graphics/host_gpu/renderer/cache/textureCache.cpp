@@ -2192,6 +2192,30 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (requested.IsBlock() && !cached.info.IsBlock()) {
 			return {ExpandImage(requested, cached_id)};
 		}
+		// A 1x1x1 texel read as 2D by one shader and 3D by another has the same guest bytes in
+		// either type: keep both native images instead of recreating one per request (a menu
+		// did this ~110 times a frame). Only for clean, untouched-by-GPU single texels.
+		if (requested.IsVolume() != cached.info.IsVolume() && requested.type != cached.info.type &&
+		    requested.data.size == cached.info.data.size && requested.extent.width == 1 &&
+		    requested.extent.height == 1 && requested.extent.depth == 1 &&
+		    cached.info.extent.width == 1 && cached.info.extent.height == 1 &&
+		    cached.info.extent.depth == 1 && requested.resources == cached.info.resources &&
+		    requested.resources.levels == 1 && requested.resources.layers == 1 &&
+		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format) &&
+		    !cached.IsGpuModified() && !cached.binding.is_target && [&] {
+			    size_t owners = 0;
+			    ForEachPage(requested.data.address, 1, [&](uint64_t page) {
+				    if (const auto* list = m_image_page_table.Find(page)) {
+					    owners = list->size();
+				    }
+			    });
+			    return owners < 4;
+		    }()) {
+			// Compatible formats only: an incompatible one still goes through the replace path
+			// below, which frees the old image. Keeping every format/type pair alive piled
+			// >127 owners on this page (PageManager write-watcher overflow).
+			return {merged_id};
+		}
 		// Volume depth is not an array-layer count. A larger depth can retain the
 		// same block-slice layout while requiring a larger native image.
 		if ((requested.IsVolume() || cached.info.IsVolume()) &&
@@ -3424,9 +3448,34 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		image.dcc_clear_checked_tick  = current_tick;
 		image.dcc_clear_checked_first = first;
 		image.dcc_clear_checked_count = count;
+		// Round 139: not when something wrote the metadata since that check. A game can fast-clear
+		// the same target again in the same recording: a course layout screen draws each map
+		// into one multisampled target, its CMASK filled again before each, and a map drawn
+		// without a submission between it and the last was drawn over the one before (the check
+		// skipped here). The check (or the read of the bytes) then watches the slices, so a
+		// target bound again with its metadata untouched still skips it.
+		const auto slices = layers != 0 ? range.size / layers : 0;
 		if (already_resolved_this_tick &&
-		    !m_buffer_cache.IsRegionCpuModified(range.address, range.size)) {
+		    !m_buffer_cache.IsRegionCpuModified(range.address, range.size) &&
+		    (slices == 0 ||
+		     m_buffer_cache.MetadataUnwritten(range.address + slices * first, slices * count))) {
+			if (FrameGraph::Logging()) {
+				FrameGraph::Log("  color clear of 0x%012" PRIx64 " (%s 0x%012" PRIx64
+				                ", layers %u+%u): checked already in this recording, nothing wrote "
+				                "its metadata since",
+				                desc.info.data.address,
+				                desc.info.metadata.kind == ImageMetadataKind::Dcc ? "DCC" : "CMASK",
+				                range.address, first, count);
+			}
 			return;
+		}
+		if (already_resolved_this_tick && FrameGraph::Logging()) {
+			FrameGraph::Log("  color clear of 0x%012" PRIx64 " (%s 0x%012" PRIx64
+			                ", layers %u+%u): checked again in this recording, its metadata "
+			                "written since",
+			                desc.info.data.address,
+			                desc.info.metadata.kind == ImageMetadataKind::Dcc ? "DCC" : "CMASK",
+			                range.address, first, count);
 		}
 	}
 	// These one-mip surfaces use complete 4 KiB color metadata blocks.
@@ -3606,6 +3655,9 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			}
 		}
 	}
+	// Round 139: what was read here holds until something writes the slices again (after the
+	// expanded keys' own write above), so a binding later in this recording skips them.
+	m_buffer_cache.WatchMetadata(range.address + slice_size * first, slice_size * count);
 	report();
 }
 
@@ -4980,7 +5032,8 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 		pending->ranges.emplace_back(range.address, range.size);
 	}
 	m_scheduler.DeferPriorityOperation([download, dedicated, range, mapped, offset, guard,
-	                                    readback_guard, guest_hash, landed_flag, pending] {
+	                                    readback_guard, guest_hash, landed_flag, pending, evicting,
+	                                    buffer_cache = &m_buffer_cache] {
 		struct Landed {
 			const std::shared_ptr<std::atomic<bool>>& flag;
 			~Landed() {
@@ -5030,6 +5083,14 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 		const LibKernel::Memory::WriteSourceScope source(
 		    LibKernel::Memory::WriteSource::ImageWriteBack);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		// Round 140 (from Franseven): the backing write takes no write fault, so cached buffers
+		// over these bytes (a pool the image lives in) still hold the old ones while the tracker
+		// holds them clean (grass vertices wrong after a race, then a time trial). Evicted images
+		// only: a kept image's pages turned CPU-dirty would upload this copy over GPU pixels
+		// drawn since it was recorded.
+		if (evicting && buffer_cache->RedirtyMapped(range.address, range.size) != 0) {
+			buffer_cache->MarkMappedPending(range.address, range.size);
+		}
 		if (readback_guard) {
 			NoteLandedReadback(range.address, mapped, range.size);
 			NoteReadbackLanded(range.address, mapped, range.size, false);

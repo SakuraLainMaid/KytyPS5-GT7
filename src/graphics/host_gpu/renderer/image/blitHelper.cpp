@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "gpu_blit_shaders/gpu_blit_color_to_ms_depth_spv.h"
+#include "gpu_blit_shaders/gpu_blit_color_to_ms_spv.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_blit_ms_depth_sample0_spv.h"
 #include "gpu_blit_shaders/gpu_blit_ms_stencil_sample0_spv.h"
@@ -43,6 +44,7 @@ BlitHelper::BlitHelper(GraphicContext& graphics, CommandScheduler& scheduler)
 	m_fragment_shader = CompileSPV(GPU_BLIT_COLOR_TO_MS_DEPTH_SPV, m_graphics.device);
 	m_sample0_shader  = CompileSPV(GPU_BLIT_MS_DEPTH_SAMPLE0_SPV, m_graphics.device);
 	m_stencil0_shader = CompileSPV(GPU_BLIT_MS_STENCIL_SAMPLE0_SPV, m_graphics.device);
+	m_color_ms_shader = CompileSPV(GPU_BLIT_COLOR_TO_MS_SPV, m_graphics.device);
 }
 
 BlitHelper::~BlitHelper() {
@@ -57,6 +59,9 @@ BlitHelper::~BlitHelper() {
 	}
 	if (m_stencil0_shader != nullptr) {
 		m_graphics.device.destroyShaderModule(m_stencil0_shader, nullptr);
+	}
+	if (m_color_ms_shader != nullptr) {
+		m_graphics.device.destroyShaderModule(m_color_ms_shader, nullptr);
 	}
 	if (m_vertex_shader != nullptr) {
 		m_graphics.device.destroyShaderModule(m_vertex_shader, nullptr);
@@ -83,10 +88,12 @@ vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
 	stages[0].module = m_vertex_shader;
 	stages[0].pName  = "main";
 	stages[1].stage  = vk::ShaderStageFlagBits::eFragment;
-	const bool color_output = key.kind == PipelineKind::MsStencilSample0;
-	stages[1].module        = key.kind == PipelineKind::MsDepthSample0     ? m_sample0_shader
-	                          : key.kind == PipelineKind::MsStencilSample0 ? m_stencil0_shader
-	                                                                       : m_fragment_shader;
+	const bool color_output =
+	    key.kind == PipelineKind::MsStencilSample0 || key.kind == PipelineKind::ColorToMs;
+	stages[1].module = key.kind == PipelineKind::MsDepthSample0     ? m_sample0_shader
+	                   : key.kind == PipelineKind::MsStencilSample0 ? m_stencil0_shader
+	                   : key.kind == PipelineKind::ColorToMs        ? m_color_ms_shader
+	                                                                : m_fragment_shader;
 	stages[1].pName  = "main";
 
 	vk::PipelineVertexInputStateCreateInfo vertex_input {};
@@ -104,7 +111,11 @@ vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
 	depth.depthWriteEnable = color_output ? VK_FALSE : VK_TRUE;
 	depth.depthCompareOp   = vk::CompareOp::eAlways;
 	vk::PipelineColorBlendAttachmentState color_attachment {};
-	color_attachment.colorWriteMask = vk::ColorComponentFlagBits::eR;
+	color_attachment.colorWriteMask =
+	    key.kind == PipelineKind::ColorToMs
+	        ? vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+	              vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA
+	        : vk::ColorComponentFlagBits::eR;
 	vk::PipelineColorBlendStateCreateInfo color_blend {};
 	if (color_output) {
 		color_blend.attachmentCount = 1;
@@ -142,6 +153,7 @@ vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
 	    m_graphics.device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &pipeline),
 	    key.kind == PipelineKind::MsDepthSample0     ? "create MS-depth-sample-0 pipeline"
 	    : key.kind == PipelineKind::MsStencilSample0 ? "create MS-stencil-sample-0 pipeline"
+	    : key.kind == PipelineKind::ColorToMs        ? "create color-to-MS pipeline"
 	                                                 : "create color-to-MS-depth pipeline");
 	m_pipelines.push_back({key, pipeline});
 	return pipeline;
@@ -374,6 +386,74 @@ void BlitHelper::CopyMsStencilSample0(Image& source, Image& destination) {
 		command.draw(3, 1, 0, 0);
 		command.endRendering();
 	}
+}
+
+void BlitHelper::ReplicateColorToMs(Image& source, Image& destination) {
+	const auto& source_info      = source.info;
+	const auto& destination_info = destination.info;
+	EXIT_IF(source.backing.samples != 1 || destination.backing.samples <= 1 ||
+	        source_info.pixel_format != destination_info.pixel_format ||
+	        source.backing.image_type != vk::ImageType::e2D ||
+	        destination.backing.image_type != vk::ImageType::e2D ||
+	        source_info.extent.width != destination_info.extent.width ||
+	        source_info.extent.height != destination_info.extent.height ||
+	        source.backing.image == nullptr || destination.backing.image == nullptr);
+	m_scheduler.EndRendering();
+
+	ImageViewInfo source_view_info {};
+	source_view_info.format = source_info.pixel_format;
+	source_view_info.type   = vk::ImageViewType::e2D;
+	source_view_info.aspect = vk::ImageAspectFlagBits::eColor;
+	source_view_info.usage  = vk::ImageUsageFlagBits::eSampled;
+	const auto source_view  = source.FindView(source_view_info);
+
+	ImageViewInfo destination_view_info {};
+	destination_view_info.format = destination_info.pixel_format;
+	destination_view_info.type   = vk::ImageViewType::e2D;
+	destination_view_info.aspect = vk::ImageAspectFlagBits::eColor;
+	destination_view_info.usage  = vk::ImageUsageFlagBits::eColorAttachment;
+	const auto destination_view  = destination.FindView(destination_view_info);
+
+	const auto command = m_scheduler.Current().Recorder();
+	source.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
+	               command);
+	destination.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+	                    vk::AccessFlagBits2::eColorAttachmentWrite, {}, command);
+
+	vk::RenderingAttachmentInfo color_attachment {};
+	color_attachment.imageView   = destination_view;
+	color_attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+	color_attachment.loadOp      = vk::AttachmentLoadOp::eDontCare;
+	color_attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+
+	vk::RenderingInfo rendering {};
+	rendering.renderArea.extent = {destination_info.extent.width, destination_info.extent.height};
+	rendering.layerCount        = 1;
+	rendering.colorAttachmentCount = 1;
+	rendering.pColorAttachments    = &color_attachment;
+	command.beginRendering(rendering);
+
+	vk::DescriptorImageInfo descriptor_image {};
+	descriptor_image.imageView   = source_view;
+	descriptor_image.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	vk::WriteDescriptorSet descriptor_write {};
+	descriptor_write.dstBinding      = 0;
+	descriptor_write.descriptorCount = 1;
+	descriptor_write.descriptorType  = vk::DescriptorType::eSampledImage;
+	descriptor_write.pImageInfo      = &descriptor_image;
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_pipeline_layout, 0, 1,
+	                             &descriptor_write);
+	command.bindPipeline(vk::PipelineBindPoint::eGraphics,
+	                     GetPipeline({destination_info.samples, destination_info.pixel_format,
+	                                  PipelineKind::ColorToMs}));
+
+	command.setViewport(vk::Viewport {0.0f, 0.0f, static_cast<float>(destination_info.extent.width),
+	                                  static_cast<float>(destination_info.extent.height), 0.0f,
+	                                  1.0f});
+	command.setScissor(
+	    vk::Rect2D {{0, 0}, {destination_info.extent.width, destination_info.extent.height}});
+	command.draw(3, 1, 0, 0);
+	command.endRendering();
 }
 
 } // namespace Libs::Graphics

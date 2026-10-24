@@ -875,6 +875,17 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// KYTY_NO_CLEAN_WRITE_EMULATION=1, or KYTY_BISECT's writes:off, takes the old way.
 		static const bool emulate_clean_writes =
 		    std::getenv("KYTY_NO_CLEAN_WRITE_EMULATION") == nullptr;
+		// Round 135: the reads and stores below that go to the GPU thread are counted by
+		// instruction (BufferCache::ReadMemory).
+		struct FaultPcScope {
+			explicit FaultPcScope(uint64_t pc)
+			    : previous(std::exchange(Common::PerfStats::t_fault_pc, pc)) {}
+			~FaultPcScope() { Common::PerfStats::t_fault_pc = previous; }
+			FaultPcScope(const FaultPcScope&)            = delete;
+			FaultPcScope& operator=(const FaultPcScope&) = delete;
+			uint64_t      previous;
+		};
+		const FaultPcScope fault_pc(info->exception_address);
 		if (access == GpuAccess::Write && emulate_clean_writes &&
 		    !Libs::Graphics::GuestGpu::IsGpuThread() && !Libs::Graphics::Bisect::CleanWritesOff() &&
 		    Libs::LibKernel::Memory::IsGpuWrittenPage(info->access_violation_vaddr)) {

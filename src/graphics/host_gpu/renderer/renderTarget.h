@@ -19,6 +19,10 @@ struct RenderAttachment {
 	bool                    depth_clear   = false;
 	bool                    has_stencil   = false;
 	bool                    stencil_clear = false;
+	// EQAA fallback: the attachment is a temporary multisampled image resolved onto this view.
+	vk::ImageView           resolve_image_view   = nullptr;
+	vk::ImageLayout         resolve_image_layout = vk::ImageLayout::eUndefined;
+	vk::ResolveModeFlagBits resolve_mode         = vk::ResolveModeFlagBits::eNone;
 
 	bool operator==(const RenderAttachment&) const = default;
 };
@@ -64,6 +68,14 @@ inline constexpr TargetViewInfo ResolveTargetViewInfo(uint32_t base_layer, uint3
 	}
 	return {base_layer == last_layer ? TargetViewType::Image2D : TargetViewType::Image2DArray,
 	        base_layer, last_layer - base_layer + 1u, last_layer + 1u};
+}
+
+// PS5 EQAA without host mixed-sample support (a capture layer hides
+// VK_NV_framebuffer_mixed_samples): 1-sample colour over 2..4-sample depth renders the colour at
+// the depth sample count and resolves it. pipelineCache.cpp and renderDraw.cpp must agree.
+[[nodiscard]] inline constexpr bool
+EmulatesColorAtDepthSamples(bool accepts_mixed, uint32_t color_samples, uint32_t depth_samples) {
+	return !accepts_mixed && color_samples == 1 && depth_samples > 1 && depth_samples <= 4;
 }
 
 } // namespace Libs::Graphics

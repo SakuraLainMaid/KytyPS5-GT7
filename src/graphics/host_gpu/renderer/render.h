@@ -180,6 +180,7 @@ public:
 	void AnnotateDiagnosticTargets(const DiagnosticTargets& targets) const noexcept;
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
+	[[nodiscard]] bool IsRendering() const noexcept { return m_rendering; }
 
 	// The raw command buffer. With the recording thread (CommandScheduler::EnableRecordingThread)
 	// this first waits until the thread has run everything queued; hot paths use Recorder().
@@ -236,6 +237,7 @@ private:
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
+	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
@@ -353,7 +355,26 @@ private:
 	                                               uint32_t group_y, uint32_t group_z,
 	                                               uint32_t mode, uint64_t code_address = 0);
 
+	// Temporary multisampled colour images for the EQAA fallback (EmulatesColorAtDepthSamples).
+	struct MsColorTarget {
+		ImageId                image_id   = 0;
+		vk::Format             format     = vk::Format::eUndefined;
+		uint32_t               width      = 0;
+		uint32_t               height     = 0;
+		uint32_t               layers     = 0;
+		uint32_t               samples    = 0;
+		uint32_t               base_level = 0;
+		uint32_t               base_layer = 0;
+		std::unique_ptr<Image> image;
+		vk::ImageView          view = nullptr;
+	};
+	MsColorTarget& GetMsColorTarget(CommandBuffer& buffer, ImageId image_id, const Image& source,
+	                                uint32_t width, uint32_t height, uint32_t layers,
+	                                uint32_t samples, uint32_t base_level, uint32_t base_layer,
+	                                bool& created);
+
 	RenderContext&                        m_context;
+	std::vector<MsColorTarget>            m_ms_color_targets;
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;

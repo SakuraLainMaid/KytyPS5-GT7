@@ -799,10 +799,11 @@ static void ShaderGetStaticInputInfoPS(
 	ps_info.ps_pixel_kill_enable         = sh.db_shader_control.shader_kill_enable;
 	ps_info.ps_depth_export_enable       = sh.db_shader_control.shader_z_export_enable;
 	ps_info.ps_sample_mask_export_enable = sh.db_shader_control.shader_mask_export_enable;
+	// Alpha-to-mask coverage must gate depth writes, so it rules out early fragment tests.
 	ps_info.ps_early_z =
 	    (sh.db_shader_control.shader_z_behavior == 1 && !sh.db_shader_control.shader_kill_enable &&
 	     !sh.db_shader_control.shader_z_export_enable &&
-	     !sh.db_shader_control.shader_mask_export_enable);
+	     !sh.db_shader_control.shader_mask_export_enable && !sh.AlphaToMask());
 	ps_info.ps_execute_on_noop = sh.db_shader_control.shader_execute_on_noop;
 
 	for (uint32_t i = 0; i < ps_info.input_num; i++) {
@@ -1190,8 +1191,30 @@ static bool PrepareTessellationProgramsImpl(const HW::VertexShaderInfo&         
 	             regs.gs_regs.rsrc2.user_sgpr > HW::UserSgprInfo::SGPRS_MAX)) {
 		return false;
 	}
-	EXIT_NOT_IMPLEMENTED(unsupported_types);
-	EXIT_NOT_IMPLEMENTED(unsupported_stages);
+	// Round 138: a set this path cannot run (a wave32 hull or domain stage, a geometry shader
+	// after the tessellator, or other binary types) has its patch draws skipped, as a set the
+	// analysis rejects, instead of ending the emulator (a replay after a long race did). Once per
+	// set and stage mask: the mask says which it was.
+	if (unsupported_types || unsupported_stages) {
+		const uint32_t                      stages = context.GetShaderStages();
+		static std::mutex                   logged_mutex;
+		static std::unordered_set<uint64_t> logged;
+		std::scoped_lock                    lock(logged_mutex);
+		if (logged.size() < 64u && logged.insert(tess_key ^ (uint64_t {stages} << 1u)).second) {
+			LOGF("Tessellation: LS 0x%016" PRIx64 " / HS 0x%016" PRIx64 " / ES 0x%016" PRIx64
+			     " not supported, its patch draws are skipped: VGT_SHADER_STAGES_EN 0x%08x "
+			     "(%s%s%s%s), "
+			     "binary types %u/%u/%u\n",
+			     local_hash, control_hash, evaluation_hash, stages,
+			     (stages & 0x4u) == 0 ? "no hull stage; " : "",
+			     (stages & 0x20u) != 0 ? "a geometry shader after the tessellator; " : "",
+			     (stages & 0x00200000u) != 0 ? "wave32 hull stage; " : "",
+			     (stages & 0x00400000u) != 0 ? "wave32 domain stage" : "",
+			     static_cast<unsigned>(local.type), static_cast<unsigned>(control.type),
+			     static_cast<unsigned>(evaluation.type));
+		}
+		return false;
+	}
 	EXIT_IF(regs.hs_regs.user_data_addr == 0);
 
 	const auto local_users      = std::span(regs.hs_user_sgpr.value, regs.hs_regs.rsrc2.user_sgpr);

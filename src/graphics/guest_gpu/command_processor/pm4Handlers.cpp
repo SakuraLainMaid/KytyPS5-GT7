@@ -21,6 +21,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -72,6 +73,18 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	return raw_offset & ~RegisterSelectorMask;
 }
 
+// DB_ALPHA_TO_MASK's enable, honoured as alpha-to-coverage since round 135 (mainline 13b291f9);
+// KYTY_ALPHA_TO_COVERAGE=0 ignores it, as before (draws that ask for it get no alpha coverage).
+bool AlphaToCoverageOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_ALPHA_TO_COVERAGE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
+// KYTY_PM4_BARRIERS=global (GuestGpu::GlobalPm4Barriers): the RELEASE_MEMs that recorded a
+// full barrier before round 135.
 bool ReleaseMemGcrNeedsBarrier(uint32_t eop_event_type, uint32_t gcr_cntl) {
 	return eop_event_type != 0x28u ||
 	       (gcr_cntl & (GcrGl2MetadataInvalidate | GcrGl0VectorInvalidate | GcrGl1Invalidate |
@@ -448,7 +461,10 @@ KYTY_HW_CTX_PARSER(HwCtxSetPointState) {
 KYTY_HW_CTX_PARSER(HwCtxSetAlphaToMask) {
 	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
 
-	for (uint32_t i = 0; i < num_values; i++) {
+	cp.GetCtx().SetAlphaToMaskEnable(
+	    AlphaToCoverageOn() &&
+	    KYTY_PM4_GET(buffer[0], DB_ALPHA_TO_MASK, ALPHA_TO_MASK_ENABLE) != 0);
+	for (uint32_t i = 1; i < num_values; i++) {
 		HwCtxIgnoreAlphaToMaskRegister(buffer[i]);
 	}
 
@@ -2406,27 +2422,19 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		}
 	};
 
-	if (data_sel == 0 || interrupt_selector == 4) {
-		if (eop_event_type != 0x28 || gcr_cntl != 0) {
+	// Cache actions only order GPU work, which the renderer's resource barriers already order
+	// (mainline 70668fbd; KYTY_PM4_BARRIERS=global records the full barrier of before).
+	const bool global_barriers = GuestGpu::GlobalPm4Barriers();
+	if (data_sel == 0 || interrupt_selector == 4 ||
+	    (release_dst == ReleaseMemDstMemory && dst_gpu_addr == nullptr)) {
+		if (global_barriers && (eop_event_type != 0x28 || gcr_cntl != 0)) {
 			cp.EmitGlobalBarrier();
 		}
-
 		trigger_interrupt();
 
 		return 7;
 	}
-
-	if (release_dst == ReleaseMemDstMemory && dst_gpu_addr == nullptr) {
-		if (eop_event_type != 0x28 || gcr_cntl != 0) {
-			cp.EmitGlobalBarrier();
-		}
-
-		trigger_interrupt();
-
-		return 7;
-	}
-
-	if (ReleaseMemGcrNeedsBarrier(eop_event_type, gcr_cntl)) {
+	if (global_barriers && ReleaseMemGcrNeedsBarrier(eop_event_type, gcr_cntl)) {
 		cp.EmitGlobalBarrier();
 	}
 
@@ -3649,7 +3657,9 @@ void GraphicsInitJmpTablesCxIndirect() {
 	g_hw_ctx_indirect_func[Pm4::PA_SC_CONSERVATIVE_RASTERIZATION_CNTL] =
 	    [](KYTY_HW_CTX_INDIRECT_ARGS) { HwCtxIgnorePaScExtendedControl(cmd_offset, value); };
 	g_hw_ctx_indirect_func[Pm4::DB_ALPHA_TO_MASK] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreAlphaToMaskRegister(value);
+		cp.GetCtx().SetAlphaToMaskEnable(
+		    AlphaToCoverageOn() &&
+		    KYTY_PM4_GET(value, DB_ALPHA_TO_MASK, ALPHA_TO_MASK_ENABLE) != 0);
 	};
 	g_hw_ctx_indirect_func[Pm4::CB_COLOR_CONTROL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetColorControl(DecodeColorControl(value));

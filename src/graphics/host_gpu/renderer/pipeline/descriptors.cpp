@@ -1446,12 +1446,50 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 	return {id, nullptr, std::move(desc)};
 }
 
+// Round 142: KYTY_CUBE_EDGE_CLAMP=0 turns it off. A cube map is sampled here as a 2D array of
+// its faces (face coordinates and face index from V_CUBE*), so the sampler's address mode applies
+// inside each face. The console's cube addressing ignores it and filters across the face edges;
+// with WRAP (what a sky's sampler often has, since the console ignores it) bilinear filtering at
+// an edge blends in the face's opposite edge: a thin line along every face edge, in the sky and
+// in the reflections. CLAMP_LAST_TEXEL keeps each face's filtering inside it.
+static bool CubeEdgeClamp() {
+	static const bool on = [] {
+		const char* value   = std::getenv("KYTY_CUBE_EDGE_CLAMP");
+		const bool  enabled = value == nullptr || value[0] != '0';
+		LOGF("Cube maps: samplers used only with cube maps %s at the face edges "
+		     "(KYTY_CUBE_EDGE_CLAMP)\n",
+		     enabled ? "clamp" : "keep the guest's address mode");
+		return enabled;
+	}();
+	return on;
+}
+
+// Whether every image this sampler is paired with is a cube map.
+static bool SamplesCubesOnly(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                             uint32_t                                        sampler) {
+	bool any = false;
+	for (const auto& pair: program.info.sampled_pairs) {
+		if (pair.sampler != sampler) {
+			continue;
+		}
+		if (pair.image >= program.info.images.size() || !program.info.images[pair.image].cube) {
+			return false;
+		}
+		any = true;
+	}
+	return any;
+}
+
 static vk::Sampler NativeSampler(RenderContext&                                  context,
                                  const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                  uint32_t index, const ShaderRecompiler::IR::DescriptorValue& value,
                                  bool big_depth_image, bool normalize_unnormalized) {
 	auto        descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
 	const auto& sampler = program.info.samplers[index];
+	if (!sampler.bindless && CubeEdgeClamp() && SamplesCubesOnly(program, index)) {
+		// CLAMP_X and CLAMP_Y (bits 0-2 and 3-5) to CLAMP_LAST_TEXEL (2).
+		descriptor.fields[0] = (descriptor.fields[0] & ~0x3fu) | 2u | (2u << 3u);
+	}
 	if (normalize_unnormalized) {
 		// The stage's copy divides its coordinates by the mip's size (SpirvNormalizedExplicitLod):
 		// FORCE_UNNORMALIZED off, the guest's LOD range and clamps as they are.
@@ -3553,6 +3591,14 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		if (size != requested_size && resource < program.info.buffers.size() &&
 		    program.info.buffers[resource].written) {
 			size = SparseWriteSize(m_context, program.shader_hash, address, requested_size, size);
+		}
+		{
+			// A range past the device limit would EXIT in NativeStorageBuffer (a game binds one).
+			const auto& graphics = m_context.GetGraphics();
+			size                 = std::min(
+                size,
+                uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
+                    (graphics.StorageMinAlignment() - 1));
 		}
 		if (size == 0) {
 			// Nothing is mapped at the base yet. Streaming titles bind regions they back later (a

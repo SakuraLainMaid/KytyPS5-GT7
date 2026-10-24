@@ -5,15 +5,17 @@
 #include <bit>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+uint32_t EmitIdentity(ValueEmitContext& ctx, uint32_t value);
+
 // Operand signatures distinguish SPIR-V IDs (uint32_t), raw literals/values
 // (IR::Value), and instructions whose metadata or operand loads must stay lazy.
 #define EMIT_NATIVE(name, opcode, type, ...)                                                       \
 	inline constexpr auto Emit##name = EmitNative<spv::opcode, IR::Type::type, __VA_ARGS__>;
-EMIT_NATIVE(BitCastU16F16, OpBitcast, U32, uint32_t)
+inline constexpr auto EmitBitCastU16F16 = EmitIdentity;
 inline constexpr auto EmitBitCastF16U16 = EmitBitCastU16F16;
 inline constexpr auto EmitConvertU32U16 = EmitBitCastU16F16;
 inline constexpr auto EmitConvertU32U8  = EmitBitCastU16F16;
-inline constexpr auto EmitBitCastU32F32 = EmitBitCastU16F16;
+EMIT_NATIVE(BitCastU32F32, OpBitcast, U32, uint32_t)
 EMIT_NATIVE(BitCastF32U32, OpBitcast, F32, uint32_t)
 EMIT_NATIVE(BitCastU64F64, OpBitcast, U64, uint32_t)
 EMIT_NATIVE(BitCastF64U64, OpBitcast, F64, uint32_t)
@@ -189,7 +191,6 @@ uint32_t              EmitFPSin(EmitterState& state, uint32_t arg0);
 uint32_t              EmitFPCos(EmitterState& state, uint32_t arg0);
 #undef EMIT_NATIVE
 
-uint32_t              EmitIdentity(ValueEmitContext& ctx, uint32_t value);
 void                  EmitVoid(ValueEmitContext&);
 inline constexpr auto EmitReference    = EmitVoid;
 inline constexpr auto EmitReferenceU32 = EmitVoid;
@@ -203,6 +204,7 @@ void                  EmitStoreCompletion(EmitterState& state);
 void                  EmitShaderTrap(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitShaderProbe(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitShaderStuckProbe(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitDataCacheInvalidate(EmitterState& state);
 void                  EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
@@ -310,6 +312,7 @@ inline constexpr auto EmitSharedAtomicDec32     = EmitSharedIncDec;
 inline constexpr auto EmitSharedAtomicSMin32    = EmitAtomic32;
 inline constexpr auto EmitSharedAtomicUMin32    = EmitAtomic32;
 inline constexpr auto EmitSharedAtomicSMax32    = EmitAtomic32;
+inline constexpr auto EmitSharedAtomicCmpSwap32 = EmitAtomic32;
 inline constexpr auto EmitSharedAtomicUMax32    = EmitAtomic32;
 inline constexpr auto EmitSharedAtomicAnd32     = EmitAtomic32;
 inline constexpr auto EmitSharedAtomicOr32      = EmitAtomic32;

@@ -1956,6 +1956,36 @@ void TestImagesSamplersAndAliases() {
         "buffer/image descriptor alias was not linked");
 }
 
+void TestIndependentImageSamplerPairs() {
+	Fixture    fixture(ShaderType::Pixel);
+	const auto address = fixture.ImageAddress();
+	MemoryInfo memory;
+	memory.kind            = ResourceKind::Image;
+	memory.image_dimension = Decoder::ImageDimension::Dim2D;
+	for (uint32_t use = 0; use < 144; ++use) {
+		const auto pair  = use % 72;
+		const auto pc    = use * 4;
+		const auto image = fixture.Image({Value(pair / 8), Value(0u), Value(0u), Value(0u),
+		                                  Value(0u), Value(0u), Value(0u), Value(0u)},
+		                                 pc);
+		const auto sampler =
+		    fixture.Sampler({Value(pair % 8), Value(0u), Value(0u), Value(0u)}, pc);
+		fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, address},
+		             fixture.AddMemory(memory, pc));
+	}
+	fixture.PlanAndTrack();
+
+	Check(fixture.program.info.images.size() == 9 && fixture.program.info.samplers.size() == 8 &&
+	          fixture.program.info.sampled_pairs.size() == 72,
+	      "distinct image/sampler combinations were limited or duplicated");
+	for (uint32_t index = 0; index < 72; ++index) {
+		const auto& pair = fixture.program.info.sampled_pairs[index];
+		Check(pair.image == index / 8 && pair.sampler == index % 8 &&
+		          pair.first_use_pc == index * 4,
+		      "sampled pair lost its independent resources or first use");
+	}
+}
+
 void TestSampleAdjustSamplerScratch() {
   Fixture fixture(ShaderType::Pixel);
   const auto active = fixture.Emit(
@@ -2333,9 +2363,11 @@ void TestDynamicStorageMipTracking() {
   changed_user_data[3] =
       (changed_user_data[3] & ~((0xfu << 12u) | (0xfu << 16u))) |
       (4u << 12u) | (3u << 16u);
-  Check(!MaterializeResources(resource_plan, {.user_data = changed_user_data},
-                              changed_snapshot, changed_specialization),
-        "an inverted dynamic storage mip range was accepted");
+  // An inverted range is an invalid T#: it is nulled like any other, not rejected.
+  Check(MaterializeResources(resource_plan, {.user_data = changed_user_data}, changed_snapshot,
+	                         changed_specialization) &&
+	        changed_snapshot.images[0].dwords[0] == 0u,
+	    "an inverted dynamic storage mip range was not nulled");
 }
 
 void TestSrtFlatteningAndRuntimeMemoization() {
@@ -3824,7 +3856,8 @@ int main() {
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
-    Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
+	Run("independent image/sampler pairs", TestIndependentImageSamplerPairs);
+	Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
     Run("FMASK load specialization", TestFmaskLoadSpecialization);
     Run("gather LOD sampler validation", TestGatherLodSamplerValidation);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);

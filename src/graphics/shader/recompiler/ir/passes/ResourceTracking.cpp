@@ -83,6 +83,19 @@ uint32_t PossibleU32Bits(Value value) {
 			           ? PossibleU32Bits(inst->Arg(0)) << (shift.U32() & 31u)
 			           : UINT32_MAX;
 		}
+		case ValueOpcode::BitFieldInsert: {
+			// Bits outside the inserted field come from the base, the field from the insert.
+			const auto offset = inst->Arg(2).Resolve();
+			const auto count  = inst->Arg(3).Resolve();
+			if (!offset.IsImmediate() || !count.IsImmediate() || offset.U32() >= 32u ||
+			    count.U32() > 32u - offset.U32()) {
+				return UINT32_MAX;
+			}
+			const auto field = (count.U32() == 32u ? UINT32_MAX : (1u << count.U32()) - 1u)
+			                   << offset.U32();
+			return (PossibleU32Bits(inst->Arg(0)) & ~field) |
+			       ((PossibleU32Bits(inst->Arg(1)) << offset.U32()) & field);
+		}
 		default: return UINT32_MAX;
 	}
 }
@@ -3086,9 +3099,6 @@ private:
 				pair.first_use_pc = std::min(pair.first_use_pc, pc);
 				return;
 			}
-		}
-		if (m_info.sampled_pairs.size() >= ShaderInfo::MaxSampledPairs) {
-			Fail(pc, "sampled image/sampler pair limit exceeded");
 		}
 		m_info.sampled_pairs.push_back({image, sampler, pc});
 	}

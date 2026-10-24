@@ -153,7 +153,6 @@ static int KYTY_SYSV_ABI PadClose(int handle) {
 	return OK;
 }
 
-// PPSA02385
 static int KYTY_SYSV_ABI PadOpenExtStub(int user_id, int type, int index, const void* param) {
 	PRINT_NAME();
 
@@ -166,7 +165,32 @@ static int KYTY_SYSV_ABI PadOpenExtStub(int user_id, int type, int index, const 
 	return OK;
 }
 
-// PPSA02385
+// ScePadExtControllerInformation: the standard controller's information, then the special
+// controller's type and capabilities.
+struct PadExtControllerInformation {
+	float    touch_pixel_density;
+	uint16_t touch_resolution_x;
+	uint16_t touch_resolution_y;
+	uint8_t  stick_dead_zone_left;
+	uint8_t  stick_dead_zone_right;
+	uint8_t  connection_type;
+	uint8_t  connected_count;
+	bool     connected;
+	int32_t  device_class;
+	uint8_t  reserve[8];
+	uint16_t pad_type1;
+	uint16_t pad_type2;
+	uint8_t  capability;
+	union {
+		uint8_t quantity_of_selector_switch;
+		int32_t max_physical_wheel_angle;
+		uint8_t data[8];
+	};
+};
+static_assert(sizeof(PadExtControllerInformation) == 44);
+
+// The special controllers (wheels, sticks) a game opens with PadOpenExt: none is connected, and
+// the information says so (it was left unwritten before round 136).
 static int KYTY_SYSV_ABI PadGetExtControllerInformationStub(int handle, void* info) {
 	PRINT_NAME();
 
@@ -174,6 +198,10 @@ static int KYTY_SYSV_ABI PadGetExtControllerInformationStub(int handle, void* in
 	     "\t info   = 0x%016" PRIx64 "\n",
 	     handle, reinterpret_cast<uint64_t>(info));
 
+	if (info == nullptr) {
+		return -2137915391; /* PAD_ERROR_INVALID_ARG, 0x80920001 */
+	}
+	std::memset(info, 0, sizeof(PadExtControllerInformation));
 	return OK;
 }
 

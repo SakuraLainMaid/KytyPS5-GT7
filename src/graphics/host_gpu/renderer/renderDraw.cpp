@@ -644,7 +644,7 @@ static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& sh_regs) {
 	const auto& db = sh_regs.db_shader_control;
 	return db.shader_kill_enable || db.shader_z_export_enable || db.shader_mask_export_enable ||
-	       db.shader_dual_export_enable || db.shader_execute_on_noop;
+	       db.shader_dual_export_enable || db.shader_execute_on_noop || sh_regs.AlphaToMask();
 }
 
 struct DrawRenderState {
@@ -808,6 +808,71 @@ static void LogHtileClear(const RenderDepthInfo& depth, std::optional<uint32_t> 
 	     depth.depth_clear_value, stencil_text.c_str());
 }
 
+// Vulkan resolves float and normalised formats by averaging; integer formats must resolve with
+// SAMPLE_ZERO. SAMPLE_ZERO is valid for every format, so it is also the answer when the emulator
+// does not classify the guest format.
+static vk::ResolveModeFlagBits ColorResolveMode(Prospero::BufferFormat format) {
+	switch (Prospero::SampledTextureNumericClass(format)) {
+		case Prospero::TextureNumericClass::Float: return vk::ResolveModeFlagBits::eAverage;
+		default: return vk::ResolveModeFlagBits::eSampleZero;
+	}
+}
+
+RenderExecutor::~RenderExecutor() = default;
+
+RenderExecutor::MsColorTarget&
+RenderExecutor::GetMsColorTarget(CommandBuffer& buffer, ImageId image_id, const Image& source,
+                                 uint32_t width, uint32_t height, uint32_t layers, uint32_t samples,
+                                 uint32_t base_level, uint32_t base_layer, bool& created) {
+	created = false;
+	for (auto& target: m_ms_color_targets) {
+		if (target.image_id == image_id && target.format == source.info.pixel_format &&
+		    target.width == width && target.height == height && target.layers == layers &&
+		    target.samples == samples && target.base_level == base_level &&
+		    target.base_layer == base_layer) {
+			return target;
+		}
+	}
+
+	ImageInfo info {};
+	info.pixel_format    = source.info.pixel_format;
+	info.guest_format    = source.info.guest_format;
+	info.type            = Prospero::ImageType::kColor2D;
+	info.extent          = {width, height, 1};
+	info.resources       = {1, layers};
+	info.bytes_per_block = source.info.bytes_per_block;
+	info.pitch           = width * source.info.bytes_per_block;
+	info.samples         = samples;
+	info.tile_mode       = Prospero::TileMode::kLinear;
+	info.bgra16          = source.info.bgra16;
+
+	MsColorTarget target {};
+	target.image_id   = image_id;
+	target.format     = info.pixel_format;
+	target.width      = width;
+	target.height     = height;
+	target.layers     = layers;
+	target.samples    = samples;
+	target.base_level = base_level;
+	target.base_layer = base_layer;
+	target.image      = std::make_unique<Image>(buffer.GetGraphics(),
+	                                            m_context.GetTextureCache().m_scheduler, info);
+	ImageViewInfo view_info {};
+	view_info.format      = info.pixel_format;
+	view_info.type        = vk::ImageViewType::e2D;
+	view_info.aspect      = vk::ImageAspectFlagBits::eColor;
+	view_info.layer_count = layers;
+	view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+	target.view           = target.image->FindView(view_info);
+	EXIT_IF(target.view == nullptr);
+	// ponytail: the temporaries live as long as the executor, one per guest render target shape.
+	// Ceiling: a game with thousands of distinct targets keeps a few hundred MB; pool by size when
+	// that shows up.
+	m_ms_color_targets.push_back(std::move(target));
+	created = true;
+	return m_ms_color_targets.back();
+}
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
@@ -820,6 +885,16 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	state.height                = std::numeric_limits<uint32_t>::max();
 	state.num_layers            = std::numeric_limits<uint32_t>::max();
 	state.num_color_attachments = 0;
+	// EQAA fallback, decided exactly as pipelineCache.cpp does: 1-sample colour over multisampled
+	// depth with no host mixed-sample support (RenderDoc). The colour renders into a temporary
+	// image at the depth sample count and resolves onto the guest target, so depth stays attached.
+	const uint32_t depth_samples = depth.image_id ? depth.desc.info.samples : 0;
+	uint32_t       color_samples = 0;
+	const bool     emulate_color =
+	    MsColorTargetsResolvable({colors, color_count}, color_samples) &&
+	    EmulatesColorAtDepthSamples(
+	        m_context.GetGraphics().AcceptsMixedSamples(color_samples, depth_samples),
+	        color_samples, depth_samples);
 	for (uint32_t i = 0; i < color_count; i++) {
 		auto& target = colors[i];
 		EXIT_IF(!target.image_id);
@@ -834,6 +909,29 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const auto& view   = target.desc.view_info;
 		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
 		                                            : vk::ImageLayout::eColorAttachmentOptimal;
+		vk::ImageView           attachment_view   = image_view;
+		vk::ImageLayout         attachment_layout = layout;
+		vk::ImageView           resolve_view      = nullptr;
+		vk::ImageLayout         resolve_layout    = vk::ImageLayout::eUndefined;
+		vk::ResolveModeFlagBits resolve_mode      = vk::ResolveModeFlagBits::eNone;
+		if (emulate_color) {
+			bool  created = false;
+			auto& ms = GetMsColorTarget(buffer, target.image_id, image, image.info.extent.width,
+			                            image.info.extent.height, view.layer_count, depth_samples,
+			                            view.base_level, view.base_layer, created);
+			// The temporary carries this pass's colour so far: seed it when the draw opens a pass,
+			// and when the target joins a pass that was already running without it.
+			if (created || !buffer.IsRendering()) {
+				cache.m_blit_helper.ReplicateColorToMs(image, *ms.image);
+			}
+			ms.image->Transit(vk::ImageLayout::eColorAttachmentOptimal,
+			                  vk::AccessFlagBits2::eColorAttachmentWrite, {}, buffer.Recorder());
+			attachment_view   = ms.view;
+			attachment_layout = vk::ImageLayout::eColorAttachmentOptimal;
+			resolve_view      = image_view;
+			resolve_layout    = layout;
+			resolve_mode      = ColorResolveMode(image.info.guest_format);
+		}
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access =
 		    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
@@ -847,9 +945,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		state.height            = std::min(state.height, extent.height);
 		state.num_layers        = std::min(state.num_layers, view.layer_count);
 		state.num_color_attachments = std::max(state.num_color_attachments, target.target_slot + 1);
-		auto& attachment            = state.color_attachments[target.target_slot];
-		attachment.image_view   = image_view;
-		attachment.image_layout = layout;
+		auto& attachment                = state.color_attachments[target.target_slot];
+		attachment.image_view           = attachment_view;
+		attachment.image_layout         = attachment_layout;
+		attachment.resolve_image_view   = resolve_view;
+		attachment.resolve_image_layout = resolve_layout;
+		attachment.resolve_mode         = resolve_mode;
 	}
 	if (depth.image_id) {
 		const auto owner = cache.m_slot_images.try_get(depth.image_id);
@@ -951,6 +1052,13 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.depth_clear    = depth.depth_load_clear_enable;
 		attachment.has_stencil    = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eStencil);
 		attachment.stencil_clear  = depth.stencil_clear_enable;
+		// ponytail: no mixed samples and no colour emulation: the draw renders without depth, as
+		// the pipeline was built (pipelineCache.cpp). Depth tests are lost for it; emulating more
+		// layouts (arrays, mips) would keep them.
+		if (!m_context.GetGraphics().AcceptsMixedSamples(color_samples, depth.desc.info.samples) &&
+		    !emulate_color) {
+			attachment = {};
+		}
 	}
 	if (color_count == 0 && !depth.image_id) {
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
@@ -2015,6 +2123,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	RefreshShaders(buffer, draw, color_output_mask, state);
 	LogDrawCensus(buffer, draw, state);
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
+		OcclusionQueries::SkippedDraw(m_context, buffer.GetRegisters().GetDbCountControl());
 		if (FrameGraph::Logging()) {
 			FrameGraph::Log("  not drawn: no %s program (vs 0x%012" PRIx64 " ps 0x%012" PRIx64 ")",
 			                !state.programs.vertex[0] ? "vertex" : "pixel",
@@ -2681,6 +2790,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    primitive_restart_enable, state.programs, defer);
 	}
 	if (deferred_pipeline == nullptr) {
+		OcclusionQueries::SkippedDraw(m_context, buffer.GetRegisters().GetDbCountControl());
 		if (FrameGraph::Logging()) {
 			FrameGraph::Log("  skipped: its pipeline is still compiling");
 		}
@@ -2896,6 +3006,22 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                          nullptr, 0, nullptr);
 	}
 
+	vk::PipelineStageFlags shader_write_stages = {};
+	for (const auto& stage: vertex_stages) {
+		if (HasShaderBufferWrites(stage.stage)) {
+			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
+		}
+	}
+	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
+		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
+	}
+	if (shader_write_stages && !GuestGpu::GlobalPm4Barriers()) {
+		// As for dispatches, buffer writes wait for earlier accesses to the memory (mainline
+		// 70668fbd: this replaces the global barriers of PM4 flush events, which
+		// KYTY_PM4_BARRIERS=global records again, without this).
+		m_context.GetCommandScheduler().EndRendering();
+		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
+	}
 	LogDrawPhase(draw.Name(), "BeginRendering");
 	SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	FrameGraphQueries::PrepareDraw(m_context.GetGraphics().device, m_context.GetCommandScheduler(),
@@ -3011,15 +3137,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 
 	SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
-	vk::PipelineStageFlags shader_write_stages = {};
-	for (const auto& stage: vertex_stages) {
-		if (HasShaderBufferWrites(stage.stage)) {
-			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
-		}
-	}
-	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
-		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
-	}
 	if (shader_write_stages) {
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);

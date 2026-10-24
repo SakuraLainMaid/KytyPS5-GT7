@@ -172,6 +172,9 @@ struct DirectMemoryUse {
 // KYTY_BISECT's backing:locked (round 82): copies to and from guest memory hold the backing
 // store's lock while they copy, as before round 82.
 void SetBackingCopyLocked(bool locked);
+// KYTY_BISECT's protect:exclusive (round 135): the page tracker's protections take the address
+// space's lock exclusively, as before they shared it.
+void SetProtectLockExclusive(bool exclusive);
 // GPU thread: some byte of [vaddr, vaddr + size) was written by GPU work into a buffer, so the
 // GPU holds it and a host read would wait for the GPU.
 [[nodiscard]] bool     IsGpuBufferWritten(uint64_t vaddr, uint64_t size);

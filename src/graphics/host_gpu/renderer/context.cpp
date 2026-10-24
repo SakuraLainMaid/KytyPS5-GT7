@@ -213,6 +213,9 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 		    attachment.is_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
 		colors[i].storeOp                 = vk::AttachmentStoreOp::eStore;
 		colors[i].clearValue.color.uint32 = attachment.clear_value;
+		colors[i].resolveMode             = attachment.resolve_mode;
+		colors[i].resolveImageView        = attachment.resolve_image_view;
+		colors[i].resolveImageLayout      = attachment.resolve_image_layout;
 	}
 
 	const auto&                 depth_stencil = state.depth_stencil_attachment;
@@ -241,8 +244,14 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
 	ScrubDeadRenderingViews(rendering, "a draw's rendering");
 	Recorder().beginRendering(rendering);
+	// The open pass holds the cleared contents, so a later clear begins a new pass.
 	m_render_state = state;
-	m_rendering    = true;
+	for (auto& color: m_render_state.color_attachments) {
+		color.is_clear = false;
+	}
+	m_render_state.depth_stencil_attachment.depth_clear   = false;
+	m_render_state.depth_stencil_attachment.stencil_clear = false;
+	m_rendering                                           = true;
 }
 
 void CommandBuffer::EndRendering() const {

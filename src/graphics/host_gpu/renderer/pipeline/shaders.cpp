@@ -582,6 +582,8 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	build.multisampling.sampleShadingEnable  = static_params.sample_shading_enable ? VK_TRUE : VK_FALSE;
 	build.multisampling.rasterizationSamples = vulkan_sample_count(static_params.samples);
 	build.multisampling.minSampleShading     = 1.0f;
+	build.multisampling.alphaToCoverageEnable =
+	    static_params.alpha_to_coverage_enable ? VK_TRUE : VK_FALSE;
 
 	auto& color_blend_attachment = build.color_blend;
 	for (uint32_t i = 0; i < rendering.color_count; i++) {
@@ -802,11 +804,14 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 
 vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build,
                                   vk::PipelineCache driver_cache, vk::Pipeline* pipeline,
-                                  bool cache_only) {
+                                  bool cache_only, bool no_optimization) {
 	const auto create_begin = std::chrono::steady_clock::now();
 	auto       info         = build.pipeline_info;
 	if (cache_only) {
 		info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+	}
+	if (no_optimization) {
+		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
 	}
 	// Round 134: a crash in the driver names the pipeline it was making (Common::CrashNote).
 	std::array<char, 160> note {};

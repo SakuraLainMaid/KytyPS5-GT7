@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -9,9 +10,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstdlib>
 #include <cstring>
-#include <bit>
 #include <optional>
 #include <vector>
 
@@ -383,6 +384,9 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			}
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::StoreCompletion: requirements.subgroup_barrier = true; break;
+				case IR::ValueOpcode::DataCacheInvalidate:
+					requirements.coherent_buffers = true;
+					break;
 				case IR::ValueOpcode::BvhIntersect: requirements.bvh = true; break;
 				case IR::ValueOpcode::LoopBudgetTick: requirements.ray_loop_rounds = true; break;
 				case IR::ValueOpcode::ShaderStuckProbe: requirements.stuck_probe = true; break;
@@ -504,7 +508,12 @@ std::atomic_bool     g_image_min_lod {false};
 std::atomic_bool     g_denorm_flush_f32 {false};
 std::atomic_uint32_t g_device_clock_shift {3};
 std::atomic_bool     g_coherent_load_acquire {false};
+std::atomic_bool     g_emit_names {false};
 } // namespace
+
+void SetEmitNames(bool enabled) {
+	g_emit_names.store(enabled, std::memory_order_relaxed);
+}
 
 void SetCoherentLoadAcquire(bool enabled) {
 	g_coherent_load_acquire.store(enabled, std::memory_order_relaxed);
@@ -598,6 +607,10 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 		IR::ValidateProgram(program, true);
 	}
 	EmitterState state(program, input_info);
+	// OpName is debug info: only shaders dumped for debugging carry it.
+	if (Config::GraphicsDebugDumpEnabled() || g_emit_names.load(std::memory_order_relaxed)) {
+		state.builder.EnableNames();
+	}
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u

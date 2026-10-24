@@ -128,6 +128,19 @@ struct GraphicContext {
 	// color <= depth, with rasterization at the depth count.
 	enum class MixedAttachmentSamples : uint8_t { None, Amd, Nv };
 	MixedAttachmentSamples             mixed_attachment_samples              = MixedAttachmentSamples::None;
+	// Whether one draw can attach color and depth at these sample counts (0 color: depth only).
+	[[nodiscard]] bool AcceptsMixedSamples(uint32_t color_samples,
+	                                       uint32_t depth_samples) const noexcept {
+		if (color_samples == 0 || color_samples == depth_samples) {
+			return true;
+		}
+		switch (mixed_attachment_samples) {
+			case MixedAttachmentSamples::Amd: return true;
+			case MixedAttachmentSamples::Nv: return color_samples < depth_samples;
+			case MixedAttachmentSamples::None: return false;
+		}
+		return false;
+	}
 	// Round 108: the raster sample count and the depth/stencil and color sample count masks
 	// VK_NV_coverage_reduction_mode takes TRUNCATE with (as the device lists them): color sample i
 	// is covered by raster sample i alone, as the PS5's color

@@ -426,6 +426,7 @@ set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms_depth.frag"
 	"${gpu_tiler_shader_dir}/gpu_blit_ms_depth_sample0.frag"
 	"${gpu_tiler_shader_dir}/gpu_blit_ms_stencil_sample0.frag"
+	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms.frag"
 	"${gpu_tiler_shader_dir}/gpu_video_out_overlay.frag"
 	"${gpu_tiler_shader_dir}/color_clear_check.comp"
 	"${gpu_tiler_shader_dir}/gpu_conditional_clear_float.frag"
@@ -581,6 +582,7 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+add_kyty_full_emulator_test(ajm_atrac9_config_tests "${KYTY_TESTS_DIR}/ajmAtrac9ConfigTests.cpp")
 # Offline batch translation of shaders extracted from game files; a tool, not a test.
 add_kyty_full_emulator_test(shader_batch_tool "${KYTY_TESTS_DIR}/ShaderBatchTool.cpp")
 if(KYTY_CLANG_CL)
@@ -853,6 +855,7 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME ajm_atrac9_config COMMAND $<TARGET_FILE:ajm_atrac9_config_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -934,6 +937,7 @@ if(BUILD_TESTING)
 
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests
+		ajm_atrac9_config_tests
 		shader_cfg_tests
 		scalar_provenance_tests
 		image_page_table_tests

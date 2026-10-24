@@ -169,6 +169,9 @@ void Builder::AddEntryPoint(spv::ExecutionModel execution_model, uint32_t entry_
 }
 
 void Builder::AddName(uint32_t target, const char* name) {
+	if (!m_emit_names) {
+		return;
+	}
 	std::vector<uint32_t> operands = {target};
 	AppendString(operands, name);
 	AppendInstruction(m_debug, spv::OpName, operands);

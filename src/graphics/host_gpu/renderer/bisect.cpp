@@ -121,6 +121,11 @@ struct Step {
 	bool              syncwait_old   = false;
 	bool              storeclean_off = false;
 	bool              hold_off       = false; // hold:off (round 133)
+	// Round 135.
+	bool              cleanpage_old   = false; // cleanpage:old
+	bool              readwait_writer = false; // readwait:writer
+	bool              barriers_global = false; // barriers:global
+	bool              protect_excl    = false; // protect:exclusive
 	std::string       cpu_set;          // empty: as at the start
 	std::string       name;             // for the screen and the picture's file name
 	std::string       text;             // name and actions, for the log
@@ -423,6 +428,22 @@ bool ParseAction(std::string_view action, Step& step) {
 		step.hold_off = true;
 		return true;
 	}
+	if (action == "cleanpage:old") {
+		step.cleanpage_old = true;
+		return true;
+	}
+	if (action == "readwait:writer") {
+		step.readwait_writer = true;
+		return true;
+	}
+	if (action == "barriers:global") {
+		step.barriers_global = true;
+		return true;
+	}
+	if (action == "protect:exclusive") {
+		step.protect_excl = true;
+		return true;
+	}
 	if (action == "memsync:sync") {
 		step.memsync_sync = true;
 		return true;
@@ -684,6 +705,7 @@ void ApplyEffects(bool toggled = false) {
 	GpuTiming::SetWatch(step != nullptr && step->gpu_watch);
 	PagedRangeSet::SetIndexOff(step != nullptr && step->dirtyindex_off);
 	LibKernel::Memory::SetBackingCopyLocked(step != nullptr && step->backing_locked);
+	LibKernel::Memory::SetProtectLockExclusive(step != nullptr && step->protect_excl);
 	LibKernel::SyncOnAddress::SetOldWaits(step != nullptr && step->syncwait_old);
 	Common::PerfStats::SetSpinLocks(Common::PerfStats::SpinLocksFromEnvironment() ||
 	                                (step != nullptr && step->locks_spin));
@@ -1202,6 +1224,21 @@ bool StoreCleanOff() {
 bool FrameHoldOff() {
 	const auto* step = Current();
 	return step != nullptr && step->hold_off;
+}
+
+bool CleanPageOld() {
+	const auto* step = Current();
+	return step != nullptr && step->cleanpage_old;
+}
+
+bool ReadWaitWriter() {
+	const auto* step = Current();
+	return step != nullptr && step->readwait_writer;
+}
+
+bool GlobalPm4Barriers() {
+	const auto* step = Current();
+	return step != nullptr && step->barriers_global;
 }
 
 bool PhaseTimingAll() {

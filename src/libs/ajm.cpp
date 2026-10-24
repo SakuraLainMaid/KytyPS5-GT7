@@ -157,7 +157,12 @@ int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
 	if (config_data == nullptr || config_info == nullptr) {
 		return AJM_ERROR_INVALID_PARAMETER;
 	}
-	if (!AjmAt9ConfigDataValid(static_cast<const uint8_t*>(config_data))) {
+	// The configuration reaches us in stream order or as the stored little-endian word some games
+	// hold (30 c0 72 fe); normalize first, validate the stream order, and only then look at the
+	// handle. Validating the stored word rejects the configuration outright.
+	std::array<uint8_t, ATRAC9_CONFIG_DATA_SIZE> config {};
+	AjmAt9NormalizeConfig(static_cast<const uint8_t*>(config_data), config.data());
+	if (!AjmAt9ConfigDataValid(config.data())) {
 		return AJM_ERROR_INVALID_PARAMETER;
 	}
 
@@ -165,9 +170,8 @@ int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
 	if (handle == nullptr) {
 		return AJM_ERROR_INVALID_PARAMETER;
 	}
-
 	Atrac9CodecInfo codec_info {};
-	const int       init_result = AjmAt9InitDecoder(handle, static_cast<const uint8_t*>(config_data));
+	const int       init_result = AjmAt9InitDecoder(handle, config.data());
 	const int       info_result =
 	    init_result == 0 ? Atrac9GetCodecInfo(handle, &codec_info) : init_result;
 	Atrac9ReleaseHandle(handle);
