@@ -159,6 +159,9 @@ void BufferCache::ChangeRegister(BufferId id) {
 void BufferCache::TouchBuffer(const Buffer& buffer) {
 	if (!buffer.is_deleted) {
 		m_lru_cache.Touch(buffer.lru_id, LruClock());
+		if (buffer.gc_pending) {
+			buffer.gc_reused = true;
+		}
 	}
 }
 
@@ -3360,6 +3363,10 @@ void BufferCache::RunGarbageCollector() {
 			// See CreateBuffer: the tracker rejects address 0, so this one is never collected.
 			return false;
 		}
+		if (buffer.gc_pending) {
+			// Its download is in flight; the deferred step at the end drops it.
+			return false;
+		}
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges.Ranges(),
 		                                           buffer.CpuAddress(), buffer.Size(),
 		                                           "garbage collection");
@@ -3431,6 +3438,61 @@ void BufferCache::RunGarbageCollector() {
 	// recording, so that recording has to actually submit and complete -- see ReadMemory's wait
 	// for why waiting on an older per-buffer tick here would skip that entirely.
 	const auto completion_tick = m_scheduler.CurrentTick();
+	// KYTY_GC_ASYNC_DOWNLOAD=0 waits here as before. By default the GPU thread goes on, and the
+	// buffers are dropped by a deferred operation once the GPU has finished this tick and its
+	// downloads are published (deferred operations run after their tick's priority callbacks). In
+	// a 1440p race on a 6 GB card the wait took 37 ms of each 290 ms frame (2026-10-24). A buffer
+	// a draw or dispatch uses again meanwhile stays: its pages may hold newer GPU writes.
+	static const bool async_download = [] {
+		const char* value = std::getenv("KYTY_GC_ASYNC_DOWNLOAD");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (async_download) {
+		struct Pending {
+			BufferId id;
+			uint64_t address;
+		};
+		std::vector<Pending> pending;
+		pending.reserve(dirty_buffers.size());
+		for (const auto id: dirty_buffers) {
+			auto& buffer      = m_slot_buffers[id];
+			buffer.gc_pending = true;
+			buffer.gc_reused  = false;
+			pending.push_back({id, buffer.CpuAddress()});
+		}
+		m_scheduler.DeferOperation([this, completion_tick, pending = std::move(pending)] {
+			static uint64_t dropped = 0, kept = 0;
+			for (const auto& [id, address]: pending) {
+				auto* buffer = m_slot_buffers.try_get(id);
+				if (buffer == nullptr || buffer->is_deleted || !buffer->gc_pending ||
+				    buffer->CpuAddress() != address) {
+					continue;
+				}
+				buffer->gc_pending = false;
+				if (buffer->gc_reused || buffer->last_use_tick > completion_tick) {
+					buffer->gc_reused = false;
+					kept++;
+					continue;
+				}
+				m_memory_tracker.UnmarkRegionAsGpuModified(buffer->CpuAddress(), buffer->Size());
+				if (m_memory_tracker.IsRegionGpuModified(buffer->CpuAddress(), buffer->Size()) ||
+				    m_gpu_modified_ranges.Intersects(buffer->CpuAddress(), buffer->Size())) {
+					kept++;
+					continue;
+				}
+				m_memory_tracker.UntrackMemory(buffer->CpuAddress(), buffer->Size());
+				NoteBufferEvent(BufferEventKind::Collected, *buffer);
+				Unregister(id);
+				m_slot_buffers.erase(id);
+				if (++dropped % 1024 == 1) {
+					LOGF("BufferCache: %" PRIu64 " GPU-written buffers dropped after their "
+					     "downloads landed, %" PRIu64 " kept (used again meanwhile)\n",
+					     dropped, kept);
+				}
+			}
+		});
+		return;
+	}
 	m_scheduler.Wait(completion_tick);
 	m_scheduler.WaitPriorityOperations(completion_tick);
 	for (const auto id: dirty_buffers) {

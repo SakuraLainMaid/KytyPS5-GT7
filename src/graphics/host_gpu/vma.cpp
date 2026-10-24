@@ -47,6 +47,15 @@ bool GraphicContext::CreateAllocator() {
 	if (memory_budget_ext_enabled) {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
 	}
+	// KYTY_VMA_BLOCK_MB=<n>: size of the memory blocks VMA carves large heaps into (default 256).
+	// Smaller blocks leave less unused room inside them on a card short of video memory.
+	if (const char* value = std::getenv("KYTY_VMA_BLOCK_MB"); value != nullptr) {
+		const auto block_mb = std::strtoull(value, nullptr, 10);
+		if (block_mb != 0) {
+			info.preferredLargeHeapBlockSize = static_cast<VkDeviceSize>(block_mb) << 20u;
+			LOGF("KYTY_VMA_BLOCK_MB: VMA block size %" PRIu64 " MB\n", static_cast<uint64_t>(block_mb));
+		}
+	}
 
 	// Testing aid: KYTY_VRAM_LIMIT_MB=<n> caps every device-local heap at n MB, so a large card
 	// behaves like a 4, 6 or 8 GB one: VMA reports the capped budget, allocations past it fail

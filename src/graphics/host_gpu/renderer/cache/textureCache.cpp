@@ -7215,10 +7215,18 @@ void TextureCache::RunGarbageCollector() {
 		// What the images really take in video memory: AccountedSize is the guest's byte count,
 		// which leaves out host padding, alignment and format expansion.
 		uint64_t real_bytes = 0;
+		// The render targets of at most 1024x1024 the collector keeps (small_target below).
+		uint64_t small_targets      = 0;
+		uint64_t small_target_bytes = 0;
 		m_slot_images.ForEach([&](ImageId, const Image& image) {
 			if (image.registered) {
 				images++;
 				bytes += image.AccountedSize();
+				if (image.usage.render_target && image.info.extent.width <= 1024 &&
+				    image.info.extent.height <= 1024) {
+					small_targets++;
+					small_target_bytes += image.AccountedSize();
+				}
 				if (image.backing.allocation != nullptr) {
 					VmaAllocationInfo allocation {};
 					vmaGetAllocationInfo(m_graphics.allocator, image.backing.allocation, &allocation);
@@ -7228,10 +7236,11 @@ void TextureCache::RunGarbageCollector() {
 		});
 		LOGF("TexStats: runs=%" PRIu64 " frame=%" PRIu64 " images=%" PRIu64 " image_bytes=%" PRIu64
 		     "MB real_bytes=%" PRIu64 "MB device_used=%" PRIu64 "MB pressure=%" PRIu64
-		     "MB critical=%" PRIu64 "MB\n",
+		     "MB critical=%" PRIu64 "MB small_targets=%" PRIu64 " (%" PRIu64 "MB)\n",
 		     m_gc_tick, m_graphics.presented_frames.load(std::memory_order_relaxed), images,
 		     bytes >> 20u, real_bytes >> 20u, m_total_used_memory >> 20u,
-		     m_pressure_gc_memory >> 20u, m_critical_gc_memory >> 20u);
+		     m_pressure_gc_memory >> 20u, m_critical_gc_memory >> 20u, small_targets,
+		     small_target_bytes >> 20u);
 		// Per heap: usage is the whole process (driver included), allocation what VMA handed out.
 		m_graphics.LogMemoryBudget();
 		LOGF("TexGc: visited=%" PRIu64 " freed=%" PRIu64 " (%" PRIu64 "MB) written_back=%" PRIu64
