@@ -3469,21 +3469,27 @@ void BufferCache::RunGarbageCollector() {
 					continue;
 				}
 				buffer->gc_pending = false;
-				if (buffer->gc_reused || buffer->last_use_tick > completion_tick) {
+				// GPU writes recorded since the downloads (also through buffer device addresses,
+				// which bind nothing and so leave gc_reused alone) are in m_gpu_modified_ranges
+				// again: then the buffer holds bytes newer than guest memory and stays.
+				if (buffer->gc_reused || buffer->last_use_tick > completion_tick ||
+				    m_gpu_modified_ranges.Intersects(buffer->CpuAddress(), buffer->Size())) {
 					buffer->gc_reused = false;
 					kept++;
 					continue;
 				}
 				m_memory_tracker.UnmarkRegionAsGpuModified(buffer->CpuAddress(), buffer->Size());
-				if (m_memory_tracker.IsRegionGpuModified(buffer->CpuAddress(), buffer->Size()) ||
-				    m_gpu_modified_ranges.Intersects(buffer->CpuAddress(), buffer->Size())) {
+				if (m_memory_tracker.IsRegionGpuModified(buffer->CpuAddress(), buffer->Size())) {
 					kept++;
 					continue;
 				}
 				m_memory_tracker.UntrackMemory(buffer->CpuAddress(), buffer->Size());
 				NoteBufferEvent(BufferEventKind::Collected, *buffer);
-				Unregister(id);
-				m_slot_buffers.erase(id);
+				// Not destroyed at once: work recorded after the downloads may still reach it
+				// through its device address on the GPU (a device loss on 2026-10-24: a write
+				// into a buffer destroyed one tick before the GPU finished). DeleteBuffer clears
+				// its address table entries and destroys it once the current tick is done.
+				DeleteBuffer(id);
 				if (++dropped % 1024 == 1) {
 					LOGF("BufferCache: %" PRIu64 " GPU-written buffers dropped after their "
 					     "downloads landed, %" PRIu64 " kept (used again meanwhile)\n",
