@@ -561,23 +561,12 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	    attribute.tiling_mode != 0 || attribute.pad0 != 0 || attribute.reserved1[0] != 0 ||
 	    attribute.reserved1[1] != 0 || attribute.reserved1[2] != 0 || buffer.data_address == 0 ||
 	    compression == Graphics::VideoOutCompression::Unsupported) {
-		EXIT("unsupported or invalid video-out surface attributes: %ux%u pitch_in_pixel=%u "
-		     "tiling_mode=%u aspect_ratio=%u option=0x%x reserved0=%u pad0=%u reserved1=%u,%u,%u "
-		     "pixel_format=0x%016" PRIx64 " data=0x%016" PRIx64 " metadata=0x%016" PRIx64
-		     " category=%u compression=%d dcc_control=0x%08x dcc_clear=0x%016" PRIx64 "\n",
-		     static_cast<uint32_t>(attribute.width), static_cast<uint32_t>(attribute.height),
-		     static_cast<uint32_t>(attribute.pitch_in_pixel),
-		     static_cast<uint32_t>(attribute.tiling_mode),
-		     static_cast<uint32_t>(attribute.aspect_ratio),
-		     static_cast<uint32_t>(attribute.option), static_cast<uint32_t>(attribute.reserved0),
-		     static_cast<uint32_t>(attribute.pad0), static_cast<uint32_t>(attribute.reserved1[0]),
-		     static_cast<uint32_t>(attribute.reserved1[1]),
-		     static_cast<uint32_t>(attribute.reserved1[2]),
-		     static_cast<uint64_t>(attribute.pixel_format),
-		     static_cast<uint64_t>(buffer.data_address),
-		     static_cast<uint64_t>(buffer.metadata_address), static_cast<uint32_t>(category),
-		     static_cast<int>(compression), static_cast<uint32_t>(attribute.dcc_control),
-		     static_cast<uint64_t>(attribute.dcc_cb_register_clear_color));
+		// Round 147: what was not accepted, for the report.
+		EXIT("unsupported or invalid video-out surface attributes: %ux%u, category %d, DCC control "
+		     "0x%08x%s, data 0x%" PRIx64 ", metadata 0x%" PRIx64 "\n",
+		     attribute.width, attribute.height, category, attribute.dcc_control,
+		     compression == Graphics::VideoOutCompression::Unsupported ? " (not supported)" : "",
+		     buffer.data_address, buffer.metadata_address);
 	}
 	Graphics::VideoOutPixelFormatInfo pixel_format {};
 	if (!Graphics::DecodeVideoOutPixelFormat(attribute.pixel_format, pixel_format)) {

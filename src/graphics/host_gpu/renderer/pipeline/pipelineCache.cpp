@@ -1879,6 +1879,23 @@ public:
 		m_work.notify_one();
 	}
 
+	// Round 144: a draw that may not be skipped waits for this job, so it counts as asked for now
+	// and the next free worker takes it. Nothing else asks while the GPU thread waits: after 2 s
+	// every queued job was background work, which only the background workers took, the oldest
+	// and the newest first, and a race start on a cold cache waited 190 s for one pipeline.
+	// Round 145: `stalled` (the GPU thread waited 100 ms already) lets every worker take the
+	// background work for the next 500 ms. The game is stopped meanwhile, so the cores are free,
+	// and the next draws that may not be skipped find their pipelines done: one race start waited
+	// for 51 in a row, 49 s, with 13 of the 16 workers idle.
+	void Ask(const PendingGraphicsPipeline& job, bool stalled) {
+		const auto now = AskClockMs();
+		job.asked.store(now, std::memory_order_relaxed);
+		if (stalled) {
+			m_stalled_until.store(now + 500, std::memory_order_relaxed);
+		}
+		m_work.notify_all();
+	}
+
 	// Waits up to the budget; true when the job is done.
 	bool Wait(const PendingGraphicsPipeline& job, std::chrono::microseconds budget) {
 		KYTY_PROFILER_BLOCK("PipelineCompiler::Wait");
@@ -1920,7 +1937,8 @@ private:
 	// its compiles queued behind each new frame's, and they never ran, not even when it came back.
 	// Jobs no draw asked for in the last 2 s and the optimized compiles of pipelines drawn
 	// unoptimized run on the first g_pipeline_background workers only: 8 compiles behind the
-	// scene took the cores the game shares, and it ran slower until a restart.
+	// scene took the cores the game shares, and it ran slower until a restart. While the GPU
+	// thread is stalled on a compile, every worker takes them (round 145, Ask).
 	bool Pick(uint32_t index, std::shared_ptr<PendingGraphicsPipeline>& job, bool& lookup) {
 		lookup = !m_lookups.empty();
 		if (lookup) {
@@ -1928,7 +1946,8 @@ private:
 			m_lookups.pop_front();
 			return true;
 		}
-		const bool background = index < g_pipeline_background;
+		const bool background = index < g_pipeline_background ||
+		                        AskClockMs() < m_stalled_until.load(std::memory_order_relaxed);
 		if (!m_queue.empty()) {
 			// ponytail: a linear scan; a heap if the queue grows to many thousands.
 			auto pick = index == 0
@@ -2058,6 +2077,8 @@ private:
 	std::deque<std::shared_ptr<PendingGraphicsPipeline>> m_optimize;
 	std::vector<std::thread>                             m_threads;
 	uint32_t                                             m_lookup_threads = 0;
+	// Round 145: until this AskClockMs, every worker may take background work (Ask).
+	std::atomic<uint64_t>                                m_stalled_until {0};
 	bool                                                 m_stopped        = false;
 };
 
@@ -4791,8 +4812,8 @@ bool SmallColorTargetDraw(const HW::Context& context) {
 // time, several times every 10 s, all race long (2026-10-18, warm86: up to 38 s of 42). A draw
 // into such a target may be skipped while its shaders translate or its pipeline compiles: it
 // misses a frame or a few, not a picture drawn once. Such a target is a reflection cube (learned
-// by renderDraw.cpp) the game has drawn in two frames or more, or one drawn in at least three of
-// six frames in a row at some time, when the draw tests against a depth target bound with it,
+// by renderDraw.cpp; drawn in two frames or more until round 146), or one drawn in at least three
+// of six frames in a row at some time, when the draw tests against a depth target bound with it,
 // with a test that can fail or a depth write (a 3D pass: the depth test enable alone is not
 // enough, the lost glyphs above had it set). The second holds until the target goes unused for
 // 32 frames; the cube's count is kept for good (round 88): the race start had none of the frames
@@ -4919,7 +4940,11 @@ bool RedrawnTargetDraw(const HW::Context& context) {
 		return false;
 	}
 	if (ReflectionCubeDraw(context)) {
-		return frames.frames >= 2;
+		// Round 146: from its first frame. A race start can draw its cube for the first time in
+		// the session: on a cold cache (a new car or track after a shader reset) its draws
+		// compiled 33 pipelines on the GPU thread, 26 s of a 51 s freeze before the countdown.
+		// The cube is drawn again the next frame.
+		return true;
 	}
 	return (frames.steady && DepthTestedDraw(context)) || GbufferPassDraw(context);
 }
@@ -4933,6 +4958,33 @@ void NoteReflectionCubeTarget(uint64_t address) {
 		return;
 	}
 	g_reflection_cubes[g_reflection_cube_count++] = address;
+}
+
+// Round 143: KYTY_PS_BARYCENTRICS=0 leaves a pixel shader's raw barycentric registers (the I/J
+// VGPRs the hardware fills) unset, so they read as 0 and the shader declares no gl_BaryCoordKHR
+// for them; "mesh" does it only for pixel shaders drawn with a mesh shader. Interpolated inputs
+// do not need these registers (V_INTERP_P2 reads the attribute itself); shaders that interpolate
+// by hand from them come out flat. A test for drivers whose shader compiler fails on
+// barycentrics: an AMD driver crashes building the first mesh pipeline (issue 21).
+enum class RawBarycentrics : uint8_t { Keep, Mesh, Off };
+
+static RawBarycentrics RawBarycentricsMode() {
+	static const RawBarycentrics mode = [] {
+		const char*     value  = std::getenv("KYTY_PS_BARYCENTRICS");
+		RawBarycentrics result = RawBarycentrics::Keep;
+		if (value != nullptr && std::strcmp(value, "0") == 0) {
+			result = RawBarycentrics::Off;
+		} else if (value != nullptr && std::strcmp(value, "mesh") == 0) {
+			result = RawBarycentrics::Mesh;
+		}
+		const char* text = result == RawBarycentrics::Off    ? "read as 0 in every pixel shader"
+		                   : result == RawBarycentrics::Mesh ? "read as 0 with mesh shaders"
+		                                                     : "from the host's barycentrics";
+		::printf("Pixel shaders: raw barycentric registers %s (KYTY_PS_BARYCENTRICS)\n", text);
+		LOGF("Pixel shaders: raw barycentric registers %s (KYTY_PS_BARYCENTRICS)\n", text);
+		return result;
+	}();
+	return mode;
 }
 
 bool PipelineCache::DescribeGraphicsStages(
@@ -5015,6 +5067,12 @@ bool PipelineCache::DescribeGraphicsStages(
 			LOGF("Half-float stores: %s\n", mode);
 		});
 		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		if (const auto raw = RawBarycentricsMode();
+		    raw == RawBarycentrics::Off || (raw == RawBarycentrics::Mesh && mesh_active)) {
+			// Part of the program key: the default keeps its translations.
+			pixel_info.ps_perspective_center_vgpr   = UINT32_MAX;
+			pixel_info.ps_perspective_centroid_vgpr = UINT32_MAX;
+		}
 		// SPI_SHADER_COL_FORMAT describes export packing, not the attachment numeric type.
 		// In particular, 32-bit exports can carry raw integer material data.
 		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
@@ -5899,8 +5957,11 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 			// A draw that may not be skipped waits for the compile another draw of the same
 			// pipeline sent to the background (round 87: more of those are sent now).
 			const GpuPhases::Scope wait_phase(GpuPhases::Phase::PipelineWait);
+			bool                   stalled = false;
 			while (!FinishPending(found)) {
+				m_compiler->Ask(*found.pending, stalled);
 				(void)m_compiler->Wait(*found.pending, std::chrono::milliseconds(100));
+				stalled = true;
 			}
 		}
 		return &found;
