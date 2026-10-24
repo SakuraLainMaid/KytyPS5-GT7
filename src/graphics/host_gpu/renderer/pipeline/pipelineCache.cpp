@@ -1879,6 +1879,15 @@ public:
 		m_work.notify_one();
 	}
 
+	// Round 144: a draw that may not be skipped waits for this job, so it counts as asked for now
+	// and the next free worker takes it. Nothing else asks while the GPU thread waits: after 2 s
+	// every queued job was background work, which only the background workers took, the oldest
+	// and the newest first, and a race start on a cold cache waited 190 s for one pipeline.
+	void Ask(const PendingGraphicsPipeline& job) {
+		job.asked.store(AskClockMs(), std::memory_order_relaxed);
+		m_work.notify_all();
+	}
+
 	// Waits up to the budget; true when the job is done.
 	bool Wait(const PendingGraphicsPipeline& job, std::chrono::microseconds budget) {
 		KYTY_PROFILER_BLOCK("PipelineCompiler::Wait");
@@ -5931,6 +5940,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 			// pipeline sent to the background (round 87: more of those are sent now).
 			const GpuPhases::Scope wait_phase(GpuPhases::Phase::PipelineWait);
 			while (!FinishPending(found)) {
+				m_compiler->Ask(*found.pending);
 				(void)m_compiler->Wait(*found.pending, std::chrono::milliseconds(100));
 			}
 		}
