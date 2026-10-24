@@ -1883,8 +1883,16 @@ public:
 	// and the next free worker takes it. Nothing else asks while the GPU thread waits: after 2 s
 	// every queued job was background work, which only the background workers took, the oldest
 	// and the newest first, and a race start on a cold cache waited 190 s for one pipeline.
-	void Ask(const PendingGraphicsPipeline& job) {
-		job.asked.store(AskClockMs(), std::memory_order_relaxed);
+	// Round 145: `stalled` (the GPU thread waited 100 ms already) lets every worker take the
+	// background work for the next 500 ms. The game is stopped meanwhile, so the cores are free,
+	// and the next draws that may not be skipped find their pipelines done: one race start waited
+	// for 51 in a row, 49 s, with 13 of the 16 workers idle.
+	void Ask(const PendingGraphicsPipeline& job, bool stalled) {
+		const auto now = AskClockMs();
+		job.asked.store(now, std::memory_order_relaxed);
+		if (stalled) {
+			m_stalled_until.store(now + 500, std::memory_order_relaxed);
+		}
 		m_work.notify_all();
 	}
 
@@ -1929,7 +1937,8 @@ private:
 	// its compiles queued behind each new frame's, and they never ran, not even when it came back.
 	// Jobs no draw asked for in the last 2 s and the optimized compiles of pipelines drawn
 	// unoptimized run on the first g_pipeline_background workers only: 8 compiles behind the
-	// scene took the cores the game shares, and it ran slower until a restart.
+	// scene took the cores the game shares, and it ran slower until a restart. While the GPU
+	// thread is stalled on a compile, every worker takes them (round 145, Ask).
 	bool Pick(uint32_t index, std::shared_ptr<PendingGraphicsPipeline>& job, bool& lookup) {
 		lookup = !m_lookups.empty();
 		if (lookup) {
@@ -1937,7 +1946,8 @@ private:
 			m_lookups.pop_front();
 			return true;
 		}
-		const bool background = index < g_pipeline_background;
+		const bool background = index < g_pipeline_background ||
+		                        AskClockMs() < m_stalled_until.load(std::memory_order_relaxed);
 		if (!m_queue.empty()) {
 			// ponytail: a linear scan; a heap if the queue grows to many thousands.
 			auto pick = index == 0
@@ -2067,6 +2077,8 @@ private:
 	std::deque<std::shared_ptr<PendingGraphicsPipeline>> m_optimize;
 	std::vector<std::thread>                             m_threads;
 	uint32_t                                             m_lookup_threads = 0;
+	// Round 145: until this AskClockMs, every worker may take background work (Ask).
+	std::atomic<uint64_t>                                m_stalled_until {0};
 	bool                                                 m_stopped        = false;
 };
 
@@ -5939,9 +5951,11 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 			// A draw that may not be skipped waits for the compile another draw of the same
 			// pipeline sent to the background (round 87: more of those are sent now).
 			const GpuPhases::Scope wait_phase(GpuPhases::Phase::PipelineWait);
+			bool                   stalled = false;
 			while (!FinishPending(found)) {
-				m_compiler->Ask(*found.pending);
+				m_compiler->Ask(*found.pending, stalled);
 				(void)m_compiler->Wait(*found.pending, std::chrono::milliseconds(100));
+				stalled = true;
 			}
 		}
 		return &found;
