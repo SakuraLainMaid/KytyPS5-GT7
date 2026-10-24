@@ -337,6 +337,120 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
        </layout>
       </widget>
      </item>
+     <item row="3" column="1">
+      <widget class="QGroupBox" name="console_group">
+       <property name="title"><string>Console</string></property>
+       <layout class="QFormLayout" name="consoleLayout">
+        <property name="fieldGrowthPolicy"><enum>QFormLayout::AllNonFixedFieldsGrow</enum></property>
+        <item row="0" column="0" colspan="2">
+         <widget class="QCheckBox" name="checkBox_ps5_pro">
+          <property name="toolTip"><string>Report a PS5 Pro (sceKernelGetOperationMode mode 3, sceKernelIsTrinityMode 1) instead of a base PS5. Games may then pick their PS5 Pro modes, which the emulator may not support.</string></property>
+          <property name="text"><string>Report a PS5 Pro (experimental)</string></property>
+         </widget>
+        </item>
+        <item row="1" column="0" colspan="2">
+         <widget class="QCheckBox" name="checkBox_power_saver">
+          <property name="toolTip"><string>Report the console's power saver mode (submode 1). Games that support it lower their resolution or use fewer threads; in Gran Turismo 7 it selects the 1080p graphics profile.</string></property>
+          <property name="text"><string>Power saver mode</string></property>
+         </widget>
+        </item>
+        <item row="2" column="0">
+         <widget class="QLabel" name="label_gt7_render_patch">
+          <property name="text"><string>GT7 render patch:</string></property>
+         </widget>
+        </item>
+        <item row="2" column="1">
+         <widget class="QComboBox" name="comboBox_gt7_render_patch">
+          <property name="toolTip"><string>Gran Turismo 7 (PPSA01317 01.710.000) only: the game's power saver profile at 1920x1080, or patched to 2560x1440. Uses the patch files in the emulator's patches folder; replaces the game's cheat file for that run.</string></property>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+     </item>
+     <item row="5" column="0" colspan="2">
+      <widget class="QGroupBox" name="tuning_group">
+       <property name="title"><string>Performance tuning (experimental)</string></property>
+       <layout class="QGridLayout" name="tuningLayout" columnstretch="0,1,0,1">
+        <property name="horizontalSpacing"><number>8</number></property>
+        <property name="verticalSpacing"><number>6</number></property>
+        <item row="0" column="0" colspan="2">
+         <widget class="QCheckBox" name="checkBox_vma_small_blocks">
+          <property name="toolTip"><string>Allocate video memory in 64 MB blocks instead of 256 MB (KYTY_VMA_BLOCK_MB=64): less unused room inside blocks on cards short of video memory.</string></property>
+          <property name="text"><string>Small video memory blocks</string></property>
+         </widget>
+        </item>
+        <item row="0" column="2" colspan="2">
+         <widget class="QCheckBox" name="checkBox_low_vram_gc">
+          <property name="toolTip"><string>Collect textures more eagerly when video memory runs short (KYTY_TEX_GC_FLOOR_MB=1200, KYTY_TEX_GC_MIN_AGE=3).</string></property>
+          <property name="text"><string>Low video memory texture collection</string></property>
+         </widget>
+        </item>
+        <item row="1" column="0" colspan="2">
+         <widget class="QCheckBox" name="checkBox_readahead">
+          <property name="toolTip"><string>Download memory the game's threads read back as soon as the GPU writes it again, so their reads find it in memory (KYTY_READAHEAD=1).</string></property>
+          <property name="text"><string>Readahead of GPU-written memory</string></property>
+         </widget>
+        </item>
+        <item row="1" column="2" colspan="2">
+         <widget class="QCheckBox" name="checkBox_long_fault_window">
+          <property name="toolTip"><string>Release a whole block that faults again within 300 ms instead of 100 ms (KYTY_FAULT_WINDOW_MS=300): fewer write-protection faults.</string></property>
+          <property name="text"><string>Longer write-fault window</string></property>
+         </widget>
+        </item>
+        <item row="2" column="0">
+         <widget class="QLabel" name="label_pipeline_mode">
+          <property name="text"><string>Pipeline compiles:</string></property>
+         </widget>
+        </item>
+        <item row="2" column="1">
+         <widget class="QComboBox" name="comboBox_pipeline_mode">
+          <property name="toolTip"><string>Background: draws whose pipeline is still compiling are skipped (untextured models for a moment).
+Background, complete frames: compiles run in parallel, and a frame that skipped a draw is not shown (the last complete one stays, up to 5 s).
+GPU thread: each pipeline compiles on the spot (a stall for each new one).</string></property>
+         </widget>
+        </item>
+        <item row="2" column="2">
+         <widget class="QLabel" name="label_pipeline_threads">
+          <property name="text"><string>Compile threads:</string></property>
+         </widget>
+        </item>
+        <item row="2" column="3">
+         <widget class="QSpinBox" name="spinBox_pipeline_threads">
+          <property name="toolTip"><string>Background pipeline compile threads (KYTY_PIPELINE_THREADS). Auto: half the processors. Each takes memory while it compiles.</string></property>
+          <property name="specialValueText"><string>Auto</string></property>
+          <property name="minimum"><number>0</number></property>
+          <property name="maximum"><number>32</number></property>
+         </widget>
+        </item>
+        <item row="3" column="0">
+         <widget class="QLabel" name="label_cpu_set">
+          <property name="text"><string>CPU placement:</string></property>
+         </widget>
+        </item>
+        <item row="3" column="1">
+         <widget class="QComboBox" name="comboBox_cpu_set">
+          <property name="toolTip"><string>Where the emulator's threads run (KYTY_CPU_SET), on CPUs with two kinds of cores or caches.
+GPU thread on its own core: the other threads on the other cluster.
+GPU thread on its own core, game on fast cores: the game's threads also get the fast cluster's remaining cores; pipeline compilers stay on the other cluster.</string></property>
+         </widget>
+        </item>
+        <item row="3" column="2">
+         <widget class="QLabel" name="label_ray_loop_cap">
+          <property name="text"><string>Ray traversal cap:</string></property>
+         </widget>
+        </item>
+        <item row="3" column="3">
+         <widget class="QSpinBox" name="spinBox_ray_loop_cap">
+          <property name="toolTip"><string>Rounds a ray's BVH walk may take (KYTY_RAY_LOOP_CAP). Default: 16384. Lower is faster, with less accurate ray-traced effects.</string></property>
+          <property name="specialValueText"><string>Default</string></property>
+          <property name="minimum"><number>0</number></property>
+          <property name="maximum"><number>65536</number></property>
+          <property name="singleStep"><number>256</number></property>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+     </item>
     </layout>
    </item>
    <item row="1" column="1">

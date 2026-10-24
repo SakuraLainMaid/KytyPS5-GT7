@@ -79,6 +79,10 @@ struct ConfigOptions {
 	bool                   playgo_hack_enabled         = false;
 	bool                   bindless_images_enabled     = false;
 	bool                   float_image_atomics_enabled = true;
+	// sceKernelGetOperationMode / sceKernelIsTrinityMode: report a PS5 Pro (mode 3) instead of a
+	// base PS5 (mode 2), and the console's power saver mode (submode 1).
+	bool                   ps5_pro_enabled             = false;
+	bool                   power_saver_enabled         = false;
 	// Guest shaders whose draws and dispatches are skipped: hex hashes, comma-separated.
 	std::string            skip_shader_hashes;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -132,6 +136,8 @@ bool ReadbackLinearImagesEnabled();
 bool TessellationEnabled();
 bool TrophyEnabled();
 bool BindlessImagesEnabled();
+bool Ps5ProEnabled();
+bool PowerSaverEnabled();
 const std::string& GetSkipShaderHashes();
 bool FloatImageAtomicsEnabled();
 bool PlayGoHackEnabled();

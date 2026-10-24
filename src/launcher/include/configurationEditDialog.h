@@ -9,6 +9,7 @@ class QGroupBox;
 class QListWidget;
 class QMoveEvent;
 class QResizeEvent;
+class QScrollArea;
 class QToolButton;
 class QSettings;
 class QWidget;
@@ -43,11 +44,16 @@ private:
 	QListWidget*                 m_game_dirs_list         = nullptr;
 	QToolButton*                 m_remove_game_dir_button = nullptr;
 	bool                         m_global_settings        = false;
+	QScrollArea*                 m_scroll                 = nullptr;
 
 protected:
 	void Init(const Configuration& info);
 	void InitGameDirectories();
 	void AddGameDirectoryItem(const QString& dir);
+	// The settings sit in a scroll area; the dialog takes the size they need, but no more than
+	// the screen it is on has room for, and stays inside that screen.
+	void InitScrollArea();
+	void FitToScreen(bool restored);
 
 	void moveEvent(QMoveEvent* event) override;
 	void resizeEvent(QResizeEvent* event) override;

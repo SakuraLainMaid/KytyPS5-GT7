@@ -138,6 +138,21 @@ public:
 	bool                   profiler_enabled            = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   amd_cpu_enabled             = false;
+	// Console (--ps5-pro, --power-saver) and GT7's render patch: "1080p" or "1440p", empty off.
+	bool                   ps5_pro_enabled             = false;
+	bool                   power_saver_enabled         = false;
+	QString                gt7_render_patch;
+	// Performance tuning, passed as KYTY_* environment variables (CreateEmulatorEnvironment).
+	bool                   vma_small_blocks            = false;
+	bool                   low_vram_gc                 = false;
+	bool                   readahead_enabled           = false;
+	bool                   long_fault_window           = false;
+	// "background" (skip draws; the default), "hold" (complete frames) or "sync".
+	QString                pipeline_mode               = QStringLiteral("background");
+	int                    pipeline_threads            = 0; // 0: the emulator's choice
+	// KYTY_CPU_SET: empty (the emulator's choice), "gpucore" or "gpucoregame".
+	QString                cpu_set;
+	int                    ray_loop_cap                = 0; // 0: the emulator's default
 #if defined(_WIN32)
 	bool red_zone_protection_enabled = false;
 #endif
@@ -174,6 +189,17 @@ public:
 		profiler_enabled            = other.profiler_enabled;
 		renderdoc_enabled           = other.renderdoc_enabled;
 		amd_cpu_enabled             = other.amd_cpu_enabled;
+		ps5_pro_enabled             = other.ps5_pro_enabled;
+		power_saver_enabled         = other.power_saver_enabled;
+		gt7_render_patch            = other.gt7_render_patch;
+		vma_small_blocks            = other.vma_small_blocks;
+		low_vram_gc                 = other.low_vram_gc;
+		readahead_enabled           = other.readahead_enabled;
+		long_fault_window           = other.long_fault_window;
+		pipeline_mode               = other.pipeline_mode;
+		pipeline_threads            = other.pipeline_threads;
+		cpu_set                     = other.cpu_set;
+		ray_loop_cap                = other.ray_loop_cap;
 #if defined(_WIN32)
 		red_zone_protection_enabled = other.red_zone_protection_enabled;
 #endif

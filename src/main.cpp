@@ -151,6 +151,8 @@ static void PrintUsage() {
 	    "  --trophy-notifications <true|false>   Show trophy unlock toasts and play their sound.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --bindless                           Sample heap-indexed images through bindless arrays.\n");
+	::printf("  --ps5-pro                            Report a PS5 Pro to the game (experimental).\n");
+	::printf("  --power-saver                        Report the console's power saver mode to the game.\n");
 	::printf("  --reflections-every <n>              Redraw reflection cubes every nth frame.\n");
 	::printf("  --no-float-image-atomics             Skip shaders that run integer image atomics on R32\n"
 	         "                                       float images (they run by default).\n");
@@ -309,6 +311,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		}
 		if (arg == "--bindless") {
 			options.config.bindless_images_enabled = true;
+			continue;
+		}
+		if (arg == "--ps5-pro") {
+			options.config.ps5_pro_enabled = true;
+			continue;
+		}
+		if (arg == "--power-saver") {
+			options.config.power_saver_enabled = true;
 			continue;
 		}
 		if (arg == "--float-image-atomics" || arg == "--no-float-image-atomics") {

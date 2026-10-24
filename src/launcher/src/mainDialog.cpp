@@ -214,7 +214,23 @@ static QString BoolArg(bool value) {
 	return value ? QStringLiteral("true") : QStringLiteral("false");
 }
 
-static QStringList CreateEmulatorArgs(const Configuration& info) {
+// GT7's render patch file for this game, when one is chosen and the game is the version the patch
+// is for: <emulator folder>/patches/GT7_PPSA01317_01.710.000_<1080p|1440p>.json.
+static QString Gt7RenderPatchPath(const Configuration& info, const QDir& emulator_dir) {
+	if (info.gt7_render_patch.isEmpty() ||
+	    info.title_id.trimmed().compare(QStringLiteral("PPSA01317"), Qt::CaseInsensitive) != 0) {
+		return {};
+	}
+	const auto version = info.gameVersion.trimmed();
+	if (!version.isEmpty() && version != QStringLiteral("01.710.000")) {
+		return {};
+	}
+	const auto path = emulator_dir.filePath(
+	    QStringLiteral("patches/GT7_PPSA01317_01.710.000_%1.json").arg(info.gt7_render_patch));
+	return QFileInfo::exists(path) ? path : QString {};
+}
+
+static QStringList CreateEmulatorArgs(const Configuration& info, const QDir& emulator_dir) {
 	QStringList args;
 	auto        r = EnumToText(info.screen_resolution).split('x');
 
@@ -251,6 +267,12 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	if (info.bindless_images_enabled) {
 		args << "--bindless";
+	}
+	if (info.ps5_pro_enabled) {
+		args << "--ps5-pro";
+	}
+	if (info.power_saver_enabled) {
+		args << "--power-saver";
 	}
 	if (info.reflections_half_rate) {
 		args << "--reflections-every" << QStringLiteral("2");
@@ -294,12 +316,55 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	args << "--game" << game;
 
-	const auto patch_plan = PatchesDialog::PatchPlanPath(info.title_id);
-	if (QFileInfo::exists(patch_plan)) {
+	// The emulator takes one patch file: GT7's render patch, when chosen and present, replaces
+	// the title's cheat file for the run.
+	const auto render_patch = Gt7RenderPatchPath(info, emulator_dir);
+	const auto patch_plan   = PatchesDialog::PatchPlanPath(info.title_id);
+	if (!render_patch.isEmpty()) {
+		args << "--game-patch" << render_patch;
+	} else if (QFileInfo::exists(patch_plan)) {
 		args << "--game-patch" << patch_plan;
 	}
 
 	return args;
+}
+
+// The performance tuning settings, as the emulator's KYTY_* environment variables. An option
+// left at its default sets nothing, so the variable keeps whatever the launcher's own
+// environment has (an advanced user's override).
+static QProcessEnvironment CreateEmulatorEnvironment(const Configuration& info) {
+	auto env = QProcessEnvironment::systemEnvironment();
+	if (info.vma_small_blocks) {
+		env.insert(QStringLiteral("KYTY_VMA_BLOCK_MB"), QStringLiteral("64"));
+	}
+	if (info.low_vram_gc) {
+		env.insert(QStringLiteral("KYTY_TEX_GC_FLOOR_MB"), QStringLiteral("1200"));
+		env.insert(QStringLiteral("KYTY_TEX_GC_MIN_AGE"), QStringLiteral("3"));
+	}
+	if (info.readahead_enabled) {
+		env.insert(QStringLiteral("KYTY_READAHEAD"), QStringLiteral("1"));
+	}
+	if (info.long_fault_window) {
+		env.insert(QStringLiteral("KYTY_FAULT_WINDOW_MS"), QStringLiteral("300"));
+	}
+	if (info.pipeline_mode == QStringLiteral("hold")) {
+		env.insert(QStringLiteral("KYTY_HOLD_COMPILING"), QStringLiteral("1"));
+		env.insert(QStringLiteral("KYTY_HOLD_SKIPPED_DRAWS"), QStringLiteral("1"));
+		env.insert(QStringLiteral("KYTY_HOLD_MAX_MS"), QStringLiteral("5000"));
+	} else if (info.pipeline_mode == QStringLiteral("sync")) {
+		env.insert(QStringLiteral("KYTY_ASYNC_PIPELINES"), QStringLiteral("0"));
+	}
+	if (info.pipeline_threads > 0) {
+		env.insert(QStringLiteral("KYTY_PIPELINE_THREADS"),
+		           QString::number(info.pipeline_threads));
+	}
+	if (!info.cpu_set.isEmpty()) {
+		env.insert(QStringLiteral("KYTY_CPU_SET"), info.cpu_set);
+	}
+	if (info.ray_loop_cap > 0) {
+		env.insert(QStringLiteral("KYTY_RAY_LOOP_CAP"), QString::number(info.ray_loop_cap));
+	}
+	return env;
 }
 
 #ifdef __linux__
@@ -414,7 +479,7 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	QFileInfo f(interpreter);
 	auto      dir = f.absoluteDir();
 
-	auto args = CreateEmulatorArgs(info);
+	auto args = CreateEmulatorArgs(info, dir);
 	if (args.isEmpty()) {
 		QMessageBox::critical(this, tr("Error"), tr("Invalid emulator configuration"));
 		QApplication::quit();
@@ -460,6 +525,7 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	process->setArguments(args);
 #endif
 	process->setWorkingDirectory(dir.path());
+	process->setProcessEnvironment(CreateEmulatorEnvironment(info));
 #if defined(_WIN32)
 	process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
 		args->flags |= static_cast<uint32_t>(CREATE_NEW_CONSOLE);

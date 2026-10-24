@@ -1,5 +1,7 @@
 #include "configuration.h"
 
+#include <algorithm>
+
 QVariantMap Configuration::GameSettings() const {
 	QVariantMap values;
 #define KYTY_CFG_SET(n) values.insert(QStringLiteral(#n), QVariant::fromValue(n).toString())
@@ -31,6 +33,17 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(profiler_enabled);
 	KYTY_CFG_SET(renderdoc_enabled);
 	KYTY_CFG_SET(amd_cpu_enabled);
+	KYTY_CFG_SET(ps5_pro_enabled);
+	KYTY_CFG_SET(power_saver_enabled);
+	KYTY_CFG_SET(gt7_render_patch);
+	KYTY_CFG_SET(vma_small_blocks);
+	KYTY_CFG_SET(low_vram_gc);
+	KYTY_CFG_SET(readahead_enabled);
+	KYTY_CFG_SET(long_fault_window);
+	KYTY_CFG_SET(pipeline_mode);
+	KYTY_CFG_SET(pipeline_threads);
+	KYTY_CFG_SET(cpu_set);
+	KYTY_CFG_SET(ray_loop_cap);
 #if defined(_WIN32)
 	KYTY_CFG_SET(red_zone_protection_enabled);
 #endif
@@ -80,6 +93,27 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(profiler_enabled);
 	KYTY_CFG_GET(renderdoc_enabled);
 	amd_cpu_enabled = s.value("amd_cpu_enabled", false).toBool();
+	// Settings files from before these options keep the defaults; unknown values fall back too.
+	ps5_pro_enabled     = s.value("ps5_pro_enabled", false).toBool();
+	power_saver_enabled = s.value("power_saver_enabled", false).toBool();
+	gt7_render_patch    = s.value("gt7_render_patch", QString {}).toString();
+	if (gt7_render_patch != QStringLiteral("1080p") && gt7_render_patch != QStringLiteral("1440p")) {
+		gt7_render_patch.clear();
+	}
+	vma_small_blocks  = s.value("vma_small_blocks", false).toBool();
+	low_vram_gc       = s.value("low_vram_gc", false).toBool();
+	readahead_enabled = s.value("readahead_enabled", false).toBool();
+	long_fault_window = s.value("long_fault_window", false).toBool();
+	pipeline_mode     = s.value("pipeline_mode", QStringLiteral("background")).toString();
+	if (pipeline_mode != QStringLiteral("hold") && pipeline_mode != QStringLiteral("sync")) {
+		pipeline_mode = QStringLiteral("background");
+	}
+	pipeline_threads = std::clamp(s.value("pipeline_threads", 0).toInt(), 0, 32);
+	cpu_set          = s.value("cpu_set", QString {}).toString();
+	if (cpu_set != QStringLiteral("gpucore") && cpu_set != QStringLiteral("gpucoregame")) {
+		cpu_set.clear();
+	}
+	ray_loop_cap = std::clamp(s.value("ray_loop_cap", 0).toInt(), 0, 65536);
 #if defined(_WIN32)
 	red_zone_protection_enabled =
 	    s.value("red_zone_protection_enabled", red_zone_protection_enabled).toBool();

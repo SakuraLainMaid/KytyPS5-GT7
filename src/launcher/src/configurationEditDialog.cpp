@@ -13,6 +13,7 @@
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLayout>
@@ -23,6 +24,9 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QResizeEvent>
+#include <QScreen>
+#include <QScrollArea>
+#include <QScrollBar>
 #include <QSettings>
 #include <QSlider>
 #include <QSpinBox>
@@ -31,6 +35,8 @@
 #include <QTreeView>
 #include <QVBoxLayout>
 #include <QtAlgorithms>
+
+#include <algorithm>
 
 #if QT_CONFIG(vulkan)
 #include <QVulkanInstance>
@@ -124,8 +130,23 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
     : QDialog(parent, Qt::WindowCloseButtonHint), m_ui(new Ui::ConfigurationEditDialog),
       m_info(info) {
 	m_ui->setupUi(this);
-	setMinimumWidth(width());
 	InitGameDirectories();
+	InitScrollArea();
+	// Small screens: the scroll area takes what does not fit, so the dialog itself can be small.
+	setMinimumSize(480, 320);
+	m_ui->comboBox_gt7_render_patch->addItem(tr("Off"), QString {});
+	m_ui->comboBox_gt7_render_patch->addItem(tr("1920x1080 (power saver profile)"),
+	                                         QStringLiteral("1080p"));
+	m_ui->comboBox_gt7_render_patch->addItem(tr("2560x1440"), QStringLiteral("1440p"));
+	m_ui->comboBox_pipeline_mode->addItem(tr("Background (skip draws)"),
+	                                      QStringLiteral("background"));
+	m_ui->comboBox_pipeline_mode->addItem(tr("Background, complete frames"),
+	                                      QStringLiteral("hold"));
+	m_ui->comboBox_pipeline_mode->addItem(tr("On the GPU thread"), QStringLiteral("sync"));
+	m_ui->comboBox_cpu_set->addItem(tr("Default"), QString {});
+	m_ui->comboBox_cpu_set->addItem(tr("GPU thread on its own core"), QStringLiteral("gpucore"));
+	m_ui->comboBox_cpu_set->addItem(tr("GPU thread on its own core, game on fast cores"),
+	                                QStringLiteral("gpucoregame"));
 	m_ui->controller_group->setVisible(false);
 	m_ui->settings_button->setVisible(false);
 
@@ -169,9 +190,61 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 
 	setSizeGripEnabled(true);
 
-	restoreGeometry(g_last_geometry);
+	const bool restored = restoreGeometry(g_last_geometry);
 
 	Init(info);
+	FitToScreen(restored);
+}
+
+void ConfigurationEditDialog::InitScrollArea() {
+	// Everything above the buttons moves into a scroll area: the sections, the game folders and
+	// the controller settings (in the same places of a grid of their own).
+	auto* content = new QWidget;
+	auto* grid    = new QGridLayout(content);
+	grid->setContentsMargins(0, 0, 0, 0);
+	grid->setHorizontalSpacing(m_ui->gridLayout->horizontalSpacing());
+	grid->setVerticalSpacing(m_ui->gridLayout->verticalSpacing());
+	m_ui->gridLayout->removeItem(m_ui->sectionsLayout);
+	m_ui->sectionsLayout->setParent(nullptr);
+	grid->addLayout(m_ui->sectionsLayout, 0, 0, 1, 2);
+	m_ui->gridLayout->removeWidget(m_game_dirs_group);
+	grid->addWidget(m_game_dirs_group, 1, 0, 1, 1);
+	m_ui->gridLayout->removeWidget(m_ui->controller_group);
+	grid->addWidget(m_ui->controller_group, 1, 1, 1, 1);
+	grid->setRowStretch(2, 1);
+
+	m_scroll = new QScrollArea(this);
+	m_scroll->setWidgetResizable(true);
+	m_scroll->setFrameShape(QFrame::NoFrame);
+	m_scroll->setWidget(content);
+	m_ui->gridLayout->addWidget(m_scroll, 0, 0, 2, 2);
+}
+
+void ConfigurationEditDialog::FitToScreen(bool restored) {
+	auto* where = screen();
+	if (where == nullptr || m_scroll == nullptr) {
+		return;
+	}
+	layout()->activate();
+	// Room for the window frame and title bar, which the geometry leaves out.
+	const auto available = where->availableGeometry().adjusted(8, 40, -8, -8);
+	// All the content without scrolling: the dialog's own hint with the content's in place of
+	// the scroll area's, and a vertical scroll bar's width in case it is needed after all.
+	const auto content = m_scroll->widget()->sizeHint();
+	auto       wanted  = layout()->sizeHint() - m_scroll->sizeHint() + content +
+	              QSize(m_scroll->verticalScrollBar()->sizeHint().width(), 0);
+	if (restored) {
+		wanted = size(); // The size the user left it at, within the screen below.
+	}
+	resize(wanted.boundedTo(available.size()).expandedTo(minimumSize()));
+	auto frame = geometry();
+	if (!available.contains(frame)) {
+		frame.moveLeft(std::clamp(frame.left(), available.left(),
+		                          std::max(available.left(), available.right() - frame.width())));
+		frame.moveTop(std::clamp(frame.top(), available.top(),
+		                         std::max(available.top(), available.bottom() - frame.height())));
+		move(frame.topLeft());
+	}
 }
 
 QByteArray ConfigurationEditDialog::g_last_geometry;
@@ -278,6 +351,20 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
 	m_ui->checkBox_trophy_notifications->setChecked(info.trophy_enabled);
 	m_ui->checkBox_bindless->setChecked(info.bindless_images_enabled);
+	m_ui->checkBox_ps5_pro->setChecked(info.ps5_pro_enabled);
+	m_ui->checkBox_power_saver->setChecked(info.power_saver_enabled);
+	m_ui->comboBox_gt7_render_patch->setCurrentIndex(
+	    std::max(0, m_ui->comboBox_gt7_render_patch->findData(info.gt7_render_patch)));
+	m_ui->checkBox_vma_small_blocks->setChecked(info.vma_small_blocks);
+	m_ui->checkBox_low_vram_gc->setChecked(info.low_vram_gc);
+	m_ui->checkBox_readahead->setChecked(info.readahead_enabled);
+	m_ui->checkBox_long_fault_window->setChecked(info.long_fault_window);
+	m_ui->comboBox_pipeline_mode->setCurrentIndex(
+	    std::max(0, m_ui->comboBox_pipeline_mode->findData(info.pipeline_mode)));
+	m_ui->spinBox_pipeline_threads->setValue(info.pipeline_threads);
+	m_ui->comboBox_cpu_set->setCurrentIndex(
+	    std::max(0, m_ui->comboBox_cpu_set->findData(info.cpu_set)));
+	m_ui->spinBox_ray_loop_cap->setValue(info.ray_loop_cap);
 	m_ui->checkBox_reflections_half_rate->setChecked(info.reflections_half_rate);
 	m_ui->lineEdit_skip_shaders->setText(info.skip_shader_hashes);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
@@ -374,8 +461,7 @@ void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs) {
 	m_game_dirs_group->setVisible(true);
 	m_ui->controller_group->setVisible(true);
 	update_game_directory_buttons();
-	layout()->activate();
-	resize(size().expandedTo(minimumSizeHint()));
+	FitToScreen(false);
 }
 
 QStringList ConfigurationEditDialog::GetGameDirectories() const {
@@ -440,6 +526,17 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
 	info.trophy_enabled            = ui.checkBox_trophy_notifications->isChecked();
 	info.bindless_images_enabled   = ui.checkBox_bindless->isChecked();
+	info.ps5_pro_enabled           = ui.checkBox_ps5_pro->isChecked();
+	info.power_saver_enabled       = ui.checkBox_power_saver->isChecked();
+	info.gt7_render_patch          = ui.comboBox_gt7_render_patch->currentData().toString();
+	info.vma_small_blocks          = ui.checkBox_vma_small_blocks->isChecked();
+	info.low_vram_gc               = ui.checkBox_low_vram_gc->isChecked();
+	info.readahead_enabled         = ui.checkBox_readahead->isChecked();
+	info.long_fault_window         = ui.checkBox_long_fault_window->isChecked();
+	info.pipeline_mode             = ui.comboBox_pipeline_mode->currentData().toString();
+	info.pipeline_threads          = ui.spinBox_pipeline_threads->value();
+	info.cpu_set                   = ui.comboBox_cpu_set->currentData().toString();
+	info.ray_loop_cap              = ui.spinBox_ray_loop_cap->value();
 	info.reflections_half_rate     = ui.checkBox_reflections_half_rate->isChecked();
 	info.skip_shader_hashes        = ui.lineEdit_skip_shaders->text().simplified().remove(' ');
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();

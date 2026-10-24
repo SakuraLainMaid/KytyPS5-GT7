@@ -172,6 +172,14 @@ bool BindlessImagesEnabled() {
 	return g_config->bindless_images_enabled;
 }
 
+bool Ps5ProEnabled() {
+	return g_config->ps5_pro_enabled;
+}
+
+bool PowerSaverEnabled() {
+	return g_config->power_saver_enabled;
+}
+
 const std::string& GetSkipShaderHashes() {
 	return g_config->skip_shader_hashes;
 }

@@ -1328,17 +1328,18 @@ static int KYTY_SYSV_ABI KernelIsTrinityMode() {
 	auto count = call_count.fetch_add(1, std::memory_order_relaxed);
 	if (count < 8 || (count % 1024) == 0) {
 		PRINT_NAME();
-		LOGF("\tcall = %u, return = 0 (base PS5 mode)\n", count + 1);
+		LOGF("\tcall = %u, return = %d (%s)\n", count + 1, Config::Ps5ProEnabled() ? 1 : 0,
+		     Config::Ps5ProEnabled() ? "PS5 Pro mode, --ps5-pro" : "base PS5 mode");
 	}
 
-	return 0;
+	return Config::Ps5ProEnabled() ? 1 : 0;
 }
 
 static int KYTY_SYSV_ABI KernelGetOperationMode(int* mode, int* submode) {
 	PRINT_NAME();
 
-	*mode    = 2; // PS5 Base
-	*submode = 0; // None
+	*mode    = Config::Ps5ProEnabled() ? 3 : 2;     // PS5 Pro (--ps5-pro) or base PS5
+	*submode = Config::PowerSaverEnabled() ? 1 : 0; // power saver mode (--power-saver) or none
 	LOGF("\t mode = %d, submode = %d\n", *mode, *submode);
 	return OK;
 }
