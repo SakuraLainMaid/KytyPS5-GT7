@@ -6009,6 +6009,8 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 			return nullptr;
 		}
 		GpuPhases::Count(GpuPhases::Phase::PipelineSkip, 1);
+		// For the flip of this frame, with KYTY_HOLD_COMPILING=1 (GpuPhases::TakeFrameHold).
+		GpuPhases::NoteCompileSkip();
 		Profiler::Add(Profiler::Counter::SkippedPipelinePending);
 		Profiler::CommandZone::Annotate("skipped: pipeline compiling");
 		// Diagnostics: each pipeline whose draws are skipped, once (the first 128).

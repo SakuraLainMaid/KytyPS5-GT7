@@ -84,6 +84,10 @@ public:
 	uint64_t last_use_tick = 0;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// Collected with its download in flight (BufferCache::RunGarbageCollector), and whether a draw
+	// or dispatch used it again before the download landed (then it stays).
+	bool         gc_pending = false;
+	mutable bool gc_reused  = false;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

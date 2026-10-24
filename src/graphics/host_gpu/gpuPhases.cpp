@@ -186,10 +186,26 @@ bool TakeFrameHold() noexcept {
 		     n);
 		return static_cast<uint32_t>(n);
 	}();
-	constexpr uint32_t MaxInARow  = 2;
-	constexpr uint32_t ShownAfter = 8;
+	static const auto max_held = [] {
+		const char* value = std::getenv("KYTY_HOLD_MAX_MS");
+		return std::chrono::milliseconds(
+		    value != nullptr && *value != '\0' ? std::strtoul(value, nullptr, 10) : 5000u);
+	}();
+	static const bool compiling = [] {
+		const char* value = std::getenv("KYTY_HOLD_COMPILING");
+		const bool  on    = value != nullptr && value[0] == '1';
+		if (on) {
+			LOGF("Frame holds: draws left out while their pipelines compiled count too; frames are "
+			     "held in a row for up to %lld ms (KYTY_HOLD_COMPILING, KYTY_HOLD_MAX_MS)\n",
+			     static_cast<long long>(max_held.count()));
+		}
+		return on;
+	}();
+	static const uint32_t MaxInARow  = compiling ? UINT32_MAX : 2u;
+	static const uint32_t ShownAfter = compiling ? 1u : 8u;
 	struct Holds {
 		std::chrono::steady_clock::time_point since    = std::chrono::steady_clock::now();
+		std::chrono::steady_clock::time_point held_since; // the first frame of this run of holds
 		uint32_t                              in_a_row = 0;
 		uint32_t                              shown    = ShownAfter;
 		// Since the last line.
@@ -203,7 +219,10 @@ bool TakeFrameHold() noexcept {
 		uint64_t held     = 0;
 	};
 	static Holds   s;
-	const uint64_t skips = g_frame_lookup_skips.exchange(0, std::memory_order_relaxed);
+	const uint64_t compile_skips = g_frame_compile_skips.exchange(0, std::memory_order_relaxed);
+	const uint64_t skips = g_frame_lookup_skips.exchange(0, std::memory_order_relaxed) +
+	                       (compiling ? compile_skips : 0u);
+	const auto now = std::chrono::steady_clock::now();
 	s.frames++;
 	if (skips != 0) {
 		s.skipping++;
@@ -214,8 +233,12 @@ bool TakeFrameHold() noexcept {
 		s.over_300 += skips >= 300 ? 1u : 0u;
 	}
 	const bool hold = threshold != 0 && !Bisect::FrameHoldOff() && skips >= threshold &&
-	                  s.in_a_row < MaxInARow && (s.in_a_row != 0 || s.shown >= ShownAfter);
+	                  s.in_a_row < MaxInARow && (s.in_a_row != 0 || s.shown >= ShownAfter) &&
+	                  (!compiling || s.in_a_row == 0 || now - s.held_since < max_held);
 	if (hold) {
+		if (s.in_a_row == 0) {
+			s.held_since = now;
+		}
 		s.in_a_row++;
 		s.shown = 0;
 		s.held++;
@@ -223,7 +246,6 @@ bool TakeFrameHold() noexcept {
 		s.in_a_row = 0;
 		s.shown    = std::min(s.shown + 1u, ShownAfter);
 	}
-	const auto now = std::chrono::steady_clock::now();
 	if (now - s.since >= ReportInterval) {
 		if (s.skipped != 0) {
 			LOGF("Pipeline lookups (%.1f s): %" PRIu64 " draws left out while their pipelines were "
@@ -234,12 +256,14 @@ bool TakeFrameHold() noexcept {
 			     std::chrono::duration<double>(now - s.since).count(), s.skipped, s.skipping,
 			     s.frames, s.most, s.over_32, s.over_100, s.over_300, s.held);
 		}
-		const auto in_a_row = s.in_a_row;
-		const auto shown    = s.shown;
-		s                   = {};
-		s.since             = now;
-		s.in_a_row          = in_a_row;
-		s.shown             = shown;
+		const auto in_a_row   = s.in_a_row;
+		const auto shown      = s.shown;
+		const auto held_since = s.held_since;
+		s                     = {};
+		s.since               = now;
+		s.in_a_row            = in_a_row;
+		s.shown               = shown;
+		s.held_since          = held_since;
 	}
 	return hold;
 }

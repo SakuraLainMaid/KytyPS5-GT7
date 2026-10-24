@@ -258,12 +258,21 @@ inline std::atomic<uint32_t> g_frame_lookup_skips {0};
 inline void                  NoteLookupSkip() noexcept {
     g_frame_lookup_skips.fetch_add(1, std::memory_order_relaxed);
 }
+// The draws left out while their pipelines compiled in the background, since the same flip. They
+// only count towards a hold with KYTY_HOLD_COMPILING=1 (TakeFrameHold).
+inline std::atomic<uint32_t> g_frame_compile_skips {0};
+inline void                  NoteCompileSkip() noexcept {
+    g_frame_compile_skips.fetch_add(1, std::memory_order_relaxed);
+}
 
 // GPU thread, at a flip of the main display: whether the screen keeps the frame it shows instead
 // of this one, which left out KYTY_HOLD_SKIPPED_DRAWS draws or more (100 by default; 0: never)
 // while their pipelines were looked up. A burst of lookups at a race start left out most of the
 // track for a frame or two; that frame is not shown, at most two in a row, then eight frames
 // shown before the next. Notes the frame's left-out draws for the 10 s "Pipeline lookups" line.
+// KYTY_HOLD_COMPILING=1: draws left out while their pipelines compiled count too, and frames are
+// held in a row for up to KYTY_HOLD_MAX_MS (5000 by default), so the screen shows only complete
+// frames while a burst of new pipelines compiles in parallel; one frame is shown after the cap.
 [[nodiscard]] bool TakeFrameHold() noexcept;
 
 namespace Detail {
