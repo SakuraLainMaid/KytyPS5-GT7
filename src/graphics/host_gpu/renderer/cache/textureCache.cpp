@@ -864,6 +864,30 @@ static uint64_t CacheCapBytes(const char* name) {
 	return mib == 0 ? UINT64_MAX : mib << 20u;
 }
 
+// KYTY_TEX_GC_FLOOR_MB (default 512): the lowest a memory shortfall pushes the collector's
+// thresholds. The shortfall counts the whole device (buffers, the driver's own), so on a 6 GB card
+// it can exceed every byte the cache may free; at the old fixed 512 MB the collector then evicted
+// and recreated render targets almost every frame (GT7's garage: 1.46 M evictions in 30 minutes,
+// 1-4 fps).
+static uint64_t GcFloorBytes() {
+	static const uint64_t floor = [] {
+		const char* value = std::getenv("KYTY_TEX_GC_FLOOR_MB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {512}) << 20u;
+	}();
+	return floor;
+}
+
+// KYTY_TEX_GC_MIN_AGE (default 1): frames an image must go unused before the collector may take
+// it over the critical threshold (under pressure it is at least 4, and stays so).
+static uint64_t GcMinAge() {
+	static const uint64_t age = [] {
+		const char* value = std::getenv("KYTY_TEX_GC_MIN_AGE");
+		const auto  frames = value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {1};
+		return std::max<uint64_t>(frames, 1);
+	}();
+	return age;
+}
+
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
                            PageManager& page_manager, BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
@@ -6875,7 +6899,7 @@ void TextureCache::RunGarbageCollector() {
 	if (const auto shortfall = m_graphics.MemoryShortfall(); shortfall != 0) {
 		const auto collectable = CollectableMemory();
 		const auto cap =
-		    std::max<uint64_t>(collectable > shortfall ? collectable - shortfall : 0, 512ull << 20u);
+		    std::max<uint64_t>(collectable > shortfall ? collectable - shortfall : 0, GcFloorBytes());
 		m_trigger_gc_memory  = std::min(m_base_trigger_gc_memory, cap);
 		m_pressure_gc_memory = std::min(m_base_pressure_gc_memory, cap);
 		m_critical_gc_memory = std::min(m_base_critical_gc_memory, cap + cap / 8);
@@ -6964,7 +6988,11 @@ void TextureCache::RunGarbageCollector() {
 		// the frame that used them, to recreate them the next (11 000 images a second at the
 		// title menu). An image used in the frame being recorded is never a candidate, at any
 		// pressure; over budget the collector reaches back only as far as the previous frame.
-		const uint64_t age = std::min<uint64_t>(aggressive ? 1 : pressured ? 4 : 16, clock);
+		const uint64_t min_age = GcMinAge();
+		const uint64_t age     = std::min<uint64_t>(aggressive  ? min_age
+		                                            : pressured ? std::max<uint64_t>(4, min_age)
+		                                                        : std::max<uint64_t>(16, min_age),
+		                                            clock);
 		// Under pressure the work is budgeted per frame, in bytes actually freed, and in
 		// proportion to the excess, so the cache converges on its threshold instead of either
 		// churning (a per-run budget: 7 600 submissions a frame) or growing without bound (a
@@ -7123,17 +7151,28 @@ void TextureCache::RunGarbageCollector() {
 	if (m_gc_tick % 500 == 0) {
 		uint64_t images = 0;
 		uint64_t bytes  = 0;
+		// What the images really take in video memory: AccountedSize is the guest's byte count,
+		// which leaves out host padding, alignment and format expansion.
+		uint64_t real_bytes = 0;
 		m_slot_images.ForEach([&](ImageId, const Image& image) {
 			if (image.registered) {
 				images++;
 				bytes += image.AccountedSize();
+				if (image.backing.allocation != nullptr) {
+					VmaAllocationInfo allocation {};
+					vmaGetAllocationInfo(m_graphics.allocator, image.backing.allocation, &allocation);
+					real_bytes += allocation.size;
+				}
 			}
 		});
 		LOGF("TexStats: runs=%" PRIu64 " frame=%" PRIu64 " images=%" PRIu64 " image_bytes=%" PRIu64
-		     "MB device_used=%" PRIu64 "MB pressure=%" PRIu64 "MB critical=%" PRIu64 "MB\n",
+		     "MB real_bytes=%" PRIu64 "MB device_used=%" PRIu64 "MB pressure=%" PRIu64
+		     "MB critical=%" PRIu64 "MB\n",
 		     m_gc_tick, m_graphics.presented_frames.load(std::memory_order_relaxed), images,
-		     bytes >> 20u, m_total_used_memory >> 20u, m_pressure_gc_memory >> 20u,
-		     m_critical_gc_memory >> 20u);
+		     bytes >> 20u, real_bytes >> 20u, m_total_used_memory >> 20u,
+		     m_pressure_gc_memory >> 20u, m_critical_gc_memory >> 20u);
+		// Per heap: usage is the whole process (driver included), allocation what VMA handed out.
+		m_graphics.LogMemoryBudget();
 		LOGF("TexGc: visited=%" PRIu64 " freed=%" PRIu64 " (%" PRIu64 "MB) written_back=%" PRIu64
 		     " gone=%" PRIu64 " depth=%" PRIu64 " gpu_tiled=%" PRIu64 " gpu_unpressured=%" PRIu64
 		     " gpu_download_failed=%" PRIu64 " nothing_old_enough=%" PRIu64 " bindless=%" PRIu64

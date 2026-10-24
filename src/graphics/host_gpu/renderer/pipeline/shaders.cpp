@@ -39,8 +39,16 @@ namespace Libs::Graphics {
 
 // KYTY_DISABLE_OPTIMIZATION_HASHES="hash,hash,...": build the pipelines of these guest shaders
 // with VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT, to tell driver code-generation problems apart
-// from emulation problems.
+// from emulation problems. KYTY_DISABLE_OPTIMIZATION_HASHES=all builds every pipeline so: the
+// driver compiles GT7's 150,000-230,000-word pixel shaders much faster, and they run slower.
 static bool DisableOptimizationFor(uint64_t shader_hash) {
+	static const bool all = [] {
+		const char* value = std::getenv("KYTY_DISABLE_OPTIMIZATION_HASHES");
+		return value != nullptr && std::string_view(value) == "all";
+	}();
+	if (all) {
+		return true;
+	}
 	static const std::vector<uint64_t> hashes = [] {
 		std::vector<uint64_t> result;
 		if (const char* value = std::getenv("KYTY_DISABLE_OPTIMIZATION_HASHES"); value != nullptr) {

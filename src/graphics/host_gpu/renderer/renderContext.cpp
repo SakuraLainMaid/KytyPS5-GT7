@@ -68,6 +68,22 @@ uint64_t FaultBlockBytes() {
 	return Bisect::FaultBlocksOff() ? 0 : bytes;
 }
 
+// A fault window in ms from the environment (1 to 5000; otherwise the default). The defaults suit
+// 30-60 fps: at 5 fps a frame takes 200 ms, so memory the game rewrites once a frame never faults
+// "again within 100 ms" and each of its pages keeps faulting on its own (GT7's garage: 46 % of the
+// write faults).
+uint64_t FaultWindowMs(const char* name, uint64_t fallback) {
+	uint64_t ms = fallback;
+	if (const char* value = std::getenv(name); value != nullptr && *value != '\0') {
+		ms = std::strtoull(value, nullptr, 10);
+		if (ms < 1 || ms > 5000) {
+			ms = fallback;
+		}
+	}
+	LOGF("Write faults: %s = %" PRIu64 " ms\n", name, ms);
+	return ms;
+}
+
 // Round 90: whether a WAIT_REG_MEM that passed lets the walk for memory-reading shaders run again
 // in the same submission (PrepareBda). KYTY_BDA_WAIT_SYNC=0 (or the F8 step "bdasync:submission")
 // walks once a submission, as before.
@@ -90,10 +106,10 @@ uint64_t NowMs() {
 	                                 .count());
 }
 
-// Whether the block faulted less than 100 ms before; notes this fault. A hint: threads race on
-// the slots, and a block that shares one with another may be missed.
+// Whether the block faulted less than 100 ms (KYTY_FAULT_WINDOW_MS) before; notes this fault. A
+// hint: threads race on the slots, and a block that shares one with another may be missed.
 bool BlockFaultedRecently(uint64_t block_index, uint64_t now_ms) {
-	constexpr uint64_t                             WindowMs = 100;
+	static const uint64_t                          WindowMs = FaultWindowMs("KYTY_FAULT_WINDOW_MS", 100);
 	constexpr uint64_t                             TimeBits = 24;
 	constexpr uint64_t                             TimeMask = (uint64_t {1} << TimeBits) - 1;
 	static std::array<std::atomic<uint64_t>, 4096> recent {};
@@ -174,11 +190,11 @@ uint64_t ReleaseAroundImages(BufferCache& cache, uint64_t block, uint64_t block_
 	return released;
 }
 
-// Hot pages (Bisect::HotPages): whether the page (or block) faulted within 250 ms of its fault
-// before, three times running; notes this fault. A hint, as BlockFaultedRecently: a key that shares
-// a slot with another may be missed.
+// Hot pages (Bisect::HotPages): whether the page (or block) faulted within 250 ms
+// (KYTY_HOT_PAGES_WINDOW_MS) of its fault before, three times running; notes this fault. A hint, as
+// BlockFaultedRecently: a key that shares a slot with another may be missed.
 bool FaultRecurs(uint64_t key, uint64_t now_ms) {
-	constexpr uint64_t                              WindowMs  = 250;
+	static const uint64_t                           WindowMs  = FaultWindowMs("KYTY_HOT_PAGES_WINDOW_MS", 250);
 	constexpr uint64_t                              CountBits = 8;
 	constexpr uint64_t                              TimeBits  = 20;
 	constexpr uint64_t                              KeyBits   = 64 - CountBits - TimeBits;

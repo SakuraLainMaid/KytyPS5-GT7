@@ -3940,6 +3940,26 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len, bool* not_one_
 		                                    &unused_size, &unused_gpu));
 	}
 
+	// The released range's host pages go back to the system (GuestBackingStore::DropRange); its
+	// views are unmapped above. KYTY_DROP_RELEASED=0 keeps them, as before.
+	static const bool drop_released = [] {
+		const char* value = std::getenv("KYTY_DROP_RELEASED");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (drop_released) {
+		static std::atomic<uint64_t> dropped_total {0};
+		uint64_t                     dropped = 0;
+		for (const auto& block: allocated_span) {
+			dropped += g_guest_address_space->DropBacking(block.start_addr, block.size);
+		}
+		const auto total = dropped_total.fetch_add(dropped) + dropped;
+		if (dropped >= (64ull << 20u)) {
+			LOGF("Direct memory: %" PRIu64 " MiB of released memory handed back to the system (%" PRIu64
+			     " MiB so far)\n",
+			     dropped >> 20u, total >> 20u);
+		}
+	}
+
 	if (g_free_callback != nullptr) {
 		for (const auto& alias: mapped_aliases) {
 			g_free_callback(alias.map_vaddr, alias.map_size);

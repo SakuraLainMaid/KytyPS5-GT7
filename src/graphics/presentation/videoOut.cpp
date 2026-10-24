@@ -22,11 +22,16 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/elf.h"
+#include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
+#include "common/singleton.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -556,7 +561,23 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	    attribute.tiling_mode != 0 || attribute.pad0 != 0 || attribute.reserved1[0] != 0 ||
 	    attribute.reserved1[1] != 0 || attribute.reserved1[2] != 0 || buffer.data_address == 0 ||
 	    compression == Graphics::VideoOutCompression::Unsupported) {
-		EXIT("unsupported or invalid video-out surface attributes\n");
+		EXIT("unsupported or invalid video-out surface attributes: %ux%u pitch_in_pixel=%u "
+		     "tiling_mode=%u aspect_ratio=%u option=0x%x reserved0=%u pad0=%u reserved1=%u,%u,%u "
+		     "pixel_format=0x%016" PRIx64 " data=0x%016" PRIx64 " metadata=0x%016" PRIx64
+		     " category=%u compression=%d dcc_control=0x%08x dcc_clear=0x%016" PRIx64 "\n",
+		     static_cast<uint32_t>(attribute.width), static_cast<uint32_t>(attribute.height),
+		     static_cast<uint32_t>(attribute.pitch_in_pixel),
+		     static_cast<uint32_t>(attribute.tiling_mode),
+		     static_cast<uint32_t>(attribute.aspect_ratio),
+		     static_cast<uint32_t>(attribute.option), static_cast<uint32_t>(attribute.reserved0),
+		     static_cast<uint32_t>(attribute.pad0), static_cast<uint32_t>(attribute.reserved1[0]),
+		     static_cast<uint32_t>(attribute.reserved1[1]),
+		     static_cast<uint32_t>(attribute.reserved1[2]),
+		     static_cast<uint64_t>(attribute.pixel_format),
+		     static_cast<uint64_t>(buffer.data_address),
+		     static_cast<uint64_t>(buffer.metadata_address), static_cast<uint32_t>(category),
+		     static_cast<int>(compression), static_cast<uint32_t>(attribute.dcc_control),
+		     static_cast<uint64_t>(attribute.dcc_cb_register_clear_color));
 	}
 	Graphics::VideoOutPixelFormatInfo pixel_format {};
 	if (!Graphics::DecodeVideoOutPixelFormat(attribute.pixel_format, pixel_format)) {
@@ -1591,8 +1612,61 @@ KYTY_SYSV_ABI int VideoOutUnregisterBuffers(int handle, int set_index) {
 	return OK;
 }
 
+// KYTY_SCAN_PAIR=<a>,<b> with KYTY_SCAN_FLIP=<n> (default 1000): at the n-th CPU flip, list the
+// places in the calling module's writable segments where the 32-bit value a is followed by b within
+// 16 bytes, as module-relative addresses. A debugging aid for finding the globals that hold a size
+// (1920,1080 for GT7's remaining 1080p buffers under the 1440p patch).
+static void ScanForValuePair(uint64_t caller) {
+	static const auto setting = []() -> std::array<uint64_t, 3> {
+		const char* pair = std::getenv("KYTY_SCAN_PAIR");
+		if (pair == nullptr) {
+			return {0, 0, 0};
+		}
+		char*          end = nullptr;
+		const uint64_t a   = std::strtoull(pair, &end, 10);
+		const uint64_t b   = (end != nullptr && *end == ',') ? std::strtoull(end + 1, nullptr, 10) : 0;
+		const char*    at  = std::getenv("KYTY_SCAN_FLIP");
+		return {a, b, at != nullptr ? std::strtoull(at, nullptr, 10) : 1000};
+	}();
+	static std::atomic<uint64_t> flips {0};
+	if (setting[0] == 0 || flips.fetch_add(1) + 1 != setting[2]) {
+		return;
+	}
+	auto* program = Common::Singleton<Loader::RuntimeLinker>::Instance()->FindProgramByAddr(caller);
+	if (program == nullptr) {
+		LOGF("ScanPair: no module at caller 0x%016" PRIx64 "\n", caller);
+		return;
+	}
+	const auto* ehdr  = program->elf->GetEhdr();
+	const auto* phdr  = program->elf->GetPhdr();
+	int         found = 0;
+	for (int i = 0; i < ehdr->e_phnum; i++) {
+		if (phdr[i].p_type != Loader::PT_LOAD || (phdr[i].p_flags & 2u) == 0 || phdr[i].p_memsz < 8) {
+			continue;
+		}
+		const auto* words = reinterpret_cast<const uint32_t*>(program->base_vaddr + phdr[i].p_vaddr);
+		const auto  count = phdr[i].p_memsz / 4;
+		for (uint64_t w = 0; w + 1 < count; w++) {
+			if (words[w] != setting[0]) {
+				continue;
+			}
+			for (uint64_t d = 1; d <= 4 && w + d < count; d++) {
+				if (words[w + d] == setting[1]) {
+					LOGF("ScanPair: %" PRIu64 " at +0x%" PRIx64 ", %" PRIu64 " %" PRIu64 " bytes later\n",
+					     setting[0], phdr[i].p_vaddr + w * 4, setting[1], d * 4);
+					found++;
+				}
+			}
+		}
+	}
+	LOGF("ScanPair: %d places in %s (flip %" PRIu64 ")\n", found,
+	     program->file_name.filename().string().c_str(), setting[2]);
+}
+
 KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64_t flip_arg) {
 	PRINT_NAME();
+
+	ScanForValuePair(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 
 	uint64_t  request_id = 0;
 	const int result     = ReserveFlipRequest(DriverState(), handle, index, flip_mode, flip_arg,
@@ -1814,12 +1888,33 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
 	status->resolution =
 	    ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
+	// KYTY_VIDEO_OUT_RESOLUTION=<n> reports that output resolution instead (1 1080p, 2 2160p,
+	// 3 4320p, 4 1440p). GT7 sizes its render-size pair from it (0xca19b0 hands it to 0x1a39ee0),
+	// so under the 1440p patch a reported 1080p output put half its buffers back at 1920x1080.
+	static const uint32_t resolution_override = [] {
+		const char* value = std::getenv("KYTY_VIDEO_OUT_RESOLUTION");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	if (resolution_override != 0) {
+		status->resolution = resolution_override;
+	}
 	status->dynamicRange = 1;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119
 	         ? VIDEO_OUT_REFRESH_RATE_119_88HZ
 	         : VIDEO_OUT_REFRESH_RATE_59_94HZ);
-	status->flags       = 0;
+	// KYTY_VIDEO_OUT_STATUS_FLAGS=<hex>: bits reported in the output status flags (default 0). GT7
+	// picks its graphics profile from bit 0x10 (4 or 5 when the operation submode is 1, 8 or 10 and
+	// 9 or 11 in its 120 Hz modes); what the bit stands for on hardware is not known yet.
+	static const uint64_t status_flags = [] {
+		const char* value = std::getenv("KYTY_VIDEO_OUT_STATUS_FLAGS");
+		const uint64_t flags = value != nullptr ? std::strtoull(value, nullptr, 16) : 0;
+		if (flags != 0) {
+			LOGF("VideoOut: output status flags 0x%" PRIx64 " (KYTY_VIDEO_OUT_STATUS_FLAGS)\n", flags);
+		}
+		return flags;
+	}();
+	status->flags       = status_flags;
 	status->reserved[0] = 0;
 	status->reserved[1] = 0;
 	status->reserved[2] = 0;

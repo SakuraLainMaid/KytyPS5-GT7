@@ -209,6 +209,58 @@ public:
 		return true;
 	}
 
+	// Gives the host memory behind [backing_offset, +size) back to the system: the guest released
+	// it, so its contents are no longer needed (a later allocation of the range gets undefined
+	// bytes, as on the console, and the old bytes before this). Committed pages stay committed,
+	// so a later map needs no commit; Windows only drops them from RAM. GT7 peaked at 9.8 GB of
+	// direct memory while using 3.5 GB, and the 6 GB in between stayed resident on a 32 GB PC.
+	// Returns the bytes handed back.
+	uint64_t DropRange(uint64_t backing_offset, uint64_t size) {
+		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
+			return 0;
+		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// DiscardVirtualMemory (Windows 8.1) frees the pages without writing them out; where it
+		// refuses, unlocking pages that are not locked trims them from the working set instead.
+		using discard_func_t       = DWORD(WINAPI*)(PVOID, SIZE_T);
+		static const auto discard  = reinterpret_cast<discard_func_t>(
+            GetProcAddress(GetModuleHandleA("kernel32.dll"), "DiscardVirtualMemory"));
+		uint64_t          dropped  = 0;
+		const auto        drop_run = [&](uint64_t offset, uint64_t bytes) {
+            void* address = m_backing_base + offset;
+            if (discard == nullptr || discard(address, bytes) != ERROR_SUCCESS) {
+                (void)VirtualUnlock(address, bytes);
+            }
+            dropped += bytes;
+		};
+		std::lock_guard lock(m_commit_mutex);
+		const auto      end       = backing_offset + size;
+		uint64_t        run_start = 0;
+		uint64_t        run_size  = 0;
+		for (auto offset = backing_offset; offset < end;) {
+			const auto granule_end = std::min(end, (offset / CommitGranule + 1u) * CommitGranule);
+			if (!m_lazy_commit || IsCommittedUnlocked(offset / CommitGranule)) {
+				if (run_size != 0 && run_start + run_size == offset) {
+					run_size += granule_end - offset;
+				} else {
+					if (run_size != 0) {
+						drop_run(run_start, run_size);
+					}
+					run_start = offset;
+					run_size  = granule_end - offset;
+				}
+			}
+			offset = granule_end;
+		}
+		if (run_size != 0) {
+			drop_run(run_start, run_size);
+		}
+		return dropped;
+#else
+		return 0;
+#endif
+	}
+
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 		if (data == nullptr) {
 			return false;
@@ -917,6 +969,10 @@ public:
 
 	bool ZeroBacking(uint64_t backing_offset, uint64_t size) {
 		return m_backing->ZeroRange(backing_offset, size);
+	}
+
+	uint64_t DropBacking(uint64_t backing_offset, uint64_t size) {
+		return m_backing->DropRange(backing_offset, size);
 	}
 
 	[[nodiscard]] bool Owns(uint64_t vaddr, uint64_t size) {

@@ -10,6 +10,7 @@
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -764,7 +765,8 @@ static bool ttf_data_has_supported_magic(const uint8_t* data, uint32_t size) {
 
 	return (data[0] == 0x00 && data[1] == 0x01 && data[2] == 0x00 && data[3] == 0x00) ||
 	       (data[0] == 't' && data[1] == 'r' && data[2] == 'u' && data[3] == 'e') ||
-	       (data[0] == 'O' && data[1] == 'T' && data[2] == 'T' && data[3] == 'O');
+	       (data[0] == 'O' && data[1] == 'T' && data[2] == 'T' && data[3] == 'O') ||
+	       (data[0] == 't' && data[1] == 't' && data[2] == 'c' && data[3] == 'f');
 }
 
 static bool init_stb_font(FontState* font, const uint8_t* data, uint32_t size) {
@@ -773,7 +775,9 @@ static bool init_stb_font(FontState* font, const uint8_t* data, uint32_t size) {
 	}
 
 	stbtt_fontinfo info {};
-	if (stbtt_InitFont(&info, data, 0) == 0) {
+	// A collection (ttcf) uses its first font.
+	const int offset = stbtt_GetFontOffsetForIndex(data, 0);
+	if (offset < 0 || stbtt_InitFont(&info, data, offset) == 0) {
 		return false;
 	}
 
@@ -824,22 +828,74 @@ static uint32_t stb_supported_codepoint(FontState* font, uint32_t code) {
 	return code;
 }
 
+// The face for characters the font has no glyph for: neither the system font sets' stand-in
+// (Roboto) nor the Latin fonts a title ships have CJK glyphs, and GT7 in Chinese drew '?' for every
+// character. KYTY_FONT_CJK=<path> names a TrueType/OpenType file or collection; otherwise Microsoft
+// YaHei, SimHei or SimSun from the Windows fonts folder, or Noto Sans CJK on Linux.
+static const stbtt_fontinfo* cjk_fallback_face() {
+	static std::vector<uint8_t> data;
+	static stbtt_fontinfo       info {};
+	static const bool           loaded = [] {
+		std::vector<std::filesystem::path> candidates;
+		if (const char* path = std::getenv("KYTY_FONT_CJK"); path != nullptr && path[0] != '\0') {
+			candidates.emplace_back(path);
+		}
+		const char* windir = std::getenv("WINDIR");
+		const auto  fonts  = std::filesystem::path(windir != nullptr ? windir : "C:\\Windows") / "Fonts";
+		for (const char* name: {"msyh.ttc", "simhei.ttf", "simsun.ttc"}) {
+			candidates.push_back(fonts / name);
+		}
+		candidates.emplace_back("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc");
+		candidates.emplace_back("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc");
+		for (const auto& path: candidates) {
+			auto bytes = read_file_bytes(path);
+			if (!ttf_data_has_supported_magic(bytes.data(), static_cast<uint32_t>(bytes.size()))) {
+				continue;
+			}
+			const int offset = stbtt_GetFontOffsetForIndex(bytes.data(), 0);
+			data             = std::move(bytes);
+			if (offset >= 0 && stbtt_InitFont(&info, data.data(), offset) != 0) {
+				LOGF("Font: CJK fallback %s\n", path.string().c_str());
+				return true;
+			}
+			data.clear();
+		}
+		LOGF("Font: no CJK fallback found (set KYTY_FONT_CJK)\n");
+		return false;
+	}();
+	return loaded ? &info : nullptr;
+}
+
+// The face to draw code with: the font's own, the CJK fallback when only it has the glyph, or the
+// font's own '?'.
+static const stbtt_fontinfo* stb_glyph_face(FontState* font, uint32_t* code) {
+	if (*code <= 0x10ffffu && stbtt_FindGlyphIndex(&font->font_info, static_cast<int>(*code)) != 0) {
+		return &font->font_info;
+	}
+	if (const auto* cjk = cjk_fallback_face();
+	    cjk != nullptr && *code <= 0x10ffffu && stbtt_FindGlyphIndex(cjk, static_cast<int>(*code)) != 0) {
+		return cjk;
+	}
+	*code = stb_supported_codepoint(font, *code);
+	return &font->font_info;
+}
+
 static bool get_stb_metrics(FontState* font, uint32_t code, FontGlyphMetrics* metrics) {
 	if (metrics == nullptr || !ensure_stb_font(font)) {
 		return false;
 	}
 
-	code                = stb_supported_codepoint(font, code);
-	const float scale_x = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_w);
-	const float scale_y = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_h);
+	const auto* face    = stb_glyph_face(font, &code);
+	const float scale_x = stbtt_ScaleForMappingEmToPixels(face, font->scale_w);
+	const float scale_y = stbtt_ScaleForMappingEmToPixels(face, font->scale_h);
 
 	int advance = 0;
 	int x0      = 0;
 	int y0      = 0;
 	int x1      = 0;
 	int y1      = 0;
-	stbtt_GetCodepointHMetrics(&font->font_info, static_cast<int>(code), &advance, nullptr);
-	stbtt_GetCodepointBox(&font->font_info, static_cast<int>(code), &x0, &y0, &x1, &y1);
+	stbtt_GetCodepointHMetrics(face, static_cast<int>(code), &advance, nullptr);
+	stbtt_GetCodepointBox(face, static_cast<int>(code), &x0, &y0, &x1, &y1);
 
 	metrics->width                = static_cast<float>(x1 - x0) * scale_x;
 	metrics->height               = static_cast<float>(y1 - y0) * scale_y;
@@ -859,16 +915,15 @@ static bool init_stb_image(std::vector<uint8_t>* image, FontTransImage* trans_im
 		return false;
 	}
 
-	code                = stb_supported_codepoint(font, code);
-	const float scale_x = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_w);
-	const float scale_y = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_h);
+	const auto* face    = stb_glyph_face(font, &code);
+	const float scale_x = stbtt_ScaleForMappingEmToPixels(face, font->scale_w);
+	const float scale_y = stbtt_ScaleForMappingEmToPixels(face, font->scale_h);
 
 	int x0 = 0;
 	int y0 = 0;
 	int x1 = 0;
 	int y1 = 0;
-	stbtt_GetCodepointBitmapBox(&font->font_info, static_cast<int>(code), scale_x, scale_y, &x0, &y0,
-	                            &x1, &y1);
+	stbtt_GetCodepointBitmapBox(face, static_cast<int>(code), scale_x, scale_y, &x0, &y0, &x1, &y1);
 
 	const auto width  = static_cast<uint32_t>(std::clamp(x1 - x0, 0, FONT_GLYPH_MAX_DIM));
 	const auto height = static_cast<uint32_t>(std::clamp(y1 - y0, 0, FONT_GLYPH_MAX_DIM));
@@ -883,7 +938,7 @@ static bool init_stb_image(std::vector<uint8_t>* image, FontTransImage* trans_im
 		return true;
 	}
 
-	stbtt_MakeCodepointBitmap(&font->font_info, image->data(), static_cast<int>(width),
+	stbtt_MakeCodepointBitmap(face, image->data(), static_cast<int>(width),
 	                          static_cast<int>(height), static_cast<int>(width), scale_x, scale_y,
 	                          static_cast<int>(code));
 
