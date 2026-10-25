@@ -201,7 +201,15 @@ uint64_t GraphicContext::MemoryShortfall() const {
 
 namespace {
 
+// Size classes of device-local allocations, for how they fill VMA's blocks.
+constexpr std::array<uint64_t, 5> VramSizeLimits = {256ull << 10u, 4ull << 20u, 16ull << 20u,
+                                                     32ull << 20u, UINT64_MAX};
+constexpr std::array<const char*, 5> VramSizeNames = {"<256K", "<4M", "<16M", "<32M", ">=32M"};
+
 struct VramCounters {
+	// Device-local bytes and counts by size class: [0] inside VMA's blocks, [1] dedicated memory.
+	std::array<std::array<std::atomic<int64_t>, 2>, VramSizeLimits.size()> sized_bytes {};
+	std::array<std::array<std::atomic<int64_t>, 2>, VramSizeLimits.size()> sized_count {};
 	// Bytes by kind, [0] in device-local memory, [1] elsewhere (spilled to system memory).
 	std::array<std::array<std::atomic<int64_t>, 2>, static_cast<size_t>(VramKind::Count)> bytes {};
 	std::array<std::array<std::atomic<int64_t>, 2>, static_cast<size_t>(VramKind::Count)> count {};
@@ -223,6 +231,18 @@ void VramAdd(VmaAllocator allocator, VmaAllocation allocation, VramKind kind, in
 	vmaGetAllocationMemoryProperties(allocator, allocation, &properties);
 	const size_t where = (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 ? 0 : 1;
 	auto&        vram  = Vram();
+	if (where == 0) {
+		VmaAllocationInfo2 info2 {};
+		vmaGetAllocationInfo2(allocator, allocation, &info2);
+		const size_t dedicated = info2.dedicatedMemory != VK_FALSE ? 1 : 0;
+		size_t       bin       = 0;
+		while (info.size >= VramSizeLimits[bin]) {
+			bin++;
+		}
+		vram.sized_bytes[bin][dedicated].fetch_add(sign * static_cast<int64_t>(info.size),
+		                                           std::memory_order_relaxed);
+		vram.sized_count[bin][dedicated].fetch_add(sign, std::memory_order_relaxed);
+	}
 	vram.bytes[static_cast<size_t>(kind)][where].fetch_add(sign * static_cast<int64_t>(info.size),
 	                                                       std::memory_order_relaxed);
 	vram.count[static_cast<size_t>(kind)][where].fetch_add(sign, std::memory_order_relaxed);
@@ -274,6 +294,35 @@ void GraphicContext::LogMemoryBudget() const {
 		}
 	}
 	LOGF("VRAM by kind: %s\n", line.c_str());
+	// How VMA's blocks are filled: the device-local allocations by size, in blocks and
+	// dedicated; per device-local memory type, its blocks, what they hold and their free ranges.
+	std::string sizes;
+	for (size_t bin = 0; bin < VramSizeNames.size(); bin++) {
+		sizes += fmt::format("{}{} {} MB ({}) + dedicated {} MB ({})", bin == 0 ? "" : ", ",
+		                     VramSizeNames[bin],
+		                     vram.sized_bytes[bin][0].load(std::memory_order_relaxed) >> 20,
+		                     vram.sized_count[bin][0].load(std::memory_order_relaxed),
+		                     vram.sized_bytes[bin][1].load(std::memory_order_relaxed) >> 20,
+		                     vram.sized_count[bin][1].load(std::memory_order_relaxed));
+	}
+	LOGF("VRAM by size: %s\n", sizes.c_str());
+	VmaTotalStatistics totals {};
+	vmaCalculateStatistics(allocator, &totals);
+	for (uint32_t type = 0; type < properties.memoryTypeCount; type++) {
+		const auto& stats = totals.memoryType[type];
+		if (stats.statistics.blockBytes == 0 ||
+		    !(properties.memoryTypes[type].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+			continue;
+		}
+		LOGF("VMA type %u (flags 0x%x): %u blocks %" PRIu64 " MB, %u allocations %" PRIu64
+		     " MB, %u free ranges %" PRIu64 " MB (largest %" PRIu64 " MB)\n",
+		     type, static_cast<uint32_t>(properties.memoryTypes[type].propertyFlags),
+		     stats.statistics.blockCount, stats.statistics.blockBytes >> 20u,
+		     stats.statistics.allocationCount, stats.statistics.allocationBytes >> 20u,
+		     stats.unusedRangeCount,
+		     (stats.statistics.blockBytes - stats.statistics.allocationBytes) >> 20u,
+		     stats.unusedRangeCount != 0 ? stats.unusedRangeSizeMax >> 20u : 0);
+	}
 }
 
 uint64_t GraphicContext::GetDeviceMemoryUsage() const {
