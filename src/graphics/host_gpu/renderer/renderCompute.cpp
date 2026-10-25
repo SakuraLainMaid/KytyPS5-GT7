@@ -122,8 +122,16 @@ int64_t BeginGpuZone(RenderContext& context, CommandBuffer& buffer, uint64_t has
 // dispatch; KYTY_DISPATCH_RECOVERY_TRUST=<n> sets the clean runs needed.
 struct DispatchRecoveryPolicy {
 	std::unordered_map<uint64_t, uint32_t> clean_runs;
+	// Clean protected runs of each shader in all, across re-arms; a retry of the shader sets it
+	// back to 0. A shader with proven_runs of them keeps its trust when a fault elsewhere re-arms
+	// the others (KYTY_DISPATCH_RECOVERY_PROVEN, default 16; 0: every re-arm clears every trust).
+	// In a 1440p GT7 race the faults of other work re-armed about 250 times a second without a
+	// single retry in 260 000 dispatches, and the drains before the protected dispatches took a
+	// third of the GPU thread (2026-10-25).
+	std::unordered_map<uint64_t, uint32_t> proven;
 	uint64_t                               seen_faults          = 0;
 	uint32_t                               trust_runs           = 4;
+	uint32_t                               proven_runs          = 16;
 	bool                                   always               = false;
 	uint64_t                               protected_dispatches = 0;
 	uint64_t                               trusted_dispatches   = 0;
@@ -705,6 +713,11 @@ DispatchRecoveryPolicy& RecoveryPolicy() {
 		if (const char* value = std::getenv("KYTY_DISPATCH_RECOVERY_TRUST")) {
 			p.trust_runs = static_cast<uint32_t>(std::strtoul(value, nullptr, 0));
 		}
+		if (const char* value = std::getenv("KYTY_DISPATCH_RECOVERY_PROVEN")) {
+			p.proven_runs = static_cast<uint32_t>(std::strtoul(value, nullptr, 0));
+		}
+		LOGF("DispatchRecovery: trust after %u clean runs, kept across re-arms after %u%s\n",
+		     p.trust_runs, p.proven_runs, p.proven_runs == 0 ? " (never)" : "");
 		return p;
 	}();
 	return policy;
@@ -735,7 +748,14 @@ public:
 		if (!policy.always) {
 			if (const auto faults = cache.UnattributedFaults(); faults != policy.seen_faults) {
 				policy.seen_faults = faults;
-				policy.clean_runs.clear();
+				if (policy.proven_runs == 0) {
+					policy.clean_runs.clear();
+				} else {
+					std::erase_if(policy.clean_runs, [&policy](const auto& entry) {
+						const auto proven = policy.proven.find(entry.first);
+						return proven == policy.proven.end() || proven->second < policy.proven_runs;
+					});
+				}
 				policy.rearms++;
 			}
 			if (policy.clean_runs[shader_address] >= policy.trust_runs) {
@@ -805,10 +825,12 @@ public:
 			}
 			if (m_attempts == 0) {
 				policy.clean_runs[m_shader_address]++;
+				policy.proven[m_shader_address]++;
 			}
 			return false;
 		}
 		policy.clean_runs[m_shader_address] = 0;
+		policy.proven[m_shader_address]     = 0;
 		policy.retries++;
 		if (++m_attempts > 128) {
 			EXIT("GPU shader paging did not converge: shader=0x%016" PRIx64 " pages=%" PRIu64 "\n",
