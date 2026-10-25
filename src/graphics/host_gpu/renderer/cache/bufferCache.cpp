@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
+#include "graphics/host_gpu/renderer/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/stallWatch.h"
@@ -276,6 +277,7 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 	for (auto& copy: copies) {
 		copy.dstOffset += offset;
 	}
+	const GpuProfiler::TransferZone gpu_zone(m_scheduler, "Buffer download");
 
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
@@ -2113,6 +2115,7 @@ void BufferCache::RecordUpload(Buffer& buffer, std::span<const vk::BufferCopy> c
 		}
 	}
 	KYTY_PROFILER_BLOCK("Sync::Copy");
+	const GpuProfiler::TransferZone gpu_zone(m_scheduler, "Buffer upload");
 	m_scheduler.NoteTransfer(StallWatch::Transfer::BufferUpload, total_size);
 	auto& command = m_scheduler.Current();
 	command.EndRendering();

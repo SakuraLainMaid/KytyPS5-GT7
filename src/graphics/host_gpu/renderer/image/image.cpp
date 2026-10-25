@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -317,6 +318,7 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	                                   static_cast<uint32_t>(copies.size()),
 	                                   static_cast<uint32_t>(std::min<uint64_t>(size, UINT32_MAX)),
 	                                   static_cast<uint32_t>(backing.format));
+	const GpuProfiler::TransferZone gpu_zone(m_scheduler, "Image upload");
 	auto command                        = m_scheduler.Current().Recorder();
 	command.pipelineBarrier2(dependency);
 	command.copyBufferToImage(buffer, backing.image, vk::ImageLayout::eTransferDstOptimal,
@@ -361,6 +363,7 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	                                   static_cast<uint32_t>(copies.size()),
 	                                   static_cast<uint32_t>(std::min<uint64_t>(size, UINT32_MAX)),
 	                                   static_cast<uint32_t>(backing.format));
+	const GpuProfiler::TransferZone gpu_zone(m_scheduler, "Image download");
 	auto command                        = m_scheduler.Current().Recorder();
 	command.pipelineBarrier2(dependency);
 	command.copyImageToBuffer(backing.image, vk::ImageLayout::eTransferSrcOptimal, buffer,
@@ -464,6 +467,7 @@ void Image::CopyImage(Image& source) {
 	    CommandBufferDebugOp::ImageCopy, info.data.address, source.info.data.address,
 	    static_cast<uint32_t>(copies.size()), static_cast<uint32_t>(source.backing.format),
 	    static_cast<uint32_t>(backing.format));
+	const GpuProfiler::TransferZone gpu_zone(m_scheduler, "Image copy");
 	auto command = m_scheduler.Current().Recorder();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);

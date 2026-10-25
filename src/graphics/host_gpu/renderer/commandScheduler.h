@@ -302,6 +302,8 @@ private:
 	// being recorded.
 	std::unique_ptr<StallWatch::Timeline> m_timeline;
 	uint64_t                              m_open_tick = 0;
+	// The open command buffer's GPU zone (GpuProfiler), or -1.
+	int64_t                               m_command_zone = -1;
 	BeforeFlush                           m_before_flush      = nullptr;
 	void*                                 m_before_flush_user = nullptr;
 	bool                                  m_in_before_flush   = false;

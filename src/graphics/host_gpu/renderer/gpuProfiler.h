@@ -14,6 +14,7 @@
 namespace Libs::Graphics {
 
 class CommandBuffer;
+class CommandScheduler;
 class RenderContext;
 
 namespace GpuProfiler {
@@ -39,6 +40,30 @@ inline void End(CommandBuffer& buffer, int64_t token) {
 		Detail::EndSlow(buffer, token);
 	}
 }
+
+// A zone around the transfer work recorded in its scope (a download, an upload, an image copy),
+// so the GPU's time outside the shaders shows on the timeline. The scope must not submit: both
+// timestamps go into the command buffer current at its start. Only the renderer's scheduler.
+class TransferZone {
+public:
+	TransferZone(CommandScheduler& scheduler, const char* name) {
+		if (Profiler::g_counters) {
+			Open(scheduler, name);
+		}
+	}
+	~TransferZone() {
+		if (m_token >= 0) {
+			Detail::EndSlow(*m_buffer, m_token);
+		}
+	}
+	TransferZone(const TransferZone&)            = delete;
+	TransferZone& operator=(const TransferZone&) = delete;
+
+private:
+	void           Open(CommandScheduler& scheduler, const char* name);
+	CommandBuffer* m_buffer = nullptr;
+	int64_t        m_token  = -1;
+};
 
 } // namespace GpuProfiler
 } // namespace Libs::Graphics

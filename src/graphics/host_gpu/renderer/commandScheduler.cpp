@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/bisect.h"
+#include "graphics/host_gpu/renderer/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/stallWatch.h"
@@ -617,6 +618,9 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 			}
 		});
 		GpuTiming::BeginCommandBuffer(m_context, *this, m_command.Recorder(), tick);
+		if (&m_context.GetCommandScheduler() == this) {
+			m_command_zone = GpuProfiler::Begin(m_context, m_command, "Command buffer", 14, 0x9c9c9c);
+		}
 		return m_command;
 	}
 	m_command.m_buffer = m_command_pool.Commit(tick);
@@ -625,12 +629,16 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 		m_timeline->WriteBegin(m_command.m_buffer, tick);
 	}
 	GpuTiming::BeginCommandBuffer(m_context, *this, m_command.Recorder(), tick);
+	if (&m_context.GetCommandScheduler() == this) {
+		m_command_zone = GpuProfiler::Begin(m_context, m_command, "Command buffer", 14, 0x9c9c9c);
+	}
 	return m_command;
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(m_command.IsInvalid());
+	GpuProfiler::End(m_command, std::exchange(m_command_zone, -1));
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 

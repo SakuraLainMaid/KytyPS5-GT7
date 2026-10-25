@@ -233,6 +233,19 @@ int64_t BeginSlow(RenderContext& context, CommandBuffer& buffer, const char* nam
 	return static_cast<int64_t>(query);
 }
 
+} // namespace Detail
+
+void TransferZone::Open(CommandScheduler& scheduler, const char* name) {
+	auto& context = scheduler.Context();
+	if (&context.GetCommandScheduler() != &scheduler) {
+		return; // the presenter's own scheduler
+	}
+	m_buffer = &scheduler.Current();
+	m_token  = Detail::BeginSlow(context, *m_buffer, name, std::strlen(name), 0x59a14f);
+}
+
+namespace Detail {
+
 void EndSlow(CommandBuffer& buffer, int64_t token) {
 	auto&      state = GetState();
 	const auto index = static_cast<uint32_t>((static_cast<uint64_t>(token) + 1) % state.count);
