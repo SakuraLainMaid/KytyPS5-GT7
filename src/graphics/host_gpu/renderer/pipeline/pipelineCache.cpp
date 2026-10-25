@@ -810,29 +810,28 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 }
 
 // Round 148: KYTY_MESH_TEST's copy of a mesh shader (spirvMeshTest.h), checked by the SPIR-V
-// validator; empty when the shader runs as it is.
+// validator; empty when the shader runs as it is. Round 151: also the host's (MeshHostFlags: no
+// Layer output on an AMD GPU).
 static std::vector<uint32_t> MeshTestVariant(const ShaderRecompiler::CompileOptions& options,
-                                             const std::vector<uint32_t>&            spirv) {
-	const auto                   flags   = MeshTestSetting();
+                                             const std::vector<uint32_t>& spirv, uint32_t flags) {
 	auto                         variant = SpirvMeshTest(spirv, flags);
 	static std::atomic<uint32_t> logged {0};
 	const bool                   log = logged.fetch_add(1, std::memory_order_relaxed) < 64;
 	if (variant.empty()) {
 		if (log) {
-			LOGF("KYTY_MESH_TEST: mesh shader 0x%016" PRIx64 " has nothing to take out (%s)\n",
-			     options.shader_hash, MeshTestNames(flags).c_str());
+			LOGF("Mesh shader 0x%016" PRIx64 " has nothing to take out (%s)\n", options.shader_hash,
+			     MeshTestNames(flags).c_str());
 		}
 		return {};
 	}
 	if (!ValidateShaderSpirvNow(options.dump_label, options.shader_hash, variant)) {
-		LOGF("KYTY_MESH_TEST: the copy of mesh shader 0x%016" PRIx64
-		     " is not valid SPIR-V; the shader runs as it is\n",
-		     options.shader_hash);
+		LOGF("Mesh shader 0x%016" PRIx64
+		     ": its copy (%s) is not valid SPIR-V; the shader runs as it is\n",
+		     options.shader_hash, MeshTestNames(flags).c_str());
 		return {};
 	}
 	if (log) {
-		LOGF("KYTY_MESH_TEST: mesh shader 0x%016" PRIx64
-		     " runs as a copy (%s): %zu words, was %zu\n",
+		LOGF("Mesh shader 0x%016" PRIx64 " runs as a copy (%s): %zu words, was %zu\n",
 		     options.shader_hash, MeshTestNames(flags).c_str(), variant.size(), spirv.size());
 	}
 	DumpShaderSpirv("ms_test", options.shader_hash, variant);
@@ -2554,8 +2553,10 @@ struct PipelineCache::ProgramCache {
 			exact = ExactFloatVariant(options, spirv);
 		}
 		std::vector<uint32_t> mesh_test;
-		if (options.stage == ShaderType::Mesh && MeshTestSetting() != 0) {
-			mesh_test = MeshTestVariant(options, exact.empty() ? spirv : exact);
+		if (options.stage == ShaderType::Mesh) {
+			if (const auto flags = MeshTestSetting() | MeshHostFlags(); flags != 0) {
+				mesh_test = MeshTestVariant(options, exact.empty() ? spirv : exact, flags);
+			}
 		}
 		const auto module = CompileSPV(!mesh_test.empty() ? mesh_test
 		                               : exact.empty()    ? spirv

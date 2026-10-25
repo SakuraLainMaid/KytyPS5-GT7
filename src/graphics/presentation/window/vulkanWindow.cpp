@@ -12,6 +12,7 @@
 #include "common/timer.h"
 #include "graphics/host_gpu/aftermath.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/spirvMeshTest.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -842,6 +843,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	     ShaderRecompiler::Spirv::GetCoherentLoadAcquire() ? "on" : "off",
 	     ShaderRecompiler::Spirv::CoherentLoadModeName(
 	         ShaderRecompiler::Spirv::GetCoherentLoadMode()));
+	// Round 151: AMD's driver crashed on the mesh shaders' Layer output (spirvMeshTest.h).
+	SetMeshHost(properties2.properties.vendorID);
 	vk::PhysicalDeviceAddressBindingReportFeaturesEXT address_binding {};
 	if (graphics.address_binding_report_enabled) {
 		address_binding.reportAddressBinding = VK_TRUE;

@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <spirv/unified1/spirv.hpp>
 #include <string_view>
@@ -49,7 +50,29 @@ bool IsAccessChain(spv::Op op) {
 	       op == spv::OpPtrAccessChain || op == spv::OpInBoundsPtrAccessChain;
 }
 
+std::atomic<uint32_t> g_mesh_host_flags {0};
+
 } // namespace
+
+void SetMeshHost(uint32_t vendor_id) {
+	constexpr uint32_t     AmdVendor = 0x1002u;
+	const char*            value     = std::getenv("KYTY_MESH_LAYER");
+	const std::string_view setting(value != nullptr ? value : "");
+	const bool drop = setting == "drop" || (setting != "keep" && vendor_id == AmdVendor);
+	g_mesh_host_flags.store(drop ? static_cast<uint32_t>(MeshTestNoLayer) : 0u,
+	                        std::memory_order_relaxed);
+	const char* why =
+	    setting == "drop"   ? "KYTY_MESH_LAYER=drop"
+	    : setting == "keep" ? "KYTY_MESH_LAYER=keep"
+	    : drop ? "an AMD GPU, whose driver crashed on it (issue 21); KYTY_MESH_LAYER=keep "
+	             "keeps it"
+	           : "KYTY_MESH_LAYER=drop leaves it out";
+	LOGF("Mesh shaders: their Layer output is %s (%s)\n", drop ? "left out" : "kept", why);
+}
+
+uint32_t MeshHostFlags() {
+	return g_mesh_host_flags.load(std::memory_order_relaxed);
+}
 
 uint32_t MeshTestSetting() {
 	static const uint32_t flags = [] {

@@ -30,6 +30,16 @@ enum MeshTestFlag : uint32_t {
 [[nodiscard]] uint32_t    MeshTestSetting();
 [[nodiscard]] std::string MeshTestNames(uint32_t flags);
 
+// Round 151: AMD's Windows driver crashed making every pipeline whose mesh shader writes the
+// per-primitive Layer output (an RX 6950 XT, drivers 26.5.1 and 26.10.1; issue 21). Of
+// KYTY_MESH_TEST's copies only those without the Layer output compiled, and with them the game's
+// text drew. So on an AMD GPU the mesh shaders' modules leave Layer out: a draw into a target of
+// one layer draws into it the same. KYTY_MESH_LAYER=keep keeps it there, =drop leaves it out on
+// any GPU. Called once with the device's vendor before any shader is compiled.
+void SetMeshHost(uint32_t vendor_id);
+// The parts every mesh shader's module leaves out on this host (MeshTestNoLayer or none).
+[[nodiscard]] uint32_t MeshHostFlags();
+
 // The copy of a mesh shader's SPIR-V with the flags' parts taken out; empty when there is
 // nothing to take out or the module is not one it understands.
 [[nodiscard]] std::vector<uint32_t> SpirvMeshTest(std::span<const uint32_t> spirv, uint32_t flags);
