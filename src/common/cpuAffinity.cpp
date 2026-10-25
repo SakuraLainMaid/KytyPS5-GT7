@@ -560,4 +560,23 @@ void LowerThreadPriority() {
 #endif
 }
 
+ThreadPriorityFloor::ThreadPriorityFloor() noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const int current = GetThreadPriority(GetCurrentThread());
+	if (current != THREAD_PRIORITY_ERROR_RETURN && current < THREAD_PRIORITY_NORMAL &&
+	    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) != 0) {
+		m_previous = current;
+		m_raised   = true;
+	}
+#endif
+}
+
+ThreadPriorityFloor::~ThreadPriorityFloor() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (m_raised) {
+		SetThreadPriority(GetCurrentThread(), m_previous);
+	}
+#endif
+}
+
 } // namespace Common

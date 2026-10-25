@@ -62,6 +62,9 @@
 //   fastread:any the fast readback copies bytes even while a command that stores through shader
 //                addresses is unfinished (it may miss what that command stores there: a test of
 //                what waiting for those commands costs)
+//   fastread:gpu the GPU thread waits for a fast readback's copy and puts its bytes in guest
+//                memory, as before round 152, instead of the reading thread
+//                (KYTY_FAST_READBACK=gpu for the whole run)
 // and (round 65):
 //   recheck      a render target's fast clear is checked on the GPU again at the first draw of
 //                every command buffer, as before round 65, even when nothing wrote its metadata
@@ -314,10 +317,11 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] float    TessMaxLevel();
 [[nodiscard]] uint32_t FlushInterval();
 [[nodiscard]] bool     Readahead();
-// Any thread: cmask:off; fastread:off; fastread:any.
+// Any thread: cmask:off; fastread:off; fastread:any; fastread:gpu.
 [[nodiscard]] bool MsaaCmaskOff();
 [[nodiscard]] bool FastReadbackOff();
 [[nodiscard]] bool FastReadbackAnyAddress();
+[[nodiscard]] bool FastReadbackOnGpuThread();
 // Any thread: recheck; locks:spin; htile:depth; patternfill:off; faultblock:off.
 [[nodiscard]] bool GpuClearRecheck();
 [[nodiscard]] bool LocksSpin();

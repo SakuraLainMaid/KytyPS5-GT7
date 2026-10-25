@@ -47,6 +47,7 @@ struct Step {
 	bool              cmask_off    = false;
 	bool              fastread_off = false;
 	bool              fastread_any = false;
+	bool              fastread_gpu    = false; // round 152
 	bool              recheck      = false;
 	bool              locks_spin   = false;
 	bool              htile_depth  = false;
@@ -222,6 +223,10 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "fastread:any") {
 		step.fastread_any = true;
+		return true;
+	}
+	if (action == "fastread:gpu") {
+		step.fastread_gpu = true;
 		return true;
 	}
 	if (action == "recheck") {
@@ -943,6 +948,11 @@ bool FastReadbackOff() {
 bool FastReadbackAnyAddress() {
 	const auto* step = Current();
 	return step != nullptr && step->fastread_any;
+}
+
+bool FastReadbackOnGpuThread() {
+	const auto* step = Current();
+	return step != nullptr && step->fastread_gpu;
 }
 
 bool GpuClearRecheck() {

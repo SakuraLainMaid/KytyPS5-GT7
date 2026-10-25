@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/pagedRangeSet.h"
+#include "graphics/host_gpu/renderer/cache/readbackQueue.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/cache/writeTicks.h"
 
@@ -30,7 +31,6 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 class CommandScheduler;
-class ReadbackQueue;
 class TextureCache;
 
 using BufferId = Common::SlotId;
@@ -171,6 +171,10 @@ public:
 	[[nodiscard]] bool              HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	// The same, under the dirty-range lock: for a GPU-read delegate (Memory::SetGpuReadDelegate).
 	[[nodiscard]] bool              HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size);
+	// Round 152, GPU thread, without the dirty-range lock: the fast readbacks' copies of bytes in
+	// [vaddr, vaddr + size) are put in guest memory now (HasGpuDirtyBytes takes them as
+	// GPU-written until then), for a read of guest memory that cannot wait for a fault's path.
+	void FinishFastReadbacks(uint64_t vaddr, uint64_t size);
 	// Any thread: none of the bytes is GPU-written, or on its way back from the GPU, so guest
 	// memory holds their current value even when their page is protected.
 	[[nodiscard]] bool              IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const;
@@ -431,13 +435,22 @@ private:
 	                                      bool from_gpu_thread, bool async, bool writer_wait);
 	// A game thread's read (ReadMemoryStep, GPU thread) of [window_begin, window_end): the
 	// GPU-written bytes of the window from ticks the GPU has finished are copied on the readback
-	// queue and waited for there, then put in guest memory, and the window's pages that hold no
-	// GPU-written bytes any more are lifted. Bytes of an unfinished tick, or that a download or an
-	// image write-back on its way also holds, stay for a later read. False when the faulting pages
-	// hold such bytes, a command storing through shader addresses is unfinished, or nothing could
-	// be copied (the old download then runs).
+	// queue. With `wait_here` they are waited for there, then put in guest memory, and the
+	// window's pages that hold no GPU-written bytes any more are lifted; without it (round 152),
+	// the copy is left to the reading thread (m_step_ticket), whose next step lifts the pages.
+	// Bytes of an unfinished tick, or that a download or an image write-back on its way also holds,
+	// stay for a later read. False when the faulting pages hold such bytes, a command storing
+	// through shader addresses is unfinished, or nothing could be copied (the old download then
+	// runs).
 	[[nodiscard]] bool FastReadback(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                uint64_t window_begin, uint64_t window_end, bool is_write);
+	                                uint64_t window_begin, uint64_t window_end, bool is_write,
+	                                bool wait_here);
+	// Round 152, any thread: the fast readback's copy `ticket` is in guest memory when this returns
+	// (waited for and put there by this thread, or by the one that got to it first). Who, for the
+	// counts: the reading thread, the GPU thread for its own read (or with KYTY_FAST_READBACK=gpu),
+	// the GPU thread for another thread's read, or the priority thread.
+	enum class FastCompleter : uint8_t { Reader, Inline, GpuThread, Priority };
+	void CompleteFastReadback(ReadbackQueue::Ticket ticket, FastCompleter who);
 	// The pages of the readback window around vaddr that hold no GPU-written bytes, nor bytes
 	// still being downloaded, lose their GPU-written protection (a run of pages at a time).
 	void LiftCurrentPages(const Buffer& buffer, uint64_t vaddr);
@@ -487,6 +500,10 @@ private:
 	// window cleared the range while the second was in flight; a game thread then took the
 	// page as current, wrote it, and the second publication put older GPU bytes over that).
 	std::vector<std::pair<uint64_t, uint64_t>>         m_downloading_list;
+	// Round 152: the bytes of fast readbacks' copies not yet in guest memory (they are in
+	// m_downloading_ranges too), for HasGpuDirtyBytesShared; the GPU thread asks the readback
+	// queue instead (HasGpuDirtyBytes), without the lock.
+	RangeSet m_fast_pending_ranges;
 	// Write bitmap (WriteBitmapAddress): the buffer, the whole pages whose GPU writes all came
 	// through tracked bindings, and per 4 MiB region the last tick a tracked binding wrote it.
 	// Guarded by m_dirty_ranges_mutex, as m_gpu_modified_ranges.
@@ -543,6 +560,7 @@ private:
 		WaitWriter, // waits for its writer's command buffer, then asks again (readwait:writer)
 		Download,   // downloaded behind the renderer's queue
 		Nothing,    // went to download, and nothing was left to download
+		FastWait,   // waited for another read's copy of its pages to land, then asks again
 		Count
 	};
 	enum class FastRefusal : uint8_t {
@@ -568,6 +586,9 @@ private:
 	uint64_t m_fast_known_tick   = 0;
 	// The bytes the last ReadMemoryStep recorded a download of (GPU thread).
 	uint64_t m_step_bytes = 0;
+	// Round 152: the fast readback copy the reading thread waits for, then asks again (GPU
+	// thread, read back by ReadMemory's command).
+	ReadbackQueue::Ticket m_step_ticket;
 	// GpuThreadFastReads is alive (GPU thread only).
 	bool m_gpu_thread_fast_reads = false;
 	// Readahead (ReadaheadEnabled), GPU thread only: the blocks learned in this generation and

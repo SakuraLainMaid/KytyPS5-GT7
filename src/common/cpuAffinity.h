@@ -42,6 +42,22 @@ void RegisterGpuSideThread(const char* name);
 // THREAD_PRIORITY_BELOW_NORMAL; Linux: a nice value of 5; a no-op elsewhere.
 void LowerThreadPriority();
 
+// Round 152: while it lives, the calling thread runs at normal priority at least, so that threads
+// waiting for what it is doing (the GPU thread, for a game thread's copy into guest memory) are
+// not held up by a low priority the game gave it. Windows (a guest priority of 733 or more runs at
+// THREAD_PRIORITY_LOWEST); a no-op elsewhere.
+class ThreadPriorityFloor final {
+public:
+	ThreadPriorityFloor() noexcept;
+	~ThreadPriorityFloor();
+	ThreadPriorityFloor(const ThreadPriorityFloor&)            = delete;
+	ThreadPriorityFloor& operator=(const ThreadPriorityFloor&) = delete;
+
+private:
+	[[maybe_unused]] int  m_previous = 0;
+	[[maybe_unused]] bool m_raised   = false;
+};
+
 } // namespace Common
 
 #endif // EMULATOR_SRC_COMMON_CPUAFFINITY_H_

@@ -150,8 +150,8 @@ inline void AddReadahead(uint64_t bytes) {
 		Detail::AddReadaheadSlow(bytes);
 	}
 }
-// A game thread's read copied on the readback queue (BufferCache::FastReadback): how long the GPU
-// thread waited for the copy, and its bytes.
+// A game thread's read copied on the readback queue (BufferCache::FastReadback): how long its copy
+// was waited for (by the reading thread since round 152, before by the GPU thread), and its bytes.
 inline void AddFastReadback(uint64_t wait_ns, uint64_t bytes) {
 	if (Active()) {
 		Detail::AddFastReadbackSlow(wait_ns, bytes);

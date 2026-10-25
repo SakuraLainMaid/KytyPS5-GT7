@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/cpuAffinity.h"
 #include "common/logging/log.h"
 #include "common/perfStats.h"
 #include "common/profiler.h"
@@ -36,8 +37,10 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -165,6 +168,11 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
 void BufferCache::DeleteBuffer(BufferId id) {
 	if (IsBufferInvalid(id)) {
 		return;
+	}
+	// Round 152: a fast readback's copy may still be reading it on the readback queue, which the
+	// renderer's ticks (the release below) do not wait for.
+	if (m_readback_queue != nullptr) {
+		m_readback_queue->WaitCopiesFrom(m_slot_buffers[id].Handle());
 	}
 	Unregister(id);
 	// As TextureCache::DeleteImage: earlier command buffers may still use the buffer on the GPU.
@@ -840,20 +848,21 @@ namespace {
 // asked for them (Common::PerfStats::t_fault_pc; 0: not from a fault), with how each went (its
 // first step) and how long the thread was held, and every 10 s the costliest ("Reads of
 // GPU-written memory" lines). Only while the Perf lines are on.
-constexpr size_t kReadOutcomes = 10;
+constexpr size_t kReadOutcomes = 11;
 constexpr size_t kFastRefusals = 9;
 
 constexpr std::array<const char*, kReadOutcomes> kReadOutcomeNames {
-    "?",                             // None
-    "nothing to do",                 // Direct
-    "write bitmap waits",            // Bitmap
-    "lifted",                        // Lifted
-    "lifted once a download landed", // LiftWaited
-    "current already",               // Clean
-    "copied at once",                // Fast
-    "waited for the writer",         // WaitWriter
-    "downloaded",                    // Download
-    "nothing left to download"};     // Nothing
+    "?",                               // None
+    "nothing to do",                   // Direct
+    "write bitmap waits",              // Bitmap
+    "lifted",                          // Lifted
+    "lifted once a download landed",   // LiftWaited
+    "current already",                 // Clean
+    "copied at once",                  // Fast
+    "waited for the writer",           // WaitWriter
+    "downloaded",                      // Download
+    "nothing left to download",        // Nothing
+    "waited for another read's copy"}; // FastWait
 constexpr std::array<const char*, kFastRefusals> kFastRefusalNames {
     "?",                       // None
     "no readback queue",       // Unavailable
@@ -1095,6 +1104,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			uint64_t    current   = 0;
 			uint64_t    known     = 0;
 			uint32_t    left      = 0;
+			// Round 152: the fast readback copy to wait for, then ask again.
+			ReadbackQueue::Ticket ticket;
 		} step;
 		const auto sent = measure ? now_ns() : 0;
 		m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write,
@@ -1119,6 +1130,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			step.current = m_fast_current_tick;
 			step.known   = m_fast_known_tick;
 			step.left    = m_fast_left;
+			step.ticket  = std::exchange(m_step_ticket, {});
 			if (measure) {
 				step.recorded = now_ns();
 			}
@@ -1144,6 +1156,17 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			note.then_fast = step.outcome == ReadOutcome::Fast;
 		}
 		steps++;
+		if (step.ticket.Valid()) {
+			// Round 152: the copy of the faulting pages' bytes (this read's, or another's) is on
+			// its way on the readback queue. This thread waits for it and puts the bytes in guest
+			// memory, not the GPU thread, then asks again (the pages are then lifted).
+			const auto wait_from = measure ? now_ns() : 0;
+			CompleteFastReadback(step.ticket, FastCompleter::Reader);
+			if (measure) {
+				wait_ns += now_ns() - wait_from;
+			}
+			continue;
+		}
 		if (step.wait_tick == 0) {
 			break;
 		}
@@ -1246,6 +1269,22 @@ static bool FastReadbackEnabled() {
 	return enabled && !Bisect::FastReadbackOff();
 }
 
+// Round 152: KYTY_FAST_READBACK=gpu (or KYTY_BISECT's fastread:gpu): the GPU thread waits for each
+// fast readback's copy and puts its bytes in guest memory, as before, instead of the reading
+// thread.
+static bool FastReadbackWaitsOnGpuThread() {
+	static const bool gpu = [] {
+		const char* value = std::getenv("KYTY_FAST_READBACK");
+		const bool  on    = value != nullptr && std::string_view(value) == "gpu";
+		LOGF("BufferCache: a fast readback's copy on the readback queue is waited for by %s\n",
+		     on ? "the GPU thread (KYTY_FAST_READBACK=gpu, as before round 152)"
+		        : "the reading thread, not the GPU thread (round 152; KYTY_FAST_READBACK=gpu or "
+		          "KYTY_BISECT's fastread:gpu: the GPU thread, as before)");
+		return on;
+	}();
+	return gpu || Bisect::FastReadbackOnGpuThread();
+}
+
 namespace {
 // What the fast readback did, and why reads went the old way, for the "Fast readback:" line (GPU
 // thread only).
@@ -1253,8 +1292,9 @@ struct FastReadbackStats {
 	uint64_t attempts    = 0;
 	uint64_t done        = 0;
 	uint64_t bytes       = 0;
-	uint64_t wait_ns     = 0;
-	uint64_t longest_ns  = 0;
+	uint64_t gpu_ns      = 0; // the GPU thread's time in the copied ones
+	uint64_t ranges      = 0; // the copied ones' ranges
+	uint64_t full        = 0; // every copy slot was in use: the oldest was finished first
 	uint64_t left        = 0; // ranges elsewhere in the windows, left for a later read
 	uint64_t recording   = 0; // the faulting pages' writer is in the command buffer being recorded
 	uint64_t in_flight   = 0; // submitted, not finished
@@ -1266,6 +1306,17 @@ struct FastReadbackStats {
 };
 FastReadbackStats g_fast_readback;
 
+// Round 152, any thread: the copies waited for and put in guest memory, how long their waits were,
+// and by whom (BufferCache::FastCompleter: the reading thread, the GPU thread for its own read,
+// the GPU thread for another's, the priority thread).
+struct FastCompletions {
+	std::atomic<uint64_t>                count {0};
+	std::atomic<uint64_t>                wait_ns {0};
+	std::atomic<uint64_t>                longest_ns {0};
+	std::array<std::atomic<uint64_t>, 4> by {};
+};
+FastCompletions g_fast_completions;
+
 // Every 4096 attempts, when an attempt ends: what those did (then the counts start again), with
 // the KYTY_BISECT step they ran in.
 struct FastReadbackReport {
@@ -1274,29 +1325,128 @@ struct FastReadbackReport {
 		if (stats.attempts < 4096) {
 			return;
 		}
-		const double average = stats.done != 0 ? static_cast<double>(stats.wait_ns) / 1e3 /
-		                                             static_cast<double>(stats.done)
-		                                       : 0.0;
-		const auto   step    = Common::PerfStats::WindowConfiguration();
-		const auto   tag     = step.empty() ? std::string() : " [" + step + "]";
+		auto&          completions = g_fast_completions;
+		const uint64_t waits       = completions.count.exchange(0, std::memory_order_relaxed);
+		const uint64_t wait_ns     = completions.wait_ns.exchange(0, std::memory_order_relaxed);
+		const uint64_t longest_ns  = completions.longest_ns.exchange(0, std::memory_order_relaxed);
+		std::array<uint64_t, 4> by {};
+		for (size_t i = 0; i < by.size(); i++) {
+			by[i] = completions.by[i].exchange(0, std::memory_order_relaxed);
+		}
+		const auto average = [](uint64_t ns, uint64_t n) {
+			return n != 0 ? static_cast<double>(ns) / 1e3 / static_cast<double>(n) : 0.0;
+		};
+		const auto step = Common::PerfStats::WindowConfiguration();
+		const auto tag  = step.empty() ? std::string() : " [" + step + "]";
 		LOGF("Fast readback: %" PRIu64 " of %" PRIu64
-		     " reads copied on the readback queue%s (%.1f MB, waited %.0f us on average, longest "
-		     "%.0f us; %" PRIu64 " ranges elsewhere in their windows left for later); the others "
-		     "waited for the renderer's queue: %" PRIu64 " written in the command buffer being "
-		     "recorded, %" PRIu64 " in one not finished, %" PRIu64 " being downloaded, %" PRIu64
-		     " too big, %" PRIu64 " without GPU-written bytes to copy, %" PRIu64
+		     " reads copied on the readback queue%s (%.1f MB in %.1f ranges each, the GPU thread "
+		     "%.0f us on each; "
+		     "%" PRIu64 " ranges elsewhere in their windows left for later); their copies waited "
+		     "for %.0f us on average, longest %.0f us, by the reading thread %" PRIu64
+		     ", the GPU thread %" PRIu64 " for its own reads and %" PRIu64 " for others' (%" PRIu64
+		     " with every copy slot in use), the priority thread %" PRIu64
+		     "; the others waited for the renderer's queue: %" PRIu64
+		     " written in the command buffer being recorded, %" PRIu64
+		     " in one not finished, %" PRIu64 " being downloaded, %" PRIu64 " too big, %" PRIu64
+		     " without GPU-written bytes to copy, %" PRIu64
 		     " behind shader address stores, %" PRIu64 " other\n",
 		     stats.done, stats.attempts, tag.c_str(), static_cast<double>(stats.bytes) / 1e6,
-		     average, static_cast<double>(stats.longest_ns) / 1e3, stats.left, stats.recording,
-		     stats.in_flight, stats.downloading, stats.too_big, stats.nothing, stats.address,
-		     stats.other);
+		     stats.done != 0 ? static_cast<double>(stats.ranges) / static_cast<double>(stats.done)
+		                     : 0.0,
+		     average(stats.gpu_ns, stats.done), stats.left, average(wait_ns, waits),
+		     static_cast<double>(longest_ns) / 1e3, by[0], by[1], by[2], stats.full, by[3],
+		     stats.recording, stats.in_flight, stats.downloading, stats.too_big, stats.nothing,
+		     stats.address, stats.other);
 		stats = {};
 	}
 };
 } // namespace
 
+void BufferCache::CompleteFastReadback(ReadbackQueue::Ticket ticket, FastCompleter who) {
+	if (m_readback_queue == nullptr || !ticket.Valid()) {
+		return;
+	}
+	// A game thread the game runs at a low priority would hold up the threads that wait for this
+	// copy (the GPU thread, the priority thread) whenever it is preempted.
+	std::optional<Common::ThreadPriorityFloor> floor;
+	if (who == FastCompleter::Reader) {
+		floor.emplace();
+	}
+	const ReadbackQueue::Job* job       = nullptr;
+	uint64_t                  waited_ns = 0;
+	const uint8_t*            bytes     = m_readback_queue->Claim(ticket, job, waited_ns);
+	if (bytes == nullptr) {
+		// Another thread got to it first (or it is in guest memory already).
+		m_readback_queue->WaitDone(ticket);
+		return;
+	}
+	const auto buffer_address = job->buffer_address;
+	const auto total          = job->total_size;
+	const auto job_begin      = job->begin;
+	const auto job_end        = job->end;
+	{
+		// Into guest memory, as a download's publication puts them (DownloadBufferCopies).
+		const Libs::LibKernel::Memory::WriteSourceScope source(
+		    Libs::LibKernel::Memory::WriteSource::FastReadback);
+		for (const auto& copy: job->copies) {
+			const auto  address = buffer_address + copy.srcOffset;
+			const auto* from    = bytes + copy.dstOffset;
+			if (Libs::LibKernel::Memory::TryWriteBacking(address, from, copy.size)) {
+				continue;
+			}
+			// Bytes the guest has unmapped since the GPU wrote them: the pages still mapped get
+			// theirs.
+			for (uint64_t done = 0; done < copy.size;) {
+				const auto at    = address + done;
+				const auto piece = std::min<uint64_t>(
+				    copy.size - done, Common::AlignDown(at, 0x1000u) + 0x1000u - at);
+				if (!Libs::LibKernel::Memory::TryWriteBacking(at, from + done, piece) &&
+				    Libs::LibKernel::Memory::TryClampRangeSize(at, piece) == piece) {
+					EXIT("Memory: required direct-backing write failed, addr=0x%016" PRIx64
+					     " size=0x%016" PRIx64 "\n",
+					     at, piece);
+				}
+				done += piece;
+			}
+		}
+	}
+	{
+		// The bytes are no longer on their way (as a download's publication): only this copy's
+		// entries go, so ranges another download (or copy) still has in flight stay marked; only
+		// those within the copy's bounds can have lost bytes.
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		for (const auto& copy: job->copies) {
+			const std::pair<uint64_t, uint64_t> range {buffer_address + copy.srcOffset, copy.size};
+			const auto                          entry =
+			    std::find(m_downloading_list.begin(), m_downloading_list.end(), range);
+			if (entry != m_downloading_list.end()) {
+				*entry = m_downloading_list.back();
+				m_downloading_list.pop_back();
+			}
+			m_downloading_ranges.Subtract(range.first, range.second);
+			// Copies on their way never overlap (FastReadback leaves out bytes on their way).
+			m_fast_pending_ranges.Subtract(range.first, range.second);
+		}
+		for (const auto& [start, length]: m_downloading_list) {
+			if (start < job_end && job_begin < start + length) {
+				m_downloading_ranges.Add(start, length);
+			}
+		}
+	}
+	m_readback_queue->Done(ticket);
+	auto& completions = g_fast_completions;
+	completions.count.fetch_add(1, std::memory_order_relaxed);
+	completions.wait_ns.fetch_add(waited_ns, std::memory_order_relaxed);
+	for (auto longest = completions.longest_ns.load(std::memory_order_relaxed);
+	     waited_ns > longest && !completions.longest_ns.compare_exchange_weak(
+	                                longest, waited_ns, std::memory_order_relaxed);) {
+	}
+	completions.by[static_cast<size_t>(who)].fetch_add(1, std::memory_order_relaxed);
+	Common::PerfStats::AddFastReadback(waited_ns, total);
+}
+
 bool BufferCache::FastReadback(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t window_begin,
-                               uint64_t window_end, bool is_write) {
+                               uint64_t window_end, bool is_write, bool wait_here) {
 	// Round 135: why nothing was copied, for ReadMemoryStep (readwait:writer) and the counts.
 	m_fast_refusal      = FastRefusal::Unavailable;
 	m_fast_writer_tick  = 0;
@@ -1308,7 +1458,8 @@ bool BufferCache::FastReadback(Buffer& buffer, uint64_t vaddr, uint64_t size, ui
 	    window_end <= window_begin) {
 		return false;
 	}
-	auto& stats = g_fast_readback;
+	const auto started = StallWatch::NowNs();
+	auto&      stats   = g_fast_readback;
 	stats.attempts++;
 	const FastReadbackReport report {stats};
 	// Between commands: every write marked so far has its command in a command buffer, and its
@@ -1446,47 +1597,63 @@ bool BufferCache::FastReadback(Buffer& buffer, uint64_t vaddr, uint64_t size, ui
 		m_fast_refusal = FastRefusal::TooBig;
 		return false;
 	}
+	// Round 152: every copy slot holds a copy not yet in guest memory: the oldest goes there first
+	// (by this thread, if its reader has not got to it yet).
+	if (m_readback_queue->Full()) {
+		stats.full++;
+		CompleteFastReadback(m_readback_queue->Oldest(), FastCompleter::GpuThread);
+	}
 	// After every tick the GPU is known to have finished, not only the copied ranges' writers (all
 	// done by then): a command storing through shader addresses may have written them later. The
 	// wait is free, the tick being done.
-	uint64_t       waited_ns = 0;
-	const uint8_t* bytes = m_readback_queue->Copy(buffer.Handle(), copies, total, known, waited_ns);
-	if (bytes == nullptr) {
+	ReadbackQueue::Job job;
+	job.source         = buffer.Handle();
+	job.buffer_address = buffer_address;
+	job.total_size     = total;
+	job.begin          = UINT64_MAX;
+	job.end            = 0;
+	for (const auto& copy: copies) {
+		job.begin = std::min(job.begin, buffer_address + copy.srcOffset);
+		job.end   = std::max(job.end, buffer_address + copy.srcOffset + copy.size);
+	}
+	job.copies        = copies;
+	const auto ticket = m_readback_queue->Submit(std::move(job), known);
+	if (!ticket.Valid()) {
 		stats.other++;
 		m_fast_refusal = FastRefusal::Other;
 		return false;
 	}
-	// Into guest memory, as a download's publication puts them (DownloadBufferCopies).
-	const Libs::LibKernel::Memory::WriteSourceScope source(
-	    Libs::LibKernel::Memory::WriteSource::FastReadback);
-	for (const auto& copy: copies) {
-		const auto  address = buffer_address + copy.srcOffset;
-		const auto* source  = bytes + copy.dstOffset;
-		if (Libs::LibKernel::Memory::TryWriteBacking(address, source, copy.size)) {
-			continue;
-		}
-		// Bytes the guest has unmapped since the GPU wrote them: the pages still mapped get theirs.
-		for (uint64_t done = 0; done < copy.size;) {
-			const auto at = address + done;
-			const auto piece =
-			    std::min<uint64_t>(copy.size - done, Common::AlignDown(at, 0x1000u) + 0x1000u - at);
-			if (!Libs::LibKernel::Memory::TryWriteBacking(at, source + done, piece) &&
-			    Libs::LibKernel::Memory::TryClampRangeSize(at, piece) == piece) {
-				EXIT("Memory: required direct-backing write failed, addr=0x%016" PRIx64
-				     " size=0x%016" PRIx64 "\n",
-				     at, piece);
-			}
-			done += piece;
-		}
-	}
 	{
-		// Nothing recorded a GPU write since the ranges were collected: only the GPU thread
-		// records them, and it is here.
+		// As a download's (DownloadBufferWindow): the bytes are no longer waiting for a download
+		// but on their way, until the copy's publication (CompleteFastReadback) puts them in guest
+		// memory. A GPU write recorded since marks them written again.
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		for (const auto& copy: copies) {
-			m_gpu_modified_ranges.Subtract(buffer_address + copy.srcOffset, copy.size);
+			const auto start = buffer_address + copy.srcOffset;
+			m_gpu_modified_ranges.Subtract(start, copy.size);
+			m_downloading_ranges.Add(start, copy.size);
+			m_downloading_list.emplace_back(start, copy.size);
+			m_fast_pending_ranges.Add(start, copy.size);
 		}
 	}
+	m_fast_step    = true;
+	m_fast_refusal = FastRefusal::None;
+	stats.done++;
+	stats.bytes += total;
+	stats.ranges += copies.size();
+	stats.left += left;
+	if (!wait_here) {
+		// Round 152: the reading thread waits for the copy and puts its bytes in guest memory
+		// (ReadMemory), and its next step lifts the pages. A publication recorded after this one
+		// (a download's, an image write-back's) waits for it on the priority thread first, so it
+		// cannot land under these older bytes, even if the reading thread is held up.
+		m_scheduler.DeferPriorityOperation(
+		    [this, ticket] { CompleteFastReadback(ticket, FastCompleter::Priority); });
+		m_step_ticket = ticket;
+		stats.gpu_ns += StallWatch::NowNs() - started;
+		return true;
+	}
+	CompleteFastReadback(ticket, FastCompleter::Inline);
 	// A page under an image write-back still to land is lifted too: a guest read of its bytes,
 	// not GPU-written ones, took them from guest memory before, as the clean-read emulation does.
 	LiftCurrentPages(buffer, vaddr);
@@ -1497,14 +1664,7 @@ bool BufferCache::FastReadback(Buffer& buffer, uint64_t vaddr, uint64_t size, ui
 	if (is_write) {
 		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 	}
-	m_fast_step    = true;
-	m_fast_refusal = FastRefusal::None;
-	stats.done++;
-	stats.bytes += total;
-	stats.wait_ns += waited_ns;
-	stats.longest_ns = std::max(stats.longest_ns, waited_ns);
-	stats.left += left;
-	Common::PerfStats::AddFastReadback(waited_ns, total);
+	stats.gpu_ns += StallWatch::NowNs() - started;
 	return true;
 }
 
@@ -1512,8 +1672,26 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
                                      bool from_gpu_thread, bool async, bool writer_wait) {
 	m_step_outcome = ReadOutcome::Direct;
 	m_fast_refusal = FastRefusal::None;
+	m_step_ticket  = {};
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return 0;
+	}
+	// Round 152: bytes of the faulting pages a fast readback has copied and not yet put in guest
+	// memory (FastReadback): the pages stay protected until they are there. A game thread waits
+	// for them (its own copy's or another read's) and asks again; the GPU thread puts them there
+	// itself.
+	if (m_readback_queue != nullptr && m_readback_queue->AnyPending()) {
+		const auto first = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+		const auto last  = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+		for (auto ticket = m_readback_queue->PendingIn(first, last); ticket.Valid();
+		     ticket      = m_readback_queue->PendingIn(first, last)) {
+			if (!from_gpu_thread) {
+				m_step_ticket  = ticket;
+				m_step_outcome = ReadOutcome::FastWait;
+				return 0;
+			}
+			CompleteFastReadback(ticket, FastCompleter::GpuThread);
+		}
 	}
 	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
@@ -1700,11 +1878,13 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 	Timeline::Mark("readmem", vaddr, from_gpu_thread ? 1u : 0u);
 	// Bytes the GPU has finished writing: copied on the readback queue at once, instead of behind
 	// what the renderer's queue still has to run. The GPU thread's own reads too where it allows
-	// (GpuThreadFastReads): the copy is done when FastReadback returns.
+	// (GpuThreadFastReads): the copy is done when FastReadback returns. A game thread's is left
+	// to it (round 152): ReadMemory waits for it, then asks again.
 	const bool gpu_thread_fast =
 	    from_gpu_thread && m_gpu_thread_fast_reads && !Bisect::FlipCheckOld();
 	if ((async || gpu_thread_fast) &&
-	    FastReadback(buffer, vaddr, size, window_begin, window_end, is_write)) {
+	    FastReadback(buffer, vaddr, size, window_begin, window_end, is_write,
+	                 from_gpu_thread || FastReadbackWaitsOnGpuThread())) {
 		m_step_outcome = ReadOutcome::Fast;
 		if (gpu_thread_fast) {
 			static std::atomic<uint64_t> fast_reads {0};
@@ -3132,12 +3312,28 @@ bool BufferCache::AddressWritesInFlight() {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	return m_gpu_modified_ranges.Intersects(vaddr, size);
+	// Round 152: bytes a fast readback has copied are not in guest memory until the thread that
+	// waits for the copy puts them there: the GPU thread's own reads (the SRT walks, prepared
+	// draws, an image's first fill) take them as GPU-written until then.
+	return m_gpu_modified_ranges.Intersects(vaddr, size) ||
+	       (m_readback_queue != nullptr && m_readback_queue->AnyPending() &&
+	        m_readback_queue->PendingIn(vaddr, vaddr + size).Valid());
+}
+
+void BufferCache::FinishFastReadbacks(uint64_t vaddr, uint64_t size) {
+	if (m_readback_queue == nullptr || size == 0 || !m_readback_queue->AnyPending()) {
+		return;
+	}
+	for (auto ticket = m_readback_queue->PendingIn(vaddr, vaddr + size); ticket.Valid();
+	     ticket      = m_readback_queue->PendingIn(vaddr, vaddr + size)) {
+		CompleteFastReadback(ticket, FastCompleter::GpuThread);
+	}
 }
 
 bool BufferCache::HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size) {
 	std::shared_lock lock(m_dirty_ranges_mutex);
-	return m_gpu_modified_ranges.Intersects(vaddr, size);
+	return m_gpu_modified_ranges.Intersects(vaddr, size) ||
+	       m_fast_pending_ranges.Intersects(vaddr, size);
 }
 
 void BufferCache::DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size) {
@@ -3442,6 +3638,11 @@ void BufferCache::RunGarbageCollector() {
 		}
 		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 		NoteBufferEvent(BufferEventKind::Collected, buffer);
+		// The fast readbacks' copies recorded before the wait above are done (their safety-net
+		// operations were among those waited for); none is recorded since (round 152).
+		if (m_readback_queue != nullptr) {
+			m_readback_queue->WaitCopiesFrom(buffer.Handle());
+		}
 		Unregister(id);
 		m_slot_buffers.erase(id);
 	}

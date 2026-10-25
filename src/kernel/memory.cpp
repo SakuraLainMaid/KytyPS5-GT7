@@ -1470,6 +1470,9 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 			return false;
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
+		// Round 152: bytes a fast readback's copy is still bringing in are put there first (a
+		// short wait, not the fault's path, which may drain the GPU for the page's other bytes).
+		buffers.FinishFastReadbacks(vaddr, size);
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
 			buffers.ReadMemory(vaddr, size);
 		}
@@ -1505,8 +1508,14 @@ static bool MaybeGpuDirtyForClean(uint64_t vaddr, uint64_t size) {
 	if (t_gpu_read_delegate) {
 		return GetGpuResources().GetBufferCache().HasGpuDirtyBytesShared(vaddr, size);
 	}
-	return !Graphics::GuestGpu::IsGpuThread() ||
-	       GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
+	if (!Graphics::GuestGpu::IsGpuThread()) {
+		return true;
+	}
+	// Round 152: as TryReadBufferBacking, bytes a fast readback's copy is still bringing in are
+	// put there first.
+	auto& buffers = GetGpuResources().GetBufferCache();
+	buffers.FinishFastReadbacks(vaddr, size);
+	return buffers.HasGpuDirtyBytes(vaddr, size);
 }
 
 const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size) {
