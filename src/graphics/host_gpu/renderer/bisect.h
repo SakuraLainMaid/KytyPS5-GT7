@@ -65,6 +65,9 @@
 //   fastread:gpu the GPU thread waits for a fast readback's copy and puts its bytes in guest
 //                memory, as before round 152, instead of the reading thread
 //                (KYTY_FAST_READBACK=gpu for the whole run)
+//   liftwait:old a game thread's read of pages a download is still bringing in waits for the
+//                latest download of all, as before round 153, instead of the ones that cover its
+//                pages (KYTY_LIFT_WAIT=old for the whole run)
 // and (round 65):
 //   recheck      a render target's fast clear is checked on the GPU again at the first draw of
 //                every command buffer, as before round 65, even when nothing wrote its metadata
@@ -322,6 +325,7 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] bool FastReadbackOff();
 [[nodiscard]] bool FastReadbackAnyAddress();
 [[nodiscard]] bool FastReadbackOnGpuThread();
+[[nodiscard]] bool LiftWaitOld();
 // Any thread: recheck; locks:spin; htile:depth; patternfill:off; faultblock:off.
 [[nodiscard]] bool GpuClearRecheck();
 [[nodiscard]] bool LocksSpin();

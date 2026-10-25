@@ -315,8 +315,20 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
+	// Round 153: an asynchronous download's publication tick and the bounds of its bytes, for the
+	// reads that wait for it (DownloadTickFor).
+	uint64_t batch_id = 0; // not const: a constant 0 would need no capture
+	if constexpr (async) {
+		batch_id = ++m_download_batch_ids;
+	}
+	uint64_t batch_begin = UINT64_MAX;
+	uint64_t batch_end   = 0;
+	for (const auto& copy: copies) {
+		batch_begin = std::min(batch_begin, buffer_address + copy.srcOffset);
+		batch_end   = std::max(batch_end, buffer_address + copy.srcOffset + copy.size);
+	}
 	auto publish = [this, mapped, offset, total_size, buffer_address, copies = std::move(copies),
-	                owner = std::move(temporary)] {
+	                owner = std::move(temporary), batch_id] {
 		const Libs::LibKernel::Memory::WriteSourceScope source(
 		    Libs::LibKernel::Memory::WriteSource::Download);
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
@@ -366,8 +378,23 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 		for (const auto& [start, bytes]: m_downloading_list) {
 			m_downloading_ranges.Add(start, bytes);
 		}
+		if (batch_id != 0) {
+			const auto batch =
+			    std::find_if(m_download_batches.begin(), m_download_batches.end(),
+			                 [&](const DownloadBatch& b) { return b.id == batch_id; });
+			if (batch != m_download_batches.end()) {
+				*batch = m_download_batches.back();
+				m_download_batches.pop_back();
+			}
+		}
 	};
 	if constexpr (async) {
+		{
+			// The tick DeferPriorityOperation gives the publication: nothing submits in between.
+			std::unique_lock lock(m_dirty_ranges_mutex);
+			m_download_batches.push_back(
+			    {batch_id, m_scheduler.CurrentTick(), batch_begin, batch_end});
+		}
 		m_scheduler.DeferPriorityOperation(std::move(publish));
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
@@ -840,6 +867,17 @@ static bool ReadWaitWriter() {
 		return value != nullptr && std::strcmp(value, "writer") == 0;
 	}();
 	return writer || Bisect::ReadWaitWriter();
+}
+
+// Round 153, KYTY_LIFT_WAIT=old (or KYTY_BISECT's liftwait:old): a read of pages whose bytes a
+// download is still bringing in waits for the latest download of all, as before, instead of the
+// ones that cover its pages.
+static bool LiftWaitOld() {
+	static const bool old = [] {
+		const char* value = std::getenv("KYTY_LIFT_WAIT");
+		return value != nullptr && std::strcmp(value, "old") == 0;
+	}();
+	return old || Bisect::LiftWaitOld();
 }
 
 namespace {
@@ -1789,28 +1827,42 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 		m_step_outcome = ReadOutcome::Lifted;
 		// An asynchronous readback of these bytes may not be in guest memory yet: the access
 		// must not see the older bytes, so it waits for that publication first.
-		bool downloading = false;
+		bool     downloading   = false;
+		uint64_t download_tick = 0;
 		{
 			std::shared_lock lock(m_dirty_ranges_mutex);
 			downloading = m_downloading_ranges.Intersects(page_begin, page_end - page_begin);
+			// Round 153: the downloads that cover these pages, not the latest of all (that one
+			// publishes after them, often several command buffers later). liftwait:old (or
+			// KYTY_LIFT_WAIT=old) waits for the latest, as before.
+			if (downloading && !LiftWaitOld()) {
+				for (const auto& batch: m_download_batches) {
+					if (batch.begin < page_end && page_begin < batch.end) {
+						download_tick = std::max(download_tick, batch.tick);
+					}
+				}
+			}
 		}
-		if (downloading && m_last_async_download_tick != 0) {
+		if (downloading && download_tick == 0) {
+			download_tick = m_last_async_download_tick;
+		}
+		if (downloading && download_tick != 0) {
 			// Downloads are submitted as they are recorded (readahead's in its before-flush hook,
 			// a game thread's below), so this tick should be submitted already. Were it not, it
 			// would be submitted here: on the GPU thread without the hook, which must not run in
 			// the middle of a command (it downloads ranges the command has yet to write).
-			if (m_last_async_download_tick >= m_scheduler.CurrentTick()) {
+			if (download_tick >= m_scheduler.CurrentTick()) {
 				if (from_gpu_thread) {
-					m_scheduler.Wait(m_last_async_download_tick);
+					m_scheduler.Wait(download_tick);
 				} else {
 					m_scheduler.Flush();
 				}
 			}
 			if (async) {
 				m_step_outcome = ReadOutcome::LiftWaited;
-				return m_last_async_download_tick;
+				return download_tick;
 			}
-			m_scheduler.WaitPriorityOperations(m_last_async_download_tick);
+			m_scheduler.WaitPriorityOperations(download_tick);
 		}
 		if (async && ReadbackWindow() != 0) {
 			// The whole download window, as the synchronous path lifts it: page by page, each

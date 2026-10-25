@@ -516,6 +516,17 @@ private:
 	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK), or readahead download;
 	// GPU thread only.
 	uint64_t                                           m_last_async_download_tick = 0;
+	// Round 153: each asynchronous download's publication tick and the bounds of its bytes (one a
+	// DownloadBufferCopies), under m_dirty_ranges_mutex, so a read of pages a download is still
+	// bringing in waits for the downloads that cover them; and the batches' ids (GPU thread).
+	struct DownloadBatch {
+		uint64_t id    = 0;
+		uint64_t tick  = 0;
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+	};
+	std::vector<DownloadBatch> m_download_batches;
+	uint64_t                   m_download_batch_ids = 0;
 	// The tick of the last GPU write recorded to each range (MarkGpuWritten), under
 	// m_dirty_ranges_mutex; and the fast readback's queue (FastReadback).
 	WriteTicks                     m_write_ticks;
