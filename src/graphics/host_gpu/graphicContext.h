@@ -66,6 +66,23 @@ struct DiagnosticCheckpoint {
 
 struct GraphicContext;
 
+// What each VMA allocation is for, counted by heap (vma.cpp), for LogMemoryBudget's "VRAM by
+// kind" line: where a card's video memory goes.
+enum class VramKind : uint8_t {
+	CacheBuffer,    // a buffer mirroring guest memory (the buffer cache's)
+	OtherBuffer,    // a device buffer of the emulator's own (null buffer, tables, scratch)
+	UploadBuffer,   // staging for uploads
+	DownloadBuffer, // staging for downloads
+	StreamBuffer,   // the stream ring
+	RenderTarget,   // an image drawn to as a color attachment
+	DepthTarget,    // a depth or stencil attachment
+	StorageImage,   // an image written by shaders, not drawn to
+	Texture,        // any other image
+	Count
+};
+void VramNoteCreated(VmaAllocator allocator, VmaAllocation allocation, VramKind kind);
+void VramNoteDestroyed(VmaAllocator allocator, VmaAllocation allocation);
+
 // Records a checkpoint in the ring and returns its slot (for annotations). vkCmdSetCheckpointNV
 // takes DiagnosticCheckpointMarker of it, its sequence: a device-loss report then knows when the
 // slot has been reused for a later checkpoint.

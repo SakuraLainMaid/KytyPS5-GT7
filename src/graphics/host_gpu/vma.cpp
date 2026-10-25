@@ -25,6 +25,9 @@
 #include <atomic>
 #include <cinttypes>
 #include <cstdlib>
+#include <string>
+
+#include <fmt/format.h>
 
 namespace Libs::Graphics {
 
@@ -196,6 +199,50 @@ uint64_t GraphicContext::MemoryShortfall() const {
 	return shortfall.load(std::memory_order_relaxed);
 }
 
+namespace {
+
+struct VramCounters {
+	// Bytes by kind, [0] in device-local memory, [1] elsewhere (spilled to system memory).
+	std::array<std::array<std::atomic<int64_t>, 2>, static_cast<size_t>(VramKind::Count)> bytes {};
+	std::array<std::array<std::atomic<int64_t>, 2>, static_cast<size_t>(VramKind::Count)> count {};
+};
+
+VramCounters& Vram() {
+	static VramCounters counters;
+	return counters;
+}
+
+constexpr std::array<const char*, static_cast<size_t>(VramKind::Count)> VramKindNames = {
+    "cache buffers", "other buffers", "upload", "download", "stream ring",
+    "render targets", "depth targets", "storage images", "textures"};
+
+void VramAdd(VmaAllocator allocator, VmaAllocation allocation, VramKind kind, int64_t sign) {
+	VmaAllocationInfo info {};
+	vmaGetAllocationInfo(allocator, allocation, &info);
+	VkMemoryPropertyFlags properties = 0;
+	vmaGetAllocationMemoryProperties(allocator, allocation, &properties);
+	const size_t where = (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 ? 0 : 1;
+	auto&        vram  = Vram();
+	vram.bytes[static_cast<size_t>(kind)][where].fetch_add(sign * static_cast<int64_t>(info.size),
+	                                                       std::memory_order_relaxed);
+	vram.count[static_cast<size_t>(kind)][where].fetch_add(sign, std::memory_order_relaxed);
+}
+
+VramKind ImageKind(const vk::ImageCreateInfo& info) {
+	if (info.usage & vk::ImageUsageFlagBits::eDepthStencilAttachment) {
+		return VramKind::DepthTarget;
+	}
+	if (info.usage & vk::ImageUsageFlagBits::eColorAttachment) {
+		return VramKind::RenderTarget;
+	}
+	if (info.usage & vk::ImageUsageFlagBits::eStorage) {
+		return VramKind::StorageImage;
+	}
+	return VramKind::Texture;
+}
+
+} // namespace
+
 void GraphicContext::LogMemoryBudget() const {
 	LogCommit("now");
 	if (allocator == nullptr || physical_device == nullptr) {
@@ -212,6 +259,21 @@ void GraphicContext::LogMemoryBudget() const {
 		     static_cast<uint64_t>(budgets[i].statistics.allocationBytes),
 		     static_cast<uint64_t>(budgets[i].statistics.blockBytes));
 	}
+	// Video memory by what it holds; "elsewhere" is what spilled to system memory. Outside VMA
+	// (the driver's own, swapchain images, query pools) is the device heap's usage minus its
+	// blocks.
+	std::string line;
+	auto&       vram = Vram();
+	for (size_t kind = 0; kind < VramKindNames.size(); kind++) {
+		const auto device = vram.bytes[kind][0].load(std::memory_order_relaxed);
+		const auto other  = vram.bytes[kind][1].load(std::memory_order_relaxed);
+		line += fmt::format("{}{} {} MB ({})", line.empty() ? "" : ", ", VramKindNames[kind],
+		                    device >> 20, vram.count[kind][0].load(std::memory_order_relaxed));
+		if (other != 0) {
+			line += fmt::format(" + {} MB elsewhere", other >> 20);
+		}
+	}
+	LOGF("VRAM by kind: %s\n", line.c_str());
 }
 
 uint64_t GraphicContext::GetDeviceMemoryUsage() const {
@@ -287,6 +349,22 @@ uint64_t GraphicContext::GetRawMemoryBudget() const {
 	return budget;
 }
 
+void VramNoteCreated(VmaAllocator allocator, VmaAllocation allocation, VramKind kind) {
+	// The kind rides on the allocation (+1: a null user datum is no kind).
+	vmaSetAllocationUserData(allocator, allocation,
+	                         reinterpret_cast<void*>(static_cast<uintptr_t>(kind) + 1));
+	VramAdd(allocator, allocation, kind, 1);
+}
+
+void VramNoteDestroyed(VmaAllocator allocator, VmaAllocation allocation) {
+	VmaAllocationInfo info {};
+	vmaGetAllocationInfo(allocator, allocation, &info);
+	const auto tag = reinterpret_cast<uintptr_t>(info.pUserData);
+	if (tag != 0 && tag <= static_cast<uintptr_t>(VramKind::Count)) {
+		VramAdd(allocator, allocation, static_cast<VramKind>(tag - 1), -1);
+	}
+}
+
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
@@ -319,6 +397,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		LogMemoryBudget();
 		return false;
 	}
+	VramNoteCreated(allocator, image.allocation, ImageKind(image_info));
 
 	image.format     = image_info.format;
 	image.image_type = image_info.imageType;
@@ -338,6 +417,7 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
+	VramNoteDestroyed(allocator, image.allocation);
 	vmaDestroyImage(allocator, image.image, image.allocation);
 	image.image      = nullptr;
 	image.allocation = nullptr;

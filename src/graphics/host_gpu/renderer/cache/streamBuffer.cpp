@@ -316,6 +316,12 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		}
 	}
 
+	VramNoteCreated(graphics.allocator, m_allocation,
+	                cpu_address != 0                  ? VramKind::CacheBuffer
+	                : usage == MemoryUsage::Upload    ? VramKind::UploadBuffer
+	                : usage == MemoryUsage::Download  ? VramKind::DownloadBuffer
+	                : usage == MemoryUsage::Stream    ? VramKind::StreamBuffer
+	                                                  : VramKind::OtherBuffer);
 	VkMemoryPropertyFlags properties = 0;
 	vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &properties);
 	m_coherent   = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
@@ -333,6 +339,7 @@ Buffer::~Buffer() {
 			    m_device_address, m_scheduler != nullptr ? m_scheduler->CurrentTick() : 0,
 			    m_scheduler != nullptr ? m_scheduler->GetMasterSemaphore().KnownGpuTick() : 0);
 		}
+		VramNoteDestroyed(m_graphics->allocator, m_allocation);
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }
