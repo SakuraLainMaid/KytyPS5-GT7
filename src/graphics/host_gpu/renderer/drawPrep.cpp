@@ -44,7 +44,20 @@ thread_local bool t_has_current = false;
 // GPU thread progress per queue, packed: submission (40 bits), ordinal (24 bits).
 std::array<std::atomic<uint64_t>, MaxQueues> g_progress {};
 
-std::array<std::atomic<uint64_t>, static_cast<size_t>(Counter::Count)> g_counters {};
+// Each counter on a cache line of its own (round 155): the GPU thread's (takes, uses, misses) and
+// the scanner threads' (scanned, prepared, skips) shared lines, and each count pulled the line
+// from the other's core.
+struct alignas(64) PaddedCounter {
+	std::atomic<uint64_t> value {0};
+};
+std::array<PaddedCounter, static_cast<size_t>(Counter::Count)> g_counters {};
+
+// GPU thread (round 155): the packet the current draw's first take found, for its other stages'
+// takes (a pixel stage after the vertex stage, a tessellated draw's four) without the store's
+// lock. Only this thread pops a result, and only for a later key, so the packet stays while the
+// key does.
+thread_local PacketResult* t_found = nullptr;
+thread_local Key           t_found_key {};
 
 struct GoodPairs {
 	std::shared_mutex            mutex;
@@ -263,6 +276,19 @@ StageResult* Take(uint32_t stage) {
 		Add(Counter::MissNoKey);
 		return nullptr;
 	}
+	if (t_found != nullptr && t_found_key == *key) {
+		for (uint32_t i = 0; i < t_found->stage_count; i++) {
+			auto& result = t_found->stages[i];
+			if (result.ok && result.stage == stage) {
+				// The scanner wrote the packet before publishing it, and changes it no more.
+				return &result;
+			}
+		}
+		Add(Counter::MissNone);
+		Add(Counter::MissStage);
+		return nullptr;
+	}
+	t_found                 = nullptr;
 	auto&           store   = GetStore();
 	std::lock_guard lock(store.mutex);
 	auto&           pending = store.pending[key->queue % MaxQueues];
@@ -293,6 +319,8 @@ StageResult* Take(uint32_t stage) {
 		Add(Counter::MissPacket);
 		return nullptr;
 	}
+	t_found     = &front;
+	t_found_key = *key;
 	for (uint32_t i = 0; i < front.stage_count; i++) {
 		auto& result = front.stages[i];
 		if (result.ok && result.stage == stage) {
@@ -307,7 +335,7 @@ StageResult* Take(uint32_t stage) {
 }
 
 void Add(Counter counter, uint64_t value) {
-	g_counters[static_cast<size_t>(counter)].fetch_add(value, std::memory_order_relaxed);
+	g_counters[static_cast<size_t>(counter)].value.fetch_add(value, std::memory_order_relaxed);
 }
 
 void LogCountersIfDue() {
@@ -324,7 +352,7 @@ void LogCountersIfDue() {
 	last = now;
 	std::array<uint64_t, static_cast<size_t>(Counter::Count)> delta {};
 	for (size_t i = 0; i < delta.size(); i++) {
-		const auto value = g_counters[i].load(std::memory_order_relaxed);
+		const auto value = g_counters[i].value.load(std::memory_order_relaxed);
 		delta[i]         = value - previous[i];
 		previous[i]      = value;
 	}

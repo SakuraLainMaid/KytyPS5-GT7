@@ -84,6 +84,8 @@
 //                (KYTY_PATTERN_FILLS=0 for the whole run)
 //   faultblock:off a CPU write fault releases its own page from write tracking, as before round
 //                66, even in a block that faults again (KYTY_FAULT_BLOCK_KB=0 for the whole run)
+//   faultblock:<kb> the block such a fault releases is <kb> KB (8 to 1024, a power of two)
+//                instead of KYTY_FAULT_BLOCK_KB's (default 64; round 155)
 // and (round 67):
 //   popwait      the deferred operations a draw or a dispatch runs wait for the priority
 //                callbacks of their ticks, as before round 67, instead of being left for a later
@@ -332,6 +334,8 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] bool HtileDepthOnly();
 [[nodiscard]] bool PatternFillsOff();
 [[nodiscard]] bool FaultBlocksOff();
+// Any thread: faultblock:<kb>'s block size in KB, or -1 (round 155).
+[[nodiscard]] int32_t FaultBlockKB();
 // Any thread: popwait; texmemo:off.
 [[nodiscard]] bool PopWait();
 [[nodiscard]] bool TextureMemoOff();

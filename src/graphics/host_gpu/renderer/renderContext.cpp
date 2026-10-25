@@ -65,7 +65,14 @@ uint64_t FaultBlockBytes() {
 		                   .c_str());
 		return kb * 1024u;
 	}();
-	return Bisect::FaultBlocksOff() ? 0 : bytes;
+	if (Bisect::FaultBlocksOff()) {
+		return 0;
+	}
+	// Round 155, KYTY_BISECT's faultblock:<kb>: another block size, for an A/B within one run.
+	if (const auto kb = Bisect::FaultBlockKB(); kb > 0) {
+		return static_cast<uint64_t>(kb) * 1024u;
+	}
+	return bytes;
 }
 
 // Round 90: whether a WAIT_REG_MEM that passed lets the walk for memory-reading shaders run again
