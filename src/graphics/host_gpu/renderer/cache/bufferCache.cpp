@@ -142,7 +142,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		for (uint64_t i = 0; i < size_pages; ++i) {
 			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
 		}
-		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
+		BindBdaPageTable(table_offset, addresses.size() * sizeof(vk::DeviceAddress));
+		WriteDataBuffer(*m_bda_pagetable_buffer, table_offset,
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
@@ -151,9 +152,50 @@ void BufferCache::ChangeRegister(BufferId id) {
 		EXIT_IF(buffer.Size() > m_total_used_memory);
 		m_total_used_memory -= buffer.Size();
 		m_lru_cache.Free(buffer.lru_id);
-		m_bda_pagetable_buffer.Fill(table_offset,
-		                            size_pages * sizeof(vk::DeviceAddress), 0);
+		// Unbound blocks of a sparse table read as zeros already and drop the writes.
+		m_bda_pagetable_buffer->Fill(table_offset, size_pages * sizeof(vk::DeviceAddress), 0);
 		buffer.is_deleted = true;
+	}
+}
+
+void BufferCache::BindBdaPageTable(uint64_t offset, uint64_t size) {
+	auto& table = *m_bda_pagetable_buffer;
+	if (!table.IsSparse() || size == 0) {
+		return;
+	}
+	const auto block_size = table.SparseBlockSize();
+	std::vector<ReadbackQueue::SparseBlock> blocks;
+	for (auto block = offset / block_size; block * block_size < offset + size; block++) {
+		if (table.SparseBlockBound(block)) {
+			continue;
+		}
+		const vk::MemoryRequirements requirements {block_size, block_size, table.SparseMemoryTypes()};
+		VmaAllocationCreateInfo      create {};
+		create.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		VmaAllocation memory = nullptr;
+		auto          result = vmaAllocateMemory(
+            m_graphics.allocator, reinterpret_cast<const VkMemoryRequirements*>(&requirements),
+            &create, &memory, nullptr);
+		if (result != VK_SUCCESS) {
+			// Video memory is full: system memory serves, slower.
+			create.requiredFlags = 0;
+			result               = vmaAllocateMemory(
+                m_graphics.allocator, reinterpret_cast<const VkMemoryRequirements*>(&requirements),
+                &create, &memory, nullptr);
+		}
+		RequireVulkanSuccess(static_cast<vk::Result>(result), "allocate a BDA page table block");
+		VramNoteCreated(m_graphics.allocator, memory, VramKind::OtherBuffer);
+		table.SetSparseBlock(block, memory);
+		blocks.push_back({block * block_size, block_size, memory});
+	}
+	if (blocks.empty()) {
+		return;
+	}
+	m_readback_queue->BindZeroed(table.Handle(), blocks);
+	m_bda_blocks_bound += blocks.size();
+	if (std::has_single_bit(m_bda_blocks_bound)) {
+		LOGF("BDA page table: %" PRIu64 " blocks bound (%" PRIu64 " KB of %" PRIu64 " MB)\n",
+		     m_bda_blocks_bound, (m_bda_blocks_bound * block_size) >> 10u, table.Size() >> 20u);
 	}
 }
 
@@ -404,17 +446,36 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
-      m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                             BDA_PAGETABLE_SIZE),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB, StreamRingInHostMemory()),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
+	// The BDA page table covers the whole guest address space (768 MB); sparse, only its blocks
+	// over game memory get any (KYTY_SPARSE_BDA=0: all of it, as before). The readback queue
+	// binds them, so it is made first.
+	m_readback_queue =
+	    std::make_unique<ReadbackQueue>(m_graphics, m_scheduler, m_scheduler.GetMasterSemaphore());
+	static const bool sparse_wanted = [] {
+		const char* value = std::getenv("KYTY_SPARSE_BDA");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (sparse_wanted && m_readback_queue->CanBindSparse()) {
+		m_bda_pagetable_buffer = std::make_unique<Buffer>(graphics, scheduler, Buffer::Sparse {},
+		                                                  AllFlags, BDA_PAGETABLE_SIZE);
+	} else {
+		m_bda_pagetable_buffer = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::DeviceLocal,
+		                                                  0, AllFlags, BDA_PAGETABLE_SIZE);
+	}
+	LOGF("BDA page table: %s (%" PRIu64 " MB in all%s)\n",
+	     m_bda_pagetable_buffer->IsSparse() ? "sparse" : "flat", BDA_PAGETABLE_SIZE >> 20u,
+	     m_bda_pagetable_buffer->IsSparse()
+	         ? fmt::format(", {} KB blocks", m_bda_pagetable_buffer->SparseBlockSize() >> 10u).c_str()
+	         : "");
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
-	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
+	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer->Handle(),
 	                     "BDA Page Table Buffer");
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
@@ -433,9 +494,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	                               : "");
 	// Readahead's downloads go at the end of the command buffer that wrote their bytes.
 	m_scheduler.SetBeforeFlush(&BufferCache::IssueReadaheadHook, this);
-	// Game threads' reads of bytes the GPU has finished writing go on a queue of their own.
-	m_readback_queue =
-	    std::make_unique<ReadbackQueue>(m_graphics, m_scheduler, m_scheduler.GetMasterSemaphore());
+	// Game threads' reads of bytes the GPU has finished writing go on a queue of their own (made
+	// above, with the BDA page table).
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
@@ -3911,7 +3971,7 @@ uint64_t BufferCache::CompareWithGuest(uint64_t vaddr, uint64_t size, const std:
 			entry.expected = buffer.BufferDeviceAddress() + (page - buffer.CpuAddress());
 		}
 	}
-	copy(*table, m_bda_pagetable_buffer, PageIndex(first) * sizeof(vk::DeviceAddress), 0,
+	copy(*table, *m_bda_pagetable_buffer, PageIndex(first) * sizeof(vk::DeviceAddress), 0,
 	     pages * sizeof(vk::DeviceAddress));
 	for (const auto* target: {download.get(), table.get()}) {
 		vk::BufferMemoryBarrier barrier {};

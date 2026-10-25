@@ -126,7 +126,7 @@ public:
 	[[nodiscard]] StreamBuffer& GetStreamRing() noexcept { return m_stream_buffer; }
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer*       GetGdsBuffer() noexcept { return &m_gds_buffer; }
-	[[nodiscard]] Buffer*       GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
+	[[nodiscard]] Buffer*       GetBdaPageTableBuffer() noexcept { return m_bda_pagetable_buffer.get(); }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	// The guest bytes of a range the GPU did not write, staged for an image upload whatever
@@ -474,7 +474,10 @@ private:
 	CommandScheduler&                                  m_scheduler;
 	FaultManager                                       m_fault_manager;
 	Buffer                                             m_gds_buffer;
-	Buffer                                             m_bda_pagetable_buffer;
+	std::unique_ptr<Buffer>                            m_bda_pagetable_buffer;
+	// Gives memory to the BDA page table's blocks over [offset, offset + size) of it (sparse).
+	void                                               BindBdaPageTable(uint64_t offset, uint64_t size);
+	uint64_t                                           m_bda_blocks_bound = 0;
 	Common::SlotVector<Buffer>                         m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                          m_buffers;

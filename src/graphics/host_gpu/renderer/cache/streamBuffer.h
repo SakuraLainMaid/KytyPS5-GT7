@@ -43,6 +43,11 @@ public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
 	       bool host_cached = false);
+	// A sparse residency buffer (GraphicContext::sparse_buffers_enabled): no memory until its
+	// blocks get some (SetSparseBlock); reads of the others give zeros, writes to them are lost.
+	struct Sparse {};
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, Sparse sparse,
+	       vk::BufferUsageFlags flags, uint64_t size);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -75,6 +80,16 @@ public:
 	                                                   vk::AccessFlagBits::eMemoryWrite);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
+	[[nodiscard]] bool     IsSparse() const noexcept { return m_sparse_block != 0; }
+	// The size of a sparse block (the binding granularity), and the memory types it may take.
+	[[nodiscard]] uint64_t SparseBlockSize() const noexcept { return m_sparse_block; }
+	[[nodiscard]] uint32_t SparseMemoryTypes() const noexcept { return m_sparse_types; }
+	[[nodiscard]] bool     SparseBlockBound(uint64_t block) const noexcept {
+		return block < m_sparse_pages.size() && m_sparse_pages[block] != nullptr;
+	}
+	// The memory bound to a block (the buffer frees it).
+	void SetSparseBlock(uint64_t block, VmaAllocation memory) { m_sparse_pages[block] = memory; }
+
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted   = false;
 	// The last scheduler tick a draw or dispatch bound the buffer in (the buffer cache's).
@@ -106,6 +121,9 @@ private:
 	bool                          m_coherent = false;
 	uint32_t                      m_properties = 0;
 	std::span<uint8_t>            m_mapped;
+	uint64_t                      m_sparse_block = 0;
+	uint32_t                      m_sparse_types = 0;
+	std::vector<VmaAllocation>    m_sparse_pages;
 };
 
 class StreamBuffer final: public Buffer {

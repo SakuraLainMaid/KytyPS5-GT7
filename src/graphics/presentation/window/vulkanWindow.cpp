@@ -718,6 +718,16 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		device_features.pipelineStatisticsQuery = VK_TRUE;
 		graphics.pipeline_statistics_enabled    = true;
 	}
+	// Optional: sparse buffers, for the BDA page table (BufferCache): its 768 MB cover the whole
+	// guest address space, and only the parts over game memory are given memory.
+	if (supported_features2.features.sparseBinding == VK_TRUE &&
+	    supported_features2.features.sparseResidencyBuffer == VK_TRUE &&
+	    physical_device.getProperties().sparseProperties.residencyNonResidentStrict == VK_TRUE) {
+		device_features.sparseBinding         = VK_TRUE;
+		device_features.sparseResidencyBuffer = VK_TRUE;
+		graphics.sparse_buffers_enabled       = true;
+	}
+	LOGF("Vulkan sparse buffers: %s\n", graphics.sparse_buffers_enabled ? "true" : "false");
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64 =
 	    supported_features2.features.shaderFloat64 &&
@@ -1452,6 +1462,14 @@ void WindowContext::CreateVulkan() {
 		                            &graphic_ctx.readback_queue);
 		if (graphic_ctx.readback_queue != nullptr) {
 			graphic_ctx.readback_family = g_readback_family;
+			uint32_t count = 0;
+			graphic_ctx.physical_device.getQueueFamilyProperties(&count, nullptr);
+			std::vector<vk::QueueFamilyProperties> families(count);
+			graphic_ctx.physical_device.getQueueFamilyProperties(&count, families.data());
+			graphic_ctx.readback_sparse =
+			    g_readback_family < count &&
+			    static_cast<bool>(families[g_readback_family].queueFlags &
+			                      vk::QueueFlagBits::eSparseBinding);
 		}
 	}
 	{

@@ -332,7 +332,47 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, Sparse /*sparse*/,
+               vk::BufferUsageFlags flags, uint64_t size)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal),
+      m_size(size) {
+	EXIT_IF(!graphics.sparse_buffers_enabled || size == 0);
+	vk::BufferCreateInfo buffer_info {};
+	buffer_info.flags = vk::BufferCreateFlagBits::eSparseBinding |
+	                    vk::BufferCreateFlagBits::eSparseResidency;
+	buffer_info.size        = size;
+	buffer_info.usage       = flags;
+	buffer_info.sharingMode = vk::SharingMode::eExclusive;
+	// As the other buffers: shared with the readback queue's family, which binds its memory.
+	const std::array<uint32_t, 2> families = {graphics.queue_family, graphics.readback_family};
+	if (graphics.readback_family != static_cast<uint32_t>(-1) &&
+	    graphics.readback_family != graphics.queue_family) {
+		buffer_info.sharingMode           = vk::SharingMode::eConcurrent;
+		buffer_info.queueFamilyIndexCount = static_cast<uint32_t>(families.size());
+		buffer_info.pQueueFamilyIndices   = families.data();
+	}
+	RequireVulkanSuccess(graphics.device.createBuffer(&buffer_info, nullptr, &m_buffer),
+	                     "create a sparse buffer");
+	vk::MemoryRequirements requirements {};
+	graphics.device.getBufferMemoryRequirements(m_buffer, &requirements);
+	m_sparse_block = requirements.alignment;
+	m_sparse_types = requirements.memoryTypeBits;
+	m_sparse_pages.assign((size + m_sparse_block - 1) / m_sparse_block, nullptr);
+	m_properties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+}
+
 Buffer::~Buffer() {
+	if (m_sparse_block != 0) {
+		// Its blocks' memory goes after the buffer.
+		m_graphics->device.destroyBuffer(m_buffer);
+		for (auto* page: m_sparse_pages) {
+			if (page != nullptr) {
+				VramNoteDestroyed(m_graphics->allocator, page);
+				vmaFreeMemory(m_graphics->allocator, page);
+			}
+		}
+		return;
+	}
 	if (m_buffer != nullptr) {
 		if (m_device_address != 0 && BufferAddressLog::Recording()) {
 			BufferAddressLog::NoteDestroyed(

@@ -208,6 +208,10 @@ struct GraphicContext {
 	// thread submits to it.
 	vk::Queue readback_queue  = nullptr;
 	uint32_t  readback_family = static_cast<uint32_t>(-1);
+	// Sparse residency buffers (sparseBinding, sparseResidencyBuffer, non-resident reads strictly
+	// zero), and whether the readback queue can bind their memory.
+	bool      sparse_buffers_enabled = false;
+	bool      readback_sparse        = false;
 	// Frames presented so far: the clock the caches age their entries by.
 	std::atomic<uint64_t>              presented_frames {0};
 

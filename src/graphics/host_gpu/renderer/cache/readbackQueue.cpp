@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <cinttypes>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -146,6 +147,74 @@ const uint8_t* ReadbackQueue::Copy(vk::Buffer source, std::span<const vk::Buffer
 	m_staging->Invalidate(0, total_size);
 	waited_ns = NowNs() - begun;
 	return m_staging->Mapped().data();
+}
+
+bool ReadbackQueue::CanBindSparse() const noexcept {
+	return m_queue != nullptr && m_graphics.readback_sparse && m_graphics.sparse_buffers_enabled;
+}
+
+void ReadbackQueue::BindZeroed(vk::Buffer buffer, std::span<const SparseBlock> blocks) {
+	EXIT_IF(!CanBindSparse());
+	if (blocks.empty()) {
+		return;
+	}
+	// The blocks' memory, cleared through buffers that alias it.
+	std::vector<vk::Buffer> aliases;
+	aliases.reserve(blocks.size());
+	for (const auto& block: blocks) {
+		vk::BufferCreateInfo info {};
+		info.size        = block.size;
+		info.usage       = vk::BufferUsageFlagBits::eTransferDst;
+		info.sharingMode = vk::SharingMode::eExclusive;
+		VkBuffer alias   = VK_NULL_HANDLE;
+		RequireVulkanSuccess(static_cast<vk::Result>(vmaCreateAliasingBuffer(
+		                         m_graphics.allocator, block.memory,
+		                         static_cast<const VkBufferCreateInfo*>(info), &alias)),
+		                     "create a buffer over a sparse block");
+		aliases.emplace_back(alias);
+	}
+	RequireVulkanSuccess(m_command.reset({}), "reset the readback command buffer");
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	RequireVulkanSuccess(m_command.begin(&begin), "begin the readback command buffer");
+	for (size_t i = 0; i < blocks.size(); i++) {
+		m_command.fillBuffer(aliases[i], 0, blocks[i].size, 0);
+	}
+	RequireVulkanSuccess(m_command.end(), "end the readback command buffer");
+	vk::SubmitInfo submit {};
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers    = &m_command;
+	RequireVulkanSuccess(m_graphics.device.resetFences(1, &m_fence), "reset the readback fence");
+	RequireVulkanSuccess(m_queue.submit(1, &submit, m_fence), "submit a sparse block clear");
+	RequireVulkanSuccess(m_graphics.device.waitForFences(1, &m_fence, VK_TRUE, WaitTimeoutNs),
+	                     "wait for a sparse block clear");
+	for (auto alias: aliases) {
+		m_graphics.device.destroyBuffer(alias);
+	}
+
+	std::vector<vk::SparseMemoryBind> binds;
+	binds.reserve(blocks.size());
+	for (const auto& block: blocks) {
+		VmaAllocationInfo info {};
+		vmaGetAllocationInfo(m_graphics.allocator, block.memory, &info);
+		vk::SparseMemoryBind bind {};
+		bind.resourceOffset = block.offset;
+		bind.size           = block.size;
+		bind.memory         = info.deviceMemory;
+		bind.memoryOffset   = info.offset;
+		binds.push_back(bind);
+	}
+	vk::SparseBufferMemoryBindInfo buffer_bind {};
+	buffer_bind.buffer    = buffer;
+	buffer_bind.bindCount = static_cast<uint32_t>(binds.size());
+	buffer_bind.pBinds    = binds.data();
+	vk::BindSparseInfo bind_info {};
+	bind_info.bufferBindCount = 1;
+	bind_info.pBufferBinds    = &buffer_bind;
+	RequireVulkanSuccess(m_graphics.device.resetFences(1, &m_fence), "reset the readback fence");
+	RequireVulkanSuccess(m_queue.bindSparse(1, &bind_info, m_fence), "bind sparse blocks");
+	RequireVulkanSuccess(m_graphics.device.waitForFences(1, &m_fence, VK_TRUE, WaitTimeoutNs),
+	                     "wait for a sparse bind");
 }
 
 } // namespace Libs::Graphics

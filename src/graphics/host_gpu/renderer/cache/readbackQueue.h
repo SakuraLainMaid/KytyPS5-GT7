@@ -8,6 +8,8 @@
 #include <memory>
 #include <span>
 
+VK_DEFINE_HANDLE(VmaAllocation)
+
 namespace Libs::Graphics {
 
 class Buffer;
@@ -40,6 +42,18 @@ public:
 	[[nodiscard]] const uint8_t* Copy(vk::Buffer source, std::span<const vk::BufferCopy> copies,
 	                                  uint64_t total_size, uint64_t after_tick,
 	                                  uint64_t& waited_ns);
+
+	// Whether BindZeroed works (the queue's family binds sparse memory).
+	[[nodiscard]] bool CanBindSparse() const noexcept;
+	struct SparseBlock {
+		uint64_t      offset = 0;  // in the sparse buffer
+		uint64_t      size   = 0;
+		VmaAllocation memory = nullptr;
+	};
+	// Zeroes each block's memory, then binds it to `buffer` at its offset, and waits for both:
+	// work the renderer submitted before may still read these blocks, and reads them as zeros
+	// either way (unbound, or bound and cleared).
+	void BindZeroed(vk::Buffer buffer, std::span<const SparseBlock> blocks);
 
 private:
 	GraphicContext&         m_graphics;
