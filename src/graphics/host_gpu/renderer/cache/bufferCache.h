@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/cache/writeTicks.h"
 
+#include <array>
 #include <atomic>
 #include <functional>
 #include <map>
@@ -479,6 +480,9 @@ private:
 	BufferMap                                          m_buffers;
 	PageTable                                          m_page_table;
 	// With a page bitmap (round 80): HasGpuDirtyBytes answers most "no"s without the tree.
+	// The latest tick publishing a download of bytes in [begin, begin + size), or 0 if none is
+	// recorded. Takes m_dirty_ranges_mutex.
+	[[nodiscard]] uint64_t DownloadTickOf(uint64_t begin, uint64_t size);
 	PagedRangeSet m_gpu_modified_ranges;
 	// Bytes whose download is recorded but not yet in guest memory.
 	RangeSet                                           m_downloading_ranges;
@@ -487,6 +491,11 @@ private:
 	// window cleared the range while the second was in flight; a game thread then took the
 	// page as current, wrote it, and the second publication put older GPU bytes over that).
 	std::vector<std::pair<uint64_t, uint64_t>>         m_downloading_list;
+	// The tick whose priority operations publish each asynchronous download's copy: start, size,
+	// tick. A read that waits for a download of its pages waits for the tick of theirs, not for
+	// the latest download's (m_last_async_download_tick), which was often a dozen command
+	// buffers later (40 ms a read in a GT7 race, 2026-10-25). Guarded by m_dirty_ranges_mutex.
+	std::vector<std::array<uint64_t, 3>>               m_download_ticks;
 	// Write bitmap (WriteBitmapAddress): the buffer, the whole pages whose GPU writes all came
 	// through tracked bindings, and per 4 MiB region the last tick a tracked binding wrote it.
 	// Guarded by m_dirty_ranges_mutex, as m_gpu_modified_ranges.

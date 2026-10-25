@@ -310,6 +310,14 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
+	if constexpr (async) {
+		// Published by this tick's priority operations (DeferPriorityOperation below).
+		const auto       tick = m_scheduler.CurrentTick();
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		for (const auto& copy: copies) {
+			m_download_ticks.push_back({buffer_address + copy.srcOffset, copy.size, tick});
+		}
+	}
 	auto publish = [this, mapped, offset, total_size, buffer_address, copies = std::move(copies),
 	                owner = std::move(temporary)] {
 		const Libs::LibKernel::Memory::WriteSourceScope source(
@@ -356,6 +364,13 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 				m_downloading_list.pop_back();
 			}
 			m_downloading_ranges.Subtract(buffer_address + copy.srcOffset, copy.size);
+			const auto ticked = std::ranges::find_if(m_download_ticks, [&](const auto& entry) {
+				return entry[0] == buffer_address + copy.srcOffset && entry[1] == copy.size;
+			});
+			if (ticked != m_download_ticks.end()) {
+				*ticked = m_download_ticks.back();
+				m_download_ticks.pop_back();
+			}
 		}
 		// Ranges another download still has in flight stay marked.
 		for (const auto& [start, bytes]: m_downloading_list) {
@@ -1051,6 +1066,17 @@ void NoteReadSite(const ReadSiteNote& note) {
 
 } // namespace
 
+uint64_t BufferCache::DownloadTickOf(uint64_t begin, uint64_t size) {
+	std::shared_lock lock(m_dirty_ranges_mutex);
+	uint64_t         tick = 0;
+	for (const auto& [start, bytes, published]: m_download_ticks) {
+		if (start < begin + size && begin < start + bytes) {
+			tick = std::max(tick, published);
+		}
+	}
+	return tick;
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	KYTY_PROFILER_FUNCTION();
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
@@ -1619,23 +1645,34 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 			std::shared_lock lock(m_dirty_ranges_mutex);
 			downloading = m_downloading_ranges.Intersects(page_begin, page_end - page_begin);
 		}
-		if (downloading && m_last_async_download_tick != 0) {
+		// The tick of these pages' own download (KYTY_DOWNLOAD_TICK=0: the latest download's).
+		static const bool own_tick = [] {
+			const char* value = std::getenv("KYTY_DOWNLOAD_TICK");
+			return value == nullptr || value[0] != '0';
+		}();
+		uint64_t download_tick = m_last_async_download_tick;
+		if (downloading && own_tick) {
+			if (const auto tick = DownloadTickOf(page_begin, page_end - page_begin); tick != 0) {
+				download_tick = tick;
+			}
+		}
+		if (downloading && download_tick != 0) {
 			// Downloads are submitted as they are recorded (readahead's in its before-flush hook,
 			// a game thread's below), so this tick should be submitted already. Were it not, it
 			// would be submitted here: on the GPU thread without the hook, which must not run in
 			// the middle of a command (it downloads ranges the command has yet to write).
-			if (m_last_async_download_tick >= m_scheduler.CurrentTick()) {
+			if (download_tick >= m_scheduler.CurrentTick()) {
 				if (from_gpu_thread) {
-					m_scheduler.Wait(m_last_async_download_tick);
+					m_scheduler.Wait(download_tick);
 				} else {
 					m_scheduler.Flush();
 				}
 			}
 			if (async) {
 				m_step_outcome = ReadOutcome::LiftWaited;
-				return m_last_async_download_tick;
+				return download_tick;
 			}
-			m_scheduler.WaitPriorityOperations(m_last_async_download_tick);
+			m_scheduler.WaitPriorityOperations(download_tick);
 		}
 		if (async && ReadbackWindow() != 0) {
 			// The whole download window, as the synchronous path lifts it: page by page, each
