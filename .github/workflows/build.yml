@@ -93,6 +93,34 @@ jobs:
           glslangValidator --version
           echo Qt6_DIR=%Qt6_DIR%
 
+      # Round 150: the newest profile in pgo/ (from a recorded run; pgo/README.md), when this
+      # clang-cl reads it. Without one, or one this compiler can't read, the build is not
+      # profile-guided: a warning, not a failure.
+      - name: Profile for the optimized build
+        id: pgo
+        shell: pwsh
+        run: |
+          clang-cl --version
+          $profile = Get-ChildItem -Path pgo -Filter *.profdata -ErrorAction SilentlyContinue |
+            Sort-Object Name | Select-Object -Last 1
+          $arg = ""
+          if ($profile) {
+            $path = $profile.FullName.Replace('\', '/')
+            $probe = Join-Path $env:RUNNER_TEMP "pgo_probe.cpp"
+            "int main() { return 0; }" | Out-File -FilePath $probe -Encoding ascii
+            clang-cl /nologo /c "-fprofile-instr-use=$path" -Wno-profile-instr-unprofiled $probe "/Fo$env:RUNNER_TEMP\pgo_probe.obj"
+            if ($LASTEXITCODE -eq 0) {
+              $arg = "-DKYTY_PGO_USE=$path"
+              Write-Host "PGO: $($profile.Name)"
+            } else {
+              Write-Host "::warning::clang-cl can't read $($profile.Name): building without PGO"
+            }
+          } else {
+            Write-Host "PGO: no profile in pgo/"
+          }
+          "args=$arg" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          exit 0
+
       - name: Configure
         shell: cmd
         run: |
@@ -100,6 +128,8 @@ jobs:
             -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
+            -DKYTY_CPU_ARCH=x86-64-v3 ^
+            ${{ steps.pgo.outputs.args }} ^
             -DKYTY_BUILD_ORIGIN=%KYTY_BUILD_ORIGIN% ^
             -DKYTY_BUILD_REPOSITORY=%KYTY_BUILD_REPOSITORY% ^
             -DKYTY_RELEASE_TAG=${{ needs.metadata.outputs.release_tag }} ^
