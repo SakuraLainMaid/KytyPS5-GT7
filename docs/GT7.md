@@ -14,6 +14,11 @@ Tested with:
 These are the settings the game was tested with, in the launcher's **Edit game config** dialog for
 the game. The user profile, audio and notification settings don't matter.
 
+Since the October 25 build the launcher starts with these settings, except the screen ones
+(resolution, present mode, vblank frequency, fullscreen), which depend on your screen. A
+configuration saved with an earlier launcher is switched to them once (see What's new); what you
+change after that is kept.
+
 | Section | Setting | Value |
 | --- | --- | --- |
 | Graphics & display | Screen resolution | 3840x2160 |
@@ -59,6 +64,71 @@ update everything is compiled once more.
 
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
+
+## What's new (October 26, 2026)
+
+No shaders are compiled again after this update.
+
+- **A crash in races fixed.** The game rewrites its texture list while it streams textures in. The
+  emulator could read an entry the game was halfway through rewriting, which then pointed past the
+  end of the game's memory, and it stopped. Such an entry now gets a placeholder texture for a
+  moment and is read again later, as other half-written entries already were. This was rare and
+  depended on timing, so it could happen on earlier builds too.
+- **Graphics cards without fragment shader barycentrics get past start-up**
+  ([issue 20](https://github.com/usa-ratt/KytyPS5-GT7/issues/20)): Intel Arc, GeForce GTX 10xx and
+  Radeon RX 5000 cards, and older drivers. From upstream KytyPS5 (Matthew Hurley and nmzik). The
+  emulator shows a warning at start-up on those cards. Whether the game runs on them is not known
+  yet: a shader that needs the feature can still fail there.
+- **Less waiting on the emulator's GPU thread.** When the game reads something the graphics card
+  wrote, the copy is now waited for by the thread doing the read instead of the GPU thread, and
+  each read waits only for its own copy (`KYTY_FAST_READBACK=gpu` brings back the old way, for
+  comparison). Smaller cuts: a draw's shader stages take their prepared work without a lock, the
+  GPU thread does the page protection work itself instead of waiting for the helper thread to wake
+  up, and texture lookups go through a small quick-lookup table first. In test races the GPU
+  thread spent less time on reads, but the frame rate stayed about the same: the GPU thread
+  handles every draw and compute job the game sends (about 3,700 a frame), and that is the limit
+  now.
+
+## What's new (October 25, 2026)
+
+No shaders are compiled again after this update.
+
+- **AMD graphics cards: no more crash at the GT logo**
+  ([issue 21](https://github.com/usa-ratt/KytyPS5-GT7/issues/21)). The AMD driver crashed on one
+  part of the emulator's mesh shaders (they draw the game's text and a few other things): their
+  Layer output, which says which layer of a multi-layer picture to draw into. The game's menus and
+  races draw into one-layer pictures, so on AMD cards it is now left out (`KYTY_MESH_LAYER=keep`
+  keeps it). Found with the test settings of the third October 24 build; thanks to Shuyuyus for
+  running them. Other AMD problems may still come up further in: please report them.
+- **The recommended settings are now the defaults**
+  ([issue 25](https://github.com/usa-ratt/KytyPS5-GT7/issues/25)). New launcher configurations
+  start with the tested settings above. A configuration saved with an earlier launcher is
+  switched to them once: tessellation, bindless textures, red zone protection and the `_kyty.txt`
+  log file on, readback and the debugging options (validation, RenderDoc, command buffer dump,
+  Tracy) off, shader optimization Performance. Resolution, present mode, vblank frequency and the
+  other personal settings stay, and what you change after that is kept.
+- **Red zone protection is on by default in the emulator too** (`--no-redzone` turns it off).
+  Without it, a race could crash as it started (issue 25): the game keeps a few values just below
+  its stack, and Windows writes over them each time the emulator catches a memory access.
+- **A fix from upstream KytyPS5** (Nawid3333): the code that answers the game's thread-local
+  storage reads could change the processor's compare flags, so in rare cases the game took the
+  wrong branch right after one of those reads.
+- **A faster Windows build:** it is now compiled for AVX2 processors (every PC that runs the game
+  has AVX2) and optimized from a recorded race (profile-guided optimization). In a test race the
+  emulator's GPU thread took roughly a fifth less time a draw, but the frame rate rose only 1 to 2
+  fps: the game's own main thread holds it back now too.
+
+## What's new (October 24, 2026, third build)
+
+No shaders are compiled again after this update. Nothing changes unless the test setting below is
+set.
+
+- **AMD graphics cards:** a new test setting for the crash at the GT logo
+  ([issue 21](https://github.com/usa-ratt/KytyPS5-GT7/issues/21)). The AMD driver crashes while
+  it compiles the emulator's mesh shaders (they draw the game's text and a few other things).
+  `KYTY_MESH_TEST` (`empty`, `noguest`, `nolayer`, `nocull` or `fixedcount`) takes one part out of
+  every mesh shader before the driver sees it, to find the part the driver fails on. The steps are
+  in issue 21. With the setting on, the text is missing or looks wrong.
 
 ## What's new (October 24, 2026, second build)
 
@@ -450,10 +520,10 @@ Graphics and shaders:
   some tunnel exits and under some overpasses, and fades back once past them. It depends on the
   camera angle, so watching the same replay twice can give green once and not the other time.
 - Tokyo at night: some shadows on tunnel ceilings and walls move with the camera.
-- **AMD graphics cards:** the game crashes at the GT logo, inside the AMD driver's shader compiler
-  ([issue 12](https://github.com/usa-ratt/KytyPS5-GT7/issues/12),
-  [issue 21](https://github.com/usa-ratt/KytyPS5-GT7/issues/21)). Being looked into; this build
-  has a test setting for it (see What's new).
+- **AMD RX 9070 XT:** races crash while they load, inside the AMD driver's shader compiler, on one
+  compute shader ([issue 12](https://github.com/usa-ratt/KytyPS5-GT7/issues/12)). Workaround:
+  start the emulator with `KYTY_SKIP_SHADER_HASHES=daced64c72398e80` (the steps are in issue 12).
+  That shader does some of the game's calculations, so something in races may be a little off.
 - **Scapes:** the controls stop working after Olivier offers the drift photography tutorial
   ([issue 19](https://github.com/usa-ratt/KytyPS5-GT7/issues/19)). The tutorial waits for the
   game's online servers, which the emulator has no stand-in for, so the Menu Book "Take a Photo of
@@ -467,9 +537,10 @@ Graphics and shaders:
   names the graphics buffer involved.
 - In-game videos can play out of sync with their sound
   ([issue 4](https://github.com/usa-ratt/KytyPS5-GT7/issues/4)). Being looked into.
-- **Intel Arc graphics cards:** the emulator stops at start-up: the driver lacks fragment shader
-  barycentrics, which the emulator needs
-  ([issue 20](https://github.com/usa-ratt/KytyPS5-GT7/issues/20)). Being looked into.
+- **Intel Arc, GeForce GTX 10xx and Radeon RX 5000 cards:** since the October 26 build the
+  emulator gets past start-up on cards without fragment shader barycentrics
+  ([issue 20](https://github.com/usa-ratt/KytyPS5-GT7/issues/20)), but whether the game runs on
+  them is not known yet. Please report how far it gets.
 - **NVIDIA:** the driver's shader compiler can crash while it compiles new pipelines
   ([issue 18](https://github.com/usa-ratt/KytyPS5-GT7/issues/18)). Being looked into; the crash
   report names the pipeline.

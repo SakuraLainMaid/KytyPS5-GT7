@@ -65,12 +65,14 @@ public:
 	// Whether some are still to be done.
 	[[nodiscard]] bool DeferredPending() const noexcept;
 	// Returns once the first `issued` deferred protections and jobs are done (any thread but the
-	// worker).
-	void WaitDeferred(uint64_t issued);
+	// worker). With `help` (round 156), a batch the worker has not started is done by the caller:
+	// only where it holds none of the locks the batch takes (the page regions', the guest address
+	// space's, the memory tracker's).
+	void WaitDeferred(uint64_t issued, bool help = false);
 	// WaitDeferred(DeferredIssued()) when some are pending.
-	void FinishDeferred() {
+	void FinishDeferred(bool help = false) {
 		if (DeferredPending()) {
-			WaitDeferred(DeferredIssued());
+			WaitDeferred(DeferredIssued(), help);
 		}
 	}
 

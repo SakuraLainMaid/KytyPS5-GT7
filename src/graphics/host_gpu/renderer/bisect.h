@@ -62,6 +62,15 @@
 //   fastread:any the fast readback copies bytes even while a command that stores through shader
 //                addresses is unfinished (it may miss what that command stores there: a test of
 //                what waiting for those commands costs)
+//   fastread:gpu the GPU thread waits for a fast readback's copy and puts its bytes in guest
+//                memory, as before round 152, instead of the reading thread
+//                (KYTY_FAST_READBACK=gpu for the whole run)
+//   cuts156:off  as before round 156: the GPU thread waits for the page protection worker
+//                rather than doing a batch it has not started, and every texture description is
+//                looked up in its map (no direct-mapped front)
+//   liftwait:old a game thread's read of pages a download is still bringing in waits for the
+//                latest download of all, as before round 153, instead of the ones that cover its
+//                pages (KYTY_LIFT_WAIT=old for the whole run)
 // and (round 65):
 //   recheck      a render target's fast clear is checked on the GPU again at the first draw of
 //                every command buffer, as before round 65, even when nothing wrote its metadata
@@ -78,6 +87,8 @@
 //                (KYTY_PATTERN_FILLS=0 for the whole run)
 //   faultblock:off a CPU write fault releases its own page from write tracking, as before round
 //                66, even in a block that faults again (KYTY_FAULT_BLOCK_KB=0 for the whole run)
+//   faultblock:<kb> the block such a fault releases is <kb> KB (8 to 1024, a power of two)
+//                instead of KYTY_FAULT_BLOCK_KB's (default 64; round 155)
 // and (round 67):
 //   popwait      the deferred operations a draw or a dispatch runs wait for the priority
 //                callbacks of their ticks, as before round 67, instead of being left for a later
@@ -314,16 +325,21 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] float    TessMaxLevel();
 [[nodiscard]] uint32_t FlushInterval();
 [[nodiscard]] bool     Readahead();
-// Any thread: cmask:off; fastread:off; fastread:any.
+// Any thread: cmask:off; fastread:off; fastread:any; fastread:gpu.
 [[nodiscard]] bool MsaaCmaskOff();
 [[nodiscard]] bool FastReadbackOff();
 [[nodiscard]] bool FastReadbackAnyAddress();
+[[nodiscard]] bool FastReadbackOnGpuThread();
+[[nodiscard]] bool LiftWaitOld();
+[[nodiscard]] bool Cuts156Off();
 // Any thread: recheck; locks:spin; htile:depth; patternfill:off; faultblock:off.
 [[nodiscard]] bool GpuClearRecheck();
 [[nodiscard]] bool LocksSpin();
 [[nodiscard]] bool HtileDepthOnly();
 [[nodiscard]] bool PatternFillsOff();
 [[nodiscard]] bool FaultBlocksOff();
+// Any thread: faultblock:<kb>'s block size in KB, or -1 (round 155).
+[[nodiscard]] int32_t FaultBlockKB();
 // Any thread: popwait; texmemo:off.
 [[nodiscard]] bool PopWait();
 [[nodiscard]] bool TextureMemoOff();

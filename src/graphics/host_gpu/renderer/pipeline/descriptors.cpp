@@ -816,6 +816,47 @@ std::unordered_map<TextureDescKey, TextureDescEntry, TextureDescKeyHash>& Textur
 	return cache;
 }
 
+// Round 156: a direct-mapped front for the finds in TextureDescCache, two a texture binding (its
+// resolve and its memo's record): the map's bucket walk was ~1.4 % of the GPU thread in a race.
+// An entry's address stays while the map holds it (a node map); the front is dropped with the
+// map's clear (its generation).
+struct TextureDescFrontSlot {
+	TextureDescKey    key;
+	TextureDescEntry* entry      = nullptr;
+	uint64_t          generation = 0;
+};
+struct TextureDescFront {
+	static constexpr size_t                 Slots = 1024;
+	std::array<TextureDescFrontSlot, Slots> slots {};
+	uint64_t                                generation = 1;
+};
+
+TextureDescFront& GetTextureDescFront() {
+	thread_local const auto front = std::make_unique<TextureDescFront>();
+	return *front;
+}
+
+// The cache's entry for `key`, or nullptr.
+TextureDescEntry* FindTextureDesc(const TextureDescKey& key) {
+	auto& cache = TextureDescCache();
+	if (Bisect::Cuts156Off()) {
+		const auto it = cache.find(key);
+		return it != cache.end() ? &it->second : nullptr;
+	}
+	auto&      front = GetTextureDescFront();
+	const auto hash  = TextureDescKeyHash {}(key);
+	auto&      slot  = front.slots[hash & (TextureDescFront::Slots - 1u)];
+	if (slot.entry != nullptr && slot.generation == front.generation && slot.key == key) {
+		return slot.entry;
+	}
+	const auto it = cache.find(key);
+	if (it == cache.end()) {
+		return nullptr;
+	}
+	slot = {key, &it->second, front.generation};
+	return &it->second;
+}
+
 // KYTY_TEXTURE_MEMO=0, or KYTY_BISECT's texmemo:off: every binding is looked up again.
 bool TextureMemoEnabled() {
 	static const bool enabled = [] {
@@ -991,8 +1032,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		g_texture_memo_counts.lookups++;
 	}
 	if (use_cache) {
-		if (const auto it = cache.find(key); it != cache.end()) {
-			auto& entry = it->second;
+		if (auto* found = FindTextureDesc(key); found != nullptr) {
+			auto& entry = *found;
 			if (use_memo && MemoCurrent(entry.memo, entry.desc, texture_cache)) {
 				// The image FindImage would find: RebindImages checks it is unchanged before it
 				// uses the view again, and looks it up again otherwise.
@@ -1275,6 +1316,15 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else {
 		PopulateTextureMipLayout(desc.info);
 	}
+	// Round 156: memory past the guest's address space, for the texels or the metadata (a heap
+	// entry read mid-rewrite: FindImage's range check ended a race on one at 0x3ec08000200).
+	if (!desc.info.data.Valid() || !desc.info.metadata.range.ValidOrEmpty()) {
+		if (RejectBindlessTexture("memory past the guest's address space", address)) {
+			return {};
+		}
+		static std::atomic<uint32_t> reports {0};
+		return null_texture(reports, "in memory past the guest's address space");
+	}
 	// Round 94: a base layer past the image's layers (an EXIT in TextureViewInfo; "texture base
 	// layer is out of bounds" ended a race with bindless textures on, a heap entry again).
 	if (resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim3D &&
@@ -1293,6 +1343,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	if (use_cache) {
 		if (cache.size() >= 65536) {
 			cache.clear();
+			GetTextureDescFront().generation++;
 		}
 		cache.emplace(key, TextureDescEntry {desc, pixel_format, view_format, size.size,
 		                                     shader_conversion});
@@ -1310,9 +1361,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 void RenderExecutor::ForgetTextureMemo(const ShaderRecompiler::IR::ImageResource&   resource,
                                        const ShaderRecompiler::IR::DescriptorValue& value) {
-	auto& cache = TextureDescCache();
-	if (const auto it = cache.find(MakeTextureDescKey(resource, value)); it != cache.end()) {
-		it->second.memo = {};
+	if (auto* entry = FindTextureDesc(MakeTextureDescKey(resource, value)); entry != nullptr) {
+		entry->memo = {};
 	}
 }
 
@@ -1323,21 +1373,20 @@ void RenderExecutor::RecordTextureMemo(const ShaderRecompiler::IR::ImageResource
 	    binding.desc.type != TextureCache::BindingType::Texture || binding.desc.info.HasMetadata()) {
 		return;
 	}
-	auto&      cache = TextureDescCache();
-	const auto it    = cache.find(MakeTextureDescKey(resource, value));
-	if (it == cache.end()) {
+	auto* entry = FindTextureDesc(MakeTextureDescKey(resource, value));
+	if (entry == nullptr) {
 		return;
 	}
 	if (!m_context.GetTextureCache().MayReuseTextureBinding(binding.image_id)) {
-		it->second.memo = {};
+		entry->memo = {};
 		return;
 	}
-	it->second.memo = {binding.image_id,
-	                   binding.image_view,
-	                   binding.memo_generation,
-	                   binding.desc.view_info.base_level,
-	                   binding.desc.view_info.base_layer,
-	                   binding.memo_stamp};
+	entry->memo = {binding.image_id,
+	               binding.image_view,
+	               binding.memo_generation,
+	               binding.desc.view_info.base_level,
+	               binding.desc.view_info.base_layer,
+	               binding.memo_stamp};
 	g_texture_memo_counts.recorded++;
 }
 
