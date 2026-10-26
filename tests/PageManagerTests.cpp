@@ -642,6 +642,43 @@ void TestDeferredProtection() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+// Round 156: a waiter that helps does the deferred protections and jobs itself, in their order,
+// and many deferred batches with waiters and the worker taking turns all end done.
+void TestDeferredHelp() {
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size * 4, PAGE_READWRITE, 0x0000000200610000ull);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  {
+    PageManager::DeferScope defer(manager, true);
+    manager.UpdatePageWatchers<true>(address, page_size);
+  }
+  bool read_only_in_job = false;
+  manager.PostDeferred(
+      [&] { read_only_in_job = Protection(memory) == PAGE_READONLY; });
+  manager.FinishDeferred(true);
+  Check(!manager.DeferredPending(), "deferred work still pending after a helping wait");
+  Check(read_only_in_job, "a helped job ran before the protection deferred before it");
+  Check(Protection(memory) == PAGE_READONLY, "a helping wait did not make the protection");
+  manager.UpdatePageWatchers<false>(address, page_size);
+  uint32_t jobs_run = 0;
+  for (uint32_t round = 0; round < 2000; round++) {
+    const auto page = address + page_size * (round % 4);
+    {
+      PageManager::DeferScope defer(manager, true);
+      manager.UpdatePageWatchers<true>(page, page_size);
+    }
+    manager.PostDeferred([&jobs_run] { jobs_run++; });
+    manager.WaitDeferred(manager.DeferredIssued(), (round % 3) != 0);
+    Check(Protection(reinterpret_cast<uint8_t *>(page)) == PAGE_READONLY,
+          "a deferred protection was not made by the time its wait returned");
+    manager.UpdatePageWatchers<false>(page, page_size);
+  }
+  Check(jobs_run == 2000, "a deferred job was lost or run twice");
+  Check(!manager.DeferredPending(), "deferred work left pending");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void CheckDeathCase(const char *name) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   char path[MAX_PATH]{};
@@ -727,6 +764,7 @@ int main(int argc, char **argv) {
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
   TestDeferredProtection();
+  TestDeferredHelp();
   TestFatalPaths();
   std::puts("PageManagerTests: all cases passed");
   return 0;

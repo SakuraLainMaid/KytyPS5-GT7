@@ -50,6 +50,7 @@ struct Step {
 	bool              fastread_gpu    = false; // round 152
 	bool              liftwait_old    = false; // round 153
 	int32_t           faultblock_kb   = -1;    // faultblock:<kb> (round 155); -1: the usual
+	bool              cuts156_off     = false; // round 156
 	bool              recheck      = false;
 	bool              locks_spin   = false;
 	bool              htile_depth  = false;
@@ -233,6 +234,10 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "liftwait:old") {
 		step.liftwait_old = true;
+		return true;
+	}
+	if (action == "cuts156:off") {
+		step.cuts156_off = true;
 		return true;
 	}
 	if (action == "recheck") {
@@ -979,6 +984,11 @@ bool FastReadbackOnGpuThread() {
 bool LiftWaitOld() {
 	const auto* step = Current();
 	return step != nullptr && step->liftwait_old;
+}
+
+bool Cuts156Off() {
+	const auto* step = Current();
+	return step != nullptr && step->cuts156_off;
 }
 
 bool GpuClearRecheck() {

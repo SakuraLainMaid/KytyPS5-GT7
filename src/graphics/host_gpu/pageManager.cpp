@@ -347,13 +347,43 @@ struct PageManager::Impl {
 		}
 	}
 
-	void WaitDeferred(uint64_t count) {
+	// Returns once the first `count` deferred protections and jobs are done. With `help` (round
+	// 156), a batch nobody is working on is done by the caller rather than waited for: the worker
+	// slept through most of them (busy 10 % of a race) and the GPU thread waited for it to wake
+	// up, 2-4 % of its time. One batch at a time (`processing`), so they still end in order.
+	void WaitDeferred(uint64_t count, bool help) {
 		if (completed.load(std::memory_order_acquire) >= count) {
 			return;
 		}
 		const auto       begin = NowNs();
 		std::unique_lock lock(defer_mutex);
-		defer_done.wait(lock, [&] { return completed.load(std::memory_order_acquire) >= count; });
+		while (completed.load(std::memory_order_acquire) < count) {
+			if (help && !processing && (!deferred.empty() || !jobs.empty())) {
+				std::vector<DeferredRange>                batch;
+				std::vector<Common::UniqueFunction<void>> batch_jobs;
+				batch.swap(deferred);
+				batch_jobs.swap(jobs);
+				const auto batch_end = issued.load(std::memory_order_relaxed);
+				processing           = true;
+				lock.unlock();
+				const auto helped_begin = NowNs();
+				ProcessBatch(batch, batch_jobs);
+				stat_helped.fetch_add(1, std::memory_order_relaxed);
+				stat_helped_ns.fetch_add(NowNs() - helped_begin, std::memory_order_relaxed);
+				lock.lock();
+				completed.store(batch_end, std::memory_order_release);
+				processing      = false;
+				const bool more = !deferred.empty() || !jobs.empty() || stop_worker;
+				lock.unlock();
+				defer_done.notify_all();
+				if (more) {
+					defer_available.notify_one();
+				}
+				lock.lock();
+				continue;
+			}
+			defer_done.wait(lock);
+		}
 		stat_waits.fetch_add(1, std::memory_order_relaxed);
 		stat_wait_ns.fetch_add(NowNs() - begin, std::memory_order_relaxed);
 	}
@@ -400,88 +430,108 @@ struct PageManager::Impl {
 		return calls;
 	}
 
+	struct DeferredRange {
+		uint64_t vaddr = 0;
+		uint64_t size  = 0;
+	};
+
+	// One batch: its protections, merged where adjacent, then its jobs (whoever took it: the
+	// worker, or a waiter that helps). Counts for the "Deferred protection" line.
+	void ProcessBatch(std::vector<DeferredRange>&                batch,
+	                  std::vector<Common::UniqueFunction<void>>& batch_jobs) {
+		const auto begin = NowNs();
+		stat_ranges.fetch_add(batch.size(), std::memory_order_relaxed);
+		std::sort(batch.begin(), batch.end(),
+		          [](const DeferredRange& a, const DeferredRange& b) { return a.vaddr < b.vaddr; });
+		// Overlapping and adjacent ranges as one.
+		size_t out = 0;
+		for (size_t i = 1; i < batch.size(); i++) {
+			auto& last = batch[out];
+			if (batch[i].vaddr <= last.vaddr + last.size) {
+				last.size =
+				    std::max(last.vaddr + last.size, batch[i].vaddr + batch[i].size) - last.vaddr;
+			} else {
+				batch[++out] = batch[i];
+			}
+		}
+		batch.resize(batch.empty() ? 0 : out + 1);
+		stat_merged.fetch_add(batch.size(), std::memory_order_relaxed);
+		uint64_t calls = 0;
+		for (const auto& range: batch) {
+			calls += ApplyCurrent(range.vaddr, range.size);
+		}
+		stat_calls.fetch_add(calls, std::memory_order_relaxed);
+		batch.clear();
+		// The jobs after every protection of the batch, the ones queued before each among them,
+		// in the order they were posted.
+		for (const auto& job: batch_jobs) {
+			job();
+		}
+		stat_jobs.fetch_add(batch_jobs.size(), std::memory_order_relaxed);
+		batch_jobs.clear();
+		stat_batches.fetch_add(1, std::memory_order_relaxed);
+		stat_busy_ns.fetch_add(NowNs() - begin, std::memory_order_relaxed);
+	}
+
 	void WorkerLoop() {
 		Common::PerfStats::NameThread("GpuProtect");
 		std::vector<DeferredRange>                batch;
 		std::vector<Common::UniqueFunction<void>> batch_jobs;
 		auto                                      report_time = std::chrono::steady_clock::now();
-		uint64_t                                  jobs_run    = 0;
-		uint64_t                                  ranges      = 0;
-		uint64_t                                  merged      = 0;
-		uint64_t                                  batches     = 0;
-		uint64_t                                  calls       = 0;
-		uint64_t                                  busy_ns     = 0;
 		for (;;) {
 			uint64_t batch_end = 0;
 			{
 				std::unique_lock lock(defer_mutex);
-				defer_available.wait(
-				    lock, [&] { return stop_worker || !deferred.empty() || !jobs.empty(); });
+				// Not while a waiter does a batch (it wakes the worker when it is done and more
+				// is queued, or the worker is stopping).
+				defer_available.wait(lock, [&] {
+					return !processing && (stop_worker || !deferred.empty() || !jobs.empty());
+				});
 				if (deferred.empty() && jobs.empty()) {
 					return;
 				}
 				batch.swap(deferred);
 				batch_jobs.swap(jobs);
-				batch_end = issued.load(std::memory_order_relaxed);
+				batch_end  = issued.load(std::memory_order_relaxed);
+				processing = true;
 			}
-			const auto begin = NowNs();
-			ranges += batch.size();
-			std::sort(
-			    batch.begin(), batch.end(),
-			    [](const DeferredRange& a, const DeferredRange& b) { return a.vaddr < b.vaddr; });
-			// Overlapping and adjacent ranges as one.
-			size_t out = 0;
-			for (size_t i = 1; i < batch.size(); i++) {
-				auto& last = batch[out];
-				if (batch[i].vaddr <= last.vaddr + last.size) {
-					last.size = std::max(last.vaddr + last.size, batch[i].vaddr + batch[i].size) -
-					            last.vaddr;
-				} else {
-					batch[++out] = batch[i];
-				}
-			}
-			batch.resize(batch.empty() ? 0 : out + 1);
-			merged += batch.size();
-			for (const auto& range: batch) {
-				calls += ApplyCurrent(range.vaddr, range.size);
-			}
-			batch.clear();
-			// The jobs after every protection of the batch, the ones queued before each among
-			// them, in the order they were posted.
-			for (const auto& job: batch_jobs) {
-				job();
-			}
-			jobs_run += batch_jobs.size();
-			batch_jobs.clear();
-			busy_ns += NowNs() - begin;
-			batches++;
+			ProcessBatch(batch, batch_jobs);
 			{
 				std::lock_guard lock(defer_mutex);
 				completed.store(batch_end, std::memory_order_release);
+				processing = false;
 			}
 			defer_done.notify_all();
 			const auto now = std::chrono::steady_clock::now();
 			if (now - report_time >= std::chrono::seconds(10)) {
 				const auto seconds = std::chrono::duration<double>(now - report_time).count();
+				const auto take    = [](std::atomic<uint64_t>& value) {
+                    return value.exchange(0, std::memory_order_relaxed);
+				};
+				const auto ranges    = take(stat_ranges);
+				const auto batches   = take(stat_batches);
+				const auto merged    = take(stat_merged);
+				const auto calls     = take(stat_calls);
+				const auto jobs_run  = take(stat_jobs);
+				const auto busy_ns   = take(stat_busy_ns);
+				const auto waits     = take(stat_waits);
+				const auto wait_ns   = take(stat_wait_ns);
+				const auto kept      = take(stat_kept);
+				const auto helped    = take(stat_helped);
+				const auto helped_ns = take(stat_helped_ns);
 				LOGF("Deferred protection (%.0f s): %" PRIu64 " ranges in %" PRIu64
 				     " batches, %" PRIu64 " after merging, %" PRIu64 " host calls, %" PRIu64
 				     " jobs (upload reads), %.1f ms busy; %" PRIu64
-				     " waits for it, %.1f ms; %" PRIu64 " no-access protections made at once\n",
+				     " waits for it, %.1f ms; %" PRIu64
+				     " no-access protections made at once; %" PRIu64
+				     " batches done by a waiter instead, %.1f ms (round 156)\n",
 				     seconds, ranges, batches, merged, calls, jobs_run,
-				     static_cast<double>(busy_ns) / 1e6,
-				     stat_waits.exchange(0, std::memory_order_relaxed),
-				     static_cast<double>(stat_wait_ns.exchange(0, std::memory_order_relaxed)) / 1e6,
-				     stat_kept.exchange(0, std::memory_order_relaxed));
+				     static_cast<double>(busy_ns) / 1e6, waits, static_cast<double>(wait_ns) / 1e6,
+				     kept, helped, static_cast<double>(helped_ns) / 1e6);
 				report_time = now;
-				ranges = merged = batches = calls = busy_ns = jobs_run = 0;
 			}
 		}
 	}
-
-	struct DeferredRange {
-		uint64_t vaddr = 0;
-		uint64_t size  = 0;
-	};
 
 	std::unique_ptr<std::atomic<Region*>[]> regions;
 	std::vector<std::unique_ptr<Region>>    region_storage;
@@ -497,9 +547,19 @@ struct PageManager::Impl {
 	bool                                      stop_worker = false;
 	std::once_flag                            worker_started;
 	std::thread                               worker;
+	bool                                      processing = false; // a batch is being done
 	std::atomic<uint64_t>                     stat_waits {0};
 	std::atomic<uint64_t>                     stat_wait_ns {0};
 	std::atomic<uint64_t>                     stat_kept {0};
+	// The worker's counts, kept here since a waiter may do a batch too (round 156).
+	std::atomic<uint64_t> stat_ranges {0};
+	std::atomic<uint64_t> stat_batches {0};
+	std::atomic<uint64_t> stat_merged {0};
+	std::atomic<uint64_t> stat_calls {0};
+	std::atomic<uint64_t> stat_jobs {0};
+	std::atomic<uint64_t> stat_busy_ns {0};
+	std::atomic<uint64_t> stat_helped {0};
+	std::atomic<uint64_t> stat_helped_ns {0};
 };
 
 static_assert(std::atomic<void*>::is_always_lock_free);
@@ -565,8 +625,8 @@ bool PageManager::DeferredPending() const noexcept {
 	       m_impl->issued.load(std::memory_order_acquire);
 }
 
-void PageManager::WaitDeferred(uint64_t issued) {
-	m_impl->WaitDeferred(issued);
+void PageManager::WaitDeferred(uint64_t issued, bool help) {
+	m_impl->WaitDeferred(issued, help);
 }
 
 void PageManager::ResyncHostProtection(uint64_t vaddr, uint64_t size) {
