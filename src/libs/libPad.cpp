@@ -1,5 +1,6 @@
 #include "common/abi.h"
 #include "common/logging/log.h"
+#include "common/threads.h"
 #include "kernel/pthread.h"
 #include "libs/controller.h"
 #include "libs/errno.h"
@@ -15,7 +16,10 @@
 #include <cmath>
 #include <cstring>
 #include <fmt/format.h>
+#include <map>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace Libs {
 
@@ -59,6 +63,168 @@ std::array<std::atomic<uint32_t>, 256> g_output_counts {};
 std::array<std::atomic<uint32_t>, 256> g_get_counts {};
 std::array<std::atomic<uint32_t>, 256> g_set_counts {};
 
+// What the game sends, by kind (a command's first two bytes). Each kind is logged in full for its
+// first reports wherever in the session it first comes, and every 10 s a line counts the kinds,
+// with the range of the constant force and the rumble calls on the wheel's handle, so a moment of
+// the game (a crash, a kerb) can be matched with what it sent.
+constexpr uint64_t SummaryPeriodUs = 10'000'000;
+constexpr uint32_t LoggedPerKind   = 8;
+constexpr size_t   SummaryKinds    = 16;
+
+struct CommandStats {
+	Common::Mutex                mutex;
+	std::map<uint16_t, uint32_t> session;
+	std::map<uint16_t, uint32_t> window;
+	uint64_t                     window_start_us   = 0;
+	uint32_t                     constants         = 0;
+	float                        constant_min      = 0.0f;
+	float                        constant_max      = 0.0f;
+	float                        constant_last     = 0.0f;
+	float                        constant_step     = 0.0f;
+	bool                         constant_any      = false;
+	uint32_t                     vibrations        = 0;
+	uint32_t                     vibrations_on     = 0;
+	uint32_t                     vibrations_logged = 0;
+	uint8_t                      vibration_large   = 0;
+	uint8_t                      vibration_small   = 0;
+};
+
+CommandStats g_stats;
+
+uint16_t CommandKind(const uint8_t* buf, uint32_t length) {
+	const uint8_t first  = length > 1 ? buf[1] : 0;
+	const uint8_t second = length > 2 ? buf[2] : 0;
+	// A slot's stop carries no effect type.
+	return static_cast<uint16_t>(first << 8u |
+	                             ((first & 0xF0) != 0xF0 && (first & 0x0F) == 0x03 ? 0 : second));
+}
+
+// Under g_stats.mutex. Empty when nothing came since the last line.
+std::string TakeSummaryLocked(uint64_t now_us) {
+	auto&          s       = g_stats;
+	const uint64_t elapsed = now_us > s.window_start_us ? now_us - s.window_start_us : 0;
+	std::string    line;
+	if (!s.window.empty() || s.vibrations != 0) {
+		std::vector<std::pair<uint16_t, uint32_t>> kinds(s.window.begin(), s.window.end());
+		std::sort(kinds.begin(), kinds.end(),
+		          [](const auto& a, const auto& b) { return a.second > b.second; });
+		line = fmt::format("Wheel: the game sent in {:.1f} s:", static_cast<double>(elapsed) / 1e6);
+		for (size_t i = 0; i < kinds.size() && i < SummaryKinds; i++) {
+			line += fmt::format(" {:02x} {:02x} x{}", kinds[i].first >> 8u, kinds[i].first & 0xFFu,
+			                    kinds[i].second);
+		}
+		if (kinds.size() > SummaryKinds) {
+			line += fmt::format(" (+{} more kinds)", kinds.size() - SummaryKinds);
+		}
+		if (s.constants != 0) {
+			line += fmt::format("; constant force {:+.2f} to {:+.2f}, largest step {:.2f}",
+			                    s.constant_min, s.constant_max, s.constant_step);
+		}
+		line += fmt::format("; rumble calls {}", s.vibrations);
+		if (s.vibrations_on != 0) {
+			line += fmt::format(" ({} on, largest motors {}/{})", s.vibrations_on,
+			                    s.vibration_large, s.vibration_small);
+		}
+		line += "\n";
+	}
+	s.window.clear();
+	s.window_start_us = now_us;
+	s.constants       = 0;
+	s.constant_step   = 0.0f;
+	s.vibrations      = 0;
+	s.vibrations_on   = 0;
+	s.vibration_large = 0;
+	s.vibration_small = 0;
+	return line;
+}
+
+// Returns whether this report is to be logged in full.
+bool NoteCommand(const uint8_t* buf, uint32_t length, const Wheel::Fanatec::Command& c) {
+	const uint64_t now  = LibKernel::KernelGetProcessTime();
+	const uint16_t kind = CommandKind(buf, length);
+	std::string    line;
+	bool           full = false;
+	{
+		Common::LockGuard lock(g_stats.mutex);
+		auto&             s = g_stats;
+		if (s.window_start_us == 0) {
+			s.window_start_us = now;
+		}
+		full = ++s.session[kind] <= LoggedPerKind;
+		s.window[kind]++;
+		if (c.kind == Wheel::Fanatec::Command::Kind::SetAndPlay &&
+		    c.effect.type == Wheel::EffectType::Constant) {
+			const float level = c.effect.level;
+			if (s.constants == 0) {
+				s.constant_min = s.constant_max = level;
+			}
+			if (s.constant_any) {
+				s.constant_step = std::max(s.constant_step, std::abs(level - s.constant_last));
+			}
+			s.constant_any  = true;
+			s.constant_min  = std::min(s.constant_min, level);
+			s.constant_max  = std::max(s.constant_max, level);
+			s.constant_last = level;
+			s.constants++;
+		}
+		if (now - s.window_start_us >= SummaryPeriodUs) {
+			line = TakeSummaryLocked(now);
+		}
+	}
+	if (!line.empty()) {
+		LOGF("%s", line.c_str());
+	}
+	return full;
+}
+
+void NoteVibration(const uint8_t* motors) {
+	const uint64_t now = LibKernel::KernelGetProcessTime();
+	std::string    line;
+	bool           full = false;
+	{
+		Common::LockGuard lock(g_stats.mutex);
+		auto&             s = g_stats;
+		if (s.window_start_us == 0) {
+			s.window_start_us = now;
+		}
+		s.vibrations++;
+		if (motors[0] != 0 || motors[1] != 0) {
+			s.vibrations_on++;
+			// The first calls in full, and every call that starts a motor's strongest yet.
+			full = s.vibrations_logged < LoggedPerKind || motors[0] > s.vibration_large ||
+			       motors[1] > s.vibration_small;
+		} else {
+			full = s.vibrations_logged < LoggedPerKind;
+		}
+		s.vibration_large = std::max(s.vibration_large, motors[0]);
+		s.vibration_small = std::max(s.vibration_small, motors[1]);
+		if (full) {
+			s.vibrations_logged++;
+		}
+		if (now - s.window_start_us >= SummaryPeriodUs) {
+			line = TakeSummaryLocked(now);
+		}
+	}
+	if (full) {
+		LOGF("Pad: wheel: SetVibration(large %u, small %u): no rumble on a wheel, left out\n",
+		     motors[0], motors[1]);
+	}
+	if (!line.empty()) {
+		LOGF("%s", line.c_str());
+	}
+}
+
+void FlushSummary() {
+	std::string line;
+	{
+		Common::LockGuard lock(g_stats.mutex);
+		line = TakeSummaryLocked(LibKernel::KernelGetProcessTime());
+	}
+	if (!line.empty()) {
+		LOGF("%s", line.c_str());
+	}
+}
+
 int OpenExt(int user_id, int type, int index, const uint16_t* param) {
 	if (param == nullptr) {
 		return PAD_ERROR_INVALID_ARG;
@@ -82,6 +248,7 @@ int OpenExt(int user_id, int type, int index, const uint16_t* param) {
 int Close() {
 	g_opened = false;
 	Wheel::StopAllEffects();
+	FlushSummary();
 	LOGF("Pad: wheel: closed\n");
 	return OK;
 }
@@ -137,7 +304,8 @@ int OutputReport(uint8_t type, const uint8_t* buf, uint32_t length) {
 		case Kind::Ignored:
 		case Kind::Unknown: break;
 	}
-	if (ShouldLog(g_output_counts, type)) {
+	const bool first_of_kind = NoteCommand(buf, length, c);
+	if (ShouldLog(g_output_counts, type) || first_of_kind) {
 		LOGF("Pad: wheel: OutputReport(0x%02x, %u) #%u%s: %s\n", type, length,
 		     g_output_counts[type].load(), c.kind == Kind::Unknown ? " (not decoded)" : "",
 		     Hex(buf, std::min<uint32_t>(length, 64)).c_str());
@@ -336,10 +504,17 @@ static int KYTY_SYSV_ABI PadClose(int handle) {
 }
 
 // A wheel has no rumble, light bar, adaptive triggers or motion sensors: on its handle these
-// succeed and do nothing.
+// succeed and do nothing. Rumble calls are counted, to see whether the game sends any.
 static int KYTY_SYSV_ABI PadSetVibrationWheelAware(int                                  handle,
                                                    const Controller::PadVibrationParam* param) {
-	return PadWheel::IsHandle(handle) ? OK : Controller::PadSetVibration(handle, param);
+	if (!PadWheel::IsHandle(handle)) {
+		return Controller::PadSetVibration(handle, param);
+	}
+	if (param != nullptr) {
+		// The large motor's byte, then the small one's.
+		PadWheel::NoteVibration(reinterpret_cast<const uint8_t*>(param));
+	}
+	return OK;
 }
 
 static int KYTY_SYSV_ABI

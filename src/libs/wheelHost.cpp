@@ -724,11 +724,16 @@ void WheelHost::ApplyFfb(uint64_t now) {
 		frame.settings.direction         = m_config.ffb_direction;
 		frame.settings.mirror_conditions = steering.reverse;
 		// The sense is measured on the device's own axis; forces computed here start from the
-		// position the binding reads, so its reverse counts too. While the sense is unknown the
-		// game's forces go through as they come, as RPCS3 sends them.
+		// position the binding reads, so its reverse counts too.
 		frame.settings.device_reverse =
 		    frame.sense_known && (m_config.force_sense == ForceSense::Reversed) != steering.reverse;
-		frame.settings.reverse = m_config.reverse_effects != frame.settings.device_reverse;
+		// A positive force from the game turns the wheel towards the low end of the steering it
+		// reads: a wheel whose sense measured reversed needed the game's forces as they come
+		// (mirrored, they pushed away from the centre). So they are mirrored only where a positive
+		// force turns the other way. While the sense is unknown they go through as they come, as
+		// RPCS3 sends them.
+		frame.settings.reverse =
+		    m_config.reverse_effects != (frame.sense_known && !frame.settings.device_reverse);
 		frame.present          = m_present;
 		if (const uint32_t game = m_game_rotation;
 		    game != 0 && m_config.soft_lock && frame.sense_known) {

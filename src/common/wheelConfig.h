@@ -116,7 +116,8 @@ struct WheelConfig {
 	// Which way a positive force moves the steering axis as the device reports it (before the
 	// binding's reverse), measured by the launcher's force test. Forces computed here (the end
 	// stop, rendered damper and friction) need it and are off while it is unknown; once known,
-	// the game's forces follow it combined with reverse_effects.
+	// the game's forces are mirrored where a positive force turns the wheel towards the high end
+	// of the steering axis, combined with reverse_effects.
 	ForceSense force_sense = ForceSense::Unknown;
 	// Damper and friction computed here and played as a constant force, for wheel drivers that
 	// mishandle those effects (on a MOZA R3, RyGT found a damper took away all force feedback).
