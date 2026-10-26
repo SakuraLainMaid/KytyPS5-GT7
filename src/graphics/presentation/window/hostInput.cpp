@@ -181,7 +181,14 @@ public:
 			                      binding.key == SDLK_F7 || binding.key == SDLK_F11;
 			if (binding.control == INVALID_CONTROL || reserved ||
 			    (binding.key == SDLK_UNKNOWN && binding.mouse_button == 0)) {
-				EXIT("Invalid input mapping: %s\n", value.c_str());
+				// Round 160: left out instead of ending the emulator. The launcher keeps the
+				// mapping in settings every KytyPS5 build on the PC shares, and another build's
+				// launcher writes entries of its own there (TouchParticleSkin=BlueNeon ended
+				// this one at start-up, issue 31).
+				LOGF("Input mapping: \"%s\" is not a mapping this build knows (or uses a reserved "
+				     "key); left out\n",
+				     value.c_str());
+				continue;
 			}
 			Add(binding);
 		}
