@@ -63,6 +63,7 @@ protected slots:
 	void delete_configuartion();
 	void edit_global_settings();
 	void edit_input_mapping();
+	void edit_wheel();
 	void list_itemDoubleClicked(QTreeWidgetItem* witem, int column);
 	void show_context_menu(const QPoint& pos);
 	void open_game_folder();

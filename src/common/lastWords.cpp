@@ -51,6 +51,7 @@ HANDLE                       g_done        = nullptr;
 DWORD                        g_reporter_id = 0;
 std::atomic<bool>            g_installed {false};
 std::atomic<bool>            g_busy {false};
+std::atomic<void (*)()>      g_final_action {nullptr};
 std::atomic<bool>            g_final_made {false};
 std::atomic<uint32_t>        g_first_chance_reports {0};
 LPTOP_LEVEL_EXCEPTION_FILTER g_previous_filter = nullptr;
@@ -347,6 +348,11 @@ void Speak(const char* what, bool final, uint32_t code, uint64_t address,
 	}
 	if (final) {
 		g_final_made.store(true, std::memory_order_release);
+		// Before the report: whatever must not outlive the process in the outside world (a force
+		// on a racing wheel).
+		if (auto* action = g_final_action.exchange(nullptr, std::memory_order_acq_rel)) {
+			action();
+		}
 	}
 	auto& report           = g_report;
 	report.what            = what;
@@ -412,6 +418,10 @@ void OnPureCall() {
 
 } // namespace
 
+void SetFinalAction(void (*action)()) {
+	g_final_action.store(action, std::memory_order_release);
+}
+
 void Install() {
 	if (g_installed.load(std::memory_order_acquire)) {
 		return;
@@ -463,6 +473,8 @@ void ReportFirstChance(uint32_t code, uint64_t address, const uint64_t* paramete
 #else
 
 namespace Common::LastWords {
+
+void SetFinalAction(void (* /*action*/)()) {}
 
 void Install() {}
 

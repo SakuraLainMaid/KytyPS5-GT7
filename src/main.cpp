@@ -7,6 +7,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "common/wheelConfig.h"
 #include "emulator.h"
 #include "kytyGitVersion.h"
 
@@ -125,6 +126,10 @@ static void PrintUsage() {
 	::printf(
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
+	::printf("  --wheel <true|false>                 Show the game a racing wheel fed by host\n"
+	         "                                       devices (see --wheel-config).\n");
+	::printf("  --wheel-config <json>                Wheel mapping file. Default: wheel.json in\n"
+	         "                                       the working directory.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
@@ -520,6 +525,15 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid printf direction: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--wheel") {
+			bool enabled = false;
+			if (!ParseBool(value, enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+			Config::Wheel::SetEnabled(enabled);
+		} else if (arg == "--wheel-config") {
+			Config::Wheel::SetConfigPath(Common::PathFromUtf8(value));
 		} else if (arg == "--printf-output-file") {
 			options.config.printf_output_file = Common::PathFromUtf8(value);
 		} else if (arg == "--skip-shaders") {
