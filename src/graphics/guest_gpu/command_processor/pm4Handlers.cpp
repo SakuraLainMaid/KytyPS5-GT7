@@ -301,8 +301,15 @@ KYTY_HW_CTX_PARSER(HwCtxSetCentroidPriority) {
 	return num_values;
 }
 
-static void HwCtxIgnoreAaMaskRegister([[maybe_unused]] uint32_t cmd_offset,
-                                      [[maybe_unused]] uint32_t value) {}
+// Round 158: the AA sample masks are kept (not applied) for the "Coverage:" lines;
+// PS_SHADER_SAMPLE_EXCLUSION_MASK, which shares the parser, stays ignored.
+static void HwCtxSetAaMaskRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
+	if (cmd_offset == Pm4::PA_SC_AA_MASK_X0Y0_X1Y0) {
+		cp.GetCtx().SetAaMask(0, value);
+	} else if (cmd_offset == Pm4::PA_SC_AA_MASK_X0Y1_X1Y1) {
+		cp.GetCtx().SetAaMask(1, value);
+	}
+}
 
 static void HwCtxIgnoreAlphaToMaskRegister([[maybe_unused]] uint32_t value) {}
 
@@ -464,6 +471,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetAlphaToMask) {
 	cp.GetCtx().SetAlphaToMaskEnable(
 	    AlphaToCoverageOn() &&
 	    KYTY_PM4_GET(buffer[0], DB_ALPHA_TO_MASK, ALPHA_TO_MASK_ENABLE) != 0);
+	cp.GetCtx().SetAlphaToMaskValue(buffer[0]);
 	for (uint32_t i = 1; i < num_values; i++) {
 		HwCtxIgnoreAlphaToMaskRegister(buffer[i]);
 	}
@@ -535,7 +543,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetAaMask) {
 	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
 
 	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset + i, buffer[i]);
+		HwCtxSetAaMaskRegister(cp, cmd_offset + i, buffer[i]);
 	}
 
 	return num_values;
@@ -3637,16 +3645,16 @@ void GraphicsInitJmpTablesCxIndirect() {
 	};
 
 	g_hw_ctx_indirect_func[Pm4::PA_SC_AA_MASK_X0Y0_X1Y0] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset, value);
+		HwCtxSetAaMaskRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SC_AA_MASK_X0Y1_X1Y1] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset, value);
+		HwCtxSetAaMaskRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SU_VTX_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnoreVtxControl(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PS_SHADER_SAMPLE_EXCLUSION_MASK] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset, value);
+		HwCtxSetAaMaskRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SC_BINNER_CNTL_0] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnorePaScExtendedControl(cmd_offset, value);
@@ -3660,6 +3668,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 		cp.GetCtx().SetAlphaToMaskEnable(
 		    AlphaToCoverageOn() &&
 		    KYTY_PM4_GET(value, DB_ALPHA_TO_MASK, ALPHA_TO_MASK_ENABLE) != 0);
+		cp.GetCtx().SetAlphaToMaskValue(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::CB_COLOR_CONTROL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetColorControl(DecodeColorControl(value));
