@@ -1316,6 +1316,15 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else {
 		PopulateTextureMipLayout(desc.info);
 	}
+	// Round 156: memory past the guest's address space, for the texels or the metadata (a heap
+	// entry read mid-rewrite: FindImage's range check ended a race on one at 0x3ec08000200).
+	if (!desc.info.data.Valid() || !desc.info.metadata.range.ValidOrEmpty()) {
+		if (RejectBindlessTexture("memory past the guest's address space", address)) {
+			return {};
+		}
+		static std::atomic<uint32_t> reports {0};
+		return null_texture(reports, "in memory past the guest's address space");
+	}
 	// Round 94: a base layer past the image's layers (an EXIT in TextureViewInfo; "texture base
 	// layer is out of bounds" ended a race with bindless textures on, a heap entry again).
 	if (resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim3D &&
