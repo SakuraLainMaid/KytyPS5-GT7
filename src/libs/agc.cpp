@@ -1633,8 +1633,24 @@ uint64_t KYTY_SYSV_ABI AgcDcbContextStateOpGetSize(uint32_t operation) {
 	return static_cast<uint64_t>(context_state_op_size_dw(operation)) * sizeof(uint32_t);
 }
 
+// With --ps5-pro the kernel reports a PS5 Pro (sceKernelIsTrinityMode, sceKernelGetOperationMode);
+// KYTY_AGC_TRINITY=1 has the graphics driver say so too. Off by default: told so, GT7 sets up
+// PSSR (libPsml's mfsr2 functions, which the emulator lacks), takes a garbage memory requirement
+// from their stubs and retries a 5 GB allocation for ever, even with the Pro's larger pool (its
+// log grew by 60 GB, 2026-10-27). The packets this library builds stay the base PS5's
+// (is_trinity_mode): the command processor reads those.
 void KYTY_SYSV_ABI AgcGetIsTrinityMode(uint8_t* result) {
-	*result = is_trinity_mode();
+	static const bool follow_kernel = [] {
+		const char* value = std::getenv("KYTY_AGC_TRINITY");
+		return value != nullptr && value[0] == '1';
+	}();
+	const bool trinity = is_trinity_mode() || (follow_kernel && Config::Ps5ProEnabled());
+	static std::atomic_uint32_t calls {0};
+	if (const auto call = calls.fetch_add(1, std::memory_order_relaxed); call < 4) {
+		LOGF("AgcGetIsTrinityMode: call %u, %s\n", call + 1,
+		     trinity ? "PS5 Pro (--ps5-pro)" : "base PS5");
+	}
+	*result = trinity ? 1 : 0;
 }
 
 static constexpr int      GRAPHICS5_DRIVER_ERROR_INVALID_VALUE    = static_cast<int>(0x8a6c0033u);

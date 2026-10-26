@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/perfStats.h"
 #include "common/stringUtils.h"
@@ -1061,7 +1062,21 @@ public:
 
 	KYTY_CLASS_NO_COPY(PhysicalMemory);
 
-	static constexpr uint64_t TotalSize() { return static_cast<uint64_t>(13824) * 1024 * 1024; }
+	// The guest's memory, direct and flexible: 13.5 GiB on a PS5. A PS5 Pro gives its games about
+	// 1.2 GB more (the system keeps its own work in the Pro's extra 2 GB of DDR5, off the GDDR6),
+	// so with --ps5-pro 1.25 GiB more (KYTY_PRO_MEMORY=0: the PS5's). GT7 told it is on a Pro
+	// sized its pools for one and retried a 5 GB allocation for ever on a PS5's (2026-10-27).
+	static uint64_t TotalSize() {
+		static const uint64_t total = [] {
+			const char* value = std::getenv("KYTY_PRO_MEMORY");
+			const bool  pro   = Config::Ps5ProEnabled() && (value == nullptr || value[0] != '0');
+			const uint64_t mb = pro ? 13824u + 1280u : 13824u;
+			LOGF("Guest memory: %" PRIu64 " MiB in all (%s)\n", mb,
+			     pro ? "PS5 Pro, --ps5-pro" : "PS5");
+			return mb * 1024 * 1024;
+		}();
+		return total;
+	}
 	static uint64_t           Size() {
 		EXIT_IF(g_flexible_memory_size >= TotalSize());
 		return TotalSize() - g_flexible_memory_size;
