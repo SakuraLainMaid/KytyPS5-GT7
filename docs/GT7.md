@@ -65,6 +65,30 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 26, 2026)
+
+No shaders are compiled again after this update.
+
+- **A crash in races fixed.** The game rewrites its texture list while it streams textures in. The
+  emulator could read an entry the game was halfway through rewriting, which then pointed past the
+  end of the game's memory, and it stopped. Such an entry now gets a placeholder texture for a
+  moment and is read again later, as other half-written entries already were. This was rare and
+  depended on timing, so it could happen on earlier builds too.
+- **Graphics cards without fragment shader barycentrics get past start-up**
+  ([issue 20](https://github.com/usa-ratt/KytyPS5-GT7/issues/20)): Intel Arc, GeForce GTX 10xx and
+  Radeon RX 5000 cards, and older drivers. From upstream KytyPS5 (Matthew Hurley and nmzik). The
+  emulator shows a warning at start-up on those cards. Whether the game runs on them is not known
+  yet: a shader that needs the feature can still fail there.
+- **Less waiting on the emulator's GPU thread.** When the game reads something the graphics card
+  wrote, the copy is now waited for by the thread doing the read instead of the GPU thread, and
+  each read waits only for its own copy (`KYTY_FAST_READBACK=gpu` brings back the old way, for
+  comparison). Smaller cuts: a draw's shader stages take their prepared work without a lock, the
+  GPU thread does the page protection work itself instead of waiting for the helper thread to wake
+  up, and texture lookups go through a small quick-lookup table first. In test races the GPU
+  thread spent less time on reads, but the frame rate stayed about the same: the GPU thread
+  handles every draw and compute job the game sends (about 3,700 a frame), and that is the limit
+  now.
+
 ## What's new (October 25, 2026)
 
 No shaders are compiled again after this update.
@@ -513,9 +537,10 @@ Graphics and shaders:
   names the graphics buffer involved.
 - In-game videos can play out of sync with their sound
   ([issue 4](https://github.com/usa-ratt/KytyPS5-GT7/issues/4)). Being looked into.
-- **Intel Arc graphics cards:** the emulator stops at start-up: the driver lacks fragment shader
-  barycentrics, which the emulator needs
-  ([issue 20](https://github.com/usa-ratt/KytyPS5-GT7/issues/20)). Being looked into.
+- **Intel Arc, GeForce GTX 10xx and Radeon RX 5000 cards:** since the October 26 build the
+  emulator gets past start-up on cards without fragment shader barycentrics
+  ([issue 20](https://github.com/usa-ratt/KytyPS5-GT7/issues/20)), but whether the game runs on
+  them is not known yet. Please report how far it gets.
 - **NVIDIA:** the driver's shader compiler can crash while it compiles new pipelines
   ([issue 18](https://github.com/usa-ratt/KytyPS5-GT7/issues/18)). Being looked into; the crash
   report names the pipeline.
