@@ -63,18 +63,25 @@ std::array<std::atomic<uint32_t>, 256> g_output_counts {};
 std::array<std::atomic<uint32_t>, 256> g_get_counts {};
 std::array<std::atomic<uint32_t>, 256> g_set_counts {};
 
-// What the game sends, by kind (a command's first two bytes). Each kind is logged in full for its
-// first reports wherever in the session it first comes, and every 10 s a line counts the kinds,
-// with the range of the constant force and the rumble calls on the wheel's handle, so a moment of
-// the game (a crash, a kerb) can be matched with what it sent.
+// What the game sends, by kind (a command's first two bytes; four for the f8 09 group, whose next
+// two choose what it drives). Each kind is logged in full for its first reports wherever in the
+// session it first comes, and every 10 s a line counts the kinds, with the range of the constant
+// force and the rumble calls on the wheel's handle, so a moment of the game (a crash, a kerb) can
+// be matched with what it sent.
 constexpr uint64_t SummaryPeriodUs = 10'000'000;
 constexpr uint32_t LoggedPerKind   = 8;
 constexpr size_t   SummaryKinds    = 16;
+// A change of the constant force by this much in one update is logged with the updates around
+// it, to show the shape of a sudden force such as a crash's.
+constexpr float    JumpStep    = 0.3f;
+constexpr size_t   JumpBefore  = 3;
+constexpr int      JumpAfter   = 10;
+constexpr uint32_t JumpsLogged = 48;
 
 struct CommandStats {
 	Common::Mutex                mutex;
-	std::map<uint16_t, uint32_t> session;
-	std::map<uint16_t, uint32_t> window;
+	std::map<uint32_t, uint32_t>  session;
+	std::map<uint32_t, uint32_t>  window;
 	uint64_t                     window_start_us   = 0;
 	uint32_t                     constants         = 0;
 	float                        constant_min      = 0.0f;
@@ -87,16 +94,83 @@ struct CommandStats {
 	uint32_t                     vibrations_logged = 0;
 	uint8_t                      vibration_large   = 0;
 	uint8_t                      vibration_small   = 0;
+	std::array<float, JumpBefore> recent {};
+	size_t                        recent_count = 0;
+	uint32_t                      jumps        = 0;
+	uint32_t                      window_jumps = 0;
+	std::string                   jump_text;
+	int                           jump_left     = 0;
+	uint64_t                      jump_start_us = 0;
 };
 
 CommandStats g_stats;
 
-uint16_t CommandKind(const uint8_t* buf, uint32_t length) {
-	const uint8_t first  = length > 1 ? buf[1] : 0;
-	const uint8_t second = length > 2 ? buf[2] : 0;
+uint32_t CommandKind(const uint8_t* buf, uint32_t length) {
+	auto           at    = [&](uint32_t i) -> uint32_t { return i < length ? buf[i] : 0u; };
+	const uint32_t first = at(1);
 	// A slot's stop carries no effect type.
-	return static_cast<uint16_t>(first << 8u |
-	                             ((first & 0xF0) != 0xF0 && (first & 0x0F) == 0x03 ? 0 : second));
+	if ((first & 0xF0u) != 0xF0u && (first & 0x0Fu) == 0x03u) {
+		return first << 24u;
+	}
+	uint32_t kind = first << 24u | at(2) << 16u;
+	if (first == 0xF8u && at(2) == 0x09u) {
+		kind |= at(3) << 8u | at(4);
+	}
+	return kind;
+}
+
+std::string KindName(uint32_t kind) {
+	std::string name = fmt::format("{:02x} {:02x}", kind >> 24u, (kind >> 16u) & 0xFFu);
+	if ((kind >> 16u) == 0xF809u) {
+		name += fmt::format(" {:02x} {:02x}", (kind >> 8u) & 0xFFu, kind & 0xFFu);
+	}
+	return name;
+}
+
+// Under g_stats.mutex: a jump being followed, as far as it got.
+std::string TakeJumpLocked(uint64_t now_us) {
+	auto& s = g_stats;
+	if (s.jump_text.empty()) {
+		return {};
+	}
+	std::string line = fmt::format("{} ({} ms)\n", s.jump_text, (now_us - s.jump_start_us) / 1000);
+	s.jump_text.clear();
+	s.jump_left = 0;
+	return line;
+}
+
+// Under g_stats.mutex. Returns a finished jump's line.
+std::string NoteConstantLocked(float level, uint64_t now_us) {
+	auto&       s = g_stats;
+	std::string line;
+	if (s.jump_left > 0) {
+		s.jump_text += fmt::format(" {:+.2f}", level);
+		if (--s.jump_left == 0) {
+			line = TakeJumpLocked(now_us);
+		}
+	}
+	if (s.constant_any && std::abs(level - s.constant_last) >= JumpStep) {
+		s.jumps++;
+		s.window_jumps++;
+		if (s.jump_text.empty() && (s.jumps <= JumpsLogged || (s.jumps & (s.jumps - 1)) == 0)) {
+			s.jump_text = fmt::format("Wheel: force jump #{} at {:.1f} s:", s.jumps,
+			                          static_cast<double>(now_us) / 1e6);
+			for (size_t i = 0; i < s.recent_count; i++) {
+				s.jump_text += fmt::format(" {:+.2f}", s.recent[i]);
+			}
+			s.jump_text += fmt::format(" [{:+.2f}]", level);
+			s.jump_left     = JumpAfter;
+			s.jump_start_us = now_us;
+		}
+	}
+	// The last updates before this one, oldest first.
+	if (s.recent_count < JumpBefore) {
+		s.recent[s.recent_count++] = level;
+	} else {
+		std::rotate(s.recent.begin(), s.recent.begin() + 1, s.recent.end());
+		s.recent[JumpBefore - 1] = level;
+	}
+	return line;
 }
 
 // Under g_stats.mutex. Empty when nothing came since the last line.
@@ -105,13 +179,13 @@ std::string TakeSummaryLocked(uint64_t now_us) {
 	const uint64_t elapsed = now_us > s.window_start_us ? now_us - s.window_start_us : 0;
 	std::string    line;
 	if (!s.window.empty() || s.vibrations != 0) {
-		std::vector<std::pair<uint16_t, uint32_t>> kinds(s.window.begin(), s.window.end());
+		std::vector<std::pair<uint32_t, uint32_t>> kinds(s.window.begin(), s.window.end());
 		std::sort(kinds.begin(), kinds.end(),
 		          [](const auto& a, const auto& b) { return a.second > b.second; });
-		line = fmt::format("Wheel: the game sent in {:.1f} s:", static_cast<double>(elapsed) / 1e6);
+		line = fmt::format("Wheel: the game sent in {:.1f} s (to {:.1f} s):",
+		                   static_cast<double>(elapsed) / 1e6, static_cast<double>(now_us) / 1e6);
 		for (size_t i = 0; i < kinds.size() && i < SummaryKinds; i++) {
-			line += fmt::format(" {:02x} {:02x} x{}", kinds[i].first >> 8u, kinds[i].first & 0xFFu,
-			                    kinds[i].second);
+			line += fmt::format(" {} x{}", KindName(kinds[i].first), kinds[i].second);
 		}
 		if (kinds.size() > SummaryKinds) {
 			line += fmt::format(" (+{} more kinds)", kinds.size() - SummaryKinds);
@@ -119,6 +193,9 @@ std::string TakeSummaryLocked(uint64_t now_us) {
 		if (s.constants != 0) {
 			line += fmt::format("; constant force {:+.2f} to {:+.2f}, largest step {:.2f}",
 			                    s.constant_min, s.constant_max, s.constant_step);
+			if (s.window_jumps != 0) {
+				line += fmt::format(", {} jumps of {:.1f} or more", s.window_jumps, JumpStep);
+			}
 		}
 		line += fmt::format("; rumble calls {}", s.vibrations);
 		if (s.vibrations_on != 0) {
@@ -131,6 +208,7 @@ std::string TakeSummaryLocked(uint64_t now_us) {
 	s.window_start_us = now_us;
 	s.constants       = 0;
 	s.constant_step   = 0.0f;
+	s.window_jumps    = 0;
 	s.vibrations      = 0;
 	s.vibrations_on   = 0;
 	s.vibration_large = 0;
@@ -141,8 +219,9 @@ std::string TakeSummaryLocked(uint64_t now_us) {
 // Returns whether this report is to be logged in full.
 bool NoteCommand(const uint8_t* buf, uint32_t length, const Wheel::Fanatec::Command& c) {
 	const uint64_t now  = LibKernel::KernelGetProcessTime();
-	const uint16_t kind = CommandKind(buf, length);
+	const uint32_t kind = CommandKind(buf, length);
 	std::string    line;
+	std::string    jump;
 	bool           full = false;
 	{
 		Common::LockGuard lock(g_stats.mutex);
@@ -155,6 +234,7 @@ bool NoteCommand(const uint8_t* buf, uint32_t length, const Wheel::Fanatec::Comm
 		if (c.kind == Wheel::Fanatec::Command::Kind::SetAndPlay &&
 		    c.effect.type == Wheel::EffectType::Constant) {
 			const float level = c.effect.level;
+			jump              = NoteConstantLocked(level, now);
 			if (s.constants == 0) {
 				s.constant_min = s.constant_max = level;
 			}
@@ -170,6 +250,9 @@ bool NoteCommand(const uint8_t* buf, uint32_t length, const Wheel::Fanatec::Comm
 		if (now - s.window_start_us >= SummaryPeriodUs) {
 			line = TakeSummaryLocked(now);
 		}
+	}
+	if (!jump.empty()) {
+		LOGF("%s", jump.c_str());
 	}
 	if (!line.empty()) {
 		LOGF("%s", line.c_str());
@@ -218,7 +301,8 @@ void FlushSummary() {
 	std::string line;
 	{
 		Common::LockGuard lock(g_stats.mutex);
-		line = TakeSummaryLocked(LibKernel::KernelGetProcessTime());
+		const uint64_t    now = LibKernel::KernelGetProcessTime();
+		line                  = TakeJumpLocked(now) + TakeSummaryLocked(now);
 	}
 	if (!line.empty()) {
 		LOGF("%s", line.c_str());
@@ -297,10 +381,15 @@ int OutputReport(uint8_t type, const uint8_t* buf, uint32_t length) {
 			break;
 		case Kind::Stop: Wheel::PlayEffect(c.slot, false); break;
 		case Kind::StopAll: Wheel::StopAllEffects(); break;
-		case Kind::Rotation:
-			LOGF("Pad: wheel: the game sets the rotation to %u degrees\n", c.degrees);
+		case Kind::Rotation: {
+			// Sent with every frame in the menus: logged when it changes.
+			static std::atomic<uint32_t> last_degrees {0};
+			if (last_degrees.exchange(c.degrees) != c.degrees) {
+				LOGF("Pad: wheel: the game sets the rotation to %u degrees\n", c.degrees);
+			}
 			Wheel::SetGameRotation(c.degrees);
 			break;
+		}
 		case Kind::Ignored:
 		case Kind::Unknown: break;
 	}
