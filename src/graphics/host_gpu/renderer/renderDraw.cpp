@@ -1363,9 +1363,10 @@ static void NoteDrawRepeat(const DrawCallInfo& draw, const DrawRenderState& stat
 	stats.Note(FrameGraph::GpuThreadFrames(), inputs, resolved, textures, image_generation);
 }
 
-// Round 158: the draws whose sample coverage the guest narrows in ways the host leaves out or
-// only partly reproduces (ghost cars that draw solid, issue 30): an AA sample mask
-// (PA_SC_AA_MASK) clearing samples of a pixel of the 2x2 quad (not applied), alpha to coverage
+// Round 158: the draws whose sample coverage the guest narrows in ways the host left out or
+// only partly reproduces (ghost cars that drew solid, issue 30): an AA sample mask
+// (PA_SC_AA_MASK) clearing samples of a pixel of the 2x2 quad (applied since round 159, by a
+// copy of the pixel shader: spirvCoverageMask.h), alpha to coverage
 // (applied, without DB_ALPHA_TO_MASK's dither offsets) and coverage the pixel shader exports. A
 // "Coverage (10 s):" line counts them; the first draws of each kind with a pixel shader not seen
 // in that kind yet are logged ("Coverage:" lines) with their samples and blending.

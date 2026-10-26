@@ -301,7 +301,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetCentroidPriority) {
 	return num_values;
 }
 
-// Round 158: the AA sample masks are kept (not applied) for the "Coverage:" lines;
+// Round 158: the AA sample masks are kept (applied since round 159, spirvCoverageMask.h);
 // PS_SHADER_SAMPLE_EXCLUSION_MASK, which shares the parser, stays ignored.
 static void HwCtxSetAaMaskRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
 	if (cmd_offset == Pm4::PA_SC_AA_MASK_X0Y0_X1Y0) {

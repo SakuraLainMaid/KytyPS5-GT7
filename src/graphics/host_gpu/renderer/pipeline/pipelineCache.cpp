@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
+#include "graphics/host_gpu/renderer/pipeline/spirvCoverageMask.h"
 #include "graphics/host_gpu/renderer/pipeline/spirvMeshTest.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -2528,6 +2529,18 @@ struct PipelineCache::ProgramCache {
 		return lookup_key.function_code.size() > params.code.size() + 64u;
 	}
 
+	// Round 159: a pixel shader permutation's disk cache entry, by the hash its file is named by,
+	// for the copy that applies AA masks (CoverageVariants reads its SPIR-V back from there).
+	template <typename InputInfo>
+	void NotePixelEntry(const ShaderProgram& handle, std::span<const uint8_t> permutation_key) {
+		if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			if (coverage != nullptr && handle && !permutation_key.empty()) {
+				const auto hash = XXH3_128bits(permutation_key.data(), permutation_key.size());
+				coverage->NotePixelEntry(handle.id, {hash.high64, hash.low64});
+			}
+		}
+	}
+
 	// A compiled (or cached) permutation of the source: its module, bound for this stage.
 	template <typename InputInfo>
 	ShaderProgram AddPermutation(SourceEntry& source, const char* stage_name,
@@ -3097,9 +3110,11 @@ struct PipelineCache::ProgramCache {
 					if (!lookup_key.function_code.empty()) {
 						gave_up_call_shaders.erase(params.hash);
 					}
-					return AddPermutation(entry->second, stage_name, options, record.spirv,
-					                      std::move(record.program), input_info, push_data_cursor,
-					                      InlinedCalls(params));
+					auto handle = AddPermutation(entry->second, stage_name, options, record.spirv,
+					                             std::move(record.program), input_info,
+					                             push_data_cursor, InlinedCalls(params));
+					NotePixelEntry<InputInfo>(handle, permutation_key);
+					return handle;
 				}
 			}
 		}
@@ -3340,6 +3355,7 @@ struct PipelineCache::ProgramCache {
 			// After AddPermutation: SPIR-V that fails validation is never stored.
 			StoreEntry(false, params.hash, permutation_key, cached_permutation,
 			           permutation_payload);
+			NotePixelEntry<InputInfo>(handle, permutation_key);
 		}
 		return handle;
 	}
@@ -3807,6 +3823,8 @@ struct PipelineCache::ProgramCache {
 	bool                                                        disk_verify  = false;
 	uint64_t                                                    disk_lookups = 0;
 	std::unique_ptr<ShaderDiskCache::Store>                     disk;
+	// Round 159: told each pixel shader permutation's disk entry (PipelineCache::m_coverage).
+	CoverageVariants* coverage = nullptr;
 	// Round 95: call_targets.txt in the shader cache folder, and the shaders whose table call
 	// targets go into it (LoadCallTargets, SaveCallTargets).
 	static constexpr const char* CallTargetsHeader  = "kyty table call targets 1";
@@ -4331,6 +4349,18 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	m_program_cache->pixel_rate_variants =
 	    graphics.mixed_attachment_samples == GraphicContext::MixedAttachmentSamples::Nv &&
 	    !EqaaPerSampleShading();
+	// Round 159: the copies of fragment shaders that apply PA_SC_AA_MASK (spirvCoverageMask.h).
+	m_coverage = std::make_unique<CoverageVariants>(
+	    graphics.device, m_program_cache->disk != nullptr ? m_program_cache->disk->Directory()
+	                                                      : std::filesystem::path {});
+	m_program_cache->coverage = m_coverage.get();
+	LOGF("AA masks: draws whose PA_SC_AA_MASK differs by pixel run a copy of their pixel shader "
+	     "that applies it%s (round 159; KYTY_AA_MASK=0 or KYTY_BISECT's aamask:off leave it out)\n",
+	     !AaMaskOn() ? " - off (KYTY_AA_MASK=0)"
+	     : m_program_cache->disk == nullptr
+	         ? " - only for draws without one: the shader disk cache, which the copies are made "
+	           "from, is off"
+	         : "");
 	InitializeDriverCache();
 	if (g_async_pipelines) {
 		// KYTY_PIPELINE_THREADS=<n>; by default half the processors, 2 to 16, at below normal
@@ -5917,6 +5947,25 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	static_params.depth_min_bounds         = depth.depth_min_bounds;
 	static_params.depth_max_bounds         = depth.depth_max_bounds;
 	static_params.alpha_to_coverage_enable = ps_active && ctx.GetShaderRegisters().AlphaToMask();
+	// Round 159: PA_SC_AA_MASK reduced to the draw's samples (spirvCoverageMask.h). Until the copy
+	// of the pixel shader that applies it is made, the draw runs as before (all ones in the key).
+	vk::ShaderModule coverage_module = nullptr;
+	if (m_coverage != nullptr && rendering.color_samples == 0) {
+		const uint32_t samples = std::clamp<uint32_t>(attachment_samples, 1u, 16u);
+		const uint32_t full    = samples >= 16u ? 0xffffu : (1u << samples) - 1u;
+		const uint32_t both    = full | (full << 16u);
+		const uint32_t mask01  = ctx.GetAaMask(0) & both;
+		const uint32_t mask23  = ctx.GetAaMask(1) & both;
+		if ((mask01 != both || mask23 != both) && AaMaskOn()) {
+			coverage_module = m_coverage->Find(
+			    ps_active ? pixel_program.id : 0u,
+			    ps_active ? ps_input_info->stage.program->shader_hash : 0u, mask01, mask23);
+			if (coverage_module != nullptr) {
+				static_params.aa_mask[0] = mask01;
+				static_params.aa_mask[1] = mask23;
+			}
+		}
+	}
 	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
 	static_params.cull_back  = !rect_list && mc.cull_back;
 	static_params.cull_front = !rect_list && mc.cull_front;
@@ -6016,8 +6065,10 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	auto build_programs            = programs;
+	build_programs.coverage_module = coverage_module;
 	auto build = PrepareGraphicsPipeline(m_graphics, *cached, rendering, key.vertex_input,
-	                                     vertex_info, ps_input_info, programs, static_params);
+	                                     vertex_info, ps_input_info, build_programs, static_params);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 	uint64_t vertex_words = 0;
 	for (const auto& program: programs.vertex) {

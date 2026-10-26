@@ -28,6 +28,7 @@
 namespace Libs::Graphics {
 
 struct GraphicContext;
+class CoverageVariants;
 struct ShaderParams;
 struct RenderColorInfo;
 struct RenderDepthInfo;
@@ -71,6 +72,9 @@ struct PipelineStaticParameters {
 	uint8_t                    alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
 	bool                       separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	bool                       blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
+	// Round 159: PA_SC_AA_MASK reduced to the draw's samples, when the pixel shader's copy that
+	// applies it is used (spirvCoverageMask.h); all ones otherwise.
+	uint32_t aa_mask[2] = {0xffffffffu, 0xffffffffu};
 
 	bool operator==(const PipelineStaticParameters& other) const noexcept;
 };
@@ -80,7 +84,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 126);
+static_assert(sizeof(PipelineStaticParameters) == 134);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
@@ -275,6 +279,10 @@ public:
 		// or its pipeline compiles loses one frame of it, not a picture drawn once (rounds 87 and
 		// 88, RedrawnTargetDraw in pipelineCache.cpp).
 		bool redrawn_target = false;
+		// Round 159: set for a pipeline build only: the fragment stage's module with the draw's AA
+		// masks applied (the pixel shader's copy, or a coverage-only shader for a draw without
+		// one), or null.
+		vk::ShaderModule coverage_module = nullptr;
 
 		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }
 	};
@@ -435,6 +443,8 @@ private:
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
+	// Round 159: the fragment shaders' copies that apply PA_SC_AA_MASK (destroyed first).
+	std::unique_ptr<CoverageVariants> m_coverage;
 	// The driver cache new pipelines go to, saved to m_driver_cache_path; round 92: and the older
 	// cache files that are full (read only: a pipeline one of them holds is created from it).
 	vk::PipelineCache              m_driver_cache = nullptr;

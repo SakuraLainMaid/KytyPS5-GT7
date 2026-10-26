@@ -51,6 +51,7 @@ struct Step {
 	bool              liftwait_old    = false; // round 153
 	int32_t           faultblock_kb   = -1;    // faultblock:<kb> (round 155); -1: the usual
 	bool              cuts156_off     = false; // round 156
+	bool              aamask_off      = false; // round 159
 	bool              recheck      = false;
 	bool              locks_spin   = false;
 	bool              htile_depth  = false;
@@ -238,6 +239,10 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "cuts156:off") {
 		step.cuts156_off = true;
+		return true;
+	}
+	if (action == "aamask:off") {
+		step.aamask_off = true;
 		return true;
 	}
 	if (action == "recheck") {
@@ -989,6 +994,11 @@ bool LiftWaitOld() {
 bool Cuts156Off() {
 	const auto* step = Current();
 	return step != nullptr && step->cuts156_off;
+}
+
+bool AaMaskOff() {
+	const auto* step = Current();
+	return step != nullptr && step->aamask_off;
 }
 
 bool GpuClearRecheck() {

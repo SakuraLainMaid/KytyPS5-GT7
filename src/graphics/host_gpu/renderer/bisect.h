@@ -68,6 +68,8 @@
 //   cuts156:off  as before round 156: the GPU thread waits for the page protection worker
 //                rather than doing a batch it has not started, and every texture description is
 //                looked up in its map (no direct-mapped front)
+//   aamask:off   PA_SC_AA_MASK is left out, as before round 159: the draws whose AA sample masks
+//                differ by pixel (ghost cars) cover every pixel (KYTY_AA_MASK=0 for the whole run)
 //   liftwait:old a game thread's read of pages a download is still bringing in waits for the
 //                latest download of all, as before round 153, instead of the ones that cover its
 //                pages (KYTY_LIFT_WAIT=old for the whole run)
@@ -332,6 +334,7 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] bool FastReadbackOnGpuThread();
 [[nodiscard]] bool LiftWaitOld();
 [[nodiscard]] bool Cuts156Off();
+[[nodiscard]] bool AaMaskOff();
 // Any thread: recheck; locks:spin; htile:depth; patternfill:off; faultblock:off.
 [[nodiscard]] bool GpuClearRecheck();
 [[nodiscard]] bool LocksSpin();
