@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -14,11 +15,11 @@
 #include <memory>
 #include <mutex>
 #include <new>
-#include <type_traits>
 
 #include <queue>
 
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -45,6 +46,80 @@ struct CopyBatchState {
 	bool after_pending = false;
 	// Their destinations since the last barrier that ordered them.
 	std::vector<Written> written;
+};
+
+// Round 172: the pipelines and the dynamic state the command buffer being recorded holds, as the
+// recorder last set them (CommandRecorder), so a call that sets them to what they are can be left
+// out. Kept in the order of the commands; reset with each command buffer.
+struct DynamicStateShadow {
+	enum Kind : uint32_t {
+		Viewports,
+		Scissors,
+		LineWidth,
+		BlendConstants,
+		CullMode,
+		FrontFace,
+		DepthBoundsTest,
+		DepthBounds,
+		DepthTest,
+		DepthWrite,
+		DepthCompare,
+		DepthBiasEnable,
+		DepthBias,
+		StencilTest,
+		StencilOpFront,
+		StencilOpBack,
+		StencilCompareFront,
+		StencilCompareBack,
+		StencilWriteFront,
+		StencilWriteBack,
+		StencilReferenceFront,
+		StencilReferenceBack,
+		ColorWrite,
+		FeedbackLoop,
+		Count
+	};
+	static constexpr uint32_t MaxBytes = 16u * sizeof(vk::Viewport);
+	struct Entry {
+		bool                            valid = false;
+		uint32_t                        size  = 0;
+		std::array<std::byte, MaxBytes> bytes {};
+	};
+	std::array<Entry, Count> entries {};
+	vk::Pipeline             graphics_pipeline;
+	vk::Pipeline             compute_pipeline;
+	// The counts of the "Recorded state" line, kept here (the recording thread's) and added to
+	// RecordedCommands' at each command buffer: an atomic add a call cost more than most calls.
+	uint64_t calls           = 0;
+	uint64_t unchanged       = 0;
+	uint64_t binds           = 0;
+	uint64_t binds_unchanged = 0;
+	uint64_t left_out        = 0;
+
+	// Whether the state holds `size` bytes of `data` already; it does after.
+	bool Same(Kind kind, const void* data, uint32_t size) noexcept {
+		auto& entry = entries[kind];
+		if (entry.valid && entry.size == size && std::memcmp(entry.bytes.data(), data, size) == 0) {
+			return true;
+		}
+		entry.valid = size <= MaxBytes;
+		entry.size  = size;
+		if (entry.valid) {
+			std::memcpy(entry.bytes.data(), data, size);
+		}
+		return false;
+	}
+	void Invalidate(Kind kind) noexcept { entries[kind].valid = false; }
+	void InvalidateGraphics() noexcept {
+		for (auto& entry: entries) {
+			entry.valid = false;
+		}
+		graphics_pipeline = nullptr;
+	}
+	void InvalidateAll() noexcept {
+		InvalidateGraphics();
+		compute_pipeline = nullptr;
+	}
 };
 
 class CommandScheduler {
@@ -186,6 +261,8 @@ public:
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 	// Round 167: the recording command buffer's batch of copies (the recording side's thread).
 	[[nodiscard]] CopyBatchState& CopyBatch() noexcept { return m_copy_batch; }
+	// Round 172: the recording command buffer's pipelines and dynamic state.
+	[[nodiscard]] DynamicStateShadow& StateShadow() noexcept { return m_state_shadow; }
 
 private:
 	class CommandPool {
@@ -326,6 +403,7 @@ private:
 	bool                                  m_in_before_flush   = false;
 	PageManager*                          m_submit_pages      = nullptr;
 	CopyBatchState                        m_copy_batch;
+	DynamicStateShadow                    m_state_shadow;
 };
 
 } // namespace Libs::Graphics

@@ -595,8 +595,23 @@ CommandBuffer& CommandScheduler::Current() {
 	return m_command;
 }
 
+// Round 172: the state shadow's counts, into RecordedCommands (the "Recorded state" line).
+static void FlushStateCounts(DynamicStateShadow& shadow) {
+	namespace RC = RecordedCommands;
+	RC::Add(RC::StateCalls, shadow.calls);
+	RC::Add(RC::StateUnchanged, shadow.unchanged);
+	RC::Add(RC::PipelineBinds, shadow.binds);
+	RC::Add(RC::PipelineUnchanged, shadow.binds_unchanged);
+	RC::Add(RC::StateLeftOut, shadow.left_out);
+	shadow.calls = shadow.unchanged = shadow.binds = shadow.binds_unchanged = shadow.left_out = 0;
+}
+
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
+	// Round 172: a new command buffer holds no state. The counts of the one before go to the
+	// "Recorded state" line.
+	m_state_shadow.InvalidateAll();
+	FlushStateCounts(m_state_shadow);
 	m_command.m_open = true;
 	// Ticks are allocated in submit order, so this command buffer will be submitted with the
 	// current one.

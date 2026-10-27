@@ -2263,10 +2263,69 @@ static bool DeferProtections(const CommandScheduler& /*scheduler*/) {
 	return t_guest_gpu_thread && Bisect::AsyncMemorySync();
 }
 
+// Round 172, diagnostics: how many of the GPU thread's buffer syncs repeat one of the same range
+// (and kind) made since the last time pages became CPU-dirty anywhere, which a memo could skip.
+// A "Buffer syncs" line every 10 s.
+static void NoteSyncRepeat(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer) {
+	struct Entry {
+		uint64_t vaddr = 0;
+		uint64_t size  = 0;
+		uint64_t epoch = 0;
+		uint32_t kind  = 0;
+	};
+	struct Stats {
+		std::array<Entry, 1024>               table {};
+		uint64_t                              calls            = 0;
+		uint64_t                              written          = 0;
+		uint64_t                              texel            = 0;
+		uint64_t                              repeats          = 0;
+		uint64_t                              repeated_written = 0;
+		std::chrono::steady_clock::time_point last {};
+	};
+	// The GPU thread's alone (its callers check): no table in every thread's storage.
+	static Stats stats;
+	const auto   kind  = (is_written ? 1u : 0u) | (is_texel_buffer ? 2u : 0u);
+	const auto   epoch = g_cpu_dirty_epoch.load(std::memory_order_relaxed);
+	const auto slot  = ((vaddr >> 4u) ^ (size * 0x9e3779b97f4a7c15ull) ^ kind) % stats.table.size();
+	auto&      entry = stats.table[slot];
+	stats.calls++;
+	stats.written += is_written ? 1u : 0u;
+	stats.texel += is_texel_buffer ? 1u : 0u;
+	if (entry.vaddr == vaddr && entry.size == size && entry.kind == kind && entry.epoch == epoch) {
+		stats.repeats++;
+		stats.repeated_written += is_written ? 1u : 0u;
+	}
+	entry = {vaddr, size, epoch, kind};
+	if ((stats.calls & 4095u) != 0) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (stats.last.time_since_epoch().count() == 0) {
+		stats.last = now;
+		return;
+	}
+	const double seconds = std::chrono::duration<double>(now - stats.last).count();
+	if (seconds < 10.0) {
+		return;
+	}
+	LOGF("Buffer syncs (%.1f s): %.0f a second (%.0f of written ranges, %.0f of texel buffers); "
+	     "%.0f a second repeat one of the same range made since pages last became CPU-dirty "
+	     "(%.0f of them written)\n",
+	     seconds, static_cast<double>(stats.calls) / seconds,
+	     static_cast<double>(stats.written) / seconds, static_cast<double>(stats.texel) / seconds,
+	     static_cast<double>(stats.repeats) / seconds,
+	     static_cast<double>(stats.repeated_written) / seconds);
+	stats.calls = stats.written = stats.texel = stats.repeats = stats.repeated_written = 0;
+	stats.last                                                                         = now;
+}
+
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
 	KYTY_PROFILER_FUNCTION();
 	const GpuPhases::Scope phase(GpuPhases::Phase::BufferSync);
+	if (t_guest_gpu_thread) {
+		NoteSyncRepeat(vaddr, size, is_written, is_texel_buffer);
+	}
 	// Most calls (~22k a frame in a race) read a range whose tracker regions are all clean: what
 	// ForEachUploadRange finds for it is nothing to copy. Answer from the lock-free summary bitmap
 	// without the protection defer scope, the copy list, the lambdas and their profiler zones.

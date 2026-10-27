@@ -298,6 +298,9 @@
 //   scan:oldtaint a submission the GPU thread had passed before the scanner reached it leaves its
 //                queue's registers unknown, and nothing more of the queue is prepared up to its
 //                next suspend point, as before
+// and, round 172 (DynamicStateShadow, commandRecorder.h):
+//   state:filter pipeline binds and dynamic state calls that set what the command buffer holds
+//                already are left out (KYTY_STATE_FILTER=1 for the whole run)
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -385,6 +388,8 @@ void RequestPicture(const std::string& name);
 // Any thread: scan:shared, scan:oldtaint (round 170).
 [[nodiscard]] bool ScanShared();
 [[nodiscard]] bool ScanOldTaint();
+// Any thread: state:filter (round 172), or KYTY_STATE_FILTER=1 for the whole run.
+[[nodiscard]] bool StateFilter();
 // Any thread: scan:one.
 [[nodiscard]] bool ScanOneThread();
 // Any thread: hotpages, or KYTY_HOT_PAGES=1.

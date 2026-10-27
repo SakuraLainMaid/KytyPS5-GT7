@@ -3156,7 +3156,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const int32_t occlusion_query = OcclusionQueries::PrepareDraw(
 	    m_context, vk_buffer, buffer.GetRegisters().GetDbCountControl());
 	m_context.GetCommandScheduler().BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	// Round 172: a guest pipeline keeps the dynamic state the draws set (the color write enables
+	// only with color targets), which the draw set before it.
+	vk_buffer.bindGuestPipeline(pipeline.pipeline, rendering.num_color_attachments != 0);
 	SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	GpuTiming::Before(m_context, buffer);
 	OcclusionQueries::BeginDraw(vk_buffer, occlusion_query);

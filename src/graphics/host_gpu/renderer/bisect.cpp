@@ -138,6 +138,7 @@ struct Step {
 	bool              lean_off          = false; // lean:off (round 169)
 	bool              scan_shared       = false; // scan:shared (round 170)
 	bool              scan_oldtaint     = false; // scan:oldtaint (round 170)
+	bool              state_filter      = false; // state:filter (round 172)
 	bool              protect_excl    = false; // protect:exclusive
 	std::string       cpu_set;          // empty: as at the start
 	std::string       name;             // for the screen and the picture's file name
@@ -495,6 +496,10 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "scan:oldtaint") {
 		step.scan_oldtaint = true;
+		return true;
+	}
+	if (action == "state:filter") {
+		step.state_filter = true;
 		return true;
 	}
 	if (action == "protect:exclusive") {
@@ -1155,6 +1160,23 @@ bool ScanShared() {
 bool ScanOldTaint() {
 	const auto* step = Current();
 	return step != nullptr && step->scan_oldtaint;
+}
+
+bool StateFilter() {
+	static const bool whole_run = [] {
+		const char* value = std::getenv("KYTY_STATE_FILTER");
+		const bool  on    = value != nullptr && std::strcmp(value, "1") == 0;
+		LOGF("State filter: %s (KYTY_STATE_FILTER=1, or KYTY_BISECT's state:filter for a step: "
+		     "pipeline binds and dynamic state calls that set what the command buffer holds "
+		     "already are left out)\n",
+		     on ? "on" : "off");
+		return on;
+	}();
+	if (whole_run) {
+		return true;
+	}
+	const auto* step = Current();
+	return step != nullptr && step->state_filter;
 }
 
 bool HotPages() {

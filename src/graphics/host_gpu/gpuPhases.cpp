@@ -599,6 +599,14 @@ void ReportIfDue(uint64_t frames) {
 		     n(RC::BufferUpdates), mb(RC::BufferUpdateBytes), n(RC::BufferFills),
 		     mb(RC::BufferFillBytes), n(RC::ImageUploads), n(RC::ImageDownloads),
 		     n(RC::ImageCopies), n(RC::Clears));
+		// Round 172: pipeline binds and dynamic state calls, and those that changed nothing.
+		if (n(RC::StateCalls) + n(RC::PipelineBinds) > 0.0) {
+			LOGF("Recorded state (%.1f s), a frame: %.0f dynamic state calls (%.0f set what was "
+			     "set already), %.0f pipeline binds (%.0f of the pipeline bound already); %.0f "
+			     "left out (state:filter)\n",
+			     seconds, n(RC::StateCalls), n(RC::StateUnchanged), n(RC::PipelineBinds),
+			     n(RC::PipelineUnchanged), n(RC::StateLeftOut));
+		}
 		// Round 167: copies:lean's batches and images:lean's skipped barriers, when there were.
 		if (n(RC::BatchedCopies) + n(RC::ImageBarriersSkipped) > 0.0) {
 			LOGF("Lean barriers (%.1f s), a frame: %.0f copies in batches (%.0f barriers before "

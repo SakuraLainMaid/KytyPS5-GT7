@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -45,6 +46,12 @@ enum Kind : uint32_t {
 	BatchMerged,          // and taken into another barrier
 	BatchOverlaps,        // barriers between batched copies of the same bytes
 	ImageBarriersSkipped, // image uses that made no barrier (Image::GetBarriers)
+	// Round 172 (DynamicStateShadow).
+	StateCalls,        // dynamic state calls
+	StateUnchanged,    // ... that set what the command buffer held already
+	PipelineBinds,     // pipeline binds
+	PipelineUnchanged, // ... of the pipeline bound already
+	StateLeftOut,      // calls of both kinds left out (state:filter)
 	Count
 };
 
@@ -142,7 +149,43 @@ public:
 	}
 
 	void bindPipeline(vk::PipelineBindPoint bind_point, vk::Pipeline pipeline) const {
+		if (auto* shadow = Shadow(); shadow != nullptr) {
+			// Round 172: a graphics pipeline of the emulator's own (blits, clears) may hold any
+			// state static, which binding it makes undefined: the shadow holds none after it. Such
+			// a bind is never left out (state set since its last bind may be what it holds
+			// static). A compute pipeline holds no dynamic state.
+			if (bind_point == vk::PipelineBindPoint::eCompute) {
+				if (NoteBind(*shadow, shadow->compute_pipeline == pipeline)) {
+					return;
+				}
+				shadow->compute_pipeline = pipeline;
+			} else {
+				shadow->binds++;
+				shadow->InvalidateGraphics();
+			}
+		}
 		Run([=](vk::CommandBuffer command) { command.bindPipeline(bind_point, pipeline); });
+	}
+	// Round 172: a guest draw's graphics pipeline, made with every dynamic state the draws set
+	// (pipeline/shaders.cpp), the color write enables only with color targets. The other
+	// optional ones (raster state, feedback loop) are the same for every pipeline of a run. A
+	// state a guest pipeline may hold static must be invalidated here.
+	void bindGuestPipeline(vk::Pipeline pipeline, bool color_write_dynamic) const {
+		auto* shadow = Shadow();
+		if (shadow == nullptr) {
+			bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+			return;
+		}
+		if (NoteBind(*shadow, shadow->graphics_pipeline == pipeline)) {
+			return;
+		}
+		if (!color_write_dynamic) {
+			shadow->Invalidate(DynamicStateShadow::ColorWrite);
+		}
+		shadow->graphics_pipeline = pipeline;
+		Run([=](vk::CommandBuffer command) {
+			command.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+		});
 	}
 	void draw(uint32_t vertices, uint32_t instances, uint32_t first_vertex,
 	          uint32_t first_instance) const {
@@ -582,12 +625,17 @@ public:
 	// Round 124: one viewport or scissor, for pipelines with VK_DYNAMIC_STATE_VIEWPORT/SCISSOR
 	// (the blit helper's).
 	void setViewport(const vk::Viewport& viewport) const {
+		Invalidate(DynamicStateShadow::Viewports);
 		Run([viewport](vk::CommandBuffer command) { command.setViewport(0, 1, &viewport); });
 	}
 	void setScissor(const vk::Rect2D& scissor) const {
+		Invalidate(DynamicStateShadow::Scissors);
 		Run([scissor](vk::CommandBuffer command) { command.setScissor(0, 1, &scissor); });
 	}
 	void setViewportWithCount(uint32_t count, const vk::Viewport* viewports) const {
+		if (Unchanged(DynamicStateShadow::Viewports, viewports, count * sizeof(vk::Viewport))) {
+			return;
+		}
 		if (!Threaded()) {
 			m_direct.setViewportWithCount(count, viewports);
 			return;
@@ -597,6 +645,9 @@ public:
 		    [=](vk::CommandBuffer command) { command.setViewportWithCount(count, v); });
 	}
 	void setScissorWithCount(uint32_t count, const vk::Rect2D* scissors) const {
+		if (Unchanged(DynamicStateShadow::Scissors, scissors, count * sizeof(vk::Rect2D))) {
+			return;
+		}
 		if (!Threaded()) {
 			m_direct.setScissorWithCount(count, scissors);
 			return;
@@ -606,58 +657,119 @@ public:
 		    [=](vk::CommandBuffer command) { command.setScissorWithCount(count, s); });
 	}
 	void setLineWidth(float width) const {
+		if (Unchanged(DynamicStateShadow::LineWidth, &width, sizeof(width))) {
+			return;
+		}
 		Run([=](vk::CommandBuffer command) { command.setLineWidth(width); });
 	}
 	void setBlendConstants(const float constants[4]) const {
 		const std::array<float, 4> values {constants[0], constants[1], constants[2], constants[3]};
+		if (Unchanged(DynamicStateShadow::BlendConstants, values.data(), sizeof(values))) {
+			return;
+		}
 		Run([=](vk::CommandBuffer command) { command.setBlendConstants(values.data()); });
 	}
 	void setCullMode(vk::CullModeFlags mode) const {
+		if (Unchanged(DynamicStateShadow::CullMode, &mode, sizeof(mode))) {
+			return;
+		}
 		Run([=](vk::CommandBuffer command) { command.setCullMode(mode); });
 	}
 	void setFrontFace(vk::FrontFace face) const {
+		if (Unchanged(DynamicStateShadow::FrontFace, &face, sizeof(face))) {
+			return;
+		}
 		Run([=](vk::CommandBuffer command) { command.setFrontFace(face); });
 	}
 	void setDepthBoundsTestEnable(vk::Bool32 enable) const {
+		if (Unchanged(DynamicStateShadow::DepthBoundsTest, &enable, sizeof(enable))) {
+			return;
+		}
 		Run([=](vk::CommandBuffer command) { command.setDepthBoundsTestEnable(enable); });
 	}
 	void setDepthBounds(float min_bounds, float max_bounds) const {
+		if (const std::array<float, 2> values {min_bounds, max_bounds};
+		    Unchanged(DynamicStateShadow::DepthBounds, values.data(), sizeof(values))) {
+			return;
+		}
 		Run([=](vk::CommandBuffer command) { command.setDepthBounds(min_bounds, max_bounds); });
 	}
 	void setDepthTestEnable(vk::Bool32 enable) const {
+		if (Unchanged(DynamicStateShadow::DepthTest, &enable, sizeof(enable))) {
+			return;
+		}
 		Run([=](vk::CommandBuffer command) { command.setDepthTestEnable(enable); });
 	}
 	void setDepthWriteEnable(vk::Bool32 enable) const {
+		if (Unchanged(DynamicStateShadow::DepthWrite, &enable, sizeof(enable))) {
+			return;
+		}
 		Run([=](vk::CommandBuffer command) { command.setDepthWriteEnable(enable); });
 	}
 	void setDepthCompareOp(vk::CompareOp op) const {
+		if (Unchanged(DynamicStateShadow::DepthCompare, &op, sizeof(op))) {
+			return;
+		}
 		Run([=](vk::CommandBuffer command) { command.setDepthCompareOp(op); });
 	}
 	void setDepthBiasEnable(vk::Bool32 enable) const {
+		if (Unchanged(DynamicStateShadow::DepthBiasEnable, &enable, sizeof(enable))) {
+			return;
+		}
 		Run([=](vk::CommandBuffer command) { command.setDepthBiasEnable(enable); });
 	}
 	void setDepthBias(float constant, float clamp, float slope) const {
+		if (const std::array<float, 3> values {constant, clamp, slope};
+		    Unchanged(DynamicStateShadow::DepthBias, values.data(), sizeof(values))) {
+			return;
+		}
 		Run([=](vk::CommandBuffer command) { command.setDepthBias(constant, clamp, slope); });
 	}
 	void setStencilTestEnable(vk::Bool32 enable) const {
+		if (Unchanged(DynamicStateShadow::StencilTest, &enable, sizeof(enable))) {
+			return;
+		}
 		Run([=](vk::CommandBuffer command) { command.setStencilTestEnable(enable); });
 	}
 	void setStencilOp(vk::StencilFaceFlags face, vk::StencilOp fail, vk::StencilOp pass,
 	                  vk::StencilOp depth_fail, vk::CompareOp compare) const {
+		if (const std::array<uint32_t, 4> values {
+		        static_cast<uint32_t>(fail), static_cast<uint32_t>(pass),
+		        static_cast<uint32_t>(depth_fail), static_cast<uint32_t>(compare)};
+		    UnchangedFaces(face, DynamicStateShadow::StencilOpFront,
+		                   DynamicStateShadow::StencilOpBack, values.data(), sizeof(values))) {
+			return;
+		}
 		Run([=](vk::CommandBuffer command) {
 			command.setStencilOp(face, fail, pass, depth_fail, compare);
 		});
 	}
 	void setStencilCompareMask(vk::StencilFaceFlags face, uint32_t mask) const {
+		if (UnchangedFaces(face, DynamicStateShadow::StencilCompareFront,
+		                   DynamicStateShadow::StencilCompareBack, &mask, sizeof(mask))) {
+			return;
+		}
 		Run([=](vk::CommandBuffer command) { command.setStencilCompareMask(face, mask); });
 	}
 	void setStencilWriteMask(vk::StencilFaceFlags face, uint32_t mask) const {
+		if (UnchangedFaces(face, DynamicStateShadow::StencilWriteFront,
+		                   DynamicStateShadow::StencilWriteBack, &mask, sizeof(mask))) {
+			return;
+		}
 		Run([=](vk::CommandBuffer command) { command.setStencilWriteMask(face, mask); });
 	}
 	void setStencilReference(vk::StencilFaceFlags face, uint32_t reference) const {
+		if (UnchangedFaces(face, DynamicStateShadow::StencilReferenceFront,
+		                   DynamicStateShadow::StencilReferenceBack, &reference,
+		                   sizeof(reference))) {
+			return;
+		}
 		Run([=](vk::CommandBuffer command) { command.setStencilReference(face, reference); });
 	}
 	void setColorWriteEnableEXT(uint32_t count, const vk::Bool32* enables) const {
+		if (Unchanged(DynamicStateShadow::ColorWrite, enables, count * sizeof(vk::Bool32))) {
+			return;
+		}
 		if (!Threaded()) {
 			m_direct.setColorWriteEnableEXT(count, enables);
 			return;
@@ -667,6 +779,9 @@ public:
 		    [=](vk::CommandBuffer command) { command.setColorWriteEnableEXT(count, e); });
 	}
 	void setAttachmentFeedbackLoopEnableEXT(vk::ImageAspectFlags aspects) const {
+		if (Unchanged(DynamicStateShadow::FeedbackLoop, &aspects, sizeof(aspects))) {
+			return;
+		}
 		Run([=](vk::CommandBuffer command) {
 			command.setAttachmentFeedbackLoopEnableEXT(aspects);
 		});
@@ -676,6 +791,75 @@ private:
 	static constexpr uint32_t MaxMergedMemoryBarriers = 8;
 	static constexpr size_t   MaxBatchWrites          = 256;
 
+	// Round 172 (DynamicStateShadow).
+	[[nodiscard]] DynamicStateShadow* Shadow() const noexcept {
+		return m_scheduler != nullptr ? &m_scheduler->StateShadow() : nullptr;
+	}
+	// Whether a state call can be left out: it sets what the command buffer holds already, and
+	// state:filter (or KYTY_STATE_FILTER=1) is on. The shadow follows every call either way.
+	[[nodiscard]] bool Unchanged(DynamicStateShadow::Kind kind, const void* data,
+	                             size_t size) const {
+		auto* shadow = Shadow();
+		if (shadow == nullptr) {
+			return false;
+		}
+		shadow->calls++;
+		if (!shadow->Same(kind, data, static_cast<uint32_t>(size))) {
+			return false;
+		}
+		shadow->unchanged++;
+		if (!Bisect::StateFilter()) {
+			return false;
+		}
+		shadow->left_out++;
+		return true;
+	}
+	// A stencil state of the front face, the back face or both.
+	[[nodiscard]] bool UnchangedFaces(vk::StencilFaceFlags face, DynamicStateShadow::Kind front,
+	                                  DynamicStateShadow::Kind back, const void* data,
+	                                  size_t size) const {
+		auto* shadow = Shadow();
+		if (shadow == nullptr) {
+			return false;
+		}
+		shadow->calls++;
+		const auto bytes = static_cast<uint32_t>(size);
+		bool       same  = true;
+		// Both are updated, not only the first that differs.
+		if (face & vk::StencilFaceFlagBits::eFront) {
+			same = shadow->Same(front, data, bytes) && same;
+		}
+		if (face & vk::StencilFaceFlagBits::eBack) {
+			same = shadow->Same(back, data, bytes) && same;
+		}
+		if (!same) {
+			return false;
+		}
+		shadow->unchanged++;
+		if (!Bisect::StateFilter()) {
+			return false;
+		}
+		shadow->left_out++;
+		return true;
+	}
+	void Invalidate(DynamicStateShadow::Kind kind) const noexcept {
+		if (auto* shadow = Shadow(); shadow != nullptr) {
+			shadow->Invalidate(kind);
+		}
+	}
+	// A pipeline bind: whether it binds what is bound already and can be left out.
+	[[nodiscard]] static bool NoteBind(DynamicStateShadow& shadow, bool same) {
+		shadow.binds++;
+		if (!same) {
+			return false;
+		}
+		shadow.binds_unchanged++;
+		if (!Bisect::StateFilter()) {
+			return false;
+		}
+		shadow.left_out++;
+		return true;
+	}
 	[[nodiscard]] CopyBatchState* Batch() const noexcept {
 		return m_scheduler != nullptr ? &m_scheduler->CopyBatch() : nullptr;
 	}

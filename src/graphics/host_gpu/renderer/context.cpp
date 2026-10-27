@@ -31,6 +31,10 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
 	// Round 167: what is recorded directly comes after the batched copies' barrier.
 	Recorder().FlushCopyBatch();
+	// Round 172: and may change any state: the state shadow holds none after it. State recorded
+	// through a handle kept past a Recorder() state call is not seen by the shadow, so the handle
+	// is taken again (Handle()) after such calls.
+	m_scheduler.StateShadow().InvalidateAll();
 	if (m_scheduler.Threaded()) {
 		// Recording directly: the recording thread must have run everything queued first.
 		return m_scheduler.DrainRecording();
