@@ -45,6 +45,15 @@ struct GuestInstructionPatchResult {
 	uint64_t               control_flow_memory_instruction_count    = 0;
 	uint64_t               unrelocatable_memory_instruction_count   = 0;
 	uint64_t               indirect_red_zone_function_count         = 0;
+	// Red-zone superblocks: trampolines that carry on past their own span to the next branch
+	// target, so the protected memory instructions after it run without a jump out and back each.
+	uint64_t               superblock_count          = 0;
+	uint64_t               superblock_folded_sites   = 0; // protected, after the span
+	uint64_t               superblock_merged_pairs   = 0; // RSP moves saved
+	uint64_t               superblock_bytes          = 0;
+	uint64_t               superblock_budget_skips   = 0;
+	uint64_t               trampoline_bytes_used     = 0; // the module's, after
+	uint64_t               trampoline_bytes_capacity = 0;
 	InstructionPatchCounts reciprocal_sqrt;
 	InstructionPatchCounts extrq;
 	InstructionPatchCounts insertq;
@@ -52,8 +61,14 @@ struct GuestInstructionPatchResult {
 	InstructionPatchCounts clwb;
 };
 
+// superblock_bytes: how much of the trampoline area red-zone superblocks may use; 0 keeps every
+// trampoline to its own span.
 void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
-                                         void* trampoline_area_ptr, uint64_t trampoline_area_size);
+                                         void* trampoline_area_ptr, uint64_t trampoline_area_size,
+                                         uint64_t superblock_bytes = 0);
+// The trampoline space a module's red-zone superblocks get when KYTY_REDZONE_SUPERBLOCKS=1 (0
+// otherwise).
+uint64_t GuestInstructionSuperblockSpace();
 void UnregisterGuestInstructionPatchModule(void* module_ptr);
 
 // Apply enabled instruction fixes using native trampolines or safe trap fallbacks.

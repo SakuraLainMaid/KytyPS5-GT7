@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <source_location>
 #include <span>
 #include <vector>
 
@@ -144,7 +145,7 @@ public:
 	// before (mainline 70668fbd dropped them; the renderer's resource barriers order the work), now
 	// only with KYTY_PM4_BARRIERS=global or KYTY_BISECT's barriers:global, to compare
 	// (GuestGpu::GlobalPm4Barriers).
-	void EmitGlobalBarrier();
+	void EmitGlobalBarrier(const std::source_location& site = std::source_location::current());
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);

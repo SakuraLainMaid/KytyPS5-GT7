@@ -62,10 +62,16 @@ struct PatchModule {
 	Xbyak::CodeGenerator patch_gen;
 	Xbyak::CodeGenerator trampoline_gen;
 	bool                 trampoline_exhaustion_reported = false;
+	u64                  trampoline_capacity            = 0;
+	// The part of the trampoline area the red-zone superblocks may still use; the rest stays for
+	// the spans themselves.
+	u64 superblock_left = 0;
 
-	PatchModule(u8* module_ptr, u64 module_size, u8* trampoline_ptr, u64 trampoline_size)
+	PatchModule(u8* module_ptr, u64 module_size, u8* trampoline_ptr, u64 trampoline_size,
+	            u64 superblock_bytes)
 	    : start(module_ptr), end(module_ptr + module_size), patch_gen(module_size, module_ptr),
-	      trampoline_gen(trampoline_size, trampoline_ptr) {}
+	      trampoline_gen(trampoline_size, trampoline_ptr), trampoline_capacity(trampoline_size),
+	      superblock_left(std::min(superblock_bytes, trampoline_size)) {}
 };
 
 static std::map<u64, PatchModule> g_patch_modules;
@@ -1012,9 +1018,60 @@ void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunctio
 	}
 }
 
+// Red-zone superblocks (KYTY_REDZONE_SUPERBLOCKS=1 turns them on; off by default since round 165,
+// as the game thread they were for turned out to be waiting, not working). A span's trampoline used
+// to jump back right after its own instructions, so in a loop of protected loads every one of them
+// left the guest code and came back: two far jumps and two RSP moves each. A superblock goes on
+// copying the instructions after its span, protected ones included, to the next branch target
+// (or through a jump or a return), keeps RSP below the red zone across runs that do not touch
+// RSP or branch, and only then jumps back. The guest code itself is unchanged apart from the
+// span's own jump, so every other way in (branches, returns, the other spans) works as before.
+struct SuperblockContext {
+	bool   enabled   = false;
+	size_t allowance = 0; // trampoline bytes the superblocks of this function may use
+};
+
+bool SuperblocksEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_REDZONE_SUPERBLOCKS");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+// Instructions a superblock stops before: they would leave the trampoline's address on the guest
+// stack (calls), cannot reach far targets (the rel8-only branches), or are not plain code.
+bool EndsSuperblockBefore(const DecodedCodeInstruction& decoded) {
+	const auto category = decoded.instruction.meta.category;
+	if (category == ZYDIS_CATEGORY_CALL || category == ZYDIS_CATEGORY_INTERRUPT ||
+	    category == ZYDIS_CATEGORY_SYSCALL || category == ZYDIS_CATEGORY_SYSRET ||
+	    category == ZYDIS_CATEGORY_SYSTEM || decoded.instruction.mnemonic == ZYDIS_MNEMONIC_UD2) {
+		return true;
+	}
+	switch (decoded.instruction.mnemonic) {
+		case ZYDIS_MNEMONIC_JCXZ:
+		case ZYDIS_MNEMONIC_JECXZ:
+		case ZYDIS_MNEMONIC_JRCXZ:
+		case ZYDIS_MNEMONIC_LOOP:
+		case ZYDIS_MNEMONIC_LOOPE:
+		case ZYDIS_MNEMONIC_LOOPNE: return true;
+		default: return false;
+	}
+}
+
+// Whether RSP must be the guest's own while this unprotected instruction runs: it uses RSP, or
+// it may leave the superblock.
+bool NeedsGuestStackPointer(const DecodedCodeInstruction& decoded) {
+	const auto category = decoded.instruction.meta.category;
+	return decoded.uses_stack_pointer || decoded.changes_stack_pointer ||
+	       category == ZYDIS_CATEGORY_COND_BR || category == ZYDIS_CATEGORY_UNCOND_BR ||
+	       category == ZYDIS_CATEGORY_CALL || category == ZYDIS_CATEGORY_RET;
+}
+
 void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& function,
                                const std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
-                               GuestInstructionPatchResult&                   result) {
+                               GuestInstructionPatchResult&                   result,
+                               SuperblockContext* superblocks = nullptr) {
 	struct RelocationSpan {
 		std::vector<const DecodedCodeInstruction*> instructions;
 		uintptr_t                                  patch_start {};
@@ -1122,6 +1179,7 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 	};
 
 	std::vector<std::pair<uintptr_t, uintptr_t>> patched_spans;
+	std::vector<RelocationSpan> direct_spans; // entered by a near jump at the start
 	std::vector<uintptr_t>                       relay_slots;
 	std::vector<uintptr_t>                       short_relay_slots;
 	std::vector<uintptr_t>                       unresolved_sites;
@@ -1224,6 +1282,15 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 
 		record_rewrites(span);
 		patched_spans.emplace_back(span.patch_start, span.continuation);
+		if (superblocks != nullptr && superblocks->enabled && !span.trap_replacements &&
+		    std::ranges::none_of(span.instructions, [&](const auto* decoded) {
+			    const auto rewrite = rewrite_sites.find(decoded->address);
+			    return rewrite != rewrite_sites.end() &&
+			           (rewrite->second.replacement != InstructionReplacement::None ||
+			            rewrite->second.protected_indirect_call);
+		    })) {
+			direct_spans.push_back(span);
+		}
 		if (span.patch_size >= NearJumpSize * 2) {
 			relay_slots.push_back(span.patch_start + NearJumpSize);
 		}
@@ -1481,8 +1548,158 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 		record_rewrites(site_span);
 		patched_spans.emplace_back(site_span.patch_start, site_span.continuation);
 	}
+
+	if (superblocks == nullptr || !superblocks->enabled || direct_spans.empty() ||
+	    function.has_indirect_branch) {
+		return;
+	}
+	// A superblock may jump back to any address no span has overwritten: one outside every span,
+	// or a span's start (its jump). Branch targets are never inside a span.
+	std::ranges::sort(patched_spans);
+	const auto inside_span = [&patched_spans](uintptr_t address) {
+		auto after = std::ranges::upper_bound(patched_spans, address, {},
+		                                      [](const auto& span) { return span.first; });
+		if (after == patched_spans.begin()) {
+			return false;
+		}
+		const auto& span = *std::prev(after);
+		return span.first < address && address < span.second;
+	};
+	const auto is_protected = [&](const DecodedCodeInstruction& decoded) {
+		const auto rewrite = rewrite_sites.find(decoded.address);
+		return rewrite != rewrite_sites.end() && rewrite->second.protect_red_zone &&
+		       !rewrite->second.protected_indirect_call &&
+		       rewrite->second.replacement == InstructionReplacement::None;
+	};
+	constexpr size_t MaxExtension = 48;
+	// The original code a superblock carries on through is only reached by falling through from
+	// its span (no branch target lies inside it): the spans that start there keep their plain
+	// trampolines, for the rare way in that is not a branch (an exception's landing pad).
+	uintptr_t covered_until_end = 0;
+	for (const auto& span: direct_spans) {
+		if (span.patch_start < covered_until_end) {
+			continue;
+		}
+		std::vector<const DecodedCodeInstruction*> body = span.instructions;
+		// Where the superblock may end: after `count` instructions, jumping back to `address`.
+		struct End {
+			size_t    count;
+			uintptr_t address;
+			bool      terminated;
+		};
+		End       end {body.size(), span.continuation, false};
+		uintptr_t next = span.continuation;
+		for (size_t extra = 0; extra < MaxExtension; ++extra) {
+			if (function.branch_targets.contains(next)) {
+				break;
+			}
+			const auto found = function.instructions.find(next);
+			if (found == function.instructions.end()) {
+				break;
+			}
+			const auto& decoded = found->second;
+			const auto  rewrite = rewrite_sites.find(next);
+			if (EndsSuperblockBefore(decoded) ||
+			    (rewrite != rewrite_sites.end() &&
+			     (rewrite->second.replacement != InstructionReplacement::None ||
+			      rewrite->second.protected_indirect_call))) {
+				break;
+			}
+			const auto category = decoded.instruction.meta.category;
+			const bool terminator =
+			    category == ZYDIS_CATEGORY_UNCOND_BR || category == ZYDIS_CATEGORY_RET;
+			if (!terminator && IsControlFlowTerminator(decoded.instruction)) {
+				break;
+			}
+			body.push_back(&decoded);
+			next += decoded.instruction.length;
+			if (terminator) {
+				end = {body.size(), next, true};
+				break;
+			}
+			if (!inside_span(next)) {
+				end = {body.size(), next, false};
+			}
+		}
+		body.resize(end.count);
+		size_t folded = 0;
+		for (size_t index = span.instructions.size(); index < body.size(); ++index) {
+			folded += is_protected(*body[index]) ? 1 : 0;
+		}
+		if (folded == 0) {
+			continue;
+		}
+
+		auto&        generator = module->trampoline_gen;
+		const size_t start     = generator.getSize();
+		Xbyak::ClearError();
+		bool   encoded = true;
+		bool   lowered = false;
+		size_t merged  = 0;
+		for (const auto* decoded: body) {
+			if (is_protected(*decoded)) {
+				if (!lowered) {
+					generator.lea(rsp, ptr[rsp - GuestRedZoneSize]);
+					lowered = true;
+				} else {
+					++merged;
+				}
+				encoded = EncodeRelocatedInstruction(*decoded, generator);
+				// MOV RSP, [mem] leaves the guest's new stack pointer, which is not lowered.
+				lowered = lowered && !decoded->replaces_stack_pointer;
+			} else {
+				if (lowered && NeedsGuestStackPointer(*decoded)) {
+					generator.lea(rsp, ptr[rsp + GuestRedZoneSize]);
+					lowered = false;
+				}
+				encoded = EncodeRelocatedInstruction(*decoded, generator);
+			}
+			if (!encoded || Xbyak::GetError() != 0) {
+				break;
+			}
+		}
+		if (encoded && Xbyak::GetError() == 0) {
+			if (lowered) {
+				generator.lea(rsp, ptr[rsp + GuestRedZoneSize]);
+			}
+			if (!end.terminated) {
+				generator.jmp(reinterpret_cast<void*>(end.address));
+			}
+		}
+		const size_t used = generator.getSize() - start;
+		if (!encoded || Xbyak::GetError() != 0 || used > superblocks->allowance) {
+			const int error = Xbyak::GetError();
+			generator.reset();
+			generator.setSize(start);
+			Xbyak::ClearError();
+			if (error == Xbyak::ERR_CODE_IS_TOO_BIG || used > superblocks->allowance) {
+				// Out of room: the spans keep the trampolines they have.
+				++result.superblock_budget_skips;
+				superblocks->allowance = 0;
+				break;
+			}
+			continue;
+		}
+		superblocks->allowance -= used;
+
+		auto& patch_gen = module->patch_gen;
+		patch_gen.reset();
+		patch_gen.setSize(span.patch_start - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
+		patch_gen.jmp(generator.getCode() + start, Xbyak::CodeGenerator::LabelType::T_NEAR);
+		EXIT_IF(Xbyak::GetError() != 0);
+		covered_until_end = end.address;
+		++result.superblock_count;
+		result.superblock_folded_sites += folded;
+		result.superblock_merged_pairs += merged;
+		result.superblock_bytes += used;
+	}
 }
 } // namespace
+
+uint64_t GuestInstructionSuperblockSpace() {
+	// On top of the spans' own 8 MB: about 300,000 superblocks of 150 bytes.
+	return SuperblocksEnabled() ? uint64_t {48} * 1024u * 1024u : 0;
+}
 
 GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
 	static const auto features = [] {
@@ -1559,10 +1776,18 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 			CollectAmdInstructions(function, rewrite_sites, result, host_features);
 		}
 		if (!rewrite_sites.empty()) {
-			RelocateGuestInstructions(module, function, rewrite_sites, result);
+			SuperblockContext superblocks {
+			    .enabled   = protect_memory && module->superblock_left != 0 && SuperblocksEnabled(),
+			    .allowance = static_cast<size_t>(module->superblock_left),
+			};
+			RelocateGuestInstructions(module, function, rewrite_sites, result, &superblocks);
+			module->superblock_left =
+			    superblocks.enabled ? superblocks.allowance : module->superblock_left;
 			TrapUnrelocatedInstructions(*module, function, rewrite_sites, result);
 		}
 	}
+	result.trampoline_bytes_used     = module->trampoline_gen.getSize();
+	result.trampoline_bytes_capacity = module->trampoline_capacity;
 	const auto trampoline_addr =
 	    reinterpret_cast<u64>(module->trampoline_gen.getCode()) + trampoline_begin;
 	const auto trampoline_size = module->trampoline_gen.getSize() - trampoline_begin;
@@ -1574,6 +1799,10 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 }
 
 #else
+
+uint64_t GuestInstructionSuperblockSpace() {
+	return 0;
+}
 
 GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
 	return {};
@@ -1762,7 +1991,8 @@ bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_fram
 }
 
 void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
-                                         void* trampoline_area_ptr, uint64_t trampoline_area_size) {
+                                         void* trampoline_area_ptr, uint64_t trampoline_area_size,
+                                         uint64_t superblock_bytes) {
 #if !defined(__APPLE__)
 	EXIT_IF(module_ptr == nullptr || module_size == 0 || trampoline_area_ptr == nullptr ||
 	        trampoline_area_size == 0);
@@ -1771,12 +2001,13 @@ void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
 	g_patch_modules.emplace(std::piecewise_construct, std::forward_as_tuple(module_addr),
 	                        std::forward_as_tuple(static_cast<u8*>(module_ptr), module_size,
 	                                              static_cast<u8*>(trampoline_area_ptr),
-	                                              trampoline_area_size));
+	                                              trampoline_area_size, superblock_bytes));
 #else
 	(void)module_ptr;
 	(void)module_size;
 	(void)trampoline_area_ptr;
 	(void)trampoline_area_size;
+	(void)superblock_bytes;
 #endif
 }
 

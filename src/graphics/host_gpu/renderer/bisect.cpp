@@ -51,6 +51,7 @@ struct Step {
 	bool              liftwait_old    = false; // round 153
 	int32_t           faultblock_kb   = -1;    // faultblock:<kb> (round 155); -1: the usual
 	bool              cuts156_off     = false; // round 156
+	bool              aamask_off      = false; // round 159
 	bool              recheck      = false;
 	bool              locks_spin   = false;
 	bool              htile_depth  = false;
@@ -129,6 +130,15 @@ struct Step {
 	bool              cleanpage_old   = false; // cleanpage:old
 	bool              readwait_writer = false; // readwait:writer
 	bool              barriers_global = false; // barriers:global
+	bool              barriers_guest  = false; // barriers:guest (round 166)
+	// Round 167.
+	bool              barriers_renderer = false; // barriers:renderer
+	bool              copies_lean       = false; // copies:lean
+	bool              images_lean       = false; // images:lean
+	bool              lean_off          = false; // lean:off (round 169)
+	bool              scan_shared       = false; // scan:shared (round 170)
+	bool              scan_oldtaint     = false; // scan:oldtaint (round 170)
+	bool              state_filter      = false; // state:filter (round 172)
 	bool              protect_excl    = false; // protect:exclusive
 	std::string       cpu_set;          // empty: as at the start
 	std::string       name;             // for the screen and the picture's file name
@@ -238,6 +248,10 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "cuts156:off") {
 		step.cuts156_off = true;
+		return true;
+	}
+	if (action == "aamask:off") {
+		step.aamask_off = true;
 		return true;
 	}
 	if (action == "recheck") {
@@ -454,6 +468,38 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "barriers:global") {
 		step.barriers_global = true;
+		return true;
+	}
+	if (action == "barriers:guest") {
+		step.barriers_guest = true;
+		return true;
+	}
+	if (action == "barriers:renderer") {
+		step.barriers_renderer = true;
+		return true;
+	}
+	if (action == "copies:lean") {
+		step.copies_lean = true;
+		return true;
+	}
+	if (action == "images:lean") {
+		step.images_lean = true;
+		return true;
+	}
+	if (action == "lean:off") {
+		step.lean_off = true;
+		return true;
+	}
+	if (action == "scan:shared") {
+		step.scan_shared = true;
+		return true;
+	}
+	if (action == "scan:oldtaint") {
+		step.scan_oldtaint = true;
+		return true;
+	}
+	if (action == "state:filter") {
+		step.state_filter = true;
 		return true;
 	}
 	if (action == "protect:exclusive") {
@@ -991,6 +1037,11 @@ bool Cuts156Off() {
 	return step != nullptr && step->cuts156_off;
 }
 
+bool AaMaskOff() {
+	const auto* step = Current();
+	return step != nullptr && step->aamask_off;
+}
+
 bool GpuClearRecheck() {
 	const auto* step = Current();
 	return step != nullptr && step->recheck;
@@ -1099,6 +1150,33 @@ bool LightGridsRaw() {
 bool ScanOneThread() {
 	const auto* step = Current();
 	return step != nullptr && step->scan_one;
+}
+
+bool ScanShared() {
+	const auto* step = Current();
+	return step != nullptr && step->scan_shared;
+}
+
+bool ScanOldTaint() {
+	const auto* step = Current();
+	return step != nullptr && step->scan_oldtaint;
+}
+
+bool StateFilter() {
+	static const bool whole_run = [] {
+		const char* value = std::getenv("KYTY_STATE_FILTER");
+		const bool  on    = value != nullptr && std::strcmp(value, "1") == 0;
+		LOGF("State filter: %s (KYTY_STATE_FILTER=1, or KYTY_BISECT's state:filter for a step: "
+		     "pipeline binds and dynamic state calls that set what the command buffer holds "
+		     "already are left out)\n",
+		     on ? "on" : "off");
+		return on;
+	}();
+	if (whole_run) {
+		return true;
+	}
+	const auto* step = Current();
+	return step != nullptr && step->state_filter;
 }
 
 bool HotPages() {
@@ -1290,6 +1368,48 @@ bool ReadWaitWriter() {
 bool GlobalPm4Barriers() {
 	const auto* step = Current();
 	return step != nullptr && step->barriers_global;
+}
+
+bool GuestPm4Barriers() {
+	const auto* step = Current();
+	return step != nullptr && step->barriers_guest;
+}
+
+bool RendererPm4Barriers() {
+	const auto* step = Current();
+	return step != nullptr && step->barriers_renderer;
+}
+
+// Round 169: KYTY_LEAN_BARRIERS=1 turns copies:lean and images:lean on for the whole run (F8's
+// lean:off turns them off for a step). Off by default: with round 168's shaders a race A/B found
+// no difference (with the shaders of before, about 5 % more frames).
+static bool LeanBarriersDefault() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_LEAN_BARRIERS");
+		const bool  lean  = value != nullptr && std::strcmp(value, "1") == 0;
+		LOGF("Lean barriers: %s (KYTY_LEAN_BARRIERS=1: copies share their barriers, image uses in "
+		     "an unchanged layout make none; KYTY_BISECT's copies:lean, images:lean and lean:off "
+		     "for a step)\n",
+		     lean ? "on" : "off");
+		return lean;
+	}();
+	return on;
+}
+
+bool LeanCopies() {
+	const auto* step = Current();
+	if (step != nullptr && (step->copies_lean || step->lean_off)) {
+		return !step->lean_off;
+	}
+	return LeanBarriersDefault();
+}
+
+bool LeanImages() {
+	const auto* step = Current();
+	if (step != nullptr && (step->images_lean || step->lean_off)) {
+		return !step->lean_off;
+	}
+	return LeanBarriersDefault();
 }
 
 bool PhaseTimingAll() {

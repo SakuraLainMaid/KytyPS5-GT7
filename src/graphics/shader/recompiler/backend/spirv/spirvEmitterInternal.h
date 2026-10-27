@@ -17,6 +17,7 @@
 #include <cstring>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <spirv/unified1/GLSL.std.450.h>
 #include <string>
 #include <type_traits>
@@ -72,6 +73,11 @@ struct SpirvRequirements {
 	// address is unbounded.
 	uint32_t function_lds_dwords      = 0;
 	bool function_scratch             = false;
+	// KYTY_LDS_SLOTS (LdsSlotsEnabled): the slots a non-compute stage's function-scope LDS uses
+	// when every LDS access is a LoadSharedU32 or WriteSharedU32 of the invocation's own lane
+	// (StaticLdsSlot), and whether some access is not (then the array stays).
+	uint32_t lds_slot_mask                = 0;
+	bool     lds_slots_blocked            = false;
 	bool pixel_valid_mask             = false;
 	bool buffer_int64_atomics         = false;
 	bool buffer_u8                    = false;
@@ -165,6 +171,9 @@ struct EmitterState {
 	uint32_t                                         lds_variable            = 0;
 	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
+	// With lds_slot_plan, one Function variable per slot in place of the LDS array.
+	bool                                             lds_slot_plan = false;
+	std::array<std::array<uint32_t, 16>, 2>          lds_slot_variable {};
 	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
 	// Bindless images: set-1 runtime arrays by image type, the key -> slot translation buffer,
 	// and the slot EmitImage computed for the instruction being emitted (0 when none).
@@ -616,6 +625,23 @@ uint32_t EmitIsNanF32(EmitterState& state, uint32_t value);
 inline constexpr auto EmitTruncF32Value = EmitGlsl<GLSLstd450Trunc, IR::Type::F32, uint32_t>;
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value);
+// KYTY_PS_FLUSH: how a pixel shader flushes 32-bit denormals where the device cannot do it in
+// hardware (DenormFlushToZero; the RTX 4090's driver reports it unavailable). off (the default)
+// flushes nothing: a denormal operand or result stays denormal instead of reading as zero, which
+// differs from the guest only for values below 1.2e-38 and ran the hub fastest (about 57 fps
+// with LDS slots, no visual difference in the hub or a race). exact flushes every operand and
+// result, as before; result flushes a MAD's product and sum but not its operands; sum flushes only
+// a MAD's final sum (the flushes are a chain of dependent selects, so fewer of them shorten the
+// critical path, and a denormal product changes the flushed sum only for an addend within a few
+// bits of zero, or the sign of an exact zero).
+enum class PixelFlushMode { Exact, ResultOnly, SumOnly, Off };
+PixelFlushMode PixelFlushModeFor(const EmitterState& state);
+// A pixel (or other non-compute) shader's LDS lives in a function-scope array of its own, indexed
+// dynamically (so in local memory); the hub's heaviest pixel shaders touch it only at
+// (LaneId << 2) + 256 s bytes, the invocation's own lane of slot s. KYTY_LDS_SLOTS=0 keeps the
+// array. The slot of an access that fits, or none.
+bool                    LdsSlotsEnabled();
+std::optional<uint32_t> StaticLdsSlot(const IR::Program& program, const IR::Inst& inst);
 
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero);
 

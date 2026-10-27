@@ -68,6 +68,8 @@
 //   cuts156:off  as before round 156: the GPU thread waits for the page protection worker
 //                rather than doing a batch it has not started, and every texture description is
 //                looked up in its map (no direct-mapped front)
+//   aamask:off   PA_SC_AA_MASK is left out, as before round 159: the draws whose AA sample masks
+//                differ by pixel (ghost cars) cover every pixel (KYTY_AA_MASK=0 for the whole run)
 //   liftwait:old a game thread's read of pages a download is still bringing in waits for the
 //                latest download of all, as before round 153, instead of the ones that cover its
 //                pages (KYTY_LIFT_WAIT=old for the whole run)
@@ -278,6 +280,27 @@
 //                as before round 135 (KYTY_PM4_BARRIERS=global for the whole run)
 //   protect:exclusive the page tracker's protections take the address space's lock exclusively,
 //                as before round 135 (KYTY_PROTECT_LOCK=exclusive for the whole run)
+// and, round 166/167 (GuestGpu::GuestPm4Barriers):
+//   barriers:guest the guest's sync points order the GPU work (the default since round 167)
+//   barriers:renderer a barrier before every writing dispatch and after every dispatch, as before
+//                round 167 (KYTY_PM4_BARRIERS=renderer for the whole run)
+//   copies:lean  the buffer copies of the CPU's bytes (uploads, the GPU thread's stores) share the
+//                barriers around them with the copies next to them; with the guest's sync points,
+//                a store's copy also waits for nothing before it (CopyBatch, commandRecorder.h)
+//   images:lean  with the guest's sync points, a draw's or dispatch's use of an image in the
+//                layout it is in, with no copy, makes no barrier of its own (Image::GetBarriers)
+//   lean:off     neither, for a step of a run with KYTY_LEAN_BARRIERS=1 (both for the whole
+//                run)
+// and, round 170 (DrawPrepScanner):
+//   scan:shared  the compute queues' submissions are scanned on the graphics queue's scanner
+//                thread, behind its submissions, as before (KYTY_DRAW_PREP_SCANNERS=1 for the
+//                whole run)
+//   scan:oldtaint a submission the GPU thread had passed before the scanner reached it leaves its
+//                queue's registers unknown, and nothing more of the queue is prepared up to its
+//                next suspend point, as before
+// and, round 172 (DynamicStateShadow, commandRecorder.h):
+//   state:filter pipeline binds and dynamic state calls that set what the command buffer holds
+//                already are left out (KYTY_STATE_FILTER=1 for the whole run)
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -332,6 +355,7 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] bool FastReadbackOnGpuThread();
 [[nodiscard]] bool LiftWaitOld();
 [[nodiscard]] bool Cuts156Off();
+[[nodiscard]] bool AaMaskOff();
 // Any thread: recheck; locks:spin; htile:depth; patternfill:off; faultblock:off.
 [[nodiscard]] bool GpuClearRecheck();
 [[nodiscard]] bool LocksSpin();
@@ -361,6 +385,11 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] bool OldViewBase();
 [[nodiscard]] bool LightGridsOff();
 [[nodiscard]] bool LightGridsRaw();
+// Any thread: scan:shared, scan:oldtaint (round 170).
+[[nodiscard]] bool ScanShared();
+[[nodiscard]] bool ScanOldTaint();
+// Any thread: state:filter (round 172), or KYTY_STATE_FILTER=1 for the whole run.
+[[nodiscard]] bool StateFilter();
 // Any thread: scan:one.
 [[nodiscard]] bool ScanOneThread();
 // Any thread: hotpages, or KYTY_HOT_PAGES=1.
@@ -420,6 +449,13 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] bool CleanPageOld();
 [[nodiscard]] bool ReadWaitWriter();
 [[nodiscard]] bool GlobalPm4Barriers();
+// GPU thread: barriers:guest (round 166, GuestGpu::GuestPm4Barriers).
+[[nodiscard]] bool GuestPm4Barriers();
+// GPU thread: barriers:renderer, copies:lean, images:lean (round 167); KYTY_LEAN_BARRIERS=1 turns
+// the last two on for the whole run, lean:off off for a step (round 169).
+[[nodiscard]] bool RendererPm4Barriers();
+[[nodiscard]] bool LeanCopies();
+[[nodiscard]] bool LeanImages();
 // GPU thread: gbuffer:sync; depthread:old (round 91).
 [[nodiscard]] bool GbufferSync();
 [[nodiscard]] bool DepthReadOld();

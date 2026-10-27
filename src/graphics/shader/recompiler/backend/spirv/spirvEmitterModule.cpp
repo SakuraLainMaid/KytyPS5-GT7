@@ -822,7 +822,15 @@ void DefineModule(EmitterState& state) {
 	DefineTessellationInterfaces(state);
 	DefineDescriptors(state);
 	if (state.requirements.function_lds) {
-		state.lds_variable = state.builder.AllocateId();
+		if (!state.lds_slot_plan) {
+			state.lds_variable = state.builder.AllocateId();
+		} else {
+			for (uint32_t slot = 0; slot < 16u; slot++) {
+				if ((state.requirements.lds_slot_mask >> slot & 1u) != 0u) {
+					state.lds_slot_variable[0][slot] = state.builder.AllocateId();
+				}
+			}
+		}
 	}
 	if (state.requirements.function_scratch) {
 		for (uint32_t half = 0; half < state.lane_count; half++) {
@@ -996,7 +1004,16 @@ void DefineModule(EmitterState& state) {
 	}
 	state.builder.AddName(state.main_func, "main");
 	if (state.requirements.function_lds) {
-		state.builder.AddName(state.lds_variable, "lds_dwords");
+		if (!state.lds_slot_plan) {
+			state.builder.AddName(state.lds_variable, "lds_dwords");
+		} else {
+			for (uint32_t slot = 0; slot < 16u; slot++) {
+				if (state.lds_slot_variable[0][slot] != 0) {
+					state.builder.AddName(state.lds_slot_variable[0][slot],
+					                      fmt::format("lds_slot_{}", slot).c_str());
+				}
+			}
+		}
 	}
 	if (state.requirements.function_scratch) {
 		for (uint32_t half = 0; half < state.lane_count; half++) {

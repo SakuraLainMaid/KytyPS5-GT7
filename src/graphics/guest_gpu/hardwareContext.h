@@ -867,6 +867,14 @@ public:
 	void SetAaSampleControl(const AaSampleControl& control) { m_aa_sample_control = control; }
 	[[nodiscard]] const AaConfig& GetAaConfig() const { return m_aa_config; }
 	void                          SetAaConfig(const AaConfig& config) { m_aa_config = config; }
+	// Round 158: PA_SC_AA_MASK_X0Y0_X1Y0 (0) and PA_SC_AA_MASK_X0Y1_X1Y1 (1) as written, the
+	// samples each pixel of a 2x2 quad may cover (16 bits a pixel), applied since round 159
+	// (spirvCoverageMask.h); and DB_ALPHA_TO_MASK as written (its dither offsets are not applied).
+	// For the "Coverage:" lines and frame captures too.
+	[[nodiscard]] uint32_t GetAaMask(uint32_t index) const { return m_aa_mask[index & 1u]; }
+	void SetAaMask(uint32_t index, uint32_t value) { m_aa_mask[index & 1u] = value; }
+	[[nodiscard]] uint32_t GetAlphaToMaskValue() const { return m_alpha_to_mask_value; }
+	void                   SetAlphaToMaskValue(uint32_t value) { m_alpha_to_mask_value = value; }
 
 	[[nodiscard]] float GetDepthClearValue() const { return m_depth_clear_value; }
 	void                SetDepthClearValue(float clear_value) { m_depth_clear_value = clear_value; }
@@ -942,6 +950,8 @@ private:
 
 	AaSampleControl m_aa_sample_control;
 	AaConfig        m_aa_config;
+	std::array<uint32_t, 2> m_aa_mask {0xffffffffu, 0xffffffffu};
+	uint32_t                m_alpha_to_mask_value = 0;
 
 	uint32_t m_shader_stages = 0;
 

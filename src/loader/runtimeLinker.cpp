@@ -1,5 +1,6 @@
 #include "loader/runtimeLinker.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/crashNote.h"
@@ -2009,9 +2010,18 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	const bool patch_guest_instructions = protect_memory_faults || emulate_amd;
 
 	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
+	// Red-zone superblocks get their own room on top, so the spans keep all of theirs: half the
+	// module's size, 1 MB at least, at most GuestInstructionSuperblockSpace (it is committed).
+	const uint64_t superblock_space =
+	    protect_memory_faults && GuestInstructionSuperblockSpace() != 0
+	        ? Common::AlignUp(std::clamp<uint64_t>(program->base_size_aligned / 2, 1024u * 1024u,
+	                                               GuestInstructionSuperblockSpace()),
+	                          uint64_t {0x10000})
+	        : uint64_t {0};
+	const uint64_t trampoline_size = INSTRUCTION_TRAMPOLINE_SIZE + superblock_space;
 	if (patch_guest_instructions) {
-		EXIT_IF(INSTRUCTION_TRAMPOLINE_SIZE > UINT64_MAX - program->mapped_size);
-		program->mapped_size += INSTRUCTION_TRAMPOLINE_SIZE;
+		EXIT_IF(trampoline_size > UINT64_MAX - program->mapped_size);
+		program->mapped_size += trampoline_size;
 	}
 
 	program->base_vaddr = Libs::LibKernel::Memory::AllocateProgramMemory(
@@ -2021,10 +2031,11 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 	if (patch_guest_instructions) {
 		const auto trampoline_addr           = program->base_vaddr + program->base_size_aligned;
-		program->instruction_trampoline_size = INSTRUCTION_TRAMPOLINE_SIZE;
-		RegisterGuestInstructionPatchModule(
-		    reinterpret_cast<void*>(program->base_vaddr), program->base_size_aligned,
-		    reinterpret_cast<void*>(trampoline_addr), program->instruction_trampoline_size);
+		program->instruction_trampoline_size = trampoline_size;
+		RegisterGuestInstructionPatchModule(reinterpret_cast<void*>(program->base_vaddr),
+		                                    program->base_size_aligned,
+		                                    reinterpret_cast<void*>(trampoline_addr),
+		                                    program->instruction_trampoline_size, superblock_space);
 	}
 	if (!is_shared) {
 		program->tls.handler_vaddr =
@@ -2147,6 +2158,16 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				     result.stack_dependent_memory_instruction_count,
 				     result.control_flow_memory_instruction_count,
 				     result.unrelocatable_memory_instruction_count);
+				LOGF("Windows guest red-zone superblocks: %s, %" PRIu64 " built carrying %" PRIu64
+				     " more protected instructions, %" PRIu64
+				     " stack pointer moves saved, %.1f MB%s; "
+				     "trampolines %.1f of %.1f MB (KYTY_REDZONE_SUPERBLOCKS=1 turns them on)\n",
+				     module_name.c_str(), result.superblock_count, result.superblock_folded_sites,
+				     result.superblock_merged_pairs,
+				     static_cast<double>(result.superblock_bytes) / (1024.0 * 1024.0),
+				     result.superblock_budget_skips != 0 ? ", out of room" : "",
+				     static_cast<double>(result.trampoline_bytes_used) / (1024.0 * 1024.0),
+				     static_cast<double>(result.trampoline_bytes_capacity) / (1024.0 * 1024.0));
 			}
 		}
 		if (emulate_amd && have_function_starts) {

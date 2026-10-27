@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 #include "common/perfStats.h"
 #include "graphics/host_gpu/renderer/bisect.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 
 #include <algorithm>
 #include <array>
@@ -12,6 +13,7 @@
 #include <fmt/format.h>
 #include <initializer_list>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -597,6 +599,91 @@ void ReportIfDue(uint64_t frames) {
 		                frame(Phase::DrawBda) + frame(Phase::DispatchBda), frame(Phase::Command));
 	}
 	LOGF("%s\n", line.c_str());
+	{
+		// Round 165: what the renderer recorded besides draws and dispatches, a frame.
+		namespace RC = RecordedCommands;
+		static std::array<uint64_t, RC::Count> last {};
+		std::array<uint64_t, RC::Count>        now_counts {};
+		for (size_t i = 0; i < RC::Count; i++) {
+			now_counts[i] = RC::g_counts[i].load(std::memory_order_relaxed);
+		}
+		const double frames_d = new_frames != 0 ? static_cast<double>(new_frames) : 1.0;
+		const auto   n        = [&](RC::Kind kind) {
+            return static_cast<double>(now_counts[kind] - last[kind]) / frames_d;
+		};
+		const auto mb = [&](RC::Kind kind) { return n(kind) / 1048576.0; };
+		LOGF("Recorded (%.1f s), a frame: %.0f barriers (%.0f wait for every stage; %.0f memory, "
+		     "%.0f buffer, %.0f image barriers, %.0f of them layout changes), %.0f render passes "
+		     "(%.0f attachments loaded), %.0f buffer copies (%.2f MB), %.0f buffer updates "
+		     "(%.2f MB), %.0f fills (%.2f MB), %.0f image uploads, %.0f image downloads, %.0f "
+		     "image copies or resolves, %.0f clears\n",
+		     seconds, n(RC::Barriers), n(RC::FullBarriers), n(RC::MemoryBarriers),
+		     n(RC::BufferBarriers), n(RC::ImageBarriers), n(RC::LayoutChanges), n(RC::RenderPasses),
+		     n(RC::LoadedAttachments), n(RC::BufferCopies), mb(RC::BufferCopyBytes),
+		     n(RC::BufferUpdates), mb(RC::BufferUpdateBytes), n(RC::BufferFills),
+		     mb(RC::BufferFillBytes), n(RC::ImageUploads), n(RC::ImageDownloads),
+		     n(RC::ImageCopies), n(RC::Clears));
+		// Round 172: pipeline binds and dynamic state calls, and those that changed nothing.
+		if (n(RC::StateCalls) + n(RC::PipelineBinds) > 0.0) {
+			LOGF("Recorded state (%.1f s), a frame: %.0f dynamic state calls (%.0f set what was "
+			     "set already), %.0f pipeline binds (%.0f of the pipeline bound already); %.0f "
+			     "left out (state:filter)\n",
+			     seconds, n(RC::StateCalls), n(RC::StateUnchanged), n(RC::PipelineBinds),
+			     n(RC::PipelineUnchanged), n(RC::StateLeftOut));
+		}
+		// Round 167: copies:lean's batches and images:lean's skipped barriers, when there were.
+		if (n(RC::BatchedCopies) + n(RC::ImageBarriersSkipped) > 0.0) {
+			LOGF("Lean barriers (%.1f s), a frame: %.0f copies in batches (%.0f barriers before "
+			     "them, %.0f after them on their own, %.0f taken into another barrier, %.0f "
+			     "between copies of the same bytes), %.0f image uses with no barrier\n",
+			     seconds, n(RC::BatchedCopies), n(RC::BatchBefores), n(RC::BatchAfters),
+			     n(RC::BatchMerged), n(RC::BatchOverlaps), n(RC::ImageBarriersSkipped));
+		}
+		last = now_counts;
+		// Round 166: the barriers by the line that made them, the most first.
+		static std::array<uint64_t, RC::g_barrier_sites.size()> last_site_count {};
+		static std::array<uint64_t, RC::g_barrier_sites.size()> last_site_full {};
+		struct Place {
+			const char* file;
+			uint32_t    line;
+			uint64_t    count;
+			uint64_t    full;
+		};
+		std::vector<Place> places;
+		for (size_t i = 0; i < RC::g_barrier_sites.size(); i++) {
+			const auto& site = RC::g_barrier_sites[i];
+			const char* file = site.file.load(std::memory_order_acquire);
+			if (file == nullptr) {
+				continue;
+			}
+			const auto count = site.count.load(std::memory_order_relaxed);
+			const auto full  = site.full.load(std::memory_order_relaxed);
+			if (count != last_site_count[i]) {
+				places.push_back({file, site.line.load(std::memory_order_acquire),
+				                  count - last_site_count[i], full - last_site_full[i]});
+			}
+			last_site_count[i] = count;
+			last_site_full[i]  = full;
+		}
+		std::sort(places.begin(), places.end(),
+		          [](const Place& a, const Place& b) { return a.count > b.count; });
+		std::string by_place;
+		for (size_t k = 0; k < places.size() && k < 14; k++) {
+			std::string_view file(places[k].file);
+			if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+				file.remove_prefix(slash + 1);
+			}
+			by_place += fmt::format(
+			    "{}{}:{} {:.0f}{}", by_place.empty() ? "" : ", ", file, places[k].line,
+			    static_cast<double>(places[k].count) / frames_d,
+			    places[k].full != 0
+			        ? fmt::format(" ({:.0f} full)", static_cast<double>(places[k].full) / frames_d)
+			        : std::string());
+		}
+		if (!by_place.empty()) {
+			LOGF("Recorded barriers by place, a frame: %s\n", by_place.c_str());
+		}
+	}
 	{
 		// Round 86: the GPU thread's shader and pipeline work, when there was some.
 		const auto longest_ms = [&](Phase phase) {

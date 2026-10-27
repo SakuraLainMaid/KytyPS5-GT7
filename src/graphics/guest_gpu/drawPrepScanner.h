@@ -37,7 +37,9 @@ class Context;
 // a fifth of the stages itself (~5.8 us each). The results are published in packet order.
 class DrawPrepScanner final {
 public:
-	explicit DrawPrepScanner(RenderContext& renderer);
+	// `name`: for the log ("graphics", "compute": round 170 scans the compute queues on a
+	// scanner of their own, so they wait behind no graphics submission).
+	DrawPrepScanner(RenderContext& renderer, const char* name);
 	~DrawPrepScanner();
 	DrawPrepScanner(const DrawPrepScanner&)            = delete;
 	DrawPrepScanner& operator=(const DrawPrepScanner&) = delete;

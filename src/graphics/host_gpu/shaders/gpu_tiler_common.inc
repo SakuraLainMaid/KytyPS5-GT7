@@ -37,8 +37,16 @@ void copy_element(uint src, uint dst) {
 		uint mask = ELEMENT_BYTES == 1 ? 0xffu : 0xffffu;
 		uint value = (input_buffer.data[src >> 2] >> ((src & 3u) * 8u)) & mask;
 		uint shift = (dst & 3u) * 8u;
-		atomicAnd(output_buffer.data[dst >> 2], ~(mask << shift));
-		atomicOr(output_buffer.data[dst >> 2], value << shift);
+		// One compare-and-swap loop instead of an atomicAnd and an atomicOr: half the atomics, and
+		// the word changes once. Neighbours in the same word still merge, each retrying on a miss.
+		uint word = dst >> 2;
+		uint old  = output_buffer.data[word];
+		for (;;) {
+			uint merged = (old & ~(mask << shift)) | (value << shift);
+			uint seen   = atomicCompSwap(output_buffer.data[word], old, merged);
+			if (seen == old) break;
+			old = seen;
+		}
 	}
 }
 

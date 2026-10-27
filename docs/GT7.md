@@ -65,6 +65,70 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 27, 2026, second build)
+
+No shaders are compiled again after this update.
+
+- **A new optimization profile for the Windows build.** The build is laid out by how recorded
+  races used the code (profile-guided optimization). The old profile was recorded before the
+  busiest code changed in the last few days, so that code got no benefit from it. With the new
+  one, the emulator's graphics thread spends about 3 to 4 % less time per draw in a race. In a
+  test race at Tokyo against AI cars (RTX 5090), the dip at the starting grid went from about 19
+  to about 22 fps.
+- **More compute jobs are prepared ahead of time.** A helper thread reads the game's resource
+  tables for the compute jobs before the graphics thread runs them. It used to reach only about
+  30 % of them in a race: it read them behind the big graphics lists, and gave up on a queue it
+  fell behind on. The compute jobs now have a helper of their own that doesn't give up, and it
+  prepares about 75 to 80 % of them.
+
+## What's new (October 27, 2026)
+
+**All shaders are compiled again after this update**, once. The first time on each track (and in
+the menus), parts of the scenery and cars, and sometimes most of the world, can be missing for a
+few seconds while their shaders compile. It goes away by itself and doesn't come back on that
+track.
+
+- **A much faster world map and faster races**, from strxno's fork of this branch (thanks
+  strxno). Some graphics cards, the RTX 4090 and 5090 among them, can't round extremely small
+  numbers to zero in the shaders the way the console does, so the emulator did it with extra
+  steps around much of the shader math: thousands of them in the heaviest world map shaders.
+  Those steps are now left out (the difference is only in numbers below about 10^-38; no
+  difference was seen in the menus or in races). Some heavy world map shaders also keep a small
+  working area in fast variables now instead of slow memory, and the texture layout conversion
+  runs faster. On an RTX 5090 the world map went from about 45 fps to the 60 fps frame cap, and
+  races got about 5 % faster.
+  `KYTY_PS_FLUSH=exact`, `KYTY_CS_FLUSH=exact` and `KYTY_VS_FLUSH=exact` bring the old rounding
+  back for pixel, compute and the other shaders (all shaders are then compiled once more).
+
+## What's new (October 26, 2026, second build)
+
+No shaders are compiled again after this update.
+
+- **Racing wheels** ([pull request 29](https://github.com/usa-ratt/KytyPS5-GT7/pull/29), by
+  mixo03). A wheel, pedals and shifter that Windows sees are shown to the game as a Fanatec Gran
+  Turismo DD Pro, with force feedback. It is off until you set it up: in the launcher, click the
+  racing wheel button next to the game's configuration, set **Emulated wheel** to Fanatec Gran
+  Turismo DD Pro, map at least the steering, throttle and brake (an RPCS3 G27 mapping can be
+  imported), and click **Test force feedback** once. Leave **Reverse force direction** unticked
+  unless the wheel then pulls the wrong way in the game. Bumps, kerbs and losing grip come
+  through; hitting a wall gives little or no force yet.
+- **Ghost cars are see-through again** ([issue 30](https://github.com/usa-ratt/KytyPS5-GT7/issues/30)).
+  The game draws them on every other pixel of a checkerboard, through a setting Vulkan has no
+  direct match for, so they were drawn solid. Such draws now run a copy of their shader that
+  leaves out the right pixels. The copies are made in the background the first time a ghost
+  appears, so for a moment it can still look solid.
+- **The game no longer closes at start-up over a controller mapping it doesn't know**
+  ([issue 31](https://github.com/usa-ratt/KytyPS5-GT7/issues/31)). The launcher's controller
+  mapping is shared by every KytyPS5 build on the PC, and another build had saved an entry this
+  one didn't know. Such an entry is now skipped.
+- **About 8 % more frames in races.** The graphics card used to wait for all its work to finish
+  before and after every one of the game's compute jobs (about 1,500 a frame in a race), so it
+  never ran two at once. Now it waits where the game itself says it must, as on the console. In a
+  test race the frame rate went from about 23 to 25 fps on average, with peaks near 30, and
+  nothing looked different. If something does look wrong (flickering, missing or broken effects),
+  starting the emulator with `KYTY_PM4_BARRIERS=renderer` brings back the old way: please report
+  it.
+
 ## What's new (October 26, 2026)
 
 No shaders are compiled again after this update.
@@ -541,6 +605,7 @@ Graphics and shaders:
   emulator gets past start-up on cards without fragment shader barycentrics
   ([issue 20](https://github.com/usa-ratt/KytyPS5-GT7/issues/20)), but whether the game runs on
   them is not known yet. Please report how far it gets.
+- **Racing wheels:** hitting a wall gives little or no force on the wheel yet.
 - **NVIDIA:** the driver's shader compiler can crash while it compiles new pipelines
   ([issue 18](https://github.com/usa-ratt/KytyPS5-GT7/issues/18)). Being looked into; the crash
   report names the pipeline.
@@ -548,6 +613,13 @@ Graphics and shaders:
 
 ## Credits
 
+- **strxno** found the shader speedups of the October 27 build, in a fork of this branch: no
+  software rounding of very small numbers on GPUs that can't do it themselves, pixel shaders'
+  working area in variables, and a faster texture layout conversion.
+- **mixo03** contributed racing wheel support
+  ([pull request 29](https://github.com/usa-ratt/KytyPS5-GT7/pull/29)): any wheel, pedals and
+  shifter shown to the game as a Fanatec Gran Turismo DD Pro, with force feedback and a launcher
+  page to map them.
 - **Franseven** contributed fixes to this branch: the asynchronous compute rewind functions the game
   calls every frame, UI text blending (color One, alpha Zero over a source-alpha destination, with
   dead render-target exports no longer blocking it), UI text sampled narrower than the target it was
@@ -563,7 +635,8 @@ Graphics and shaders:
 As of October 2026:
 
 - The game reaches its menus and runs races.
-- Frame rate at 3840x2160 on the PC above: about 19 to 24 fps in a race against AI cars at Tokyo;
+- Frame rate at 3840x2160 on the PC above: about 22 to 36 fps in a race against AI cars at Tokyo
+  (about 27 to 28 on average, with peaks around 40), and the world map at the 60 fps frame cap;
   in a time trial at Tokyo, high 30s on average, mid 50s in some sections.
 - On a Ryzen with 3D V-Cache on one of its two dies (such as the 7950X3D), the emulator's
   graphics threads start on the V-Cache cores by themselves (about 2 fps in a race). Starting the

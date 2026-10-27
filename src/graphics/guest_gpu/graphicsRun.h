@@ -48,6 +48,16 @@ public:
 	// barrier of before (KYTY_PM4_BARRIERS=global, or KYTY_BISECT's barriers:global), and draws
 	// that write buffers go without the write-hazard barrier the change gave them.
 	[[nodiscard]] static bool GlobalPm4Barriers();
+	// Round 166: the guest's own synchronization orders the GPU work: a full barrier at each of
+	// its partial flushes, cache actions, ACQUIRE_MEM, waits on memory and suspend points, and at
+	// the start of each queue's slice, instead of one before every writing dispatch and one after
+	// every dispatch. The default since round 167; KYTY_PM4_BARRIERS=renderer (or =global), or
+	// KYTY_BISECT's barriers:renderer (barriers:global), turns it off.
+	[[nodiscard]] static bool GuestPm4Barriers();
+	// A barrier at the guest's sync points (global or guest).
+	[[nodiscard]] static bool Pm4SyncBarriers() {
+		return GlobalPm4Barriers() || GuestPm4Barriers();
+	}
 	// Whether any label write has been deferred (so ReadLabel must consult the pending ones).
 	[[nodiscard]] static bool LabelsDeferred() noexcept;
 	// GPU thread.
@@ -144,6 +154,8 @@ private:
 	// KYTY_DRAW_PREP: the scanner, and the number of the last graphics submission queued
 	// (under m_queue_mutex).
 	std::unique_ptr<DrawPrepScanner> m_draw_prep;
+	// Round 170: the compute queues' scanner (null: they go to m_draw_prep, as before).
+	std::unique_ptr<DrawPrepScanner> m_draw_prep_compute;
 	uint64_t                         m_prep_seq = 0;
 
 	uint64_t        m_submit_id = 0;

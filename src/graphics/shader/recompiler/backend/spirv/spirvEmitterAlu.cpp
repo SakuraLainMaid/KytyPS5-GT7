@@ -265,7 +265,8 @@ uint32_t EmitFPMad32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	// 98: under DenormFlushToZero, FMul and FAdd flush their denormal results themselves (and may
 	// flush denormal operands; NVIDIA's FTZ arithmetic does), which these shaders' float mode asks
 	// for anyway.
-	if (state.denorm_flush_f32) {
+	const auto flush_mode = PixelFlushModeFor(state);
+	if (state.denorm_flush_f32 || flush_mode == PixelFlushMode::Off) {
 		const auto product = EmitFPMul32(state, a, b);
 		state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
 		const auto sum = EmitFPAdd32(state, product, c);
@@ -307,13 +308,21 @@ uint32_t EmitFPMad32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	};
 	const auto product = EmitFPMul32(state, a, b);
 	state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
-	auto keep = normal(product);
+	if (flush_mode == PixelFlushMode::SumOnly) {
+		// KYTY_PS_FLUSH=sum (the default): only the sum is flushed (see PixelFlushMode).
+		const auto plain_sum = EmitFPAdd32(state, product, c);
+		state.builder.AddAnnotation(spv::OpDecorate, plain_sum, spv::DecorationNoContraction);
+		return flushed(plain_sum, normal(plain_sum));
+	}
+	// KYTY_PS_FLUSH=result: the operands are not flushed (see PixelFlushMode).
+	const bool result_only = flush_mode == PixelFlushMode::ResultOnly;
+	auto       keep        = normal(product);
 	for (size_t index = 0; index < 2u; index++) {
-		if (!known(index)) {
+		if (!result_only && !known(index)) {
 			keep = Binary(state, spv::OpLogicalAnd, boolean, keep, normal(index == 0 ? a : b));
 		}
 	}
-	const auto addend = known(2) ? c : flushed(c, normal(c));
+	const auto addend = result_only || known(2) ? c : flushed(c, normal(c));
 	const auto sum    = EmitFPAdd32(state, flushed(product, keep), addend);
 	state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
 	return flushed(sum, normal(sum));

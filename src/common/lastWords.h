@@ -14,6 +14,10 @@ namespace Common::LastWords {
 // host stack. Windows; elsewhere nothing is installed.
 void Install();
 
+// Run once, on the failing thread, before the final report of a process that is ending: for
+// what must not outlive it (the emulated wheel stops its forces).
+void SetFinalAction(void (*action)());
+
 // From the host fault handler (first chance), with the fault's registers (a CONTEXT): an
 // exception no handler can take on this thread is reported now, as the process will not reach
 // the unhandled-exception filter (a thread running on a guest stack, whose stack bounds are

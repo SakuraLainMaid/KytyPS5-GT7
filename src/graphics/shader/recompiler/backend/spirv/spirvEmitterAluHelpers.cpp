@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 #include <cstdlib>
+#include <string_view>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -286,7 +287,36 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	return EmitBitcastU32ToF32(state, result_bits);
 }
 
+// The mode a stage's switch names: its default when unset, off, result, sum or exact otherwise.
+static PixelFlushMode FlushModeOf(const char* name, PixelFlushMode unset) {
+	const char* value = std::getenv(name);
+	if (value == nullptr) {
+		return unset;
+	}
+	const std::string_view text(value);
+	return text == "exact"    ? PixelFlushMode::Exact
+	       : text == "result" ? PixelFlushMode::ResultOnly
+	       : text == "sum"    ? PixelFlushMode::SumOnly
+	                          : PixelFlushMode::Off;
+}
+
+// KYTY_PS_FLUSH for pixel shaders and KYTY_CS_FLUSH for compute shaders (both off unless set:
+// the race's pre-race show went from 20 to 25 fps with compute flushes off), KYTY_VS_FLUSH for
+// every geometry stage (vertex, local, mesh, tessellation; 27 fps with it off too). Set any of
+// them to exact to restore the full flush.
+PixelFlushMode PixelFlushModeFor(const EmitterState& state) {
+	static const PixelFlushMode pixel    = FlushModeOf("KYTY_PS_FLUSH", PixelFlushMode::Off);
+	static const PixelFlushMode compute  = FlushModeOf("KYTY_CS_FLUSH", PixelFlushMode::Off);
+	static const PixelFlushMode geometry = FlushModeOf("KYTY_VS_FLUSH", PixelFlushMode::Off);
+	return state.program.stage == ShaderType::Pixel     ? pixel
+	       : state.program.stage == ShaderType::Compute ? compute
+	                                                    : geometry;
+}
+
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
+	if (PixelFlushModeFor(state) == PixelFlushMode::Off) {
+		return value;
+	}
 	// x * 0 keeps the sign of a denormal; NaN and infinity fail the ordered compare.
 	const auto magnitude = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), magnitude, GlslStd450(state),

@@ -924,8 +924,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			if (created || !buffer.IsRendering()) {
 				cache.m_blit_helper.ReplicateColorToMs(image, *ms.image);
 			}
-			ms.image->Transit(vk::ImageLayout::eColorAttachmentOptimal,
-			                  vk::AccessFlagBits2::eColorAttachmentWrite, {}, buffer.Recorder());
+			{
+				const GuestImageUses guest_use;
+				ms.image->Transit(vk::ImageLayout::eColorAttachmentOptimal,
+				                  vk::AccessFlagBits2::eColorAttachmentWrite, {},
+				                  buffer.Recorder());
+			}
 			attachment_view   = ms.view;
 			attachment_layout = vk::ImageLayout::eColorAttachmentOptimal;
 			resolve_view      = image_view;
@@ -935,10 +939,13 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access =
 		    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
-		image.Transit(layout, image.binding.attachment_access,
-		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
-		                                     view.layer_count},
-		              buffer.Recorder());
+		{
+			const GuestImageUses guest_use;
+			image.Transit(layout, image.binding.attachment_access,
+			              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
+			                                     view.layer_count},
+			              buffer.Recorder());
+		}
 		const auto extent       = ClampToBacking(image, view.base_level, target.Extent(),
 		                                         target.desc.info.data.address, "color");
 		state.width             = std::min(state.width, extent.width);
@@ -1031,10 +1038,13 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access = access;
 		const auto& view                = depth.desc.view_info;
-		image.Transit(layout, access,
-		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
-		                                     view.layer_count},
-		              buffer.Recorder());
+		{
+			const GuestImageUses guest_use;
+			image.Transit(layout, access,
+			              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
+			                                     view.layer_count},
+			              buffer.Recorder());
+		}
 		const auto depth_extent =
 		    ClampToBacking(image, view.base_level,
 		                   {depth.desc.info.extent.width, depth.desc.info.extent.height},
@@ -1361,6 +1371,104 @@ static void NoteDrawRepeat(const DrawCallInfo& draw, const DrawRenderState& stat
 	}
 	resolved ^= inputs * 0x9e3779b97f4a7c15ull;
 	stats.Note(FrameGraph::GpuThreadFrames(), inputs, resolved, textures, image_generation);
+}
+
+// Round 158: the draws whose sample coverage the guest narrows in ways the host left out or
+// only partly reproduces (ghost cars that drew solid, issue 30): an AA sample mask
+// (PA_SC_AA_MASK) clearing samples of a pixel of the 2x2 quad (applied since round 159, by a
+// copy of the pixel shader: spirvCoverageMask.h), alpha to coverage
+// (applied, without DB_ALPHA_TO_MASK's dither offsets) and coverage the pixel shader exports. A
+// "Coverage (10 s):" line counts them; the first draws of each kind with a pixel shader not seen
+// in that kind yet are logged ("Coverage:" lines) with their samples and blending.
+static void NoteCoverage(const CommandBuffer& buffer, const DrawRenderState& state) {
+	static std::atomic<uint64_t> draws {0}, partial_masks {0}, alpha_draws {0}, export_draws {0};
+	static std::atomic<int64_t>  last_report {0};
+	const auto&                  registers = buffer.GetRegisters();
+	const auto&                  shader    = registers.GetShaderRegisters();
+	const auto&                  config    = registers.GetAaConfig();
+	const uint32_t               samples   = 1u << std::min<uint32_t>(config.msaa_num_samples, 4u);
+	const uint32_t               full      = samples >= 16u ? 0xffffu : (1u << samples) - 1u;
+	const std::array masks = {registers.GetAaMask(0) & 0xffffu, registers.GetAaMask(0) >> 16u,
+	                          registers.GetAaMask(1) & 0xffffu, registers.GetAaMask(1) >> 16u};
+	const bool       masked =
+	    std::ranges::any_of(masks, [&](uint32_t mask) { return (mask & full) != full; });
+	const bool alpha    = state.ps_active && shader.AlphaToMask();
+	const bool exported = state.ps_active && shader.db_shader_control.shader_mask_export_enable;
+	const auto count    = draws.fetch_add(1, std::memory_order_relaxed) + 1u;
+	if (masked) partial_masks.fetch_add(1, std::memory_order_relaxed);
+	if (alpha) alpha_draws.fetch_add(1, std::memory_order_relaxed);
+	if (exported) export_draws.fetch_add(1, std::memory_order_relaxed);
+	if ((count & 1023u) == 0u) {
+		const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+		                     std::chrono::steady_clock::now().time_since_epoch())
+		                     .count();
+		auto last = last_report.load(std::memory_order_relaxed);
+		if (last == 0) {
+			last_report.compare_exchange_strong(last, now, std::memory_order_relaxed);
+		} else if (now - last >= 10000 &&
+		           last_report.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+			const auto total    = draws.exchange(0, std::memory_order_relaxed);
+			const auto masked_n = partial_masks.exchange(0, std::memory_order_relaxed);
+			const auto alpha_n  = alpha_draws.exchange(0, std::memory_order_relaxed);
+			const auto export_n = export_draws.exchange(0, std::memory_order_relaxed);
+			if (masked_n + alpha_n + export_n != 0) {
+				LOGF("Coverage (10 s): %" PRIu64 " draws: %" PRIu64
+				     " with an AA mask clearing samples, %" PRIu64
+				     " with alpha to coverage, %" PRIu64 " exporting coverage (round 158)\n",
+				     total, masked_n, alpha_n, export_n);
+			}
+		}
+	}
+	if (!masked && !alpha && !exported) {
+		return;
+	}
+	const uint64_t                      ps = state.ps_active && state.ps_input_info.stage
+	                                             ? state.ps_input_info.stage.program->shader_hash
+	                                             : 0;
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> seen;
+	static uint32_t                     logged = 0;
+	{
+		std::lock_guard lock(mutex);
+		// A shader's AA masks as well: a dither pattern that moves from frame to frame shows.
+		const uint64_t kinds = (masked ? 1u : 0u) | (alpha ? 2u : 0u) | (exported ? 4u : 0u);
+		const uint64_t key =
+		    (ps * 8u + kinds) ^
+		    (masked ? (uint64_t {registers.GetAaMask(0)} << 32u | registers.GetAaMask(1)) *
+		                  0x9e3779b97f4a7c15ull
+		            : 0u);
+		if (logged >= 96u || !seen.insert(key).second) {
+			return;
+		}
+		logged++;
+	}
+	const auto& eqaa        = registers.GetEqaaControl();
+	const auto& color       = registers.GetBlendColor();
+	const auto  slot        = state.color_count > 0 ? state.color_info[0].target_slot : 0u;
+	const auto& blend       = registers.GetBlendControl(slot);
+	const auto  color_count = state.color_count;
+	LOGF(
+	    "Coverage:%s%s%s ps %016" PRIx64 " vs %016" PRIx64 " frame %" PRIu64
+	    ": AA mask %04x %04x %04x %04x of %u samples (exposed %u), host samples "
+	    "color %u depth %u, alpha to mask %d (DB_ALPHA_TO_MASK 0x%08x), mask export %d, EQAA "
+	    "samples mask export %u alpha %u iter %u, %u targets, slot %u blend %d (%u %u %u, alpha %u "
+	    "%u %u) write mask 0x%x, constant %g %g %g %g\n",
+	    masked ? " aa-mask" : "", alpha ? " alpha" : "", exported ? " export" : "", ps,
+	    state.vertex_info[0].stage.program->shader_hash, FrameGraph::GpuThreadFrames(), masks[0],
+	    masks[1], masks[2], masks[3], samples,
+	    1u << std::min<uint32_t>(config.msaa_exposed_samples, 4u),
+	    color_count > 0 ? state.color_info[0].desc.info.samples : 0u,
+	    state.depth_info.image_id ? state.depth_info.desc.info.samples : 0u,
+	    shader.AlphaToMask() ? 1 : 0, registers.GetAlphaToMaskValue(),
+	    shader.db_shader_control.shader_mask_export_enable ? 1 : 0,
+	    static_cast<uint32_t>(eqaa.mask_export_num_samples),
+	    static_cast<uint32_t>(eqaa.alpha_to_mask_num_samples),
+	    static_cast<uint32_t>(eqaa.ps_iter_samples), color_count, slot, blend.enable ? 1 : 0,
+	    static_cast<uint32_t>(blend.color_srcblend), static_cast<uint32_t>(blend.color_comb_fcn),
+	    static_cast<uint32_t>(blend.color_destblend), static_cast<uint32_t>(blend.alpha_srcblend),
+	    static_cast<uint32_t>(blend.alpha_comb_fcn), static_cast<uint32_t>(blend.alpha_destblend),
+	    (registers.GetRenderTargetMask() >> (slot * 4u)) & 0xfu, color.red, color.green, color.blue,
+	    color.alpha);
 }
 
 // KYTY_OP_STATS=1 (round 84): the draw's group in the "Draw targets" line, its first color target
@@ -2386,6 +2494,22 @@ static void LogFrameGraphDraw(RenderContext& context, const CommandBuffer& buffe
 	                    : 0;
 	FrameGraph::Log("  shaders: vertex%s ps %016" PRIx64 " topology %d", stages.c_str(), ps,
 	                static_cast<int>(topology));
+	// Round 158: how the guest narrows the draw's sample coverage (see NoteCoverage).
+	{
+		const auto& registers = buffer.GetRegisters();
+		const auto& shader    = registers.GetShaderRegisters();
+		const auto& config    = registers.GetAaConfig();
+		const auto& color     = registers.GetBlendColor();
+		FrameGraph::Log("  coverage: AA mask 0x%08x 0x%08x, samples log2 %u (exposed %u), alpha "
+		                "to mask %d (0x%08x), mask export %d, blend constant %g %g %g %g",
+		                registers.GetAaMask(0), registers.GetAaMask(1),
+		                static_cast<uint32_t>(config.msaa_num_samples),
+		                static_cast<uint32_t>(config.msaa_exposed_samples),
+		                state.ps_active && shader.AlphaToMask() ? 1 : 0,
+		                registers.GetAlphaToMaskValue(),
+		                shader.db_shader_control.shader_mask_export_enable ? 1 : 0, color.red,
+		                color.green, color.blue, color.alpha);
+	}
 	auto& textures = context.GetTextureCache();
 	for (uint32_t i = 0; i < state.color_count; i++) {
 		const auto& color   = state.color_info[i];
@@ -2558,6 +2682,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	NoteDrawRepeat(draw, state, index_source, vertex_stages.size(),
 	               m_context.GetTextureCache().ImageSetGeneration());
 	NoteDrawTarget(state);
+	NoteCoverage(buffer, state);
 	LearnCubeTarget(buffer, state);
 	uint32_t   mesh_groups = 0;
 	if (mesh_active) {
@@ -3015,7 +3140,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
-	if (shader_write_stages && !GuestGpu::GlobalPm4Barriers()) {
+	if (shader_write_stages && !GuestGpu::Pm4SyncBarriers()) {
 		// As for dispatches, buffer writes wait for earlier accesses to the memory (mainline
 		// 70668fbd: this replaces the global barriers of PM4 flush events, which
 		// KYTY_PM4_BARRIERS=global records again, without this).
@@ -3031,7 +3156,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const int32_t occlusion_query = OcclusionQueries::PrepareDraw(
 	    m_context, vk_buffer, buffer.GetRegisters().GetDbCountControl());
 	m_context.GetCommandScheduler().BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	// Round 172: a guest pipeline keeps the dynamic state the draws set (the color write enables
+	// only with color targets), which the draw set before it.
+	vk_buffer.bindGuestPipeline(pipeline.pipeline, rendering.num_color_attachments != 0);
 	SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	GpuTiming::Before(m_context, buffer);
 	OcclusionQueries::BeginDraw(vk_buffer, occlusion_query);
@@ -3137,7 +3264,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 
 	SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
-	if (shader_write_stages) {
+	// Round 166: with barriers:guest the guest's own sync points order the draw's writes.
+	if (shader_write_stages && !GuestGpu::GuestPm4Barriers()) {
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}
