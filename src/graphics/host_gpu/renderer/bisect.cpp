@@ -135,6 +135,7 @@ struct Step {
 	bool              barriers_renderer = false; // barriers:renderer
 	bool              copies_lean       = false; // copies:lean
 	bool              images_lean       = false; // images:lean
+	bool              lean_off          = false; // lean:off (round 169)
 	bool              protect_excl    = false; // protect:exclusive
 	std::string       cpu_set;          // empty: as at the start
 	std::string       name;             // for the screen and the picture's file name
@@ -480,6 +481,10 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "images:lean") {
 		step.images_lean = true;
+		return true;
+	}
+	if (action == "lean:off") {
+		step.lean_off = true;
 		return true;
 	}
 	if (action == "protect:exclusive") {
@@ -1333,14 +1338,35 @@ bool RendererPm4Barriers() {
 	return step != nullptr && step->barriers_renderer;
 }
 
+// Round 169: copies:lean and images:lean are on unless KYTY_LEAN_BARRIERS=0 (or F8's lean:off,
+// for a step). In a race A/B they gave about 5 % more frames, with nothing drawn differently.
+static bool LeanBarriersDefault() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_LEAN_BARRIERS");
+		const bool  lean  = value == nullptr || std::strcmp(value, "0") != 0;
+		LOGF("Lean barriers: %s (KYTY_LEAN_BARRIERS=0, or KYTY_BISECT's lean:off, for the barriers "
+		     "around every copy and image use of before round 169)\n",
+		     lean ? "copies share their barriers, image uses in an unchanged layout make none"
+		          : "off");
+		return lean;
+	}();
+	return on;
+}
+
 bool LeanCopies() {
 	const auto* step = Current();
-	return step != nullptr && step->copies_lean;
+	if (step != nullptr && (step->copies_lean || step->lean_off)) {
+		return !step->lean_off;
+	}
+	return LeanBarriersDefault();
 }
 
 bool LeanImages() {
 	const auto* step = Current();
-	return step != nullptr && step->images_lean;
+	if (step != nullptr && (step->images_lean || step->lean_off)) {
+		return !step->lean_off;
+	}
+	return LeanBarriersDefault();
 }
 
 bool PhaseTimingAll() {
