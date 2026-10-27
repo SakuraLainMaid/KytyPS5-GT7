@@ -1338,16 +1338,17 @@ bool RendererPm4Barriers() {
 	return step != nullptr && step->barriers_renderer;
 }
 
-// Round 169: copies:lean and images:lean are on unless KYTY_LEAN_BARRIERS=0 (or F8's lean:off,
-// for a step). In a race A/B they gave about 5 % more frames, with nothing drawn differently.
+// Round 169: KYTY_LEAN_BARRIERS=1 turns copies:lean and images:lean on for the whole run (F8's
+// lean:off turns them off for a step). Off by default: with round 168's shaders a race A/B found
+// no difference (with the shaders of before, about 5 % more frames).
 static bool LeanBarriersDefault() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_LEAN_BARRIERS");
-		const bool  lean  = value == nullptr || std::strcmp(value, "0") != 0;
-		LOGF("Lean barriers: %s (KYTY_LEAN_BARRIERS=0, or KYTY_BISECT's lean:off, for the barriers "
-		     "around every copy and image use of before round 169)\n",
-		     lean ? "copies share their barriers, image uses in an unchanged layout make none"
-		          : "off");
+		const bool  lean  = value != nullptr && std::strcmp(value, "1") == 0;
+		LOGF("Lean barriers: %s (KYTY_LEAN_BARRIERS=1: copies share their barriers, image uses in "
+		     "an unchanged layout make none; KYTY_BISECT's copies:lean, images:lean and lean:off "
+		     "for a step)\n",
+		     lean ? "on" : "off");
 		return lean;
 	}();
 	return on;

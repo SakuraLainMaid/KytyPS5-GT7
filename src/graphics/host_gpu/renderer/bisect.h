@@ -289,8 +289,8 @@
 //                a store's copy also waits for nothing before it (CopyBatch, commandRecorder.h)
 //   images:lean  with the guest's sync points, a draw's or dispatch's use of an image in the
 //                layout it is in, with no copy, makes no barrier of its own (Image::GetBarriers)
-//   lean:off     neither, as before round 169, when both are the default (KYTY_LEAN_BARRIERS=0
-//                for the whole run)
+//   lean:off     neither, for a step of a run with KYTY_LEAN_BARRIERS=1 (both for the whole
+//                run)
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -436,8 +436,8 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] bool GlobalPm4Barriers();
 // GPU thread: barriers:guest (round 166, GuestGpu::GuestPm4Barriers).
 [[nodiscard]] bool GuestPm4Barriers();
-// GPU thread: barriers:renderer, copies:lean, images:lean (round 167); the last two are the
-// default since round 169 (KYTY_LEAN_BARRIERS=0, or lean:off, turns them off).
+// GPU thread: barriers:renderer, copies:lean, images:lean (round 167); KYTY_LEAN_BARRIERS=1 turns
+// the last two on for the whole run, lean:off off for a step (round 169).
 [[nodiscard]] bool RendererPm4Barriers();
 [[nodiscard]] bool LeanCopies();
 [[nodiscard]] bool LeanImages();
