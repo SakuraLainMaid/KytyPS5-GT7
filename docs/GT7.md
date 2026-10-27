@@ -65,6 +65,35 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 26, 2026, second build)
+
+No shaders are compiled again after this update.
+
+- **Racing wheels** ([pull request 29](https://github.com/usa-ratt/KytyPS5-GT7/pull/29), by
+  mixo03). A wheel, pedals and shifter that Windows sees are shown to the game as a Fanatec Gran
+  Turismo DD Pro, with force feedback. It is off until you set it up: in the launcher, click the
+  racing wheel button next to the game's configuration, set **Emulated wheel** to Fanatec Gran
+  Turismo DD Pro, map at least the steering, throttle and brake (an RPCS3 G27 mapping can be
+  imported), and click **Test force feedback** once. Leave **Reverse force direction** unticked
+  unless the wheel then pulls the wrong way in the game. Bumps, kerbs and losing grip come
+  through; hitting a wall gives little or no force yet.
+- **Ghost cars are see-through again** ([issue 30](https://github.com/usa-ratt/KytyPS5-GT7/issues/30)).
+  The game draws them on every other pixel of a checkerboard, through a setting Vulkan has no
+  direct match for, so they were drawn solid. Such draws now run a copy of their shader that
+  leaves out the right pixels. The copies are made in the background the first time a ghost
+  appears, so for a moment it can still look solid.
+- **The game no longer closes at start-up over a controller mapping it doesn't know**
+  ([issue 31](https://github.com/usa-ratt/KytyPS5-GT7/issues/31)). The launcher's controller
+  mapping is shared by every KytyPS5 build on the PC, and another build had saved an entry this
+  one didn't know. Such an entry is now skipped.
+- **About 8 % more frames in races.** The graphics card used to wait for all its work to finish
+  before and after every one of the game's compute jobs (about 1,500 a frame in a race), so it
+  never ran two at once. Now it waits where the game itself says it must, as on the console. In a
+  test race the frame rate went from about 23 to 25 fps on average, with peaks near 30, and
+  nothing looked different. If something does look wrong (flickering, missing or broken effects),
+  starting the emulator with `KYTY_PM4_BARRIERS=renderer` brings back the old way: please report
+  it.
+
 ## What's new (October 26, 2026)
 
 No shaders are compiled again after this update.
@@ -541,6 +570,7 @@ Graphics and shaders:
   emulator gets past start-up on cards without fragment shader barycentrics
   ([issue 20](https://github.com/usa-ratt/KytyPS5-GT7/issues/20)), but whether the game runs on
   them is not known yet. Please report how far it gets.
+- **Racing wheels:** hitting a wall gives little or no force on the wheel yet.
 - **NVIDIA:** the driver's shader compiler can crash while it compiles new pipelines
   ([issue 18](https://github.com/usa-ratt/KytyPS5-GT7/issues/18)). Being looked into; the crash
   report names the pipeline.
@@ -548,6 +578,10 @@ Graphics and shaders:
 
 ## Credits
 
+- **mixo03** contributed racing wheel support
+  ([pull request 29](https://github.com/usa-ratt/KytyPS5-GT7/pull/29)): any wheel, pedals and
+  shifter shown to the game as a Fanatec Gran Turismo DD Pro, with force feedback and a launcher
+  page to map them.
 - **Franseven** contributed fixes to this branch: the asynchronous compute rewind functions the game
   calls every frame, UI text blending (color One, alpha Zero over a source-alpha destination, with
   dead render-target exports no longer blocking it), UI text sampled narrower than the target it was
@@ -563,7 +597,7 @@ Graphics and shaders:
 As of October 2026:
 
 - The game reaches its menus and runs races.
-- Frame rate at 3840x2160 on the PC above: about 19 to 24 fps in a race against AI cars at Tokyo;
+- Frame rate at 3840x2160 on the PC above: about 21 to 30 fps in a race against AI cars at Tokyo;
   in a time trial at Tokyo, high 30s on average, mid 50s in some sections.
 - On a Ryzen with 3D V-Cache on one of its two dies (such as the 7950X3D), the emulator's
   graphics threads start on the V-Cache cores by themselves (about 2 fps in a race). Starting the
