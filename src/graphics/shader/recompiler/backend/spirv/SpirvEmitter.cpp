@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/perfStats.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -364,6 +365,13 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				if (program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh &&
 				    kind == IR::ResourceKind::Lds) {
 					requirements.function_lds = true;
+					if (LdsSlotsEnabled()) {
+						if (const auto slot = StaticLdsSlot(program, inst); slot.has_value()) {
+							requirements.lds_slot_mask |= 1u << *slot;
+						} else {
+							requirements.lds_slots_blocked = true;
+						}
+					}
 					std::vector<const IR::Inst*> visiting;
 					const auto address = UpperBoundU32(inst.Arg(0), program.wave_size, visiting);
 					if (address.has_value()) {
@@ -626,6 +634,30 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	                         input_info.compute != nullptr &&
 	                         (input_info.compute->float_mode & 0x30u) == 0u;
 	state.wave_lds_scope = WaveLdsScope(program, workgroup, state.lane_count);
+	// The LDS slots must fit the array they replace: lane l of slot s is dword l + 64 s, which is
+	// below 64 (s + 1); the array's bounds check then never fails for them.
+	const auto lds_slots = state.requirements.lds_slot_mask;
+	state.lds_slot_plan =
+	    state.lane_count == 1u && state.requirements.function_lds &&
+	    !state.requirements.lds_slots_blocked && lds_slots != 0 &&
+	    static_cast<uint64_t>(std::bit_width(lds_slots)) * 64u <= LdsDwordCount(state);
+	static const bool lds_slots_log = [] {
+		const char* value = std::getenv("KYTY_LDS_SLOTS_LOG");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (state.requirements.function_lds && program.stage == ShaderType::Pixel && lds_slots_log) {
+		// Diagnostics: a pixel shader that keeps its LDS in a function-scope array, and whether
+		// it took the slots (the first 24).
+		static std::atomic<uint32_t> lds_reported {0};
+		if (lds_reported.fetch_add(1, std::memory_order_relaxed) < 24u) {
+			Log::WriteUnmuted(fmt::format(
+			    "LDS slots: pixel shader 0x{:016x}: {} ({}-dword function array, {} slot(s) "
+			    "used{})\n",
+			    program.shader_hash, state.lds_slot_plan ? "slots in variables" : "array kept",
+			    LdsDwordCount(state), std::popcount(lds_slots),
+			    state.requirements.lds_slots_blocked ? ", an access is not a lane slot" : ""));
+		}
+	}
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,

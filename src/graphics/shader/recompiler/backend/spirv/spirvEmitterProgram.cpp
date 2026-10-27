@@ -1038,10 +1038,21 @@ void EmitProgram(EmitterState& state) {
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
 	EmitLabel(state, state.entry_label);
 	if (state.requirements.function_lds) {
-		state.builder.AddFunction(
-		    spv::OpVariable,
-		    TypeU32ArrayPointer(state, spv::StorageClassFunction, LdsDwordCount(state)),
-		    state.lds_variable, spv::StorageClassFunction);
+		if (!state.lds_slot_plan) {
+			state.builder.AddFunction(
+			    spv::OpVariable,
+			    TypeU32ArrayPointer(state, spv::StorageClassFunction, LdsDwordCount(state)),
+			    state.lds_variable, spv::StorageClassFunction);
+		} else {
+			for (uint32_t slot = 0; slot < 16u; slot++) {
+				if (state.lds_slot_variable[0][slot] != 0) {
+					state.builder.AddFunction(
+					    spv::OpVariable,
+					    TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+					    state.lds_slot_variable[0][slot], spv::StorageClassFunction);
+				}
+			}
+		}
 	}
 	if (state.requirements.function_scratch) {
 		for (uint32_t half = 0; half < state.lane_count; half++) {

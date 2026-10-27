@@ -40,6 +40,11 @@ void main() {
 	uint shift = (dst & 2u) * 8u;
 	uint mask = 0xffffu << shift;
 	uint word = dst >> 2u;
-	atomicAnd(output_buffer.data[word], ~mask);
-	atomicOr(output_buffer.data[word], decode(input_buffer.data[src >> 2u]) << shift);
+	uint value = decode(input_buffer.data[src >> 2u]) << shift;
+	uint old   = output_buffer.data[word];
+	for (;;) {
+		uint seen = atomicCompSwap(output_buffer.data[word], old, (old & ~mask) | value);
+		if (seen == old) break;
+		old = seen;
+	}
 }

@@ -2271,9 +2271,83 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	           }));
 }
 
+// On unless KYTY_LDS_SLOTS=0: on the hub's heaviest pixel shaders it takes their dynamically
+// indexed LDS arrays (local memory) out of the frame, 42-43 to about 57 fps on an RTX 4090.
+bool LdsSlotsEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_LDS_SLOTS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
+// A pixel shader's LDS is a function-scope array of its own invocation (nothing is shared with
+// the other lanes), and the hub's heaviest shaders use it only at (LaneId << 2) + 256 s bytes:
+// lane l of slot s is dword l + 64 s, never another lane's. One variable a slot then gives the
+// values the array does, without the dynamic indexing that puts the array in local memory. Only a
+// dword read or write qualifies: wide or byte accesses, atomics, append and consume keep the array.
+std::optional<uint32_t> StaticLdsSlot(const IR::Program& program, const IR::Inst& inst) {
+	if (inst.GetOpcode() != IR::ValueOpcode::LoadSharedU32 &&
+	    inst.GetOpcode() != IR::ValueOpcode::WriteSharedU32) {
+		return std::nullopt;
+	}
+	const auto memory_index = inst.Flags<IR::MemoryFlags>().index;
+	if (memory_index >= program.memory_info.size() ||
+	    program.memory_info[memory_index].kind != IR::ResourceKind::Lds) {
+		return std::nullopt;
+	}
+	const auto offset = static_cast<int32_t>(program.memory_info[memory_index].offset);
+	if (offset < 0 || (offset & 0xff) != 0 || (offset >> 8) >= 16) {
+		return std::nullopt;
+	}
+	const auto* shift_left = inst.Arg(0).Resolve().TryInstruction();
+	if (shift_left == nullptr || shift_left->GetOpcode() != IR::ValueOpcode::ShiftLeftLogical32) {
+		return std::nullopt;
+	}
+	const auto* lane = shift_left->Arg(0).Resolve().TryInstruction();
+	const auto  by   = shift_left->Arg(1).Resolve();
+	if (lane == nullptr || lane->GetOpcode() != IR::ValueOpcode::LaneId || !by.IsImmediate() ||
+	    by.U32() != 2u) {
+		return std::nullopt;
+	}
+	return static_cast<uint32_t>(offset >> 8);
+}
+
+uint32_t LdsSlotVariable(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto slot = StaticLdsSlot(ctx.state.program, inst);
+	EXIT_IF(!slot.has_value());
+	const auto variable = ctx.state.lds_slot_variable[ctx.state.lane_half][*slot];
+	EXIT_IF(variable == 0);
+	return variable;
+}
+
+// Read as zero (and written not at all) while the lane is inactive, as the array's accesses are.
+uint32_t LoadLdsSlot(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state    = ctx.state;
+	const auto variable = LdsSlotVariable(ctx, inst);
+	const auto value    = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, variable);
+	return Select(state, TypeU32(state), ctx.Arg(inst, inst.NumArgs() - 1), value,
+	              ConstantU32(state, 0));
+}
+
+void StoreLdsSlot(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state    = ctx.state;
+	const auto variable = LdsSlotVariable(ctx, inst);
+	const auto before   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), before, variable);
+	state.builder.AddFunction(spv::OpStore, variable,
+	                          Select(state, TypeU32(state), ctx.Arg(inst, inst.NumArgs() - 1),
+	                                 ctx.Arg(inst, inst.NumArgs() - 2), before));
+}
+
 void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  op  = inst.GetOpcode();
 	const auto& mem = ctx.Memory(inst);
+	if (ctx.state.lds_slot_plan && mem.kind == IR::ResourceKind::Lds) {
+		ctx.Define(inst, LoadLdsSlot(ctx, inst));
+		return;
+	}
 	if (op == IR::ValueOpcode::LoadAddressU32 && mem.planning_only) {
 		DefinePlanningOnlyRead(ctx, inst);
 		return;
@@ -2314,6 +2388,10 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  buffer_components = IR::BufferComponentCount(op);
 	const auto  shared_components = IR::SharedComponentCount(op);
 	const auto  type              = inst.Arg(inst.NumArgs() - 2).GetType();
+	if (ctx.state.lds_slot_plan && mem.kind == IR::ResourceKind::Lds) {
+		StoreLdsSlot(ctx, inst);
+		return;
+	}
 	if (mem.kind == IR::ResourceKind::FlatLocal)
 		StoreLocalFlat(ctx, inst);
 	else if (buffer_components > 1u)
