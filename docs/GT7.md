@@ -65,6 +65,22 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 27, 2026, second build)
+
+No shaders are compiled again after this update.
+
+- **A new optimization profile for the Windows build.** The build is laid out by how recorded
+  races used the code (profile-guided optimization). The old profile was recorded before the
+  busiest code changed in the last few days, so that code got no benefit from it. With the new
+  one, the emulator's graphics thread spends about 3 to 4 % less time per draw in a race. In a
+  test race at Tokyo against AI cars (RTX 5090), the dip at the starting grid went from about 19
+  to about 22 fps.
+- **More compute jobs are prepared ahead of time.** A helper thread reads the game's resource
+  tables for the compute jobs before the graphics thread runs them. It used to reach only about
+  30 % of them in a race: it read them behind the big graphics lists, and gave up on a queue it
+  fell behind on. The compute jobs now have a helper of their own that doesn't give up, and it
+  prepares about 75 to 80 % of them.
+
 ## What's new (October 27, 2026)
 
 **All shaders are compiled again after this update**, once. The first time on each track (and in
@@ -619,8 +635,8 @@ Graphics and shaders:
 As of October 2026:
 
 - The game reaches its menus and runs races.
-- Frame rate at 3840x2160 on the PC above: about 23 to 35 fps in a race against AI cars at Tokyo
-  (about 27 on average), and the world map at the 60 fps frame cap;
+- Frame rate at 3840x2160 on the PC above: about 22 to 36 fps in a race against AI cars at Tokyo
+  (about 27 to 28 on average, with peaks around 40), and the world map at the 60 fps frame cap;
   in a time trial at Tokyo, high 30s on average, mid 50s in some sections.
 - On a Ryzen with 3D V-Cache on one of its two dies (such as the 7950X3D), the emulator's
   graphics threads start on the V-Cache cores by themselves (about 2 fps in a race). Starting the
