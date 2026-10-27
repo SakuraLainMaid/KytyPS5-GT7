@@ -131,6 +131,7 @@ struct Step {
 	bool              readwait_writer = false; // readwait:writer
 	bool              barriers_global = false; // barriers:global
 	bool              barriers_guest  = false; // barriers:guest (round 166)
+	bool              barriers_renderer = false; // barriers:renderer (round 167)
 	bool              protect_excl    = false; // protect:exclusive
 	std::string       cpu_set;          // empty: as at the start
 	std::string       name;             // for the screen and the picture's file name
@@ -464,6 +465,10 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "barriers:guest") {
 		step.barriers_guest = true;
+		return true;
+	}
+	if (action == "barriers:renderer") {
+		step.barriers_renderer = true;
 		return true;
 	}
 	if (action == "protect:exclusive") {
@@ -1310,6 +1315,11 @@ bool GlobalPm4Barriers() {
 bool GuestPm4Barriers() {
 	const auto* step = Current();
 	return step != nullptr && step->barriers_guest;
+}
+
+bool RendererPm4Barriers() {
+	const auto* step = Current();
+	return step != nullptr && step->barriers_renderer;
 }
 
 bool PhaseTimingAll() {

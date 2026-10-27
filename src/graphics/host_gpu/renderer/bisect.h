@@ -280,6 +280,10 @@
 //                as before round 135 (KYTY_PM4_BARRIERS=global for the whole run)
 //   protect:exclusive the page tracker's protections take the address space's lock exclusively,
 //                as before round 135 (KYTY_PROTECT_LOCK=exclusive for the whole run)
+// and, round 166/167 (GuestGpu::GuestPm4Barriers):
+//   barriers:guest the guest's sync points order the GPU work (the default since round 167)
+//   barriers:renderer a barrier before every writing dispatch and after every dispatch, as before
+//                round 167 (KYTY_PM4_BARRIERS=renderer for the whole run)
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -425,6 +429,8 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] bool GlobalPm4Barriers();
 // GPU thread: barriers:guest (round 166, GuestGpu::GuestPm4Barriers).
 [[nodiscard]] bool GuestPm4Barriers();
+// GPU thread: barriers:renderer (round 167).
+[[nodiscard]] bool RendererPm4Barriers();
 // GPU thread: gbuffer:sync; depthread:old (round 91).
 [[nodiscard]] bool GbufferSync();
 [[nodiscard]] bool DepthReadOld();

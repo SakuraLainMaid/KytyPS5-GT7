@@ -48,10 +48,11 @@ public:
 	// barrier of before (KYTY_PM4_BARRIERS=global, or KYTY_BISECT's barriers:global), and draws
 	// that write buffers go without the write-hazard barrier the change gave them.
 	[[nodiscard]] static bool GlobalPm4Barriers();
-	// Round 166: the guest's own synchronization orders the GPU work (KYTY_PM4_BARRIERS=guest,
-	// or KYTY_BISECT's barriers:guest): a full barrier at each of its partial flushes, cache
-	// actions, ACQUIRE_MEM, waits on memory and suspend points, and at the start of each queue's
-	// slice, instead of one before every writing dispatch and one after every dispatch.
+	// Round 166: the guest's own synchronization orders the GPU work: a full barrier at each of
+	// its partial flushes, cache actions, ACQUIRE_MEM, waits on memory and suspend points, and at
+	// the start of each queue's slice, instead of one before every writing dispatch and one after
+	// every dispatch. The default since round 167; KYTY_PM4_BARRIERS=renderer (or =global), or
+	// KYTY_BISECT's barriers:renderer (barriers:global), turns it off.
 	[[nodiscard]] static bool GuestPm4Barriers();
 	// A barrier at the guest's sync points (global or guest).
 	[[nodiscard]] static bool Pm4SyncBarriers() {

@@ -1931,26 +1931,32 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 
 bool GuestGpu::GlobalPm4Barriers() {
 	static const bool whole_run = [] {
-		const char* value = std::getenv("KYTY_PM4_BARRIERS");
-		const bool  on    = value != nullptr && std::strcmp(value, "global") == 0;
-		const bool  guest = value != nullptr && std::strcmp(value, "guest") == 0;
-		LOGF("PM4 barriers: %s (KYTY_PM4_BARRIERS=global, or KYTY_BISECT's barriers:global, for "
-		     "the full barriers of before round 135; =guest, or barriers:guest, for the guest's "
-		     "sync points instead of a barrier around every dispatch)\n",
-		     on      ? "a full barrier at each cache flush, RELEASE_MEM and suspend point"
-		     : guest ? "the guest's sync points (round 166)"
-		             : "the renderer's resource barriers only");
+		const char* value    = std::getenv("KYTY_PM4_BARRIERS");
+		const bool  on       = value != nullptr && std::strcmp(value, "global") == 0;
+		const bool  renderer = value != nullptr && std::strcmp(value, "renderer") == 0;
+		LOGF("PM4 barriers: %s (KYTY_PM4_BARRIERS=renderer, or KYTY_BISECT's barriers:renderer, "
+		     "for a barrier before every writing dispatch and after every dispatch, as before "
+		     "round 167; =global, or barriers:global, for the full barriers of before round "
+		     "135)\n",
+		     on         ? "a full barrier at each cache flush, RELEASE_MEM and suspend point"
+		     : renderer ? "the renderer's resource barriers only"
+		                : "the guest's sync points (round 166, the default since round 167)");
 		return on;
 	}();
 	return whole_run || Bisect::GlobalPm4Barriers();
 }
 
 bool GuestGpu::GuestPm4Barriers() {
-	static const bool whole_run = [] {
+	// Round 167: on unless KYTY_PM4_BARRIERS names another kind (or a step asks for one). In a
+	// race A/B the GPU thread was no longer held up waiting, about 8 % more frames.
+	static const bool renderer_run = [] {
 		const char* value = std::getenv("KYTY_PM4_BARRIERS");
-		return value != nullptr && std::strcmp(value, "guest") == 0;
+		return value != nullptr && std::strcmp(value, "renderer") == 0;
 	}();
-	return whole_run || Bisect::GuestPm4Barriers();
+	if (Bisect::GuestPm4Barriers()) {
+		return true;
+	}
+	return !renderer_run && !GlobalPm4Barriers() && !Bisect::RendererPm4Barriers();
 }
 
 void CommandProcessor::EmitGlobalBarrier(const std::source_location& site) {
