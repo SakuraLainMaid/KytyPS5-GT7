@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 #include <initializer_list>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -599,6 +600,49 @@ void ReportIfDue(uint64_t frames) {
 		     mb(RC::BufferFillBytes), n(RC::ImageUploads), n(RC::ImageDownloads),
 		     n(RC::ImageCopies), n(RC::Clears));
 		last = now_counts;
+		// Round 166: the barriers by the line that made them, the most first.
+		static std::array<uint64_t, RC::g_barrier_sites.size()> last_site_count {};
+		static std::array<uint64_t, RC::g_barrier_sites.size()> last_site_full {};
+		struct Place {
+			const char* file;
+			uint32_t    line;
+			uint64_t    count;
+			uint64_t    full;
+		};
+		std::vector<Place> places;
+		for (size_t i = 0; i < RC::g_barrier_sites.size(); i++) {
+			const auto& site = RC::g_barrier_sites[i];
+			const char* file = site.file.load(std::memory_order_acquire);
+			if (file == nullptr) {
+				continue;
+			}
+			const auto count = site.count.load(std::memory_order_relaxed);
+			const auto full  = site.full.load(std::memory_order_relaxed);
+			if (count != last_site_count[i]) {
+				places.push_back({file, site.line.load(std::memory_order_acquire),
+				                  count - last_site_count[i], full - last_site_full[i]});
+			}
+			last_site_count[i] = count;
+			last_site_full[i]  = full;
+		}
+		std::sort(places.begin(), places.end(),
+		          [](const Place& a, const Place& b) { return a.count > b.count; });
+		std::string by_place;
+		for (size_t k = 0; k < places.size() && k < 14; k++) {
+			std::string_view file(places[k].file);
+			if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+				file.remove_prefix(slash + 1);
+			}
+			by_place += fmt::format(
+			    "{}{}:{} {:.0f}{}", by_place.empty() ? "" : ", ", file, places[k].line,
+			    static_cast<double>(places[k].count) / frames_d,
+			    places[k].full != 0
+			        ? fmt::format(" ({:.0f} full)", static_cast<double>(places[k].full) / frames_d)
+			        : std::string());
+		}
+		if (!by_place.empty()) {
+			LOGF("Recorded barriers by place, a frame: %s\n", by_place.c_str());
+		}
 	}
 	{
 		// Round 86: the GPU thread's shader and pipeline work, when there was some.

@@ -3130,7 +3130,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
-	if (shader_write_stages && !GuestGpu::GlobalPm4Barriers()) {
+	if (shader_write_stages && !GuestGpu::Pm4SyncBarriers()) {
 		// As for dispatches, buffer writes wait for earlier accesses to the memory (mainline
 		// 70668fbd: this replaces the global barriers of PM4 flush events, which
 		// KYTY_PM4_BARRIERS=global records again, without this).
@@ -3252,7 +3252,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 
 	SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
-	if (shader_write_stages) {
+	// Round 166: with barriers:guest the guest's own sync points order the draw's writes.
+	if (shader_write_stages && !GuestGpu::GuestPm4Barriers()) {
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}

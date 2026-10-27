@@ -1342,6 +1342,10 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0055800 && cmd_id != 0xc0061050);
+	// Round 166 (barriers:guest): the guest's wait for its earlier work and its cache actions.
+	if (GuestGpu::GuestPm4Barriers()) {
+		cp.EmitGlobalBarrier();
+	}
 	return (cmd_id == 0xc0061050 ? 7 : 6);
 }
 
@@ -2432,7 +2436,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 
 	// Cache actions only order GPU work, which the renderer's resource barriers already order
 	// (mainline 70668fbd; KYTY_PM4_BARRIERS=global records the full barrier of before).
-	const bool global_barriers = GuestGpu::GlobalPm4Barriers();
+	const bool global_barriers = GuestGpu::Pm4SyncBarriers();
 	if (data_sel == 0 || interrupt_selector == 4 ||
 	    (release_dst == ReleaseMemDstMemory && dst_gpu_addr == nullptr)) {
 		if (global_barriers && (eop_event_type != 0x28 || gcr_cntl != 0)) {

@@ -615,6 +615,10 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	m_renderer.RefreshHotPages();
 	g_guest_wait_seq.fetch_add(1, std::memory_order_relaxed);
 	GpuPhases::Count(GpuPhases::Phase::WaitPassed, 1);
+	// Round 166 (barriers:guest): what comes after the wait comes after what it waited for.
+	if (GuestGpu::GuestPm4Barriers()) {
+		EmitGlobalBarrier();
+	}
 	if (FrameGraph::Logging()) {
 		FrameGraph::BeginOp();
 		FrameGraph::Log("wait 0x%012" PRIx64 " passed: function %u reference 0x%" PRIx64
@@ -989,6 +993,11 @@ bool GuestGpu::Process(Submission& submission) {
 
 	cp.BufferInit();
 	bool complete = true;
+	// Round 166 (barriers:guest): this queue's work comes after what the slices before it
+	// recorded, other queues' included (their labels this one may have waited for).
+	if (GuestPm4Barriers()) {
+		cp.EmitGlobalBarrier();
+	}
 
 	switch (submission.type) {
 		case SubmissionType::Graphics: {
@@ -1067,7 +1076,7 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::SuspendPoint:
 			FrameGraph::OnFrameBoundary(m_renderer.GetBufferCache());
 			m_renderer.GetTextureCache().TraceFrameEnd();
-			if (GlobalPm4Barriers()) {
+			if (Pm4SyncBarriers()) {
 				cp.EmitGlobalBarrier();
 			}
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
@@ -1924,16 +1933,27 @@ bool GuestGpu::GlobalPm4Barriers() {
 	static const bool whole_run = [] {
 		const char* value = std::getenv("KYTY_PM4_BARRIERS");
 		const bool  on    = value != nullptr && std::strcmp(value, "global") == 0;
+		const bool  guest = value != nullptr && std::strcmp(value, "guest") == 0;
 		LOGF("PM4 barriers: %s (KYTY_PM4_BARRIERS=global, or KYTY_BISECT's barriers:global, for "
-		     "the full barriers of before round 135)\n",
-		     on ? "a full barrier at each cache flush, RELEASE_MEM and suspend point"
-		        : "the renderer's resource barriers only");
+		     "the full barriers of before round 135; =guest, or barriers:guest, for the guest's "
+		     "sync points instead of a barrier around every dispatch)\n",
+		     on      ? "a full barrier at each cache flush, RELEASE_MEM and suspend point"
+		     : guest ? "the guest's sync points (round 166)"
+		             : "the renderer's resource barriers only");
 		return on;
 	}();
 	return whole_run || Bisect::GlobalPm4Barriers();
 }
 
-void CommandProcessor::EmitGlobalBarrier() {
+bool GuestGpu::GuestPm4Barriers() {
+	static const bool whole_run = [] {
+		const char* value = std::getenv("KYTY_PM4_BARRIERS");
+		return value != nullptr && std::strcmp(value, "guest") == 0;
+	}();
+	return whole_run || Bisect::GuestPm4Barriers();
+}
+
+void CommandProcessor::EmitGlobalBarrier(const std::source_location& site) {
 	const RendererLock lock(m_renderer.GetMutex());
 
 	vk::MemoryBarrier2 barrier {};
@@ -1946,7 +1966,7 @@ void CommandProcessor::EmitGlobalBarrier() {
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &barrier;
 	GetScheduler().EndRendering();
-	CurrentBuffer().Recorder().pipelineBarrier2(dependency);
+	CurrentBuffer().Recorder().pipelineBarrier2(dependency, site);
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
@@ -1972,7 +1992,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 		case 0x00000007:
 		case 0x0000000f:
 		case 0x00000010:
-			if (GuestGpu::GlobalPm4Barriers()) {
+			if (GuestGpu::Pm4SyncBarriers()) {
 				EmitGlobalBarrier();
 			}
 			break;
@@ -1987,7 +2007,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				EXIT("unknown event type: 0x%08" PRIx32 ", 0x%08" PRIx32 "\n", event_type,
 				     event_index);
 			}
-			if (GuestGpu::GlobalPm4Barriers()) {
+			if (GuestGpu::Pm4SyncBarriers()) {
 				EmitGlobalBarrier();
 			}
 			break;

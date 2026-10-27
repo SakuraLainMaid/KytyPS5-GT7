@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <source_location>
 
 namespace Libs::Graphics {
 
@@ -60,8 +61,47 @@ inline void Mark(uint32_t gap) noexcept {
 	g_gap.fetch_or(gap, std::memory_order_relaxed);
 }
 
-inline void NoteBarrier(bool full, uint32_t memory, uint32_t buffers, uint32_t images,
-                        uint32_t layout_changes) noexcept {
+// Round 166: barrier calls by the source line that made them (the caller of the barrier helpers
+// that pass theirs on), for the "Recorded" lines' places. A slot is claimed once; a full table
+// drops the rest.
+struct BarrierSite {
+	std::atomic<const char*> file {nullptr};
+	std::atomic<uint32_t>    line {0};
+	std::atomic<uint64_t>    count {0};
+	std::atomic<uint64_t>    full {0};
+};
+inline std::array<BarrierSite, 256> g_barrier_sites {};
+
+inline void NoteSite(const std::source_location& site, bool full) noexcept {
+	const char* file = site.file_name();
+	const auto  line = site.line();
+	const auto  hash = (reinterpret_cast<uintptr_t>(file) >> 3u) ^ (uintptr_t {line} * 2654435761u);
+	for (size_t probe = 0; probe < 16; probe++) {
+		auto&       slot    = g_barrier_sites[(hash + probe) % g_barrier_sites.size()];
+		const char* claimed = slot.file.load(std::memory_order_acquire);
+		if (claimed == nullptr) {
+			const char* expected = nullptr;
+			if (slot.file.compare_exchange_strong(expected, file, std::memory_order_acq_rel)) {
+				slot.line.store(line, std::memory_order_release);
+				claimed = file;
+			} else {
+				claimed = expected;
+			}
+		}
+		if (claimed == file && slot.line.load(std::memory_order_acquire) == line) {
+			slot.count.fetch_add(1, std::memory_order_relaxed);
+			if (full) {
+				slot.full.fetch_add(1, std::memory_order_relaxed);
+			}
+			return;
+		}
+	}
+}
+
+inline void
+NoteBarrier(bool full, uint32_t memory, uint32_t buffers, uint32_t images, uint32_t layout_changes,
+            const std::source_location& site = std::source_location::current()) noexcept {
+	NoteSite(site, full);
 	Add(Barriers);
 	Add(MemoryBarriers, memory);
 	Add(BufferBarriers, buffers);
@@ -212,7 +252,8 @@ public:
 	                     vk::DependencyFlags flags, uint32_t memory_count,
 	                     const vk::MemoryBarrier* memory, uint32_t buffer_count,
 	                     const vk::BufferMemoryBarrier* buffers, uint32_t image_count,
-	                     const vk::ImageMemoryBarrier* images) const {
+	                     const vk::ImageMemoryBarrier* images,
+	                     const std::source_location& site = std::source_location::current()) const {
 		{
 			uint32_t layouts = 0;
 			for (uint32_t i = 0; i < image_count; i++) {
@@ -220,7 +261,7 @@ public:
 			}
 			RecordedCommands::NoteBarrier(
 			    static_cast<bool>((source | destination) & vk::PipelineStageFlagBits::eAllCommands),
-			    memory_count, buffer_count, image_count, layouts);
+			    memory_count, buffer_count, image_count, layouts, site);
 		}
 		if (!Threaded()) {
 			m_direct.pipelineBarrier(source, destination, flags, memory_count, memory, buffer_count,
@@ -238,7 +279,9 @@ public:
 			                        image_count, i);
 		});
 	}
-	void pipelineBarrier2(const vk::DependencyInfo& dependency) const {
+	void
+	pipelineBarrier2(const vk::DependencyInfo&   dependency,
+	                 const std::source_location& site = std::source_location::current()) const {
 		{
 			uint32_t layouts = 0;
 			bool     full    = false;
@@ -260,7 +303,7 @@ public:
 			}
 			RecordedCommands::NoteBarrier(full, dependency.memoryBarrierCount,
 			                              dependency.bufferMemoryBarrierCount,
-			                              dependency.imageMemoryBarrierCount, layouts);
+			                              dependency.imageMemoryBarrierCount, layouts, site);
 		}
 		if (!Threaded()) {
 			m_direct.pipelineBarrier2(dependency);

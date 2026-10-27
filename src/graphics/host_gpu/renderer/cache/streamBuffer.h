@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <source_location>
 #include <span>
 #include <utility>
 #include <vector>
@@ -69,11 +70,13 @@ public:
 	              vk::AccessFlags source_before      = vk::AccessFlagBits::eMemoryWrite,
 	              vk::AccessFlags destination_before = vk::AccessFlagBits::eMemoryRead |
 	                                                   vk::AccessFlagBits::eMemoryWrite,
-	              vk::AccessFlags source_after       = vk::AccessFlagBits::eMemoryRead |
-	                                                   vk::AccessFlagBits::eMemoryWrite,
-	              vk::AccessFlags destination_after  = vk::AccessFlagBits::eMemoryRead |
-	                                                   vk::AccessFlagBits::eMemoryWrite);
-	void Fill(uint64_t offset, uint64_t size, uint32_t value);
+	              vk::AccessFlags source_after = vk::AccessFlagBits::eMemoryRead |
+	                                             vk::AccessFlagBits::eMemoryWrite,
+	              vk::AccessFlags destination_after = vk::AccessFlagBits::eMemoryRead |
+	                                                  vk::AccessFlagBits::eMemoryWrite,
+	              const std::source_location& site = std::source_location::current());
+	void Fill(uint64_t offset, uint64_t size, uint32_t value,
+	          const std::source_location& site = std::source_location::current());
 
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted   = false;

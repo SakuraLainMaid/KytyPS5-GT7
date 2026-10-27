@@ -110,29 +110,32 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	return has_writes;
 }
 
-void ShaderAccessBarrier(const CommandRecorder& vk_buffer, vk::PipelineStageFlags source_stages) {
+void ShaderAccessBarrier(const CommandRecorder& vk_buffer, vk::PipelineStageFlags source_stages,
+                         const std::source_location& site) {
 	EXIT_IF(vk_buffer == nullptr || !source_stages);
 	const auto barrier = MakeShaderAccessDependency();
 	vk_buffer.pipelineBarrier(source_stages, vk::PipelineStageFlagBits::eAllCommands,
-	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
+	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr, site);
 }
 
-void ShaderWriteHazardBarrier(const CommandRecorder& vk_buffer,
-                              vk::PipelineStageFlags destination_stages) {
+void ShaderWriteHazardBarrier(const CommandRecorder&      vk_buffer,
+                              vk::PipelineStageFlags      destination_stages,
+                              const std::source_location& site) {
 	EXIT_IF(vk_buffer == nullptr || !destination_stages);
 	const auto barrier = MakeShaderWriteHazardDependency();
 	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, destination_stages,
-	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
+	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr, site);
 }
 
-void ShaderWriteBarrier(const CommandRecorder& vk_buffer, vk::PipelineStageFlags source_stages) {
+void ShaderWriteBarrier(const CommandRecorder& vk_buffer, vk::PipelineStageFlags source_stages,
+                        const std::source_location& site) {
 	EXIT_IF(vk_buffer == nullptr || !source_stages);
 	const auto barrier = MakeShaderWriteDependency();
 	vk_buffer.pipelineBarrier(source_stages,
 	                          vk::PipelineStageFlagBits::eComputeShader |
 	                              vk::PipelineStageFlagBits::eAllGraphics |
 	                              vk::PipelineStageFlagBits::eTransfer,
-	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
+	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr, site);
 }
 
 } // namespace Libs::Graphics

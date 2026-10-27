@@ -423,6 +423,8 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] bool CleanPageOld();
 [[nodiscard]] bool ReadWaitWriter();
 [[nodiscard]] bool GlobalPm4Barriers();
+// GPU thread: barriers:guest (round 166, GuestGpu::GuestPm4Barriers).
+[[nodiscard]] bool GuestPm4Barriers();
 // GPU thread: gbuffer:sync; depthread:old (round 91).
 [[nodiscard]] bool GbufferSync();
 [[nodiscard]] bool DepthReadOld();
