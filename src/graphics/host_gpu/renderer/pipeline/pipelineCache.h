@@ -451,6 +451,8 @@ private:
 	std::filesystem::path          m_driver_cache_path;
 	uint64_t                       m_driver_cache_loaded = 0; // bytes of it loaded (0: none)
 	std::vector<vk::PipelineCache> m_driver_older;
+	// The files m_driver_older came from (RetireOlderFiles).
+	std::vector<std::filesystem::path> m_driver_older_paths;
 	// Round 96: driver caches Save let go of while background compiles still used them.
 	std::vector<vk::PipelineCache> m_driver_cache_parked;
 	// Unoptimized pipelines replaced by their optimized ones (FinishPending), destroyed at the end.

@@ -4497,6 +4497,63 @@ static std::filesystem::path DriverCacheFullMarker(const std::filesystem::path& 
 	return marker;
 }
 
+// Full files that no longer pay for themselves. A full file is handed to the driver whole, and the
+// driver keeps a copy: GT7's first file took 2.6 GB of RAM a run while serving 285 pipelines, its
+// others compiled since by newer shader code (each change of the recompiler's output makes the
+// pipelines of the shaders it touched new ones). At the exit the run's hits from the full files are
+// kept beside them (<file>.hits); a full file whose last run took fewer than
+// KYTY_PIPELINE_CACHE_RETIRE (default 2000; 0: never) of its pipelines from them gets a
+// <file>.retired marker and is no longer loaded. It stays on disk, and still counts as full.
+static uint64_t DriverCacheRetireBelow() {
+	static const uint64_t below = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_CACHE_RETIRE");
+		return value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : uint64_t {2000};
+	}();
+	return below;
+}
+
+static std::filesystem::path DriverCacheSidecar(const std::filesystem::path& file_path,
+                                                const char*                  suffix) {
+	auto sidecar = file_path;
+	sidecar += suffix;
+	return sidecar;
+}
+
+// Whether the full file at `file_path` is retired (marked now, from its last run's hits, or before).
+static bool DriverCacheRetired(const std::filesystem::path& file_path) {
+	const auto marker = DriverCacheSidecar(file_path, ".retired");
+	if (Common::File::IsFileExisting(marker)) {
+		return true;
+	}
+	const auto below = DriverCacheRetireBelow();
+	const auto hits  = DriverCacheSidecar(file_path, ".hits");
+	if (below == 0 || !Common::File::IsFileExisting(hits)) {
+		return false;
+	}
+	Common::File file(hits, Common::File::Mode::Read);
+	if (file.IsInvalid()) {
+		return false;
+	}
+	char     text[32] = {};
+	uint32_t read     = 0;
+	file.Read(text, sizeof(text) - 1, &read);
+	file.Close();
+	const auto last_hits = std::strtoull(text, nullptr, 10);
+	if (read == 0 || last_hits >= below) {
+		return false;
+	}
+	Common::File created;
+	if (created.Create(marker)) {
+		created.Close();
+	}
+	PipelineCacheLog("Vulkan pipeline cache: retiring {}: its last run took {} pipelines from the "
+	                 "full files (fewer than {}, KYTY_PIPELINE_CACHE_RETIRE); it is not loaded any "
+	                 "more and can be deleted ({} is its marker)",
+	                 Common::PathToString(file_path), last_hits, below,
+	                 Common::PathToString(marker));
+	return true;
+}
+
 enum class DriverCacheFile : uint8_t {
 	Missing,
 	Unreadable,   // it exists but could not be read: left alone, and not written
@@ -4595,6 +4652,13 @@ void PipelineCache::InitializeDriverCache() {
 		const bool valid = state == DriverCacheFile::Valid;
 		const bool full  = valid && (initial_data.size() >= DriverCacheFullBytes ||
                                     Common::File::IsFileExisting(DriverCacheFullMarker(file_path)));
+		if (full && index + 1 != files && DriverCacheRetired(file_path)) {
+			initial_data.clear();
+			initial_data.shrink_to_fit();
+			PipelineCacheLog("Vulkan pipeline cache: {} is retired; not loaded",
+			                 Common::PathToString(file_path));
+			continue;
+		}
 		if (!full || index + 1 == files) {
 			// New pipelines go here (a missing or unusable file is written anew).
 			write_index         = index;
@@ -4613,6 +4677,7 @@ void PipelineCache::InitializeDriverCache() {
 			continue;
 		}
 		m_driver_older.push_back(older);
+		m_driver_older_paths.push_back(file_path);
 		older_bytes += initial_data.size();
 		PipelineCacheLog("Vulkan pipeline cache: loaded {} bytes from {} ({} MB: full, read only)",
 		                 initial_data.size(), Common::PathToString(file_path),
@@ -4674,8 +4739,19 @@ void PipelineCache::Save() {
 	// "not responding".
 	const auto still_compiling = FinishBackgroundCompute(std::chrono::seconds(20));
 	if (!m_driver_older.empty()) {
+		const auto hits = g_older_file_hits.load(std::memory_order_relaxed);
 		PipelineCacheLog("Vulkan pipeline cache: {} pipelines this run came from the full files",
-		                 g_older_file_hits.load(std::memory_order_relaxed));
+		                 hits);
+		// For DriverCacheRetired at the next start.
+		const auto text = std::to_string(hits);
+		for (const auto& path: m_driver_older_paths) {
+			Common::File file;
+			if (file.Create(DriverCacheSidecar(path, ".hits"))) {
+				uint32_t written = 0;
+				file.Write(text.data(), static_cast<uint32_t>(text.size()), &written);
+				file.Close();
+			}
+		}
 		for (const auto cache: m_driver_older) {
 			m_graphics.device.destroyPipelineCache(cache, nullptr);
 		}
