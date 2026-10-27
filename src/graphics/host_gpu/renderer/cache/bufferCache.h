@@ -221,7 +221,11 @@ public:
 	// them CPU-dirty and writable, and the next sync uploaded them and made them read-only again
 	// (about 330 times a frame in a race, mostly labels). KYTY_STORE_CLEAN=0 or F8's
 	// storeclean:off: not.
-	[[nodiscard]] bool              WriteClean(uint64_t vaddr, const void* data, uint64_t size);
+	// `guest_store`: a WRITE_DATA of the guest's command stream, which with the guest's sync
+	// points waits for no GPU work before it (copies:lean, round 167). Labels, the CPU's stores
+	// and the emulator's own wait for it.
+	[[nodiscard]] bool WriteClean(uint64_t vaddr, const void* data, uint64_t size,
+	                              bool guest_store = false);
 	// Round 132: told of each WriteClean store to CPU-clean watched pages (RenderContext: the
 	// bindless table's watches, which a CPU write fault tells otherwise).
 	void SetCleanStoreHook(void (*hook)(void* user, uint64_t vaddr, uint64_t size), void* user) {
@@ -387,7 +391,10 @@ private:
 
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
-	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
+	// `guest_store`: a WRITE_DATA of the guest's command stream (WriteClean), which with the
+	// guest's sync points waits for no GPU work before it (copies:lean, round 167).
+	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size,
+	                     bool guest_store = false);
 	// Records bytes a binding makes GPU-written (after SynchronizeBuffer marked their pages).
 	void MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked = false);
 	// ReadMemoryStep: drops the pages of the readback window the bitmap shows the GPU did not

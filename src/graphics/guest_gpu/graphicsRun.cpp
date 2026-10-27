@@ -665,7 +665,8 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	// the page, draining the GPU; WriteClean writes both copies instead.
 	auto& cache = m_renderer.GetBufferCache();
 	if (write_one_address) {
-		if (cache.WriteClean(reinterpret_cast<uint64_t>(dst), &src[dw_num - 1], sizeof(uint32_t))) {
+		if (cache.WriteClean(reinterpret_cast<uint64_t>(dst), &src[dw_num - 1], sizeof(uint32_t),
+		                     true)) {
 			return;
 		}
 		m_renderer.PrepareGpuThreadWrite(reinterpret_cast<uint64_t>(dst), sizeof(uint32_t));
@@ -676,7 +677,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		                                LibKernel::Memory::WriteSource::GpuThreadStore);
 	} else {
 		const auto bytes = static_cast<size_t>(dw_num) * sizeof(uint32_t);
-		if (cache.WriteClean(reinterpret_cast<uint64_t>(dst), src, bytes)) {
+		if (cache.WriteClean(reinterpret_cast<uint64_t>(dst), src, bytes, true)) {
 			return;
 		}
 		m_renderer.PrepareGpuThreadWrite(reinterpret_cast<uint64_t>(dst), bytes);

@@ -599,6 +599,14 @@ void ReportIfDue(uint64_t frames) {
 		     n(RC::BufferUpdates), mb(RC::BufferUpdateBytes), n(RC::BufferFills),
 		     mb(RC::BufferFillBytes), n(RC::ImageUploads), n(RC::ImageDownloads),
 		     n(RC::ImageCopies), n(RC::Clears));
+		// Round 167: copies:lean's batches and images:lean's skipped barriers, when there were.
+		if (n(RC::BatchedCopies) + n(RC::ImageBarriersSkipped) > 0.0) {
+			LOGF("Lean barriers (%.1f s), a frame: %.0f copies in batches (%.0f barriers before "
+			     "them, %.0f after them on their own, %.0f taken into another barrier, %.0f "
+			     "between copies of the same bytes), %.0f image uses with no barrier\n",
+			     seconds, n(RC::BatchedCopies), n(RC::BatchBefores), n(RC::BatchAfters),
+			     n(RC::BatchMerged), n(RC::BatchOverlaps), n(RC::ImageBarriersSkipped));
+		}
 		last = now_counts;
 		// Round 166: the barriers by the line that made them, the most first.
 		static std::array<uint64_t, RC::g_barrier_sites.size()> last_site_count {};

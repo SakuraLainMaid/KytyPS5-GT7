@@ -284,6 +284,11 @@
 //   barriers:guest the guest's sync points order the GPU work (the default since round 167)
 //   barriers:renderer a barrier before every writing dispatch and after every dispatch, as before
 //                round 167 (KYTY_PM4_BARRIERS=renderer for the whole run)
+//   copies:lean  the buffer copies of the CPU's bytes (uploads, the GPU thread's stores) share the
+//                barriers around them with the copies next to them; with the guest's sync points,
+//                a store's copy also waits for nothing before it (CopyBatch, commandRecorder.h)
+//   images:lean  with the guest's sync points, a draw's or dispatch's use of an image in the
+//                layout it is in, with no copy, makes no barrier of its own (Image::GetBarriers)
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -429,8 +434,10 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] bool GlobalPm4Barriers();
 // GPU thread: barriers:guest (round 166, GuestGpu::GuestPm4Barriers).
 [[nodiscard]] bool GuestPm4Barriers();
-// GPU thread: barriers:renderer (round 167).
+// GPU thread: barriers:renderer, copies:lean, images:lean (round 167).
 [[nodiscard]] bool RendererPm4Barriers();
+[[nodiscard]] bool LeanCopies();
+[[nodiscard]] bool LeanImages();
 // GPU thread: gbuffer:sync; depthread:old (round 91).
 [[nodiscard]] bool GbufferSync();
 [[nodiscard]] bool DepthReadOld();

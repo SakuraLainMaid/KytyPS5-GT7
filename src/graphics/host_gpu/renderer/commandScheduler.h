@@ -30,6 +30,23 @@ enum class Transfer : uint8_t;
 
 class PageManager;
 
+// Round 167 (copies:lean): the batch of buffer copies the scheduler's command buffer is recording
+// (CommandRecorder::copyBufferBatched), kept in the order of its commands. A batch ends with the
+// command buffer (Submit).
+struct CopyBatchState {
+	struct Written {
+		vk::Buffer buffer;
+		uint64_t   begin = 0;
+		uint64_t   end   = 0;
+	};
+	// Nothing but batched copies since a barrier that made them wait for all the GPU work before.
+	bool fenced = false;
+	// Batched copies that no barrier has made visible to the commands after them yet.
+	bool after_pending = false;
+	// Their destinations since the last barrier that ordered them.
+	std::vector<Written> written;
+};
+
 class CommandScheduler {
 public:
 	CommandScheduler(RenderContext& context, GraphicContext& graphics);
@@ -167,6 +184,8 @@ public:
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
+	// Round 167: the recording command buffer's batch of copies (the recording side's thread).
+	[[nodiscard]] CopyBatchState& CopyBatch() noexcept { return m_copy_batch; }
 
 private:
 	class CommandPool {
@@ -306,6 +325,7 @@ private:
 	void*                                 m_before_flush_user = nullptr;
 	bool                                  m_in_before_flush   = false;
 	PageManager*                          m_submit_pages      = nullptr;
+	CopyBatchState                        m_copy_batch;
 };
 
 } // namespace Libs::Graphics

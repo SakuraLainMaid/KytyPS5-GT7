@@ -57,13 +57,31 @@ constexpr uint64_t GdsBufferSize = 64 * 1024;
 } // namespace
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
-                                  uint64_t size) {
-	auto* bytes = static_cast<const uint8_t*>(source);
+                                  uint64_t size, bool guest_store) {
+	// Round 167 (copies:lean): in the command buffer's batch of copies (copyBufferBatched). The
+	// guest's own stores are not ordered after the GPU work before them unless it waits for that
+	// work, which its sync points then order: with them, a store's copy waits for nothing either.
+	const bool batched     = Bisect::LeanCopies() && GuestGpu::IsGpuThread();
+	const bool wait_before = !guest_store || !GuestGpu::GuestPm4Barriers();
+	auto*      bytes       = static_cast<const uint8_t*>(source);
 	while (size != 0) {
 		const auto chunk  = std::min(size, m_staging_buffer.Size());
 		const auto offset = m_staging_buffer.Copy(bytes, chunk, 4);
-		buffer.CopyFrom(m_scheduler.Current(), m_staging_buffer, offset, buffer.Offset(address),
-		                chunk, vk::AccessFlagBits::eHostWrite);
+		if (batched) {
+			const auto destination = buffer.Offset(address);
+			if (destination > buffer.Size() || chunk > buffer.Size() - destination) {
+				EXIT("BufferCache: store 0x%016" PRIx64 "+0x%" PRIx64 " out of its buffer\n",
+				     address, chunk);
+			}
+			auto& command = m_scheduler.Current();
+			command.EndRendering();
+			const vk::BufferCopy copy {offset, destination, chunk};
+			command.Recorder().copyBufferBatched(m_staging_buffer.Handle(), buffer.Handle(), 1,
+			                                     &copy, wait_before);
+		} else {
+			buffer.CopyFrom(m_scheduler.Current(), m_staging_buffer, offset, buffer.Offset(address),
+			                chunk, vk::AccessFlagBits::eHostWrite);
+		}
 		bytes += chunk;
 		address += chunk;
 		size -= chunk;
@@ -713,7 +731,7 @@ static bool StoreCleanEnabled() {
 	return enabled && !Bisect::StoreCleanOff();
 }
 
-bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
+bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size, bool guest_store) {
 	if (!GuestGpu::IsGpuThread()) {
 		return false;
 	}
@@ -765,7 +783,7 @@ bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 	    !Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
 		return false;
 	}
-	WriteDataBuffer(m_slot_buffers[*owner], vaddr, data, size);
+	WriteDataBuffer(m_slot_buffers[*owner], vaddr, data, size, guest_store);
 	{
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		ForgetFills(vaddr, size);
@@ -2308,7 +2326,14 @@ void BufferCache::RecordUpload(Buffer& buffer, std::span<const vk::BufferCopy> c
 	m_scheduler.NoteTransfer(StallWatch::Transfer::BufferUpload, total_size);
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
-	const auto              native = command.Recorder();
+	const auto native = command.Recorder();
+	if (Bisect::LeanCopies() && GuestGpu::IsGpuThread()) {
+		// Round 167 (copies:lean): in the command buffer's batch of copies, after the GPU work
+		// before it (draws may still read the bytes it replaces).
+		native.copyBufferBatched(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
+		                         copies.data(), true);
+		return;
+	}
 	vk::BufferMemoryBarrier before {};
 	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
 	                       vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;

@@ -131,7 +131,10 @@ struct Step {
 	bool              readwait_writer = false; // readwait:writer
 	bool              barriers_global = false; // barriers:global
 	bool              barriers_guest  = false; // barriers:guest (round 166)
-	bool              barriers_renderer = false; // barriers:renderer (round 167)
+	// Round 167.
+	bool              barriers_renderer = false; // barriers:renderer
+	bool              copies_lean       = false; // copies:lean
+	bool              images_lean       = false; // images:lean
 	bool              protect_excl    = false; // protect:exclusive
 	std::string       cpu_set;          // empty: as at the start
 	std::string       name;             // for the screen and the picture's file name
@@ -469,6 +472,14 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "barriers:renderer") {
 		step.barriers_renderer = true;
+		return true;
+	}
+	if (action == "copies:lean") {
+		step.copies_lean = true;
+		return true;
+	}
+	if (action == "images:lean") {
+		step.images_lean = true;
 		return true;
 	}
 	if (action == "protect:exclusive") {
@@ -1320,6 +1331,16 @@ bool GuestPm4Barriers() {
 bool RendererPm4Barriers() {
 	const auto* step = Current();
 	return step != nullptr && step->barriers_renderer;
+}
+
+bool LeanCopies() {
+	const auto* step = Current();
+	return step != nullptr && step->copies_lean;
+}
+
+bool LeanImages() {
+	const auto* step = Current();
+	return step != nullptr && step->images_lean;
 }
 
 bool PhaseTimingAll() {

@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -37,6 +38,13 @@ enum Kind : uint32_t {
 	Clears,            // clearColorImage, clearDepthStencilImage
 	RenderPasses,      // beginRendering
 	LoadedAttachments, // attachments those load (LOAD_OP_LOAD)
+	// Round 167 (copies:lean, images:lean).
+	BatchedCopies,        // copies made in batches (CopyBatchState)
+	BatchBefores,         // the barriers they waited for the work before them with
+	BatchAfters,          // the barriers that made them visible, recorded on their own
+	BatchMerged,          // and taken into another barrier
+	BatchOverlaps,        // barriers between batched copies of the same bytes
+	ImageBarriersSkipped, // image uses that made no barrier (Image::GetBarriers)
 	Count
 };
 
@@ -138,41 +146,49 @@ public:
 	}
 	void draw(uint32_t vertices, uint32_t instances, uint32_t first_vertex,
 	          uint32_t first_instance) const {
+		Touch();
 		Run([=](vk::CommandBuffer command) {
 			command.draw(vertices, instances, first_vertex, first_instance);
 		});
 	}
 	void drawIndexed(uint32_t indices, uint32_t instances, uint32_t first_index, int32_t offset,
 	                 uint32_t first_instance) const {
+		Touch();
 		Run([=](vk::CommandBuffer command) {
 			command.drawIndexed(indices, instances, first_index, offset, first_instance);
 		});
 	}
 	void drawIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                  uint32_t stride) const {
+		Touch();
 		Run([=](vk::CommandBuffer command) {
 			command.drawIndirect(buffer, offset, count, stride);
 		});
 	}
 	void drawIndexedIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                         uint32_t stride) const {
+		Touch();
 		Run([=](vk::CommandBuffer command) {
 			command.drawIndexedIndirect(buffer, offset, count, stride);
 		});
 	}
 	void drawMeshTasksEXT(uint32_t x, uint32_t y, uint32_t z) const {
+		Touch();
 		Run([=](vk::CommandBuffer command) { command.drawMeshTasksEXT(x, y, z); });
 	}
 	void drawMeshTasksIndirectEXT(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                              uint32_t stride) const {
+		Touch();
 		Run([=](vk::CommandBuffer command) {
 			command.drawMeshTasksIndirectEXT(buffer, offset, count, stride);
 		});
 	}
 	void dispatch(uint32_t x, uint32_t y, uint32_t z) const {
+		Touch();
 		Run([=](vk::CommandBuffer command) { command.dispatch(x, y, z); });
 	}
 	void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) const {
+		Touch();
 		Run([=](vk::CommandBuffer command) { command.dispatchIndirect(buffer, offset); });
 	}
 	void bindIndexBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::IndexType type) const {
@@ -254,6 +270,7 @@ public:
 	                     const vk::BufferMemoryBarrier* buffers, uint32_t image_count,
 	                     const vk::ImageMemoryBarrier* images,
 	                     const std::source_location& site = std::source_location::current()) const {
+		Touch();
 		{
 			uint32_t layouts = 0;
 			for (uint32_t i = 0; i < image_count; i++) {
@@ -282,70 +299,103 @@ public:
 	void
 	pipelineBarrier2(const vk::DependencyInfo&   dependency,
 	                 const std::source_location& site = std::source_location::current()) const {
-		{
-			uint32_t layouts = 0;
-			bool     full    = false;
-			for (uint32_t i = 0; i < dependency.imageMemoryBarrierCount; i++) {
-				const auto& b = dependency.pImageMemoryBarriers[i];
-				layouts += b.oldLayout != b.newLayout ? 1u : 0u;
-				full |= static_cast<bool>((b.srcStageMask | b.dstStageMask) &
-				                          vk::PipelineStageFlagBits2::eAllCommands);
+		auto*      batch = Batch();
+		const bool full  = WaitsForEverything(dependency);
+		if (batch != nullptr && batch->after_pending) {
+			if (full) {
+				// It makes the batch's copies visible as its "after" barrier would.
+				EndBatch(*batch);
+				RecordedCommands::Add(RecordedCommands::BatchMerged);
+			} else if (dependency.memoryBarrierCount < MaxMergedMemoryBarriers) {
+				// The batch's "after" barrier goes in with this one.
+				std::array<vk::MemoryBarrier2, MaxMergedMemoryBarriers> memory {};
+				for (uint32_t i = 0; i < dependency.memoryBarrierCount; i++) {
+					memory[i] = dependency.pMemoryBarriers[i];
+				}
+				memory[dependency.memoryBarrierCount] = AfterBarrier();
+				auto merged                           = dependency;
+				merged.memoryBarrierCount             = dependency.memoryBarrierCount + 1;
+				merged.pMemoryBarriers                = memory.data();
+				EndBatch(*batch);
+				RecordedCommands::Add(RecordedCommands::BatchMerged);
+				RecordBarrier2(merged, site);
+				batch->fenced = false;
+				return;
+			} else {
+				RecordAfter();
 			}
-			for (uint32_t i = 0; i < dependency.memoryBarrierCount; i++) {
-				const auto& b = dependency.pMemoryBarriers[i];
-				full |= static_cast<bool>((b.srcStageMask | b.dstStageMask) &
-				                          vk::PipelineStageFlagBits2::eAllCommands);
-			}
-			for (uint32_t i = 0; i < dependency.bufferMemoryBarrierCount; i++) {
-				const auto& b = dependency.pBufferMemoryBarriers[i];
-				full |= static_cast<bool>((b.srcStageMask | b.dstStageMask) &
-				                          vk::PipelineStageFlagBits2::eAllCommands);
-			}
-			RecordedCommands::NoteBarrier(full, dependency.memoryBarrierCount,
-			                              dependency.bufferMemoryBarrierCount,
-			                              dependency.imageMemoryBarrierCount, layouts, site);
 		}
-		if (!Threaded()) {
-			m_direct.pipelineBarrier2(dependency);
-			return;
+		RecordBarrier2(dependency, site);
+		if (batch != nullptr) {
+			batch->fenced = full;
 		}
-		EXIT_IF(dependency.pNext != nullptr);
-		RequireNoNext(dependency.pMemoryBarriers, dependency.memoryBarrierCount);
-		RequireNoNext(dependency.pBufferMemoryBarriers, dependency.bufferMemoryBarrierCount);
-		RequireNoNext(dependency.pImageMemoryBarriers, dependency.imageMemoryBarrierCount);
-		auto copy = dependency;
-		copy.pMemoryBarriers =
-		    m_scheduler->Stash(dependency.pMemoryBarriers, dependency.memoryBarrierCount);
-		copy.pBufferMemoryBarriers = m_scheduler->Stash(dependency.pBufferMemoryBarriers,
-		                                                dependency.bufferMemoryBarrierCount);
-		copy.pImageMemoryBarriers =
-		    m_scheduler->Stash(dependency.pImageMemoryBarriers, dependency.imageMemoryBarrierCount);
-		m_scheduler->Record([copy](vk::CommandBuffer command) { command.pipelineBarrier2(copy); });
 	}
 	void copyBuffer(vk::Buffer source, vk::Buffer destination, uint32_t count,
 	                const vk::BufferCopy* regions) const {
-		{
-			uint64_t bytes = 0;
-			for (uint32_t i = 0; i < count; i++) {
-				bytes += regions[i].size;
-			}
-			RecordedCommands::Add(RecordedCommands::BufferCopies);
-			RecordedCommands::Add(RecordedCommands::BufferCopyBytes, bytes);
-			RecordedCommands::Mark(RecordedCommands::GapCopy);
-		}
-		if (!Threaded()) {
-			m_direct.copyBuffer(source, destination, count, regions);
-			return;
-		}
-		const auto* r = m_scheduler->Stash(regions, count);
-		m_scheduler->Record(
-		    [=](vk::CommandBuffer command) { command.copyBuffer(source, destination, count, r); });
+		Touch();
+		RecordCopy(source, destination, count, regions);
 	}
+	// Round 167 (copies:lean): a copy of the CPU's bytes into a GPU buffer (an upload, a store),
+	// in the command buffer's batch of such copies (CopyBatchState). Consecutive ones share the
+	// barriers around them: the first that must wait for the GPU work recorded before it
+	// (`wait_before`: draws before it may still read the bytes it replaces) records the barrier
+	// for that, and the next command that may read what the batch wrote (a draw, a dispatch, a
+	// rendering, a copy, a barrier) first makes it visible. A barrier that waited for everything
+	// just before serves as the first. Copies of bytes an earlier one of the batch wrote wait for
+	// it. The caller has ended the rendering.
+	void copyBufferBatched(vk::Buffer source, vk::Buffer destination, uint32_t count,
+	                       const vk::BufferCopy* regions, bool wait_before) const {
+		auto* batch = Batch();
+		EXIT_IF(batch == nullptr || count == 0);
+		uint64_t begin = UINT64_MAX;
+		uint64_t end   = 0;
+		for (uint32_t i = 0; i < count; i++) {
+			begin = std::min<uint64_t>(begin, regions[i].dstOffset);
+			end   = std::max<uint64_t>(end, regions[i].dstOffset + regions[i].size);
+		}
+		bool overlap = batch->written.size() >= MaxBatchWrites;
+		for (const auto& written: batch->written) {
+			if (overlap) {
+				break;
+			}
+			overlap = written.buffer == destination && written.begin < end && begin < written.end;
+		}
+		const bool before = wait_before && !batch->fenced;
+		if (overlap && !before) {
+			vk::MemoryBarrier2 barrier {};
+			barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+			barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+			barrier.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+			barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+			RecordMemoryBarrier2(barrier);
+			batch->written.clear();
+			RecordedCommands::Add(RecordedCommands::BatchOverlaps);
+		}
+		if (before) {
+			// Also orders the batch's earlier copies before this one.
+			vk::MemoryBarrier2 barrier {};
+			barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+			barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+			barrier.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+			barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+			RecordMemoryBarrier2(barrier);
+			batch->fenced = true;
+			batch->written.clear();
+			RecordedCommands::Add(RecordedCommands::BatchBefores);
+		}
+		RecordCopy(source, destination, count, regions);
+		batch->written.push_back({destination, begin, end});
+		batch->after_pending = true;
+		RecordedCommands::Add(RecordedCommands::BatchedCopies);
+	}
+	// Round 167: records the batch's "after" barrier if it is due (CommandBuffer::Handle, Submit).
+	void FlushCopyBatch() const { Touch(); }
 	void copyBuffer(vk::Buffer source, vk::Buffer destination, const vk::BufferCopy& region) const {
 		copyBuffer(source, destination, 1, &region);
 	}
 	void updateBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
 	                  const void* data) const {
+		Touch();
 		RecordedCommands::Add(RecordedCommands::BufferUpdates);
 		RecordedCommands::Add(RecordedCommands::BufferUpdateBytes, size);
 		RecordedCommands::Mark(RecordedCommands::GapCopy);
@@ -375,6 +425,7 @@ public:
 	}
 	void fillBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
 	                uint32_t value) const {
+		Touch();
 		RecordedCommands::Add(RecordedCommands::BufferFills);
 		RecordedCommands::Add(RecordedCommands::BufferFillBytes, size);
 		RecordedCommands::Mark(RecordedCommands::GapFill);
@@ -382,6 +433,7 @@ public:
 	}
 	void copyBufferToImage(vk::Buffer source, vk::Image destination, vk::ImageLayout layout,
 	                       uint32_t count, const vk::BufferImageCopy* regions) const {
+		Touch();
 		RecordedCommands::Add(RecordedCommands::ImageUploads);
 		RecordedCommands::Mark(RecordedCommands::GapImageCopy);
 		if (!Threaded()) {
@@ -399,6 +451,7 @@ public:
 	}
 	void copyImageToBuffer(vk::Image source, vk::ImageLayout layout, vk::Buffer destination,
 	                       uint32_t count, const vk::BufferImageCopy* regions) const {
+		Touch();
 		RecordedCommands::Add(RecordedCommands::ImageDownloads);
 		RecordedCommands::Mark(RecordedCommands::GapImageCopy);
 		if (!Threaded()) {
@@ -417,6 +470,7 @@ public:
 	void copyImage(vk::Image source, vk::ImageLayout source_layout, vk::Image destination,
 	               vk::ImageLayout destination_layout, uint32_t count,
 	               const vk::ImageCopy* regions) const {
+		Touch();
 		RecordedCommands::Add(RecordedCommands::ImageCopies);
 		RecordedCommands::Mark(RecordedCommands::GapImageCopy);
 		if (!Threaded()) {
@@ -435,6 +489,7 @@ public:
 	}
 	void resolveImage(vk::Image source, vk::ImageLayout source_layout, vk::Image destination,
 	                  vk::ImageLayout destination_layout, const vk::ImageResolve& region) const {
+		Touch();
 		RecordedCommands::Add(RecordedCommands::ImageCopies);
 		RecordedCommands::Mark(RecordedCommands::GapImageCopy);
 		Run([=](vk::CommandBuffer command) {
@@ -444,6 +499,7 @@ public:
 	}
 	void clearColorImage(vk::Image image, vk::ImageLayout layout, const vk::ClearColorValue* color,
 	                     uint32_t count, const vk::ImageSubresourceRange* ranges) const {
+		Touch();
 		RecordedCommands::Add(RecordedCommands::Clears);
 		RecordedCommands::Mark(RecordedCommands::GapClear);
 		if (!Threaded()) {
@@ -459,6 +515,7 @@ public:
 	void clearDepthStencilImage(vk::Image image, vk::ImageLayout layout,
 	                            const vk::ClearDepthStencilValue* value, uint32_t count,
 	                            const vk::ImageSubresourceRange* ranges) const {
+		Touch();
 		RecordedCommands::Add(RecordedCommands::Clears);
 		RecordedCommands::Mark(RecordedCommands::GapClear);
 		if (!Threaded()) {
@@ -479,6 +536,8 @@ public:
 	}
 	void beginRendering(const vk::RenderingInfo* info) const { beginRendering(*info); }
 	void beginRendering(const vk::RenderingInfo& info) const {
+		// A barrier cannot go inside the rendering: the batch's goes before it.
+		Touch();
 		{
 			uint64_t loaded = 0;
 			for (uint32_t i = 0; i < info.colorAttachmentCount; i++) {
@@ -614,6 +673,128 @@ public:
 	}
 
 private:
+	static constexpr uint32_t MaxMergedMemoryBarriers = 8;
+	static constexpr size_t   MaxBatchWrites          = 256;
+
+	[[nodiscard]] CopyBatchState* Batch() const noexcept {
+		return m_scheduler != nullptr ? &m_scheduler->CopyBatch() : nullptr;
+	}
+	// The barrier after a batch of copies: what they wrote, for everything after them.
+	[[nodiscard]] static vk::MemoryBarrier2 AfterBarrier() noexcept {
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		barrier.dstAccessMask =
+		    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+		return barrier;
+	}
+	// A memory barrier from all the work before it, its writes made visible, to all after it.
+	[[nodiscard]] static bool WaitsForEverything(const vk::DependencyInfo& dependency) noexcept {
+		for (uint32_t i = 0; i < dependency.memoryBarrierCount; i++) {
+			const auto& b = dependency.pMemoryBarriers[i];
+			if (static_cast<bool>(b.srcStageMask & vk::PipelineStageFlagBits2::eAllCommands) &&
+			    static_cast<bool>(b.dstStageMask & vk::PipelineStageFlagBits2::eAllCommands) &&
+			    static_cast<bool>(b.srcAccessMask & vk::AccessFlagBits2::eMemoryWrite) &&
+			    static_cast<bool>(b.dstAccessMask & vk::AccessFlagBits2::eMemoryRead) &&
+			    static_cast<bool>(b.dstAccessMask & vk::AccessFlagBits2::eMemoryWrite)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	static void EndBatch(CopyBatchState& batch) noexcept {
+		batch.after_pending = false;
+		batch.written.clear();
+	}
+	void
+	RecordMemoryBarrier2(const vk::MemoryBarrier2&   barrier,
+	                     const std::source_location& site = std::source_location::current()) const {
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		RecordBarrier2(dependency, site);
+	}
+	void RecordAfter() const {
+		auto* batch = Batch();
+		RecordMemoryBarrier2(AfterBarrier());
+		EndBatch(*batch);
+		batch->fenced = false;
+		RecordedCommands::Add(RecordedCommands::BatchAfters);
+	}
+	// What a command that may read or write memory does first: the batch's copies become
+	// visible to it.
+	void Touch() const {
+		auto* batch = Batch();
+		if (batch == nullptr) {
+			return;
+		}
+		if (batch->after_pending) {
+			RecordAfter();
+		}
+		batch->fenced = false;
+	}
+	void RecordBarrier2(const vk::DependencyInfo&   dependency,
+	                    const std::source_location& site) const {
+		{
+			uint32_t layouts = 0;
+			bool     full    = false;
+			for (uint32_t i = 0; i < dependency.imageMemoryBarrierCount; i++) {
+				const auto& b = dependency.pImageMemoryBarriers[i];
+				layouts += b.oldLayout != b.newLayout ? 1u : 0u;
+				full |= static_cast<bool>((b.srcStageMask | b.dstStageMask) &
+				                          vk::PipelineStageFlagBits2::eAllCommands);
+			}
+			for (uint32_t i = 0; i < dependency.memoryBarrierCount; i++) {
+				const auto& b = dependency.pMemoryBarriers[i];
+				full |= static_cast<bool>((b.srcStageMask | b.dstStageMask) &
+				                          vk::PipelineStageFlagBits2::eAllCommands);
+			}
+			for (uint32_t i = 0; i < dependency.bufferMemoryBarrierCount; i++) {
+				const auto& b = dependency.pBufferMemoryBarriers[i];
+				full |= static_cast<bool>((b.srcStageMask | b.dstStageMask) &
+				                          vk::PipelineStageFlagBits2::eAllCommands);
+			}
+			RecordedCommands::NoteBarrier(full, dependency.memoryBarrierCount,
+			                              dependency.bufferMemoryBarrierCount,
+			                              dependency.imageMemoryBarrierCount, layouts, site);
+		}
+		if (!Threaded()) {
+			m_direct.pipelineBarrier2(dependency);
+			return;
+		}
+		EXIT_IF(dependency.pNext != nullptr);
+		RequireNoNext(dependency.pMemoryBarriers, dependency.memoryBarrierCount);
+		RequireNoNext(dependency.pBufferMemoryBarriers, dependency.bufferMemoryBarrierCount);
+		RequireNoNext(dependency.pImageMemoryBarriers, dependency.imageMemoryBarrierCount);
+		auto copy = dependency;
+		copy.pMemoryBarriers =
+		    m_scheduler->Stash(dependency.pMemoryBarriers, dependency.memoryBarrierCount);
+		copy.pBufferMemoryBarriers = m_scheduler->Stash(dependency.pBufferMemoryBarriers,
+		                                                dependency.bufferMemoryBarrierCount);
+		copy.pImageMemoryBarriers =
+		    m_scheduler->Stash(dependency.pImageMemoryBarriers, dependency.imageMemoryBarrierCount);
+		m_scheduler->Record([copy](vk::CommandBuffer command) { command.pipelineBarrier2(copy); });
+	}
+	void RecordCopy(vk::Buffer source, vk::Buffer destination, uint32_t count,
+	                const vk::BufferCopy* regions) const {
+		{
+			uint64_t bytes = 0;
+			for (uint32_t i = 0; i < count; i++) {
+				bytes += regions[i].size;
+			}
+			RecordedCommands::Add(RecordedCommands::BufferCopies);
+			RecordedCommands::Add(RecordedCommands::BufferCopyBytes, bytes);
+			RecordedCommands::Mark(RecordedCommands::GapCopy);
+		}
+		if (!Threaded()) {
+			m_direct.copyBuffer(source, destination, count, regions);
+			return;
+		}
+		const auto* r = m_scheduler->Stash(regions, count);
+		m_scheduler->Record(
+		    [=](vk::CommandBuffer command) { command.copyBuffer(source, destination, count, r); });
+	}
 	template <typename F>
 	void Run(F&& fn) const {
 		if (!Threaded()) {

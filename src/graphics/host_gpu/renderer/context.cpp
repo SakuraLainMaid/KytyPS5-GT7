@@ -29,6 +29,8 @@ bool CommandBuffer::IsInvalid() const {
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	// Round 167: what is recorded directly comes after the batched copies' barrier.
+	Recorder().FlushCopyBatch();
 	if (m_scheduler.Threaded()) {
 		// Recording directly: the recording thread must have run everything queued first.
 		return m_scheduler.DrainRecording();
@@ -38,7 +40,8 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 
 CommandRecorder CommandBuffer::Recorder() const {
 	EXIT_IF(IsInvalid());
-	return m_scheduler.Threaded() ? CommandRecorder(m_scheduler, nullptr) : CommandRecorder(m_buffer);
+	// The scheduler also when recording directly: its batch of copies (CopyBatchState).
+	return CommandRecorder(m_scheduler, m_scheduler.Threaded() ? nullptr : m_buffer);
 }
 
 void CommandBuffer::Begin() {

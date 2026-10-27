@@ -49,6 +49,22 @@ struct ImageBinding {
 	bool             shader_write  = false;
 };
 
+// Round 167 (images:lean): while one lives on the GPU thread, the image uses made are a draw's or
+// a dispatch's (its render targets and textures, RenderExecutor), which the guest's own sync
+// points order. Not an emulator-made copy, blit, clear or conversion.
+class GuestImageUses final {
+public:
+	GuestImageUses() noexcept: m_previous(t_active) { t_active = true; }
+	~GuestImageUses() { t_active = m_previous; }
+	GuestImageUses(const GuestImageUses&)                      = delete;
+	GuestImageUses&           operator=(const GuestImageUses&) = delete;
+	[[nodiscard]] static bool Active() noexcept { return t_active; }
+
+private:
+	static inline thread_local bool t_active = false;
+	bool                            m_previous;
+};
+
 class Image final {
 public:
 	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
@@ -212,6 +228,9 @@ public:
 	uint64_t content_serial = 0;
 	// TextureCache::ResetUnmappedDepth: the content it last checked (UINT64_MAX: none yet).
 	uint64_t sparse_checked_serial = UINT64_MAX;
+	// Round 167 (images:lean): an emulator-made use (a copy, blit, clear, conversion) since its
+	// last barrier, which no guest sync point orders: the next use makes its barrier.
+	bool internal_use = false;
 
 private:
 	friend struct ImageTestAccess;

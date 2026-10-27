@@ -3,6 +3,8 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -18,12 +20,12 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstdlib>
+#include <fmt/format.h>
 #include <list>
 #include <mutex>
 #include <unordered_map>
-#include <fmt/format.h>
-#include <xxhash.h>
 #include <vulkan/vulkan_format_traits.hpp>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -179,6 +181,26 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	              range->base_layer != 0 || range->layer_count != info.resources.layers);
 	const bool has_subresource_states = !subresource_states.empty();
 
+	// Round 167 (images:lean): with the guest's sync points ordering the GPU work, a draw's or
+	// dispatch's use of the image in the layout it is in, with no copy before or now, makes no
+	// barrier: its accesses join the ones the next barrier waits for. An emulator-made use since
+	// the last barrier is not ordered by the guest, so the next use makes its barrier.
+	const bool guest_use = GuestImageUses::Active();
+	const bool lean =
+	    guest_use && !internal_use && Bisect::LeanImages() && GuestGpu::GuestPm4Barriers();
+	if (!guest_use) {
+		internal_use = true;
+	}
+	constexpr auto transfer_access =
+	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+	const auto joins = [&](const VulkanImageState& current) {
+		return lean && current.layout == destination_layout &&
+		       !static_cast<bool>((current.access_mask | destination_access) & transfer_access);
+	};
+	vk::AccessFlags2        joined_access {};
+	vk::PipelineStageFlags2 joined_stage {};
+	uint32_t                skipped = 0;
+
 	Barriers barriers;
 	if (partial || has_subresource_states) {
 		if (!has_subresource_states) {
@@ -194,6 +216,14 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				const auto index = level * info.resources.layers + layer;
 				EXIT_IF(index >= subresource_states.size());
 				auto& subresource_state = subresource_states[index];
+				if (joins(subresource_state)) {
+					subresource_state.access_mask |= destination_access;
+					subresource_state.pl_stage |= destination_stage;
+					joined_access |= subresource_state.access_mask;
+					joined_stage |= subresource_state.pl_stage;
+					skipped++;
+					continue;
+				}
 
 				constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite |
 				                              vk::AccessFlagBits2::eShaderWrite |
@@ -226,6 +256,11 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		if (!partial) {
 			subresource_states.clear();
 		}
+	} else if (joins(state)) {
+		state.access_mask |= destination_access;
+		state.pl_stage |= destination_stage;
+		RecordedCommands::Add(RecordedCommands::ImageBarriersSkipped);
+		return {};
 	} else {
 		constexpr auto write_access   = vk::AccessFlagBits2::eTransferWrite |
 		                                vk::AccessFlagBits2::eShaderWrite |
@@ -257,7 +292,17 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	if (state.layout != destination_layout) {
 		NoteBindlessStateChange(*this);
 	}
-	state = {destination_stage, destination_access, destination_layout};
+	// What joined (images:lean) stays for the next barrier to wait for.
+	state = {destination_stage | joined_stage, destination_access | joined_access,
+	         destination_layout};
+	if (skipped != 0) {
+		RecordedCommands::Add(RecordedCommands::ImageBarriersSkipped);
+	}
+	// A barrier for the whole image covers what an emulator-made use left; one for some of its
+	// subresources may not.
+	if (guest_use && !barriers.empty() && !has_subresource_states && !partial) {
+		internal_use = false;
+	}
 	return barriers;
 }
 

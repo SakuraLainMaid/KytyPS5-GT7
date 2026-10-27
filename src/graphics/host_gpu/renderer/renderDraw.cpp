@@ -924,8 +924,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			if (created || !buffer.IsRendering()) {
 				cache.m_blit_helper.ReplicateColorToMs(image, *ms.image);
 			}
-			ms.image->Transit(vk::ImageLayout::eColorAttachmentOptimal,
-			                  vk::AccessFlagBits2::eColorAttachmentWrite, {}, buffer.Recorder());
+			{
+				const GuestImageUses guest_use;
+				ms.image->Transit(vk::ImageLayout::eColorAttachmentOptimal,
+				                  vk::AccessFlagBits2::eColorAttachmentWrite, {},
+				                  buffer.Recorder());
+			}
 			attachment_view   = ms.view;
 			attachment_layout = vk::ImageLayout::eColorAttachmentOptimal;
 			resolve_view      = image_view;
@@ -935,10 +939,13 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access =
 		    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
-		image.Transit(layout, image.binding.attachment_access,
-		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
-		                                     view.layer_count},
-		              buffer.Recorder());
+		{
+			const GuestImageUses guest_use;
+			image.Transit(layout, image.binding.attachment_access,
+			              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
+			                                     view.layer_count},
+			              buffer.Recorder());
+		}
 		const auto extent       = ClampToBacking(image, view.base_level, target.Extent(),
 		                                         target.desc.info.data.address, "color");
 		state.width             = std::min(state.width, extent.width);
@@ -1031,10 +1038,13 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access = access;
 		const auto& view                = depth.desc.view_info;
-		image.Transit(layout, access,
-		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
-		                                     view.layer_count},
-		              buffer.Recorder());
+		{
+			const GuestImageUses guest_use;
+			image.Transit(layout, access,
+			              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
+			                                     view.layer_count},
+			              buffer.Recorder());
+		}
 		const auto depth_extent =
 		    ClampToBacking(image, view.base_level,
 		                   {depth.desc.info.extent.width, depth.desc.info.extent.height},
