@@ -2161,7 +2161,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				LOGF("Windows guest red-zone superblocks: %s, %" PRIu64 " built carrying %" PRIu64
 				     " more protected instructions, %" PRIu64
 				     " stack pointer moves saved, %.1f MB%s; "
-				     "trampolines %.1f of %.1f MB (KYTY_REDZONE_SUPERBLOCKS=0 turns them off)\n",
+				     "trampolines %.1f of %.1f MB (KYTY_REDZONE_SUPERBLOCKS=1 turns them on)\n",
 				     module_name.c_str(), result.superblock_count, result.superblock_folded_sites,
 				     result.superblock_merged_pairs,
 				     static_cast<double>(result.superblock_bytes) / (1024.0 * 1024.0),

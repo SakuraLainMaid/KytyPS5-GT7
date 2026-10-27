@@ -1018,8 +1018,9 @@ void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunctio
 	}
 }
 
-// Red-zone superblocks (KYTY_REDZONE_SUPERBLOCKS=0 turns them off). A span's trampoline used to
-// jump back right after its own instructions, so in a loop of protected loads every one of them
+// Red-zone superblocks (KYTY_REDZONE_SUPERBLOCKS=1 turns them on; off by default since round 165,
+// as the game thread they were for turned out to be waiting, not working). A span's trampoline used
+// to jump back right after its own instructions, so in a loop of protected loads every one of them
 // left the guest code and came back: two far jumps and two RSP moves each. A superblock goes on
 // copying the instructions after its span, protected ones included, to the next branch target
 // (or through a jump or a return), keeps RSP below the red zone across runs that do not touch
@@ -1033,7 +1034,7 @@ struct SuperblockContext {
 bool SuperblocksEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_REDZONE_SUPERBLOCKS");
-		return value == nullptr || std::strcmp(value, "0") != 0;
+		return value != nullptr && std::strcmp(value, "1") == 0;
 	}();
 	return enabled;
 }

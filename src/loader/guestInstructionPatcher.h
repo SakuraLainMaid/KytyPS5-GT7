@@ -66,7 +66,8 @@ struct GuestInstructionPatchResult {
 void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
                                          void* trampoline_area_ptr, uint64_t trampoline_area_size,
                                          uint64_t superblock_bytes = 0);
-// The trampoline space a module's red-zone superblocks get, unless KYTY_REDZONE_SUPERBLOCKS=0.
+// The trampoline space a module's red-zone superblocks get when KYTY_REDZONE_SUPERBLOCKS=1 (0
+// otherwise).
 uint64_t GuestInstructionSuperblockSpace();
 void UnregisterGuestInstructionPatchModule(void* module_ptr);
 
