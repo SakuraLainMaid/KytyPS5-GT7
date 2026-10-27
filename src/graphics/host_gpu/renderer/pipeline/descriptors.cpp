@@ -43,6 +43,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <array>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
@@ -214,6 +215,82 @@ vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture, uint32_t el
 	EXIT_IF(!texture.image_id || view == nullptr || texture.layout == vk::ImageLayout::eUndefined);
 	return {nullptr, view, texture.layout};
 }
+
+// Stage 2, step 0 (KYTY_BIND_REPEAT_STATS=1; docs/stage2-parallel-translation.md): how often a
+// stage's binding inputs (the program and its descriptors, user data and flattened SRT) are the
+// same as that stage's last ones, or as one of the recent ones (a direct-mapped table of 256),
+// to judge whether skipping a repeated PrepareBindings is worth it. A line every 10 s.
+namespace {
+
+struct BindRepeatStats {
+	uint64_t                 stages       = 0;
+	uint64_t                 same_as_last = 0;
+	uint64_t                 recent       = 0;
+	std::array<uint64_t, 8>  last {};
+	std::array<uint64_t, 256> table {};
+	std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+};
+
+bool BindRepeatStatsOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_BIND_REPEAT_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
+uint64_t HashBindingInputs(uint64_t shader_hash, const ShaderRecompiler::IR::ResourceSnapshot& s) {
+	uint64_t   hash = 0xcbf29ce484222325ull ^ shader_hash;
+	const auto mix  = [&hash](const void* data, size_t size) {
+		const auto* bytes = static_cast<const uint8_t*>(data);
+		for (size_t i = 0; i < size; i++) {
+			hash = (hash ^ bytes[i]) * 0x100000001b3ull;
+		}
+		hash = (hash ^ size) * 0x100000001b3ull;
+	};
+	for (const auto* list: {&s.buffers, &s.images, &s.samplers}) {
+		for (const auto& descriptor: *list) {
+			mix(descriptor.dwords.data(), descriptor.dword_count * sizeof(uint32_t));
+		}
+		mix(nullptr, 0);
+	}
+	mix(s.user_data.data(), s.user_data.size() * sizeof(uint32_t));
+	mix(s.flattened_srt.data(), s.flattened_srt.size() * sizeof(uint32_t));
+	return hash | 1u; // never 0, the tables' empty value
+}
+
+void NoteBindRepeat(uint32_t stage, uint64_t hash) {
+	static BindRepeatStats stats; // GPU thread only
+	stats.stages++;
+	auto& last = stats.last[stage & 7u];
+	if (last == hash) {
+		stats.same_as_last++;
+	}
+	last       = hash;
+	auto& slot = stats.table[hash & 255u];
+	if (slot == hash) {
+		stats.recent++;
+	}
+	slot             = hash;
+	const auto now   = std::chrono::steady_clock::now();
+	const auto spent = std::chrono::duration<double>(now - stats.since).count();
+	if (spent >= 10.0) {
+		LOGF("Binding repeats (%.0f s): %" PRIu64 " stages, the same inputs as the stage's last "
+		     "%" PRIu64 " (%.1f%%), as one of the recent %" PRIu64 " (%.1f%%)\n",
+		     spent, stats.stages, stats.same_as_last,
+		     stats.stages != 0 ? 100.0 * static_cast<double>(stats.same_as_last) /
+		                             static_cast<double>(stats.stages)
+		                       : 0.0,
+		     stats.recent,
+		     stats.stages != 0 ? 100.0 * static_cast<double>(stats.recent) /
+		                             static_cast<double>(stats.stages)
+		                       : 0.0);
+		stats.stages = stats.same_as_last = stats.recent = 0;
+		stats.since  = now;
+	}
+}
+
+} // namespace
 
 static const char* ShaderStageResourceName(ShaderType stage) {
 	switch (stage) {
@@ -3327,6 +3404,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
 	const DiagShaderScope diag_shader_scope(program.shader_hash);
+	if (BindRepeatStatsOn()) {
+		NoteBindRepeat(static_cast<uint32_t>(program.stage), HashBindingInputs(program.shader_hash, snapshot));
+	}
 	// Diagnostics: KYTY_WATCH_SHADER=<hash>[,<hash>...] logs the buffer and texture descriptors
 	// these shaders are bound with (first few uses of each; KYTY_WATCH_SHADER_EVERY=<n> adds every
 	// n-th use, up to 8 more), with the shaders that last wrote each buffer.
