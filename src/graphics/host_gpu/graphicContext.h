@@ -281,6 +281,8 @@ struct GraphicContext {
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
+	// The free ranges inside VMA's device-local blocks: held from the driver, room for VMA.
+	[[nodiscard]] uint64_t DeviceBlockFreeBytes() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 	// The driver's budget for the device-local heaps (VK_EXT_memory_budget), without the reserve
 	// and the video memory target GetTotalMemoryBudget takes off; 0 when it cannot be read.
@@ -291,7 +293,8 @@ struct GraphicContext {
 	//   MemoryShortfall for why). On Windows every GB of video memory in use is also charged to
 	//   the commit limit (WDDM backs pageable allocations), so a PC with a small page file runs
 	//   out of commit with video memory to spare (ISSUES #21);
-	// - everything the device holds past 90 % of the budget, which KYTY_VRAM_TARGET_MB caps
+	// - everything the device holds, less the free ranges in VMA's blocks (DeviceBlockFreeBytes),
+	//   past 90 % of the budget, which KYTY_VRAM_TARGET_MB caps
 	//   (default 14336: the emulator plans for a 16 GB card whatever card it runs on).
 	[[nodiscard]] uint64_t MemoryShortfall() const;
 	// Whether everything the device holds (images, buffers, the driver's own) has reached percent

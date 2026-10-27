@@ -181,7 +181,25 @@ uint64_t GraphicContext::MemoryShortfall() const {
 		uint64_t device = 0;
 		if (CanReportMemoryUsage()) {
 			const auto budget = GetTotalMemoryBudget();
-			const auto usage  = GetDeviceMemoryUsage();
+			// The free ranges inside VMA's device-local blocks are held but take the next
+			// allocations, so they are room, not use. Counted as use, they made a shortfall the
+			// collectors could never close: GT7's rewards screen after a long race held 1.5 GB free
+			// in its 64 MB blocks, "short by 865 MB" with 1.4 GB of images, and the texture collector
+			// evicted and recreated images 300 ms a frame (0 fps). Only while the device holds no
+			// more than the driver's budget (GetRawMemoryBudget; the one above is 1/8 below it, and
+			// the rewards screen held 4.6 GB, past it): counted past the driver's as well, the cache
+			// grew in a race until the device held 5.9 GB of a 4.8 GB budget, the driver paged and
+			// frames took 1 s.
+			// KYTY_SHORTFALL_BLOCK_FREE=0 counts them as use again.
+			static const bool block_free_is_room = [] {
+				const char* value = std::getenv("KYTY_SHORTFALL_BLOCK_FREE");
+				return value == nullptr || value[0] != '0';
+			}();
+			auto usage = GetDeviceMemoryUsage();
+			if (block_free_is_room && usage <= GetRawMemoryBudget()) {
+				const auto free = DeviceBlockFreeBytes();
+				usage           = usage > free ? usage - free : 0;
+			}
 			const auto mark   = budget / 10 * 9;
 			device            = budget != 0 && usage > mark ? usage - mark : 0;
 		}
@@ -343,6 +361,24 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 		}
 	}
 	return usage;
+}
+
+uint64_t GraphicContext::DeviceBlockFreeBytes() const {
+	if (allocator == nullptr) {
+		return 0;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	uint64_t free = 0;
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		if (physical_device_memory_properties.memoryHeaps[heap].flags &
+		    vk::MemoryHeapFlagBits::eDeviceLocal) {
+			const auto& stats = budgets[heap].statistics;
+			free += stats.blockBytes > stats.allocationBytes ? stats.blockBytes - stats.allocationBytes
+			                                                 : 0;
+		}
+	}
+	return free;
 }
 
 uint64_t GraphicContext::GetTotalMemoryBudget() const {

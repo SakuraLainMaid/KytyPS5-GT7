@@ -475,6 +475,23 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 // race, the device ring was 0.8 ms a frame faster (19.7 against 19.3 fps, 51 A/B pairs, round 92),
 // so it stays the default. KYTY_STREAM_HOST=1 puts the ring in cached host memory; the step
 // stream:host switches to one there.
+// The upload staging ring, in host memory the GPU reads (write-combined: it counts against the
+// RAM and commit the guest's memory already presses on a 32 GB laptop). KYTY_UPLOAD_STAGING_MB,
+// default 256 (512 before): a race uploads a few MB a frame; a larger upload goes through the ring
+// in pieces of its size.
+static uint64_t UploadStagingBytes() {
+	static const uint64_t bytes = [] {
+		uint64_t    mb    = 256;
+		const char* value = std::getenv("KYTY_UPLOAD_STAGING_MB");
+		if (value != nullptr && *value != '\0') {
+			mb = std::clamp<uint64_t>(std::strtoull(value, nullptr, 10), 32, 2048);
+		}
+		LOGF("Upload staging: %" PRIu64 " MB (KYTY_UPLOAD_STAGING_MB)\n", mb);
+		return mb << 20u;
+	}();
+	return bytes;
+}
+
 static bool StreamRingInHostMemory() {
 	const char* value = std::getenv("KYTY_STREAM_HOST");
 	return value != nullptr && value[0] == '1';
@@ -485,7 +502,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_memory_tracker(page_manager),
-      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
+      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, UploadStagingBytes()),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB, StreamRingInHostMemory()),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
