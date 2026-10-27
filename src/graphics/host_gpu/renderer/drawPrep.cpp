@@ -51,6 +51,10 @@ struct alignas(64) PaddedCounter {
 	std::atomic<uint64_t> value {0};
 };
 std::array<PaddedCounter, static_cast<size_t>(Counter::Count)> g_counters {};
+// Round 170: the counts of the compute queues' packets again (the scanner's item, or the GPU
+// thread's current packet), for a line of their own.
+std::array<PaddedCounter, static_cast<size_t>(Counter::Count)> g_compute_counters {};
+thread_local bool                                              t_scanner_compute = false;
 
 // GPU thread (round 155): the packet the current draw's first take found, for its other stages'
 // takes (a pixel stage after the vertex stage, a tessellated draw's four) without the store's
@@ -336,11 +340,23 @@ StageResult* Take(uint32_t stage) {
 
 void Add(Counter counter, uint64_t value) {
 	g_counters[static_cast<size_t>(counter)].value.fetch_add(value, std::memory_order_relaxed);
+	if (t_has_current ? t_current.queue != 0 : t_scanner_compute) {
+		g_compute_counters[static_cast<size_t>(counter)].value.fetch_add(value,
+		                                                                 std::memory_order_relaxed);
+	}
+}
+
+void SetScannerQueue(uint32_t queue) {
+	t_scanner_compute = queue != 0;
 }
 
 void LogCountersIfDue() {
+	// Round 170: two scanner threads call this.
+	static std::mutex                                                mutex;
+	std::lock_guard                                                  lock(mutex);
 	static std::chrono::steady_clock::time_point last {};
 	static std::array<uint64_t, static_cast<size_t>(Counter::Count)> previous {};
+	static std::array<uint64_t, static_cast<size_t>(Counter::Count)> previous_compute {};
 	const auto now = std::chrono::steady_clock::now();
 	if (last.time_since_epoch().count() == 0) {
 		last = now;
@@ -376,6 +392,22 @@ void LogCountersIfDue() {
 	     c(Counter::MissReads), c(Counter::ScanCondExec), c(Counter::ScanCondSkip),
 	     c(Counter::ScanCondStop), c(Counter::GpuCondExec), c(Counter::GpuCondSkip),
 	     c(Counter::VerifyChecks), c(Counter::VerifyMismatches));
+	for (size_t i = 0; i < delta.size(); i++) {
+		const auto value    = g_compute_counters[i].value.load(std::memory_order_relaxed);
+		delta[i]            = value - previous_compute[i];
+		previous_compute[i] = value;
+	}
+	LOGF("DrawPrep compute queues (10 s): scanned %llu, prepared %llu, skipped behind %llu / "
+	     "unknown shader %llu / unsupported %llu / no entry %llu, walk failed %llu, tainted %llu "
+	     "(taints %llu); GPU takes %llu, used %llu, miss none %llu (nothing waiting %llu, a later "
+	     "packet waiting %llu, another packet %llu) / entry %llu / inputs %llu / reads %llu\n",
+	     c(Counter::Scanned), c(Counter::Prepared), c(Counter::SkipBehind),
+	     c(Counter::SkipUnknownPair), c(Counter::SkipUnsupported), c(Counter::SkipNoEntry),
+	     c(Counter::FailWalk), c(Counter::Tainted),
+	     c(Counter::TaintIndirect) + c(Counter::TaintContext), c(Counter::Takes),
+	     c(Counter::Used) + c(Counter::Reused), c(Counter::MissNone), c(Counter::MissEmpty),
+	     c(Counter::MissLater), c(Counter::MissPacket), c(Counter::MissEntry),
+	     c(Counter::MissInputs), c(Counter::MissReads));
 }
 
 void NoteGoodPair(uint64_t vs_addr, uint64_t ps_addr) {

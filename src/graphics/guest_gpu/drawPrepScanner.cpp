@@ -130,10 +130,10 @@ void LogScanStopped(const char* what, uint32_t header, uint64_t value) {
 
 } // namespace
 
-DrawPrepScanner::DrawPrepScanner(RenderContext& renderer): m_renderer(renderer) {
+DrawPrepScanner::DrawPrepScanner(RenderContext& renderer, const char* name): m_renderer(renderer) {
 	const auto workers = WorkerCount();
-	LOGF("DrawPrep: the scanner's walks run on %u worker thread%s (KYTY_DRAW_PREP_WORKERS)\n",
-	     workers, workers == 1 ? "" : "s");
+	LOGF("DrawPrep: the %s scanner's walks run on %u worker thread%s (KYTY_DRAW_PREP_WORKERS)\n",
+	     name, workers, workers == 1 ? "" : "s");
 	for (uint32_t i = 0; i < workers; i++) {
 		m_workers.emplace_back([this] { WorkerRun(); });
 	}
@@ -292,6 +292,7 @@ void DrawPrepScanner::Run() {
 		}
 		m_queue = item.queue;
 		m_state = &State(item.queue);
+		DrawPrep::SetScannerQueue(item.queue);
 		if (item.seq == 0) {
 			// The GPU thread resets its command processor at a suspend point.
 			m_state->cp->Reset();
@@ -504,8 +505,15 @@ void DrawPrepScanner::Scan(const Item& item) {
 		return true;
 	};
 	const auto unreadable = [&](uint32_t header, const uint32_t* guest) {
-		// Its registers are unknown here: the queue's register copy is unreliable until a reset.
-		m_state->tainted = true;
+		// Its registers are unknown here. Round 170: the submissions after it are prepared anyway,
+		// as after register pairs the GPU wrote: a result is used only when its program entry,
+		// shader address, user data, compute sizes and every byte its walk read are the GPU
+		// thread's (TakeScanned). Before, the queue's register copy counted as unreliable up to
+		// its next suspend point, and a compute queue the scanner fell behind on once went
+		// unprepared for the rest of it (scan:oldtaint).
+		if (Bisect::ScanOldTaint()) {
+			m_state->tainted = true;
+		}
 		DrawPrep::Add(DrawPrep::Counter::TaintIndirect);
 		LogScanStopped("a command buffer it could not copy, or one the GPU thread had passed",
 		               header, reinterpret_cast<uint64_t>(guest));

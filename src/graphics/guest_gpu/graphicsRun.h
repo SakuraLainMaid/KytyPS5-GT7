@@ -154,6 +154,8 @@ private:
 	// KYTY_DRAW_PREP: the scanner, and the number of the last graphics submission queued
 	// (under m_queue_mutex).
 	std::unique_ptr<DrawPrepScanner> m_draw_prep;
+	// Round 170: the compute queues' scanner (null: they go to m_draw_prep, as before).
+	std::unique_ptr<DrawPrepScanner> m_draw_prep_compute;
 	uint64_t                         m_prep_seq = 0;
 
 	uint64_t        m_submit_id = 0;

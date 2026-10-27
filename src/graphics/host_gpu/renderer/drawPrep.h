@@ -159,6 +159,9 @@ enum class Counter : uint32_t {
 };
 void Add(Counter counter, uint64_t value = 1);
 void LogCountersIfDue();
+// A scanner thread: its counts from now on are of `queue`'s packets (round 170: the compute
+// queues' are counted again on a line of their own).
+void SetScannerQueue(uint32_t queue);
 
 // GPU thread: a vertex/pixel shader pair whose programs it prepared successfully; the scanner
 // prepares only such pairs (it never meets a shader state the draw path has not handled).

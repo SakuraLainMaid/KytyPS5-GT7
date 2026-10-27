@@ -136,6 +136,8 @@ struct Step {
 	bool              copies_lean       = false; // copies:lean
 	bool              images_lean       = false; // images:lean
 	bool              lean_off          = false; // lean:off (round 169)
+	bool              scan_shared       = false; // scan:shared (round 170)
+	bool              scan_oldtaint     = false; // scan:oldtaint (round 170)
 	bool              protect_excl    = false; // protect:exclusive
 	std::string       cpu_set;          // empty: as at the start
 	std::string       name;             // for the screen and the picture's file name
@@ -485,6 +487,14 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "lean:off") {
 		step.lean_off = true;
+		return true;
+	}
+	if (action == "scan:shared") {
+		step.scan_shared = true;
+		return true;
+	}
+	if (action == "scan:oldtaint") {
+		step.scan_oldtaint = true;
 		return true;
 	}
 	if (action == "protect:exclusive") {
@@ -1135,6 +1145,16 @@ bool LightGridsRaw() {
 bool ScanOneThread() {
 	const auto* step = Current();
 	return step != nullptr && step->scan_one;
+}
+
+bool ScanShared() {
+	const auto* step = Current();
+	return step != nullptr && step->scan_shared;
+}
+
+bool ScanOldTaint() {
+	const auto* step = Current();
+	return step != nullptr && step->scan_oldtaint;
 }
 
 bool HotPages() {

@@ -185,7 +185,15 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
 	m_gfx_cp->Reset();
 	if (DrawPrep::Enabled()) {
-		m_draw_prep = std::make_unique<DrawPrepScanner>(renderer);
+		m_draw_prep = std::make_unique<DrawPrepScanner>(renderer, "graphics");
+		// Round 170: the compute queues' submissions on a scanner of their own
+		// (KYTY_DRAW_PREP_SCANNERS=1, or KYTY_BISECT's scan:shared, as before). Behind a graphics
+		// submission of thousands of draws, a compute queue's was often still waiting when the
+		// GPU thread ran it.
+		const char* scanners = std::getenv("KYTY_DRAW_PREP_SCANNERS");
+		if (scanners == nullptr || std::strcmp(scanners, "1") != 0) {
+			m_draw_prep_compute = std::make_unique<DrawPrepScanner>(renderer, "compute");
+		}
 		LOGF("DrawPrep: the scanner prepares draws ahead of the GPU thread (KYTY_DRAW_PREP=0 turns it "
 		     "off; verify %d)\n",
 		     DrawPrep::VerifyMode());
@@ -211,6 +219,7 @@ void GuestGpu::Shutdown() {
 	if (m_thread.joinable()) {
 		m_thread.join();
 	}
+	m_draw_prep_compute.reset();
 	m_draw_prep.reset();
 	m_shutdown_complete = true;
 }
@@ -765,13 +774,17 @@ void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(!m_accepting);
 	if (m_draw_prep != nullptr) {
 		// In queue order, as the GPU thread will run them.
+		auto& scanner =
+		    submission.queue_id != 0 && m_draw_prep_compute != nullptr && !Bisect::ScanShared()
+		        ? *m_draw_prep_compute
+		        : *m_draw_prep;
 		if (submission.type == SubmissionType::Graphics ||
 		    submission.type == SubmissionType::Compute) {
 			submission.prep_seq = ++m_prep_seq;
-			m_draw_prep->EnqueueSubmission(submission.queue_id, submission.prep_seq,
-			                               submission.commands);
+			scanner.EnqueueSubmission(submission.queue_id, submission.prep_seq,
+			                          submission.commands);
 		} else if (submission.type == SubmissionType::SuspendPoint) {
-			m_draw_prep->EnqueueReset(submission.queue_id);
+			scanner.EnqueueReset(submission.queue_id);
 		}
 	}
 	const bool compute = submission.type == SubmissionType::Compute;
