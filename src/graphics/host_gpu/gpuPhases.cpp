@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 #include "common/perfStats.h"
 #include "graphics/host_gpu/renderer/bisect.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 
 #include <algorithm>
 #include <array>
@@ -573,6 +574,32 @@ void ReportIfDue(uint64_t frames) {
 		                frame(Phase::DrawBda) + frame(Phase::DispatchBda), frame(Phase::Command));
 	}
 	LOGF("%s\n", line.c_str());
+	{
+		// Round 165: what the renderer recorded besides draws and dispatches, a frame.
+		namespace RC = RecordedCommands;
+		static std::array<uint64_t, RC::Count> last {};
+		std::array<uint64_t, RC::Count>        now_counts {};
+		for (size_t i = 0; i < RC::Count; i++) {
+			now_counts[i] = RC::g_counts[i].load(std::memory_order_relaxed);
+		}
+		const double frames_d = new_frames != 0 ? static_cast<double>(new_frames) : 1.0;
+		const auto   n        = [&](RC::Kind kind) {
+            return static_cast<double>(now_counts[kind] - last[kind]) / frames_d;
+		};
+		const auto mb = [&](RC::Kind kind) { return n(kind) / 1048576.0; };
+		LOGF("Recorded (%.1f s), a frame: %.0f barriers (%.0f wait for every stage; %.0f memory, "
+		     "%.0f buffer, %.0f image barriers, %.0f of them layout changes), %.0f render passes "
+		     "(%.0f attachments loaded), %.0f buffer copies (%.2f MB), %.0f buffer updates "
+		     "(%.2f MB), %.0f fills (%.2f MB), %.0f image uploads, %.0f image downloads, %.0f "
+		     "image copies or resolves, %.0f clears\n",
+		     seconds, n(RC::Barriers), n(RC::FullBarriers), n(RC::MemoryBarriers),
+		     n(RC::BufferBarriers), n(RC::ImageBarriers), n(RC::LayoutChanges), n(RC::RenderPasses),
+		     n(RC::LoadedAttachments), n(RC::BufferCopies), mb(RC::BufferCopyBytes),
+		     n(RC::BufferUpdates), mb(RC::BufferUpdateBytes), n(RC::BufferFills),
+		     mb(RC::BufferFillBytes), n(RC::ImageUploads), n(RC::ImageDownloads),
+		     n(RC::ImageCopies), n(RC::Clears));
+		last = now_counts;
+	}
 	{
 		// Round 86: the GPU thread's shader and pipeline work, when there was some.
 		const auto longest_ms = [&](Phase phase) {

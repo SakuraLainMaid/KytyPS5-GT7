@@ -56,7 +56,50 @@ struct Pair {
 	int32_t    stats_query = -1; // its statistics query in the block, or -1
 	bool       has_stats   = false;
 	Stats      stats;
+	uint32_t gap = 0; // RecordedCommands marks of what was recorded since the timed command before
 };
+
+// Round 165: the GPU time between two timed commands, by the most telling thing recorded there.
+enum GapClass : uint32_t {
+	GapImageCopies,
+	GapBufferCopies,
+	GapClears,
+	GapFills,
+	GapLayoutChanges,
+	GapRenderPasses,
+	GapBarriers,
+	GapNothing,
+	GapClassCount
+};
+constexpr std::array<const char*, GapClassCount> GapClassNames {
+    "image copies",   "buffer copies",       "clears",   "fills",
+    "layout changes", "render pass changes", "barriers", "nothing recorded"};
+
+GapClass ClassifyGap(uint32_t gap) {
+	using namespace RecordedCommands;
+	if ((gap & GapImageCopy) != 0) {
+		return GapImageCopies;
+	}
+	if ((gap & GapCopy) != 0) {
+		return GapBufferCopies;
+	}
+	if ((gap & GapClear) != 0) {
+		return GapClears;
+	}
+	if ((gap & GapFill) != 0) {
+		return GapFills;
+	}
+	if ((gap & GapLayout) != 0) {
+		return GapLayoutChanges;
+	}
+	if ((gap & GapRenderPass) != 0) {
+		return GapRenderPasses;
+	}
+	if ((gap & GapBarrier) != 0) {
+		return GapBarriers;
+	}
+	return GapNothing;
+}
 
 std::string Count(uint64_t value) {
 	if (value >= 10'000'000) {
@@ -129,6 +172,7 @@ struct Block {
 	uint64_t          tick = 0;
 	uint32_t          used = 0;
 	int64_t           open = -1; // query index of a Before without its After yet
+	uint32_t          open_gap   = 0;  // the marks that Before took
 	uint32_t          stats_used = 0;
 	int32_t           stats_open = -1; // statistics query begun by that Before
 	std::vector<Pair> pairs;
@@ -151,6 +195,7 @@ struct State {
 	Block*                               current    = nullptr;
 	std::mutex                           stats_mutex;
 	std::unordered_map<uint64_t, Stat>   stats; // key 0: GPU time between timed commands
+	std::array<Stat, GapClassCount>      gap_stats {}; // that time by what filled the gap
 	double                               total_ms = 0.0;
 };
 
@@ -338,9 +383,14 @@ void ReadBlock(State& state, Block& block) {
 					stat.kind = pair.kind;
 				}
 				if (previous_after != 0 && before >= previous_after) {
+					const auto ms =
+					    static_cast<double>(before - previous_after) * state.period_ns / 1e6;
 					auto& gap = state.stats[0];
-					gap.ms += static_cast<double>(before - previous_after) * state.period_ns / 1e6;
+					gap.ms += ms;
 					gap.count++;
+					auto& by_kind = state.gap_stats[ClassifyGap(pair.gap)];
+					by_kind.ms += ms;
+					by_kind.count++;
 				}
 				previous_after = after;
 			}
@@ -389,6 +439,8 @@ void BeginBlockSlow(RenderContext& context, CommandScheduler& scheduler,
 	}
 	auto& state   = GetState();
 	state.current = nullptr;
+	// What a command buffer records before its first timed command is that gap's.
+	RecordedCommands::g_gap.store(0, std::memory_order_relaxed);
 	if (!state.pool) {
 		const auto& graphics = context.GetGraphics();
 		state.device         = graphics.device;
@@ -449,6 +501,7 @@ void BeforeSlow(RenderContext& context, CommandBuffer& buffer) {
 	}
 	auto&      state = GetState();
 	const auto base  = static_cast<uint32_t>(block - state.blocks.data()) * BlockQueries;
+	block->open_gap  = RecordedCommands::g_gap.exchange(0, std::memory_order_relaxed);
 	buffer.Recorder().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, state.pool,
 	                                 base + block->used);
 	block->open = block->used++;
@@ -483,7 +536,9 @@ void AfterSlow(RenderContext& context, CommandBuffer& buffer, uint64_t key, uint
 	pair.key         = key;
 	pair.kind        = kind;
 	pair.stats_query = block->stats_open;
+	pair.gap         = block->open_gap;
 	block->pairs.push_back(pair);
+	RecordedCommands::g_gap.store(0, std::memory_order_relaxed);
 	block->used++;
 	block->open       = -1;
 	block->stats_open = -1;
@@ -579,12 +634,15 @@ void Present(uint64_t frame) {
 		std::vector<std::pair<uint64_t, Stat>> sorted;
 		double                                 timed = 0.0;
 		double                                 total = 0.0;
+		std::array<Stat, GapClassCount>        gaps {};
 		{
 			std::lock_guard lock(state.stats_mutex);
 			sorted.assign(state.stats.begin(), state.stats.end());
 			state.stats.clear();
 			total          = state.total_ms;
 			state.total_ms = 0.0;
+			gaps           = state.gap_stats;
+			state.gap_stats.fill({});
 		}
 		std::sort(sorted.begin(), sorted.end(),
 		          [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
@@ -594,6 +652,18 @@ void Present(uint64_t frame) {
 			}
 		}
 		LOGF("GpuTiming frame %" PRIu64 ": span=%.1fms commands=%.1fms\n", frame, total, timed);
+		{
+			std::string by_kind;
+			for (uint32_t i = 0; i < GapClassCount; i++) {
+				if (gaps[i].count != 0) {
+					by_kind += fmt::format("{}{} {:.2f}ms x{}", by_kind.empty() ? "" : ", ",
+					                       GapClassNames[i], gaps[i].ms, gaps[i].count);
+				}
+			}
+			if (!by_kind.empty()) {
+				LOGF("GpuTiming   between, by what was recorded there: %s\n", by_kind.c_str());
+			}
+		}
 		for (size_t i = 0; i < sorted.size() && i < 20; i++) {
 			const auto& [key, stat] = sorted[i];
 			LOGF("GpuTiming   %s 0x%016" PRIx64 " %7.2fms x%" PRIu64 "\n",

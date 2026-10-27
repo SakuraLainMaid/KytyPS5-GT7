@@ -7,9 +7,73 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 
 namespace Libs::Graphics {
+
+// Round 165: what the renderer records besides draws and dispatches. Counted for the 10 s
+// "Recorded" lines (GpuPhases), and marked on the gap the next timed command closes while
+// GpuTiming times frames, so the GPU time between commands can be told apart by what filled it.
+namespace RecordedCommands {
+
+enum Kind : uint32_t {
+	Barriers,       // pipelineBarrier and pipelineBarrier2 calls
+	MemoryBarriers, // their memory, buffer and image barriers
+	BufferBarriers,
+	ImageBarriers,
+	LayoutChanges, // image barriers that change the layout
+	FullBarriers,  // calls that wait for, or block, every stage (ALL_COMMANDS)
+	BufferCopies,  // copyBuffer calls and their bytes
+	BufferCopyBytes,
+	BufferUpdates, // updateBuffer
+	BufferUpdateBytes,
+	BufferFills, // fillBuffer
+	BufferFillBytes,
+	ImageUploads,      // buffer to image
+	ImageDownloads,    // image to buffer
+	ImageCopies,       // image to image, and resolves
+	Clears,            // clearColorImage, clearDepthStencilImage
+	RenderPasses,      // beginRendering
+	LoadedAttachments, // attachments those load (LOAD_OP_LOAD)
+	Count
+};
+
+// The marks of a gap between two timed commands.
+enum Gap : uint32_t {
+	GapBarrier    = 1u << 0u,
+	GapLayout     = 1u << 1u,
+	GapCopy       = 1u << 2u, // buffer copies, updates
+	GapImageCopy  = 1u << 3u, // image uploads, downloads, copies, resolves
+	GapClear      = 1u << 4u,
+	GapFill       = 1u << 5u,
+	GapRenderPass = 1u << 6u, // a rendering began or ended
+};
+
+inline std::array<std::atomic<uint64_t>, Count> g_counts {};
+inline std::atomic<uint32_t>                    g_gap {0};
+
+inline void Add(Kind kind, uint64_t n = 1) noexcept {
+	g_counts[kind].fetch_add(n, std::memory_order_relaxed);
+}
+inline void Mark(uint32_t gap) noexcept {
+	g_gap.fetch_or(gap, std::memory_order_relaxed);
+}
+
+inline void NoteBarrier(bool full, uint32_t memory, uint32_t buffers, uint32_t images,
+                        uint32_t layout_changes) noexcept {
+	Add(Barriers);
+	Add(MemoryBarriers, memory);
+	Add(BufferBarriers, buffers);
+	Add(ImageBarriers, images);
+	Add(LayoutChanges, layout_changes);
+	if (full) {
+		Add(FullBarriers);
+	}
+	Mark(layout_changes != 0 ? (GapBarrier | GapLayout) : GapBarrier);
+}
+
+} // namespace RecordedCommands
 
 // The Vulkan commands of the hot recording paths, with vk::CommandBuffer's names and arguments
 // (ported from IDXTRI's wolverine-perf branch, d9958e28 + ad1e1396).
@@ -149,6 +213,15 @@ public:
 	                     const vk::MemoryBarrier* memory, uint32_t buffer_count,
 	                     const vk::BufferMemoryBarrier* buffers, uint32_t image_count,
 	                     const vk::ImageMemoryBarrier* images) const {
+		{
+			uint32_t layouts = 0;
+			for (uint32_t i = 0; i < image_count; i++) {
+				layouts += images[i].oldLayout != images[i].newLayout ? 1u : 0u;
+			}
+			RecordedCommands::NoteBarrier(
+			    static_cast<bool>((source | destination) & vk::PipelineStageFlagBits::eAllCommands),
+			    memory_count, buffer_count, image_count, layouts);
+		}
 		if (!Threaded()) {
 			m_direct.pipelineBarrier(source, destination, flags, memory_count, memory, buffer_count,
 			                         buffers, image_count, images);
@@ -166,6 +239,29 @@ public:
 		});
 	}
 	void pipelineBarrier2(const vk::DependencyInfo& dependency) const {
+		{
+			uint32_t layouts = 0;
+			bool     full    = false;
+			for (uint32_t i = 0; i < dependency.imageMemoryBarrierCount; i++) {
+				const auto& b = dependency.pImageMemoryBarriers[i];
+				layouts += b.oldLayout != b.newLayout ? 1u : 0u;
+				full |= static_cast<bool>((b.srcStageMask | b.dstStageMask) &
+				                          vk::PipelineStageFlagBits2::eAllCommands);
+			}
+			for (uint32_t i = 0; i < dependency.memoryBarrierCount; i++) {
+				const auto& b = dependency.pMemoryBarriers[i];
+				full |= static_cast<bool>((b.srcStageMask | b.dstStageMask) &
+				                          vk::PipelineStageFlagBits2::eAllCommands);
+			}
+			for (uint32_t i = 0; i < dependency.bufferMemoryBarrierCount; i++) {
+				const auto& b = dependency.pBufferMemoryBarriers[i];
+				full |= static_cast<bool>((b.srcStageMask | b.dstStageMask) &
+				                          vk::PipelineStageFlagBits2::eAllCommands);
+			}
+			RecordedCommands::NoteBarrier(full, dependency.memoryBarrierCount,
+			                              dependency.bufferMemoryBarrierCount,
+			                              dependency.imageMemoryBarrierCount, layouts);
+		}
 		if (!Threaded()) {
 			m_direct.pipelineBarrier2(dependency);
 			return;
@@ -185,6 +281,15 @@ public:
 	}
 	void copyBuffer(vk::Buffer source, vk::Buffer destination, uint32_t count,
 	                const vk::BufferCopy* regions) const {
+		{
+			uint64_t bytes = 0;
+			for (uint32_t i = 0; i < count; i++) {
+				bytes += regions[i].size;
+			}
+			RecordedCommands::Add(RecordedCommands::BufferCopies);
+			RecordedCommands::Add(RecordedCommands::BufferCopyBytes, bytes);
+			RecordedCommands::Mark(RecordedCommands::GapCopy);
+		}
 		if (!Threaded()) {
 			m_direct.copyBuffer(source, destination, count, regions);
 			return;
@@ -198,6 +303,9 @@ public:
 	}
 	void updateBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
 	                  const void* data) const {
+		RecordedCommands::Add(RecordedCommands::BufferUpdates);
+		RecordedCommands::Add(RecordedCommands::BufferUpdateBytes, size);
+		RecordedCommands::Mark(RecordedCommands::GapCopy);
 		if (!Threaded()) {
 			m_direct.updateBuffer(buffer, offset, size, data);
 			return;
@@ -224,10 +332,15 @@ public:
 	}
 	void fillBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
 	                uint32_t value) const {
+		RecordedCommands::Add(RecordedCommands::BufferFills);
+		RecordedCommands::Add(RecordedCommands::BufferFillBytes, size);
+		RecordedCommands::Mark(RecordedCommands::GapFill);
 		Run([=](vk::CommandBuffer command) { command.fillBuffer(buffer, offset, size, value); });
 	}
 	void copyBufferToImage(vk::Buffer source, vk::Image destination, vk::ImageLayout layout,
 	                       uint32_t count, const vk::BufferImageCopy* regions) const {
+		RecordedCommands::Add(RecordedCommands::ImageUploads);
+		RecordedCommands::Mark(RecordedCommands::GapImageCopy);
 		if (!Threaded()) {
 			m_direct.copyBufferToImage(source, destination, layout, count, regions);
 			return;
@@ -243,6 +356,8 @@ public:
 	}
 	void copyImageToBuffer(vk::Image source, vk::ImageLayout layout, vk::Buffer destination,
 	                       uint32_t count, const vk::BufferImageCopy* regions) const {
+		RecordedCommands::Add(RecordedCommands::ImageDownloads);
+		RecordedCommands::Mark(RecordedCommands::GapImageCopy);
 		if (!Threaded()) {
 			m_direct.copyImageToBuffer(source, layout, destination, count, regions);
 			return;
@@ -259,6 +374,8 @@ public:
 	void copyImage(vk::Image source, vk::ImageLayout source_layout, vk::Image destination,
 	               vk::ImageLayout destination_layout, uint32_t count,
 	               const vk::ImageCopy* regions) const {
+		RecordedCommands::Add(RecordedCommands::ImageCopies);
+		RecordedCommands::Mark(RecordedCommands::GapImageCopy);
 		if (!Threaded()) {
 			m_direct.copyImage(source, source_layout, destination, destination_layout, count,
 			                   regions);
@@ -275,6 +392,8 @@ public:
 	}
 	void resolveImage(vk::Image source, vk::ImageLayout source_layout, vk::Image destination,
 	                  vk::ImageLayout destination_layout, const vk::ImageResolve& region) const {
+		RecordedCommands::Add(RecordedCommands::ImageCopies);
+		RecordedCommands::Mark(RecordedCommands::GapImageCopy);
 		Run([=](vk::CommandBuffer command) {
 			command.resolveImage(source, source_layout, destination, destination_layout, 1,
 			                     &region);
@@ -282,6 +401,8 @@ public:
 	}
 	void clearColorImage(vk::Image image, vk::ImageLayout layout, const vk::ClearColorValue* color,
 	                     uint32_t count, const vk::ImageSubresourceRange* ranges) const {
+		RecordedCommands::Add(RecordedCommands::Clears);
+		RecordedCommands::Mark(RecordedCommands::GapClear);
 		if (!Threaded()) {
 			m_direct.clearColorImage(image, layout, color, count, ranges);
 			return;
@@ -295,6 +416,8 @@ public:
 	void clearDepthStencilImage(vk::Image image, vk::ImageLayout layout,
 	                            const vk::ClearDepthStencilValue* value, uint32_t count,
 	                            const vk::ImageSubresourceRange* ranges) const {
+		RecordedCommands::Add(RecordedCommands::Clears);
+		RecordedCommands::Mark(RecordedCommands::GapClear);
 		if (!Threaded()) {
 			m_direct.clearDepthStencilImage(image, layout, value, count, ranges);
 			return;
@@ -313,6 +436,19 @@ public:
 	}
 	void beginRendering(const vk::RenderingInfo* info) const { beginRendering(*info); }
 	void beginRendering(const vk::RenderingInfo& info) const {
+		{
+			uint64_t loaded = 0;
+			for (uint32_t i = 0; i < info.colorAttachmentCount; i++) {
+				loaded += info.pColorAttachments[i].loadOp == vk::AttachmentLoadOp::eLoad ? 1u : 0u;
+			}
+			if (info.pDepthAttachment != nullptr &&
+			    info.pDepthAttachment->loadOp == vk::AttachmentLoadOp::eLoad) {
+				loaded++;
+			}
+			RecordedCommands::Add(RecordedCommands::RenderPasses);
+			RecordedCommands::Add(RecordedCommands::LoadedAttachments, loaded);
+			RecordedCommands::Mark(RecordedCommands::GapRenderPass);
+		}
 		if (!Threaded()) {
 			m_direct.beginRendering(info);
 			return;
@@ -335,6 +471,7 @@ public:
 		});
 	}
 	void endRendering() const {
+		RecordedCommands::Mark(RecordedCommands::GapRenderPass);
 		Run([](vk::CommandBuffer command) { command.endRendering(); });
 	}
 	void setCheckpointNV(const void* marker) const {
