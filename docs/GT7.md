@@ -65,6 +65,16 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 28, 2026)
+
+No shaders are compiled again after this update.
+
+- **No more crash in custom races against GT Sophy AI**
+  ([issue 13](https://github.com/usa-ratt/KytyPS5-GT7/issues/13)). In a race with 20 cars, the
+  emulator could stop on the second lap: a pixel shader's two input settings (where its inputs
+  go) were set to different values, and the emulator only handled them being the same. It
+  handles both now.
+
 ## What's new (October 27, 2026, second build)
 
 No shaders are compiled again after this update.
